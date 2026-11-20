@@ -1,11 +1,18 @@
+//go:build !windows
+
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
 )
+
+// Upstream #430's tests, adapted to the one-way sync: the user's .claude.json
+// is only ever read, so every case that upstream used to prove a write-back
+// now proves the user's file is byte-identical afterwards.
 
 func writeClaudeConfig(t *testing.T, path string, value any) {
 	t.Helper()
@@ -40,7 +47,7 @@ func projectFlag(config map[string]any, project, flag string) any {
 	return fields[flag]
 }
 
-func TestSyncClaudeProjectTrustSharesAcceptedTrustBothWays(t *testing.T) {
+func TestSyncClaudeProjectTrustCopiesAcceptedTrustIntoTheProxyOnly(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("CLAUDE_CONFIG_DIR", "")
@@ -56,21 +63,22 @@ func TestSyncClaudeProjectTrustSharesAcceptedTrustBothWays(t *testing.T) {
 			"/work/untrusted": map[string]any{"hasTrustDialogAccepted": false},
 		},
 	})
+	userBefore, _ := os.ReadFile(userPath)
 	proxyDir := filepath.Join(home, ".subrouter", "codex", "claude-proxy", "scope")
-	writeClaudeConfig(t, filepath.Join(proxyDir, ".claude.json"), map[string]any{
+	proxyPath := filepath.Join(proxyDir, ".claude.json")
+	writeClaudeConfig(t, proxyPath, map[string]any{
 		"userID": "proxy-user",
 		"projects": map[string]any{
-			"/work/untrusted":   map[string]any{"history": []string{"x"}},
-			"/work/proxy-only":  map[string]any{"hasTrustDialogAccepted": true},
-			"/work/proxy-false": map[string]any{"hasTrustDialogAccepted": false},
+			"/work/untrusted":  map[string]any{"history": []string{"x"}},
+			"/work/proxy-only": map[string]any{"hasTrustDialogAccepted": true},
 		},
 	})
 
-	if err := syncClaudeProjectTrust(userPath, proxyDir); err != nil {
+	if err := syncClaudeProjectTrustToProxy(userPath, proxyDir); err != nil {
 		t.Fatal(err)
 	}
 
-	proxy := readClaudeConfig(t, filepath.Join(proxyDir, ".claude.json"))
+	proxy := readClaudeConfig(t, proxyPath)
 	if projectFlag(proxy, "/work/trusted", "hasTrustDialogAccepted") != true || projectFlag(proxy, "/work/trusted", "hasCompletedProjectOnboarding") != true {
 		t.Fatalf("user trust did not reach the proxy config: %v", proxy["projects"])
 	}
@@ -80,36 +88,23 @@ func TestSyncClaudeProjectTrustSharesAcceptedTrustBothWays(t *testing.T) {
 	if got := projectFlag(proxy, "/work/untrusted", "hasTrustDialogAccepted"); got != nil {
 		t.Fatalf("untrusted folder gained trust in the proxy: %v", got)
 	}
-	if proxy["userID"] != "proxy-user" || projectFlag(proxy, "/work/untrusted", "history") == nil {
+	if proxy["userID"] != "proxy-user" || projectFlag(proxy, "/work/untrusted", "history") == nil ||
+		projectFlag(proxy, "/work/proxy-only", "hasTrustDialogAccepted") != true {
 		t.Fatalf("proxy config lost its own fields: %v", proxy)
 	}
-
-	user := readClaudeConfig(t, userPath)
-	if projectFlag(user, "/work/proxy-only", "hasTrustDialogAccepted") != true {
-		t.Fatalf("trust accepted in a proxy session was not written back: %v", user["projects"])
-	}
-	if projectFlag(user, "/work/untrusted", "hasTrustDialogAccepted") != false {
-		t.Fatal("an explicit false in the user config must stay false")
-	}
-	if projectFlag(user, "/work/proxy-false", "hasTrustDialogAccepted") != nil {
-		t.Fatal("a proxy false must not be written back")
-	}
-	if user["numStartups"] != float64(42) || user["oauthAccount"] == nil {
-		t.Fatalf("user config lost its own fields: %v", user)
-	}
-	info, err := os.Stat(userPath)
-	if err != nil || info.Mode().Perm() != 0o600 {
-		t.Fatalf("user config mode = %v, %v", info.Mode().Perm(), err)
+	// The adaptation: trust accepted inside a proxy session stays there. The
+	// user's file is what every plain `claude` reads, and sr never writes it.
+	if userAfter, _ := os.ReadFile(userPath); !bytes.Equal(userBefore, userAfter) {
+		t.Fatalf("the user's .claude.json changed:\n%s\n---\n%s", userBefore, userAfter)
 	}
 
 	// A second sync is a no-op.
-	before, _ := os.ReadFile(userPath)
-	if err := syncClaudeProjectTrust(userPath, proxyDir); err != nil {
+	proxyBefore, _ := os.ReadFile(proxyPath)
+	if err := syncClaudeProjectTrustToProxy(userPath, proxyDir); err != nil {
 		t.Fatal(err)
 	}
-	after, _ := os.ReadFile(userPath)
-	if string(before) != string(after) {
-		t.Fatal("an idempotent sync rewrote the user config")
+	if proxyAfter, _ := os.ReadFile(proxyPath); !bytes.Equal(proxyBefore, proxyAfter) {
+		t.Fatal("an idempotent sync rewrote the proxy config")
 	}
 }
 
@@ -124,7 +119,7 @@ func TestSyncClaudeProjectTrustCreatesProxyConfigButNeverUserConfig(t *testing.T
 	}
 	writeClaudeConfig(t, userPath, map[string]any{"projects": map[string]any{"/a": map[string]any{"hasTrustDialogAccepted": true}}})
 	proxyDir := filepath.Join(home, "proxy")
-	if err := syncClaudeProjectTrust(userPath, proxyDir); err != nil {
+	if err := syncClaudeProjectTrustToProxy(userPath, proxyDir); err != nil {
 		t.Fatal(err)
 	}
 	if projectFlag(readClaudeConfig(t, filepath.Join(proxyDir, ".claude.json")), "/a", "hasTrustDialogAccepted") != true {
@@ -133,70 +128,79 @@ func TestSyncClaudeProjectTrustCreatesProxyConfigButNeverUserConfig(t *testing.T
 
 	missingUser := filepath.Join(home, "nobody", ".claude.json")
 	writeClaudeConfig(t, filepath.Join(proxyDir, ".claude.json"), map[string]any{"projects": map[string]any{"/b": map[string]any{"hasTrustDialogAccepted": true}}})
-	if err := syncClaudeProjectTrust(missingUser, proxyDir); err != nil {
+	if err := syncClaudeProjectTrustToProxy(missingUser, proxyDir); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(missingUser); !os.IsNotExist(err) {
-		t.Fatal("sr must never create the user's Claude config")
+	if _, err := os.Stat(filepath.Dir(missingUser)); !os.IsNotExist(err) {
+		t.Fatal("sr must never create the user's Claude config or its directory")
 	}
 }
 
 func TestSyncClaudeProjectTrustLeavesLockedConfigAlone(t *testing.T) {
 	home := t.TempDir()
 	userPath := filepath.Join(home, ".claude.json")
-	writeClaudeConfig(t, userPath, map[string]any{"projects": map[string]any{"/a": map[string]any{}}})
+	writeClaudeConfig(t, userPath, map[string]any{"projects": map[string]any{"/a": map[string]any{"hasTrustDialogAccepted": true}}})
 	proxyDir := filepath.Join(home, "proxy")
-	writeClaudeConfig(t, filepath.Join(proxyDir, ".claude.json"), map[string]any{"projects": map[string]any{"/a": map[string]any{"hasTrustDialogAccepted": true}}})
-	if err := os.Mkdir(userPath+".lock", 0o700); err != nil {
+	proxyPath := filepath.Join(proxyDir, ".claude.json")
+	writeClaudeConfig(t, proxyPath, map[string]any{"projects": map[string]any{"/a": map[string]any{}}})
+	if err := os.Mkdir(proxyPath+".lock", 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := syncClaudeProjectTrust(userPath, proxyDir); err != nil {
+	if err := syncClaudeProjectTrustToProxy(userPath, proxyDir); err != nil {
 		t.Fatal(err)
 	}
-	if projectFlag(readClaudeConfig(t, userPath), "/a", "hasTrustDialogAccepted") != nil {
-		t.Fatal("sr wrote a config while Claude held its lock")
+	if projectFlag(readClaudeConfig(t, proxyPath), "/a", "hasTrustDialogAccepted") != nil {
+		t.Fatal("sr wrote a config while its lock was held")
 	}
 }
 
 func TestSyncClaudeProjectTrustEdgeCases(t *testing.T) {
 	home := t.TempDir()
-	// The real config lives elsewhere and ~/.claude.json links to it.
-	real := filepath.Join(home, "dotfiles", "claude.json")
-	writeClaudeConfig(t, real, map[string]any{"projects": map[string]any{
-		"/revoked": map[string]any{"hasTrustDialogAccepted": false},
-	}})
-	link := filepath.Join(home, ".claude.json")
-	if err := os.Symlink(real, link); err != nil {
-		t.Fatal(err)
-	}
-	proxyDir := filepath.Join(home, "proxy")
-	writeClaudeConfig(t, filepath.Join(proxyDir, ".claude.json"), map[string]any{"projects": map[string]any{
+	userPath := filepath.Join(home, ".claude.json")
+	writeClaudeConfig(t, userPath, map[string]any{"projects": map[string]any{
 		"/revoked": map[string]any{"hasTrustDialogAccepted": true},
 		"/new":     map[string]any{"hasTrustDialogAccepted": true},
 	}})
-	if err := syncClaudeProjectTrust(link, proxyDir); err != nil {
+	// The proxy home's config lives elsewhere and .claude.json links to it.
+	proxyDir := filepath.Join(home, "proxy")
+	real := filepath.Join(home, "dotfiles", "proxy-claude.json")
+	writeClaudeConfig(t, real, map[string]any{"projects": map[string]any{
+		"/revoked": map[string]any{"hasTrustDialogAccepted": false},
+	}})
+	if err := os.MkdirAll(proxyDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(proxyDir, ".claude.json")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatal(err)
+	}
+	if err := syncClaudeProjectTrustToProxy(userPath, proxyDir); err != nil {
 		t.Fatal(err)
 	}
 	if info, err := os.Lstat(link); err != nil || info.Mode()&os.ModeSymlink == 0 {
 		t.Fatal("the config symlink was replaced by a file")
 	}
-	user := readClaudeConfig(t, real)
-	if projectFlag(user, "/revoked", "hasTrustDialogAccepted") != false {
-		t.Fatal("a proxy must not overwrite trust the user revoked")
+	proxy := readClaudeConfig(t, real)
+	if projectFlag(proxy, "/revoked", "hasTrustDialogAccepted") != false {
+		t.Fatal("the user's trust overwrote an explicit false in the proxy home")
 	}
-	if projectFlag(user, "/new", "hasTrustDialogAccepted") != true {
-		t.Fatal("trust accepted in the proxy was not written through the symlink")
+	if projectFlag(proxy, "/new", "hasTrustDialogAccepted") != true {
+		t.Fatal("the user's trust was not written through the symlink")
 	}
 	if _, err := os.Stat(real + ".lock"); !os.IsNotExist(err) {
 		t.Fatal("the config lock was not released")
 	}
 
-	// "projects": null must not panic.
-	writeClaudeConfig(t, filepath.Join(proxyDir, ".claude.json"), map[string]any{"projects": nil})
-	if err := syncClaudeProjectTrust(link, proxyDir); err != nil {
+	// "projects": null must not panic, on either side.
+	writeClaudeConfig(t, real, map[string]any{"projects": nil})
+	if err := syncClaudeProjectTrustToProxy(userPath, proxyDir); err != nil {
 		t.Fatal(err)
 	}
-	if projectFlag(readClaudeConfig(t, filepath.Join(proxyDir, ".claude.json")), "/new", "hasTrustDialogAccepted") != true {
+	if projectFlag(readClaudeConfig(t, real), "/new", "hasTrustDialogAccepted") != true {
 		t.Fatal("trust did not reach a proxy config whose projects were null")
+	}
+	writeClaudeConfig(t, userPath, map[string]any{"projects": nil})
+	if err := syncClaudeProjectTrustToProxy(userPath, proxyDir); err != nil {
+		t.Fatal(err)
 	}
 }

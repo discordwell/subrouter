@@ -295,13 +295,22 @@ func TestAutostartRunsForLocalPinEvenWhenFallbackDisabled(t *testing.T) {
 	}
 }
 
+// Upstream (f39439a) narrowed the predicate to bare and `proxy`; this fork keeps
+// every launching form on it, because srRunner.claude gates the PATCHES 15
+// local-first spill and the PATCHES 16 peer fall-through on it.
 func TestClaudeLaunchesAgent(t *testing.T) {
-	for _, args := range [][]string{nil, {}, {"proxy"}, {"proxy", "--resume", "session-a"}} {
+	for _, args := range [][]string{
+		nil, {}, {"run"}, {"run", "work"}, {"--model", "opus"}, {"-p", "hi"}, {"work", "-p", "hi"},
+		{"proxy"}, {"proxy", "--resume", "session-a"},
+	} {
 		if !claudeLaunchesAgent(args) {
 			t.Errorf("claudeLaunchesAgent(%v) = false, want true", args)
 		}
 	}
-	for _, args := range [][]string{{"run"}, {"--model", "opus"}, {"-p", "hi"}, {"list"}, {"ls"}, {"status"}, {"add"}, {"push"}, {"help"}, {"--help"}} {
+	for _, args := range [][]string{
+		{"list"}, {"ls"}, {"status"}, {"add"}, {"login"}, {"push"}, {"upload"}, {"switch"}, {"use"},
+		{"remove"}, {"rm"}, {"env"}, {"pick"}, {"proxy-scope"}, {"help"}, {"-h"}, {"--help"},
+	} {
 		if claudeLaunchesAgent(args) {
 			t.Errorf("claudeLaunchesAgent(%v) = true, want false", args)
 		}

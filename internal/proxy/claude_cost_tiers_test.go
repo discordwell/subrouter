@@ -1,7 +1,6 @@
 package proxy
 
 import (
-	"context"
 	"io"
 	"net/http"
 	"strings"
@@ -65,7 +64,8 @@ func claudeCostTierRequest(t *testing.T, apiKey string) *http.Request {
 
 // A key whose free credits are spent answers 400, not 429. The request must
 // move to the next key and the spent key must leave routing, or every new
-// session would keep landing on it and the pool would never reach tier 3.
+// session would keep landing on it. (Upstream's "tier 3", a subscription's
+// paid extra usage, is never reached here: PATCHES §23.)
 func TestClaudeSpentCreditKeyFailsOverAndIsHeldOut(t *testing.T) {
 	sessions := newSessionStore(t)
 	if _, err := sessions.Put("claude", "session-spent-credit", "claude:spent", ""); err != nil {
@@ -107,7 +107,9 @@ func TestClaudeSpentCreditKeyFailsOverAndIsHeldOut(t *testing.T) {
 	if response.StatusCode != http.StatusOK || spentHits != 1 || fundedHits != 1 {
 		t.Fatalf("status %d, spent hits %d, funded hits %d; want 200 after one failover", response.StatusCode, spentHits, fundedHits)
 	}
-	until, held := server.SchedulerRef.CreditExhaustedUntil(accounts.ProviderClaude, "claude:spent", time.Now())
+	// The fork holds the key with the account-wide unavailable mark;
+	// upstream's MarkCreditExhaustedUntil (#569) is not in its selectacct.
+	until, held := server.SchedulerRef.ExhaustedUntilFor(accounts.ProviderClaude, "claude:spent", "")
 	if !held || until.Before(time.Now().Add(claudeCreditExhaustionHold-time.Minute)) {
 		t.Fatalf("credit hold = %v, %v; want about %s", until, held, claudeCreditExhaustionHold)
 	}
@@ -251,55 +253,5 @@ func TestClaudeAllCreditKeysSpentAnswersPoolExhausted(t *testing.T) {
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want the pool-exhausted 503", response.StatusCode)
-	}
-}
-
-// Failover follows the cost order: a free-credit API key is spent before a
-// subscription's paid extra usage, and extra usage is reached once the keys
-// are spent.
-func TestClaudeRetryUsesAPICreditsBeforeExtraUsage(t *testing.T) {
-	server := Server{
-		Accounts: []accounts.Account{
-			{ID: "paid", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "tok-paid"},
-			{ID: "other", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "tok-other"},
-			{ID: "claude:credits", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeAPIKey, Token: "tok-credits"},
-		},
-		SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
-			{AccountID: "paid", Provider: accounts.ProviderClaude, Headroom: 0, ShortHeadroom: 0, WeeklyHeadroom: 0, WeeklyHeadroomKnown: true,
-				ClaudeExtraUsageEnabled: true, ClaudeExtraUsageKnown: true, ClaudeExtraUsageRemaining: 900},
-			{AccountID: "other", Provider: accounts.ProviderClaude, Headroom: 0, ShortHeadroom: 0, WeeklyHeadroom: 0, WeeklyHeadroomKnown: true},
-			{AccountID: "claude:credits", Provider: accounts.ProviderClaude, Headroom: 0.01, ShortHeadroom: 0.01,
-				MissingModelSupport: selectacct.ModelSupportUnknown},
-		})),
-	}
-	server.RefreshAccountFn = func(_ context.Context, account accounts.Account) (accounts.Account, error) {
-		return account, nil
-	}
-	tried := map[string]struct{}{"other": {}}
-	got, err := server.oauthRetryCandidate(t.Context(), accounts.ProviderClaude, "claude", "session-cost-order", "", "", tried, false, true)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got.ID != "claude:credits" {
-		t.Fatalf("retry picked %q, want the free-credit key before paid extra usage", got.ID)
-	}
-
-	server.markClaudeCreditExhausted("claude:credits")
-	got, err = server.oauthRetryCandidate(t.Context(), accounts.ProviderClaude, "claude", "session-cost-order", "", "", tried, false, true)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got.ID != "paid" {
-		t.Fatalf("retry picked %q, want extra usage once the keys are spent", got.ID)
-	}
-	statuses := server.withClaudeCostTiers([]AccountUsageStatus{
-		{AccountStatus: AccountStatus{ID: "paid", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth}},
-		{AccountStatus: AccountStatus{ID: "other", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth}},
-	})
-	if statuses[0].CostTier != claudeCostTierExtraUsage || statuses[0].CostTierRank != 3 {
-		t.Fatalf("funded cooked plan status = %+v, want extra-usage tier 3", statuses[0])
-	}
-	if statuses[1].CostTier != claudeCostTierPlan || statuses[1].CostTierRank != 1 {
-		t.Fatalf("unfunded plan status = %+v, want plan tier 1", statuses[1])
 	}
 }

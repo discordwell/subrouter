@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"path/filepath"
+	"reflect"
 	"sync/atomic"
 	"testing"
 
@@ -115,6 +116,56 @@ func TestRootHealthProbesStayBehindProxyAuth(t *testing.T) {
 		subrouter.Close()
 		if response.StatusCode == http.StatusOK {
 			t.Fatalf("%s: GET /healthz without credentials = 200 %.200s, want it refused", tc.name, body)
+		}
+	}
+}
+
+// On the public listener the proxy handler runs on PublicHandler's
+// credential-stripped copy of the server, whose own health would report a
+// token-protected box as auth "open" with account import "disabled". A root
+// probe there must answer what /_subrouter/health does on that listener: the
+// configured daemon. It still takes the proxy token first.
+func TestPublicRootHealthProbesDescribeTheConfiguredDaemon(t *testing.T) {
+	server := Server{
+		Sessions:           newSessionStore(t),
+		AdminToken:         "admin-token",
+		AccountImportToken: "import-token",
+		LocalProxyToken:    "proxy-token",
+		MaxBodyBytes:       1 << 20,
+	}
+	public := server.PublicHandler()
+	get := func(path, token string) (int, map[string]any) {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.RemoteAddr = "203.0.113.9:5555"
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+		rec := httptest.NewRecorder()
+		public.ServeHTTP(rec, req)
+		var body map[string]any
+		if rec.Code == http.StatusOK {
+			if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+				t.Fatalf("GET %s body %q is not JSON: %v", path, rec.Body.String(), err)
+			}
+		}
+		return rec.Code, body
+	}
+
+	status, want := get("/_subrouter/health", "")
+	if status != http.StatusOK || want["auth"] != "token" || want["account_import"] != AccountImportEnabled {
+		t.Fatalf("public /_subrouter/health = %d %v, want 200 describing a token-protected daemon", status, want)
+	}
+	for _, path := range []string{"/", "/health", "/healthz", "/v1/health", "/status"} {
+		status, got := get(path, "proxy-token")
+		if status != http.StatusOK {
+			t.Fatalf("public GET %s with the proxy token = %d, want 200", path, status)
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("public GET %s = %v\nwant what public /_subrouter/health says: %v", path, got, want)
+		}
+		if status, _ := get(path, ""); status == http.StatusOK {
+			t.Fatalf("public GET %s without the proxy token = 200, want it refused", path)
 		}
 	}
 }

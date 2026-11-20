@@ -63,6 +63,9 @@ func TestDefaultCodexBaseURLUsesExplicitDefaultServer(t *testing.T) {
 }
 
 func TestCodexNamedLoopbackServerIsNotBuiltInLocal(t *testing.T) {
+	// A box path: on a keyless machine the PATCHES 17 gate ignores servers.json
+	// and the remote selection entirely, so this upstream test states the unlock.
+	unlockRemoteGateForTest(t)
 	serverStore := srServerStore{Path: filepath.Join(t.TempDir(), "servers.json")}
 	if err := serverStore.save(srServerFile{
 		Default: "shadow",
@@ -537,10 +540,10 @@ func defaultSubrouterCodexConfigArgs(baseURL string) []string {
 		"-c", `model_providers.subrouter.experimental_bearer_token="subrouter"`,
 		"-c", `model_providers.subrouter.wire_api="responses"`,
 		"-c", `model_providers.subrouter.supports_websockets=true`,
-		"-c", `model_providers.subrouter.http_headers={"X-Subrouter-Agent"="codex","X-Subrouter-Retry-Policy"="autonomous"}`,
+		"-c", `model_providers.subrouter.http_headers={"X-Subrouter-Agent"="codex"}`,
 		"-c", `experimental_realtime_ws_base_url="` + codexProxyRootURL(baseURL) + `/v1/live"`,
 		"-c", `experimental_realtime_webrtc_call_base_url="` + codexProxyRootURL(baseURL) + `/v1"`,
-		"-c", `model_providers.subrouter={name="Subrouter",base_url="` + baseURL + `",experimental_bearer_token="subrouter",wire_api="responses",supports_websockets=true,http_headers={"X-Subrouter-Agent"="codex","X-Subrouter-Retry-Policy"="autonomous"}}`,
+		"-c", `model_providers.subrouter={name="Subrouter",base_url="` + baseURL + `",experimental_bearer_token="subrouter",wire_api="responses",supports_websockets=true,http_headers={"X-Subrouter-Agent"="codex"}}`,
 	}
 }
 
@@ -555,10 +558,10 @@ func TestCodexArgsInjectsUserEmailWithCustomSubrouterProvider(t *testing.T) {
 		"-c", `model_providers.subrouter.experimental_bearer_token="subrouter"`,
 		"-c", `model_providers.subrouter.wire_api="responses"`,
 		"-c", `model_providers.subrouter.supports_websockets=true`,
-		"-c", `model_providers.subrouter.http_headers={"X-Subrouter-Agent"="codex","X-Subrouter-Retry-Policy"="autonomous","X-Subrouter-User-Email"="alice@example.com"}`,
+		"-c", `model_providers.subrouter.http_headers={"X-Subrouter-Agent"="codex","X-Subrouter-User-Email"="alice@example.com"}`,
 		"-c", `experimental_realtime_ws_base_url="http://127.0.0.1:31415/v1/live"`,
 		"-c", `experimental_realtime_webrtc_call_base_url="http://127.0.0.1:31415/v1"`,
-		"-c", `model_providers.subrouter={name="Subrouter",base_url="http://127.0.0.1:31415/v1",experimental_bearer_token="subrouter",wire_api="responses",supports_websockets=true,http_headers={"X-Subrouter-Agent"="codex","X-Subrouter-Retry-Policy"="autonomous","X-Subrouter-User-Email"="alice@example.com"}}`,
+		"-c", `model_providers.subrouter={name="Subrouter",base_url="http://127.0.0.1:31415/v1",experimental_bearer_token="subrouter",wire_api="responses",supports_websockets=true,http_headers={"X-Subrouter-Agent"="codex","X-Subrouter-User-Email"="alice@example.com"}}`,
 	}
 	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
 		t.Fatalf("args = %#v, want %#v", got, want)
@@ -577,10 +580,10 @@ func TestCodexArgsInjectsAccountIDWithCustomSubrouterProvider(t *testing.T) {
 		"-c", `model_providers.subrouter.experimental_bearer_token="subrouter"`,
 		"-c", `model_providers.subrouter.wire_api="responses"`,
 		"-c", `model_providers.subrouter.supports_websockets=true`,
-		"-c", `model_providers.subrouter.http_headers={"X-Subrouter-Agent"="codex","X-Subrouter-Retry-Policy"="autonomous","X-Subrouter-Account-ID"="team-codex-1"}`,
+		"-c", `model_providers.subrouter.http_headers={"X-Subrouter-Agent"="codex","X-Subrouter-Account-ID"="team-codex-1"}`,
 		"-c", `experimental_realtime_ws_base_url="http://127.0.0.1:31415/v1/live"`,
 		"-c", `experimental_realtime_webrtc_call_base_url="http://127.0.0.1:31415/v1"`,
-		"-c", `model_providers.subrouter={name="Subrouter",base_url="http://127.0.0.1:31415/v1",experimental_bearer_token="subrouter",wire_api="responses",supports_websockets=true,http_headers={"X-Subrouter-Agent"="codex","X-Subrouter-Retry-Policy"="autonomous","X-Subrouter-Account-ID"="team-codex-1"}}`,
+		"-c", `model_providers.subrouter={name="Subrouter",base_url="http://127.0.0.1:31415/v1",experimental_bearer_token="subrouter",wire_api="responses",supports_websockets=true,http_headers={"X-Subrouter-Agent"="codex","X-Subrouter-Account-ID"="team-codex-1"}}`,
 	}
 	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
 		t.Fatalf("args = %#v, want %#v", got, want)
@@ -602,7 +605,7 @@ func TestCodexArgsKeepsCustomProviderAuthInResumableArguments(t *testing.T) {
 func TestCodexArgsInjectsUserEmailAndAccountID(t *testing.T) {
 	t.Setenv("CODEX_HOME", t.TempDir())
 	got := codexArgs([]string{"exec", "prompt"}, "http://127.0.0.1:31415/v1", "alice@example.com", "apikey:paid")
-	headers := `model_providers.subrouter.http_headers={"X-Subrouter-Agent"="codex","X-Subrouter-Retry-Policy"="autonomous","X-Subrouter-User-Email"="alice@example.com","X-Subrouter-Account-ID"="apikey:paid"}`
+	headers := `model_providers.subrouter.http_headers={"X-Subrouter-Agent"="codex","X-Subrouter-User-Email"="alice@example.com","X-Subrouter-Account-ID"="apikey:paid"}`
 	if !contains(got, headers) {
 		t.Fatalf("args = %#v, want headers %q", got, headers)
 	}
@@ -610,7 +613,7 @@ func TestCodexArgsInjectsUserEmailAndAccountID(t *testing.T) {
 
 func TestCodexArgsInjectsModelHeader(t *testing.T) {
 	got := codexArgs([]string{"exec", "-m", "GPT-5.3-Codex-Spark", "prompt"}, "http://127.0.0.1:31415/v1", "", "")
-	headers := `model_providers.subrouter.http_headers={"X-Subrouter-Agent"="codex","X-Subrouter-Retry-Policy"="autonomous","X-Subrouter-Model"="GPT-5.3-Codex-Spark"}`
+	headers := `model_providers.subrouter.http_headers={"X-Subrouter-Agent"="codex","X-Subrouter-Model"="GPT-5.3-Codex-Spark"}`
 	if !contains(got, headers) {
 		t.Fatalf("args = %#v, want headers %q", got, headers)
 	}
@@ -892,9 +895,33 @@ func TestCodexArgsRoutesRealtimeVoiceThroughSubrouter(t *testing.T) {
 	}
 }
 
+// The human's ~/.codex login never reaches a router unless the owner opts in
+// (PATCHES §22; upstream #616 had it on by default). A fresh login, a pin and
+// a tailnet router are every other condition the opt-in path needs, so this
+// fails if the default ever sends the login again.
+func TestCodexArgsPinnedLaunchSendsNoChatGPTLoginUnlessOptedIn(t *testing.T) {
+	codexHome := t.TempDir()
+	t.Setenv("CODEX_HOME", codexHome)
+	login := `{"tokens":{"id_token":"x.e30.y","access_token":"access","refresh_token":"refresh","account_id":"acct"},"last_refresh":"` + time.Now().Add(-time.Hour).UTC().Format(time.RFC3339Nano) + `"}`
+	if err := os.WriteFile(filepath.Join(codexHome, "auth.json"), []byte(login), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, value := range []string{"", "0", "false", "maybe"} {
+		t.Setenv("SUBROUTER_CODEX_CHATGPT_AUTH", value)
+		for _, baseURL := range []string{"http://router:31415/v1", "http://127.0.0.1:31415/v1", "http://100.64.0.7:31415/v1"} {
+			pinned := strings.Join(codexArgs([]string{"exec", "prompt"}, baseURL, "", "lawrence@manaflow.ai"), "\n")
+			if strings.Contains(pinned, "requires_openai_auth") || !strings.Contains(pinned, `experimental_bearer_token="subrouter"`) {
+				t.Fatalf("SUBROUTER_CODEX_CHATGPT_AUTH=%q, %s: a pinned launch must keep the bearer provider:\n%s", value, baseURL, pinned)
+			}
+		}
+	}
+}
+
 func TestCodexArgsPinnedLaunchUsesChatGPTLoginSoCatalogTiersApply(t *testing.T) {
 	codexHome := t.TempDir()
 	t.Setenv("CODEX_HOME", codexHome)
+	// Opted in (codexChatGPTAuthOptedIn); the default is off.
+	t.Setenv("SUBROUTER_CODEX_CHATGPT_AUTH", "1")
 	writeLogin := func(lastRefresh time.Time) {
 		t.Helper()
 		login := `{"tokens":{"id_token":"x.e30.y","access_token":"access","refresh_token":"refresh","account_id":"acct"},"last_refresh":"` + lastRefresh.UTC().Format(time.RFC3339Nano) + `"}`
@@ -927,7 +954,7 @@ func TestCodexArgsPinnedLaunchUsesChatGPTLoginSoCatalogTiersApply(t *testing.T) 
 	if optOut := strings.Join(codexArgs([]string{"exec", "prompt"}, "http://router:31415/v1", "", "lawrence@manaflow.ai"), "\n"); strings.Contains(optOut, "requires_openai_auth") {
 		t.Fatalf("SUBROUTER_CODEX_CHATGPT_AUTH=0 must keep the bearer provider:\n%s", optOut)
 	}
-	t.Setenv("SUBROUTER_CODEX_CHATGPT_AUTH", "")
+	t.Setenv("SUBROUTER_CODEX_CHATGPT_AUTH", "1")
 	writeLogin(time.Now().Add(-8 * 24 * time.Hour))
 	if stale := strings.Join(codexArgs([]string{"exec", "prompt"}, "http://router:31415/v1", "", "lawrence@manaflow.ai"), "\n"); strings.Contains(stale, "requires_openai_auth") {
 		t.Fatalf("a login not refreshed for a week must keep the bearer provider:\n%s", stale)

@@ -1,0 +1,409 @@
+#!/usr/bin/env python3
+"""claudemode -- point Claude Code at whichever pool actually has capacity.
+
+Run it before you start Claude Code. It reads every pool it can reach, applies
+the same rule the Go spill applies, and rewrites ANTHROPIC_BASE_URL in
+~/.claude/settings.json.
+
+  claudemode              pick automatically and repoint
+  claudemode status       show where you point now and why; change nothing
+  claudemode local        force the local daemon
+  claudemode <server>     force a named server from servers.json
+  claudemode --launch     repoint, then exec claude
+
+Why this exists rather than `alias claude='sr claude'`: the spill lives in the
+`sr claude` launcher, so it only helps sessions started that way. A directly
+launched `claude` -- or the desktop app, or an IDE extension -- reads
+settings.json and never consults it. This writes the file, so it reaches all of
+them.
+
+*** It takes effect on the NEXT Claude Code launch. *** ANTHROPIC_BASE_URL is
+read at process start; nothing can move a session that is already running.
+
+It also sets CLAUDE_CODE_PROMPT_CACHE_TTL=1h unless you already chose a TTL:
+that key, FORCE_PROMPT_CACHING_5M, or a top-level promptCacheTtl in
+settings.json; or, exported in the shell you run this from, FORCE_PROMPT_CACHING_5M
+or CLAUDE_CODE_PROMPT_CACHE_TTL with a value other than 1h. An export only
+reaches launches from a shell that has it; the desktop app and IDE extensions
+see settings.json alone, so they fall back to the 5-minute default then. Run
+from inside a Claude Code session (CLAUDECODE set), exported values are ignored:
+that environment is Claude Code's, not your shell's. Token auth makes Claude
+Code act as an API-key client, which asks for the 5-minute prompt cache; a
+signed-in subscriber gets the 1-hour one (PATCHES §21).
+
+Selection mirrors selectacct: prefer local while ANY local Claude account is
+routable for a new session (exhaustion floor plus a burn rate over the short
+window -- not a flat headroom level), otherwise take the reachable server with
+the most capacity. Unknown capacity is not "fine" -- like
+the Go side, unknown keeps you local rather than betting on a pool nobody
+measured.
+"""
+
+from __future__ import annotations
+
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import os
+import shutil
+import sys
+import urllib.error
+import urllib.request
+
+CLAUDE_SETTINGS = os.path.expanduser("~/.claude/settings.json")
+CLOUD_JSON = os.path.expanduser("~/.config/subrouter/cloud.json")
+
+
+def load_sibling(name):
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), name)
+    if not os.path.exists(path):
+        raise SystemExit(f"claudemode: cannot find {name} next to me at {path}")
+    spec = importlib.util.spec_from_loader(
+        name, importlib.machinery.SourceFileLoader(name, path)
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+# srdash owns pool discovery and reading; srq owns window vocabulary. Neither is
+# reimplemented here -- this file is only the decision and the file write.
+DASH = load_sibling("srdash")
+
+
+def claude_accounts(pool):
+    return [a for a in pool["accounts"] if a.get("provider") == "claude"]
+
+
+def account_headroom(a):
+    """Effective headroom for one account: the LOWER of the long and short
+    windows, which is what the router gates on.
+
+    Reading headroom_percent alone reports the long window and overstates a
+    pool whose 5h window is nearly spent -- it had this dashboard calling the
+    box 75% while the daemon measured it at 56% and routed accordingly. A
+    status tool that disagrees with the router about which pool is healthier
+    is worse than no status tool.
+    """
+    if not a.get("known"):
+        return None
+    values = [v for v in (a.get("headroom_percent"), a.get("short_percent"))
+              if v is not None]
+    return min(values) if values else None
+
+
+def capacity(pool):
+    """Best Claude headroom in a pool, as a fraction. -1 when nothing is known."""
+    known = [h for h in (account_headroom(a) for a in claude_accounts(pool))
+             if h is not None]
+    return (max(known) / 100) if known else -1.0
+
+
+def choose(pools):
+    """(target_pool, reason). Mirrors the Go spill, including its unknown rule."""
+    local = next((p for p in pools if p["is_local"]), None)
+    servers = [p for p in pools if not p["is_local"] and p["online"]]
+
+    if not local or not local["online"]:
+        if servers:
+            best = max(servers, key=capacity)
+            return best, "local daemon is not reachable"
+        return None, "no pool is reachable"
+
+    rows = claude_accounts(local)
+    clears = [a["clears_floor"] for a in rows]
+    if any(c is None for c in clears):
+        # Absent normalized data means unknown, and the Go side deliberately
+        # stays local rather than assuming capacity elsewhere. Same here.
+        return local, "local capacity is unknown — staying local, as the router would"
+    if any(clears):
+        best = max((a["headroom_percent"] for a in rows if a["clears_floor"]), default=0)
+        return local, f"local is routable (best {best}% left)"
+    if not servers:
+        return local, ("no local account is routable, but no server is "
+                       "reachable — staying local")
+    best = max(servers, key=capacity)
+    if capacity(best) < 0:
+        return local, f"{best['name']} reports no known capacity — staying local"
+    return best, (f"no local account is routable (best "
+                  f"{max((a['headroom_percent'] or 0) for a in rows)}% left); "
+                  f"{best['name']} has {round(capacity(best)*100)}%")
+
+
+def local_proxy_token():
+    """The local daemon's token, or "" when it does not require one.
+
+    An EMPTY token is a valid configuration, not a broken one. The daemon's
+    localProxyAuthorized() returns true outright when LocalProxyToken is unset,
+    so a loopback daemon can legitimately run open -- which is how the box has
+    always run, and how this laptop runs since the desktop ChatGPT/Codex app was
+    put on the pool (that app can only override its base URL, so it has no way to
+    present a token at all).
+
+    Treating "" as fatal is therefore wrong; the caller distinguishes "no token
+    needed" from "token needed but missing" by asking the daemon.
+    """
+    try:
+        with open(CLOUD_JSON) as fh:
+            return (json.load(fh).get("localProxyToken") or "").strip()
+    except (OSError, ValueError):
+        return ""
+
+
+def server_token(name):
+    """The credential to write for a named server: its proxyToken, else its
+    adminToken.
+
+    proxyToken (`sr server add <name> --proxy-token`, PATCHES §43) spends the
+    pool and nothing else, which is all Claude Code needs. adminToken is the
+    fallback for an entry that has none yet -- it opens the proxy too, but it
+    also drains, imports and reads every account, and whatever is written here
+    sits in ~/.claude/settings.json for every Claude Code process to read.
+
+    Read from servers.json here rather than carried on srdash's pool dict: that
+    dict is rendered into srdash's HTML, and a secret riding along in it is one
+    template change away from being published.
+    """
+    try:
+        with open(DASH.SERVERS_JSON) as fh:
+            raw = json.load(fh)
+    except (OSError, ValueError):
+        return ""
+    servers = raw.get("servers", raw) if isinstance(raw, dict) else raw
+    if isinstance(servers, dict):
+        servers = list(servers.values())
+    for server in servers or []:
+        if isinstance(server, dict) and server.get("name") == name:
+            proxy = (server.get("proxyToken") or "").strip()
+            if proxy:
+                return proxy
+            admin = (server.get("adminToken") or "").strip()
+            if admin:
+                print(f"claudemode: {name!r} has no proxyToken in servers.json, so its "
+                      "ADMIN token is being written into Claude Code's settings. Mint a "
+                      "membership token on the box (subrouter token mint <name> --role "
+                      "membership) and store it with `sr server add "
+                      f"{name} --proxy-token <token>`.", file=sys.stderr)
+            return admin
+    return ""
+
+
+def token_refused(base, token):
+    """Whether the server answers `token` with 401 on its base-URL probe.
+
+    A named token expires (90 days by default, PATCHES §43) or is revoked, and
+    srdash reads the server with the ADMIN token, so the server still shows as
+    online with capacity. Writing the dead token would 401 every Claude Code
+    launch on this machine -- the CLI, the desktop app and the IDE extension
+    all read settings.json -- with nothing saying why. The daemon answers
+    `HEAD <base>/` with 204 for a credential its proxy gate accepts and 401 for
+    one it refuses, without touching an account.
+
+    Only a 401 is a refusal. A transport error is not this probe's to judge
+    (srdash has just reached the server), so it reads as "not refused" and the
+    write goes ahead as it always did.
+    """
+    request = urllib.request.Request(base.rstrip("/") + "/", method="HEAD")
+    if token:
+        request.add_header("Authorization", f"Bearer {token}")
+    try:
+        with urllib.request.urlopen(request, timeout=DASH.TIMEOUT):
+            return False
+    except urllib.error.HTTPError as e:
+        return e.code == 401
+    except (urllib.error.URLError, OSError, ValueError):
+        return False
+
+
+def token_for(target):
+    """The credential the TARGET enforces -- not whichever one is nearest.
+
+    This used to be an unconditional local_proxy_token(), so forcing a remote
+    server wrote the LOCAL daemon's token against a REMOTE base URL and 401'd
+    every request. The guard below it only ever covered the local case, so the
+    remote case failed silently and looked like the pool being down -- the exact
+    diagnosis this tool exists to make unnecessary.
+    """
+    if target["is_local"]:
+        return local_proxy_token()
+    return server_token(target["name"])
+
+
+def current_base():
+    try:
+        with open(CLAUDE_SETTINGS) as fh:
+            return (json.load(fh).get("env") or {}).get("ANTHROPIC_BASE_URL")
+    except (OSError, ValueError):
+        return None
+
+
+CACHE_TTL_ENV = "CLAUDE_CODE_PROMPT_CACHE_TTL"
+
+
+def ttl_exported_by_user():
+    """Whether the environment running this holds the user's own TTL decision.
+
+    Claude Code applies settings.json env over the environment a terminal
+    launch starts with, so a written 1h would beat an export. But only an
+    export that is the user's and that 1h would contradict counts:
+    - Nothing counts inside Claude Code (CLAUDECODE set in every tool
+      subprocess): that environment carries every settings file's env and the
+      1h `sr claude` injects, indistinguishable from a shell export.
+    - FORCE_PROMPT_CACHING_5M present counts (any value); the TTL variable
+      counts with any value but 1h (even empty). An exported 1h is no
+      conflict, and settings.json is the only channel that reaches the desktop
+      app and IDE extensions, which never see the shell.
+    Same rule as the Go writer (claudeCacheTTLExported, PATCHES §21).
+    """
+    if os.environ.get("CLAUDECODE"):
+        return False
+    if "FORCE_PROMPT_CACHING_5M" in os.environ:
+        return True
+    return CACHE_TTL_ENV in os.environ and os.environ[CACHE_TTL_ENV] != "1h"
+
+
+def ask_for_one_hour_cache(settings, env):
+    """Ask for the 1-hour prompt cache unless the user already decided.
+
+    ANTHROPIC_AUTH_TOKEN makes Claude Code an API-key client, and an API-key
+    client asks for the 5-minute cache on the main thread. Env beats the
+    promptCacheTtl setting inside Claude Code, so any of the three keys in the
+    file is a decision this must not override -- including an empty value --
+    and so is the user's own export (ttl_exported_by_user). The subagent TTL
+    is never touched: subagents stay 5m by design. Same rule as the Go writer
+    (claudeCacheTTLDecided / claudeCacheTTLExported, PATCHES §21).
+    """
+    if CACHE_TTL_ENV in env or "FORCE_PROMPT_CACHING_5M" in env:
+        return
+    if "promptCacheTtl" in settings or ttl_exported_by_user():
+        return
+    env[CACHE_TTL_ENV] = "1h"
+
+
+def repoint(base_url, token):
+    """Merge into settings.json atomically, preserving everything else.
+
+    Atomic because a half-written settings.json takes down every Claude Code
+    session on this machine at once, and the instructions for fixing it would be
+    inside the session it just killed.
+    """
+    settings = {}
+    if os.path.exists(CLAUDE_SETTINGS):
+        with open(CLAUDE_SETTINGS) as fh:
+            settings = json.load(fh)
+        if not os.path.exists(CLAUDE_SETTINGS + ".bak"):
+            shutil.copy(CLAUDE_SETTINGS, CLAUDE_SETTINGS + ".bak")
+    os.makedirs(os.path.dirname(CLAUDE_SETTINGS), exist_ok=True)
+    env = settings.setdefault("env", {})
+    # No /v1 -- Claude Code appends its own, and the /v1 form yields /v1/v1.
+    env["ANTHROPIC_BASE_URL"] = base_url.rstrip("/")
+    if token:
+        env["ANTHROPIC_AUTH_TOKEN"] = token
+    else:
+        # Clear rather than leave behind: a token written for a previous target
+        # is meaningless against a daemon that requires none, and a stale
+        # credential sitting in settings.json is the kind of thing that later
+        # reads as the reason something failed.
+        env.pop("ANTHROPIC_AUTH_TOKEN", None)
+    ask_for_one_hour_cache(settings, env)
+    # ENABLE_TOOL_SEARCH is deliberately not written here: this file is the one
+    # plain `claude` reads, and a client-config writer there is a known brick
+    # class. `sr claude` sets it per launch instead (PATCHES §29.9.1).
+    tmp = CLAUDE_SETTINGS + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(settings, fh, indent=2)
+    os.replace(tmp, CLAUDE_SETTINGS)
+
+
+def describe(pools):
+    for pool in pools:
+        if not pool["online"]:
+            print(f"  {pool['name']:<10} offline — {pool['error']}")
+            continue
+        rows = claude_accounts(pool)
+        ok = sum(1 for a in rows if a.get("clears_floor") is True)
+        best = max((a["headroom_percent"] for a in rows
+                    if a.get("headroom_percent") is not None), default=None)
+        best_txt = "unknown" if best is None else f"best {best}% left"
+        print(f"  {pool['name']:<10} claude {ok}/{len(rows)} routable, {best_txt}")
+
+
+def main(argv):
+    parser = argparse.ArgumentParser(prog="claudemode", description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("target", nargs="?", default=None,
+                        help="'status', 'local', or a server name; default is automatic")
+    parser.add_argument("--launch", action="store_true", help="exec claude afterwards")
+    args = parser.parse_args(argv)
+
+    payload = DASH.build_payload()
+    pools = payload["pools"]
+
+    if args.target == "status":
+        print(f"pointing at: {current_base() or '(unset — native claude.ai login)'}")
+        describe(pools)
+        target, reason = choose(pools)
+        if target:
+            print(f"would pick:  {target['name']} — {reason}")
+        return 0
+
+    if args.target in (None, "auto"):
+        target, reason = choose(pools)
+        if not target:
+            print(f"claudemode: {reason}", file=sys.stderr)
+            return 2
+    else:
+        target = next((p for p in pools if p["name"] == args.target), None)
+        if not target:
+            names = ", ".join(p["name"] for p in pools)
+            print(f"claudemode: no pool named {args.target!r}; have: {names}",
+                  file=sys.stderr)
+            return 2
+        reason = "forced"
+        if not target["online"]:
+            print(f"claudemode: {target['name']} is offline — {target['error']}",
+                  file=sys.stderr)
+            return 2
+
+    token = token_for(target)
+    if not token and not target["is_local"]:
+        # A named server without a token is still a certain 401 -- servers
+        # enforce one. The LOCAL daemon may legitimately require no token, so an
+        # empty local token is not an error and must not block the launch;
+        # refusing there used to break claudemode outright the moment the token
+        # was cleared to let the desktop app onto the pool.
+        print(f"claudemode: no proxyToken or adminToken for {target['name']!r} in servers.json — "
+              f"pointing at {target['name']} without a token would 401 every "
+              "request. Refusing rather than writing a config that fails on the "
+              "first message.", file=sys.stderr)
+        return 2
+
+    if not target["is_local"] and token_refused(target["base"], token):
+        print(f"claudemode: {target['name']} refuses the token servers.json holds for it "
+              "(401): it has expired or been revoked. Mint a new one on the server "
+              "(subrouter token mint <name> --role membership) and store it with "
+              f"`sr server add {target['name']} --proxy-token <token>`. Refusing rather "
+              "than writing a config that fails every Claude Code launch.", file=sys.stderr)
+        return 2
+
+    previous = current_base()
+    repoint(target["base"], token)
+    describe(pools)
+    print(f"\n-> {target['name']}  {target['base']}\n   {reason}")
+    if previous == target["base"].rstrip("/"):
+        print("   (unchanged)")
+    print("   takes effect on the NEXT Claude Code launch — a running session keeps "
+          "its current endpoint.")
+
+    if args.launch:
+        claude = shutil.which("claude")
+        if not claude:
+            print("claudemode: claude is not on PATH", file=sys.stderr)
+            return 2
+        os.execv(claude, ["claude"])
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

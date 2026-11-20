@@ -213,6 +213,73 @@ func TestAuthenticatedClaudeCanaryRoutesAndCleansExactSession(t *testing.T) {
 	}
 }
 
+// A canary turn a peer served leaves the session held on that peer, and since
+// PATCHES §49 /_subrouter/sessions lists a held session that has no local
+// assignment: served_by "remote", account_id empty. DELETE drops the local
+// assignment only, so after cleanup the session is still listed from its hold.
+// That row is not an assignment, and the canary reads assignments: cleanup
+// passes as it did before §49.
+func TestAuthenticatedClaudeCanaryIgnoresAPeerHoldRowAfterCleanup(t *testing.T) {
+	dir := privateDir(t)
+	var mu sync.Mutex
+	assignments := map[string]string{}
+	held := map[string]bool{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch r.URL.Path {
+		case "/v1/messages":
+			var body struct {
+				Messages []struct {
+					Content string `json:"content"`
+				} `json:"messages"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil || len(body.Messages) != 1 {
+				t.Error("Claude canary request body is invalid")
+			}
+			id := r.Header.Get("X-Claude-Code-Session-Id")
+			assignments[id] = "local-placeholder"
+			held[id] = true
+			marker := strings.TrimPrefix(body.Messages[0].Content, "Reply with exactly ")
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `{"type":"message","content":[{"type":"text","text":%q}],"stop_reason":"end_turn"}`, marker)
+		case "/_subrouter/sessions":
+			if r.Method == http.MethodDelete {
+				delete(assignments, r.URL.Query().Get("session_id"))
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+			rows := []map[string]any{}
+			for id := range held {
+				row := map[string]any{"agent_type": "claude", "session_id": id, "account_id": "",
+					"served_by": "remote", "served_peer": "box", "served_account": "b1", "active": false}
+				if account, ok := assignments[id]; ok {
+					row["account_id"] = account
+				}
+				rows = append(rows, row)
+			}
+			_ = json.NewEncoder(w).Encode(rows)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	cfg := ClaudeLegConfig{Schema: ConfigSchema, HTTP: HTTPConfig{BaseURL: server.URL, TimeoutSeconds: 2, MaxResponseBytes: 1 << 16}, ProofFile: filepath.Join(dir, "proof.json"), Journal: filepath.Join(dir, "journal.json"), Model: "claude-test"}
+	path := writeConfig(t, dir, "config.json", cfg)
+	if err := RunLeg(context.Background(), "authenticated-routed-claude", path, "test-run"); err != nil {
+		t.Fatalf("a peer-held row after cleanup failed the leg: %v", err)
+	}
+	mu.Lock()
+	remaining, servedTurns := len(assignments), len(held)
+	mu.Unlock()
+	if servedTurns != 1 || remaining != 0 {
+		t.Fatalf("calibration: %d turns served, %d assignments left; want 1 and 0", servedTurns, remaining)
+	}
+	if _, err := os.Stat(cfg.ProofFile); err != nil {
+		t.Fatalf("no success proof: %v", err)
+	}
+}
+
 func TestAuthenticatedClaudeCanaryRejectsWrongMarkerAndCleans(t *testing.T) {
 	dir := privateDir(t)
 	deleted := false

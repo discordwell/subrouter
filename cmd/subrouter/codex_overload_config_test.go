@@ -1,44 +1,10 @@
 package main
 
-import (
-	"testing"
-	"time"
-)
+import "testing"
 
-func TestCodexOverloadConfigReadsCapacityRetryEnvironment(t *testing.T) {
-	t.Setenv("SUBROUTER_CODEX_OVERLOAD_FAILOVER", "1")
-	t.Setenv("SUBROUTER_CODEX_CAPACITY_RETRY", "persist")
-	t.Setenv("SUBROUTER_CODEX_CAPACITY_RETRY_BUDGET", "90s")
-	config, err := codexOverloadFailoverConfigFromEnvironment()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if config == nil || !config.CapacityRetryPersist || config.CapacityRetryBudget != 90*time.Second {
-		t.Fatalf("config = %+v, want persist with a 90s budget", config)
-	}
-
-	// Persist mode does not need the account failover: it then stays on the
-	// session's account.
-	t.Setenv("SUBROUTER_CODEX_OVERLOAD_FAILOVER", "0")
-	config, err = codexOverloadFailoverConfigFromEnvironment()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if config == nil || config.Enabled || !config.CapacityRetryPersist || config.CapacityRetryBudget != 90*time.Second {
-		t.Fatalf("config = %+v, want persist with failover explicitly disabled", config)
-	}
-
-	t.Setenv("SUBROUTER_CODEX_CAPACITY_RETRY", "hammer")
-	if _, err := codexOverloadFailoverConfigFromEnvironment(); err == nil {
-		t.Fatal("unknown capacity retry mode accepted")
-	}
-	t.Setenv("SUBROUTER_CODEX_CAPACITY_RETRY", "default")
-	t.Setenv("SUBROUTER_CODEX_CAPACITY_RETRY_BUDGET", "soon")
-	if _, err := codexOverloadFailoverConfigFromEnvironment(); err == nil {
-		t.Fatal("invalid capacity retry budget accepted")
-	}
-}
-
+// Upstream manaflow-ai/subrouter's test (c9303d3, #457). Since the 389/373
+// port the reader always returns a config, as upstream's does; the failover
+// is set here because the cap only matters with it on. PATCHES section 27.
 func TestCodexOverloadConfigReadsFailoverMaxInput(t *testing.T) {
 	t.Setenv("SUBROUTER_CODEX_OVERLOAD_FAILOVER", "1")
 	t.Setenv("SUBROUTER_CODEX_OVERLOAD_FAILOVER_MAX_INPUT", "")
@@ -62,25 +28,50 @@ func TestCodexOverloadConfigReadsFailoverMaxInput(t *testing.T) {
 	}
 }
 
-// With nothing set capacity retry stays on the session account; failover is opt-in.
+// With the failover off the capacity retry is still configured (same account
+// only). Upstream's test (#389), without its persist and client-header
+// fields, which the fork does not port, and with the failover turned off
+// explicitly: the fork ships it on (TestCodexOverloadFailoverShipsOn).
 func TestCodexOverloadConfigDefaultsToSameAccountRetry(t *testing.T) {
-	for _, key := range []string{"SUBROUTER_CODEX_OVERLOAD_FAILOVER", "SUBROUTER_CODEX_OVERLOAD_MAX_ACCOUNTS", "SUBROUTER_CODEX_OVERLOAD_MARK_TTL", "SUBROUTER_CODEX_CAPACITY_RETRY", "SUBROUTER_CODEX_CAPACITY_RETRY_BUDGET", "SUBROUTER_CODEX_CAPACITY_RETRY_HEADER"} {
+	for _, key := range []string{"SUBROUTER_CODEX_OVERLOAD_MAX_ACCOUNTS", "SUBROUTER_CODEX_OVERLOAD_MARK_TTL", "SUBROUTER_CODEX_CAPACITY_RETRY_MAX_WAIT", "SUBROUTER_CODEX_CAPACITY_RETRY_INTERVAL"} {
 		t.Setenv(key, "")
 	}
+	t.Setenv("SUBROUTER_CODEX_OVERLOAD_FAILOVER", "0")
 	config, err := codexOverloadFailoverConfigFromEnvironment()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if config == nil || config.Enabled || !config.CapacityRetryPersist || config.FailoverMaxInputUnlimited || config.CapacityRetryBudget != 10*time.Minute || config.CapacityRetryHeader {
-		t.Fatalf("config = %+v, want persistent same-account retry with client headers off", config)
+	if config == nil || config.Enabled {
+		t.Fatalf("config = %+v, want the same-account default with the failover off", config)
 	}
-	t.Setenv("SUBROUTER_CODEX_CAPACITY_RETRY_HEADER", "1")
-	if config, err = codexOverloadFailoverConfigFromEnvironment(); err != nil || !config.CapacityRetryHeader || config.Enabled {
-		t.Fatalf("config = %+v err = %v, want client capacity retry headers without implicit failover", config, err)
-	}
-	t.Setenv("SUBROUTER_CODEX_CAPACITY_RETRY_HEADER", "")
 	t.Setenv("SUBROUTER_CODEX_OVERLOAD_FAILOVER", "1")
-	if config, err = codexOverloadFailoverConfigFromEnvironment(); err != nil || !config.Enabled || !config.CapacityRetryPersist {
-		t.Fatalf("config = %+v err = %v, want persistence independent of explicit failover=1", config, err)
+	if config, err = codexOverloadFailoverConfigFromEnvironment(); err != nil || !config.Enabled {
+		t.Fatalf("config = %+v err = %v, want the failover opted in", config, err)
+	}
+}
+
+// The fork ships the capacity failover on (owner, 2026-09-28): unset is on,
+// and only an explicit 0/false/no/off turns it off. Upstream is opt-in. An
+// unrecognized value fails loudly instead of silently picking a side.
+func TestCodexOverloadFailoverShipsOn(t *testing.T) {
+	for _, raw := range []string{"", "  ", "1", "true", "YES", "on"} {
+		t.Setenv("SUBROUTER_CODEX_OVERLOAD_FAILOVER", raw)
+		config, err := codexOverloadFailoverConfigFromEnvironment()
+		if err != nil || config == nil || !config.Enabled {
+			t.Fatalf("SUBROUTER_CODEX_OVERLOAD_FAILOVER=%q: config = %+v err = %v, want the failover on", raw, config, err)
+		}
+	}
+	for _, raw := range []string{"0", "false", "No", "off"} {
+		t.Setenv("SUBROUTER_CODEX_OVERLOAD_FAILOVER", raw)
+		config, err := codexOverloadFailoverConfigFromEnvironment()
+		if err != nil || config == nil || config.Enabled {
+			t.Fatalf("SUBROUTER_CODEX_OVERLOAD_FAILOVER=%q: config = %+v err = %v, want the failover off (same-account ladder only)", raw, config, err)
+		}
+	}
+	for _, raw := range []string{"2", "maybe"} {
+		t.Setenv("SUBROUTER_CODEX_OVERLOAD_FAILOVER", raw)
+		if _, err := codexOverloadFailoverConfigFromEnvironment(); err == nil {
+			t.Fatalf("SUBROUTER_CODEX_OVERLOAD_FAILOVER=%q accepted", raw)
+		}
 	}
 }

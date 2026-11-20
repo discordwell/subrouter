@@ -198,9 +198,6 @@ type attemptBudget struct {
 	// quotaPerPass is restored only after the outer autonomous loop starts
 	// another pass. A reset wake must get the full, bounded pool allowance.
 	quotaPerPass int64
-	// claudeOverload is the request's same-account Claude overload ladder,
-	// bounded on its own (see claudeOverloadHold).
-	claudeOverload claudeOverloadHold
 	// claudeTransient429Rerouted records the one alternate account already
 	// used for a transient Claude throttle. It is request-wide so nested
 	// transport replays cannot fan one burst out across the whole pool.
@@ -1046,7 +1043,8 @@ func (t azureCodexFallbackTransport) RoundTrip(req *http.Request) (*http.Respons
 			case codexFailureServer:
 				reason = "pool_stream_failed"
 			default:
-				// A 400 or 2xx JSON body can still name model capacity.
+				// A 400 or 2xx JSON body can still name model capacity
+				// (upstream #373).
 				capacity, replaced := codexCapacityBody(response)
 				response = replaced
 				if !capacity {
@@ -1068,12 +1066,6 @@ func (t azureCodexFallbackTransport) RoundTrip(req *http.Request) (*http.Respons
 	}
 	fallback, endpoint, served := t.server.azureCodexResponse(req, body, t.sessionKey, preferred, reason)
 	if !served {
-		if retry, ok := t.server.codexFallbackRetryRequest(req, t.attempt, response); ok {
-			if response != nil && response.Body != nil {
-				_ = response.Body.Close()
-			}
-			return base.RoundTrip(retry)
-		}
 		return response, err
 	}
 	if t.server.recoveryCounters != nil {
@@ -1125,6 +1117,14 @@ func azureCodexStreamFailure(response *http.Response) (codexFailureClass, *http.
 	return class, replaced
 }
 
+// codexEventStream tells a stream from a body by its Content-Type, as
+// upstream #373 wrote it. Upstream later found (#450, 5d997cf, a live
+// capture) that chatgpt.com answers Codex's POST /responses with an SSE body
+// and NO Content-Type, on which this is false: neither the stream peek above
+// nor the SSE branch of the session commit would run. #450's fix is the
+// content-sniffing transport under the base transport (content_sniff.go),
+// ported for Codex (PATCHES section 27, fix-ups 389-1 and 389-2), so by the
+// time a Codex response reaches this check it is labelled.
 func codexEventStream(response *http.Response) bool {
 	return strings.HasPrefix(response.Header.Get("Content-Type"), "text/event-stream")
 }

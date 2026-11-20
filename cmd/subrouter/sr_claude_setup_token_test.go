@@ -265,12 +265,14 @@ func TestClaudeLoginKeepsBrowserOAuthFlow(t *testing.T) {
 			return nil
 		},
 	}
-	for _, args := range [][]string{{"login", "work"}, {"add", "--oauth", "classic"}} {
+	// addr ("add refresh") is this fork's name for the same login (2026-09
+	// grammar pass).
+	for _, args := range [][]string{{"login", "work"}, {"add", "--oauth", "classic"}, {"addr", "plain"}} {
 		if err := runner.run(t.Context(), args); err != nil {
 			t.Fatalf("%v: %v\n%s", args, err, out.String())
 		}
 	}
-	for _, name := range []string{"work", "classic"} {
+	for _, name := range []string{"work", "classic", "plain"} {
 		credential := readStoredClaudeCredential(t, store, name)
 		if credential.RefreshToken != "claude-refresh" || credential.AccessToken != "claude-access" {
 			t.Fatalf("%s: stored credential = %+v, want the OAuth pair Claude wrote", name, credential)
@@ -278,6 +280,11 @@ func TestClaudeLoginKeepsBrowserOAuthFlow(t *testing.T) {
 	}
 	if err := runner.run(t.Context(), []string{"login", "work", "--token", testSetupToken}); err == nil {
 		t.Fatal("login must refuse --token")
+	}
+	for _, args := range [][]string{{"addr", "work", "--token", testSetupToken}, {"addr", "work", "--setup-token"}, {"login", "work", "--setup-token"}} {
+		if err := runner.run(t.Context(), args); err == nil || !strings.Contains(err.Error(), "sr claude add <name>") {
+			t.Fatalf("%v must refuse a setup token and name the setup-token add: %v", args, err)
+		}
 	}
 }
 
@@ -293,7 +300,7 @@ func TestParseClaudeAddArgs(t *testing.T) {
 		{[]string{"work", "--token=tok"}, claudeAddOptions{name: "work", token: "tok"}, false},
 		{[]string{"--token", "-"}, claudeAddOptions{tokenFromStdin: true}, false},
 		{[]string{"--oauth", "work"}, claudeAddOptions{name: "work", oauth: true}, false},
-		{[]string{"--setup-token", "work"}, claudeAddOptions{name: "work"}, false},
+		{[]string{"--setup-token", "work"}, claudeAddOptions{name: "work", setupToken: true}, false},
 		{[]string{"--oauth", "--token", "tok"}, claudeAddOptions{}, true},
 		{[]string{"--token"}, claudeAddOptions{}, true},
 		{[]string{"a", "b"}, claudeAddOptions{}, true},
@@ -308,6 +315,30 @@ func TestParseClaudeAddArgs(t *testing.T) {
 		if err == nil && got != tc.want {
 			t.Errorf("%v: got %+v, want %+v", tc.args, got, tc.want)
 		}
+	}
+}
+
+// --push was retired with the house grammar: a setup token is copied to the
+// selected server automatically and a refresh-token profile moves with
+// `sr claude move`. A keyless machine has no such option at all (PATCHES 17),
+// so it is refused there as any unknown option is, naming nothing remote.
+func TestParseClaudeAddArgsRetiresPush(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("SUBROUTER_STATE_DIR", t.TempDir())
+	resetRemoteGateCache()
+	t.Cleanup(resetRemoteGateCache)
+	_, err := parseClaudeAddArgs([]string{"work", "--push"})
+	if err == nil || !strings.Contains(err.Error(), `unknown option "--push"`) {
+		t.Fatalf("keyless --push error = %v", err)
+	}
+	if strings.Contains(err.Error(), "server") {
+		t.Fatalf("keyless refusal names the remote: %v", err)
+	}
+
+	unlockRemoteGateForTest(t)
+	_, err = parseClaudeAddArgs([]string{"work", "--push"})
+	if err == nil || !strings.Contains(err.Error(), "--push is retired") || !strings.Contains(err.Error(), "sr claude move") {
+		t.Fatalf("keyed --push error = %v", err)
 	}
 }
 
@@ -341,7 +372,7 @@ func TestDisplayClaudeProfilesShowsSetupTokenExpiry(t *testing.T) {
 }
 
 func TestSRClaudeHelpDocumentsSetupTokenAndLogin(t *testing.T) {
-	for _, want := range []string{"sr add claude <name>", "setup token", "--token TOKEN|-", "--oauth", "sr claude login [name]"} {
+	for _, want := range []string{"sr add claude <name>", "setup token", "--token TOKEN|-", "--oauth", "sr claude login [name]", "sr claude addr [name]"} {
 		if !strings.Contains(srClaudeHelp, want) {
 			t.Errorf("help is missing %q", want)
 		}

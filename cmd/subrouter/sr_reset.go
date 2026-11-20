@@ -38,7 +38,7 @@ func (r srRunner) resetAgainstServer(ctx context.Context, args []string, fixedSe
 	flags := flag.NewFlagSet("reset", flag.ContinueOnError)
 	flags.SetOutput(r.errOut)
 	flags.Usage = func() {
-		fmt.Fprintln(r.errOut, "usage: subrouter reset [email] [--all [--yes]] [--gto [-n N]] [--candidates] [--min-wait D] [--dry-run] [--local]")
+		fmt.Fprintln(r.errOut, "usage: subrouter reset [email] [--all [--yes]] [--gto [-n N]] [--candidates] [--min-wait D] [--local]")
 		fmt.Fprintln(r.errOut, "  Redeem a ChatGPT Pro rate-limit reset credit.")
 		fmt.Fprintln(r.errOut, "  No args: reset the best cooked account with a credit available.")
 		fmt.Fprintln(r.errOut, "  <email>: reset a specific account.")
@@ -52,8 +52,8 @@ func (r srRunner) resetAgainstServer(ctx context.Context, args []string, fixedSe
 		fmt.Fprintln(r.errOut, "         skips (longest first). Accounts blocked only by the 5h window never qualify.")
 		fmt.Fprintln(r.errOut, "  -n N:  with --gto, redeem the top N ranked accounts (default 1).")
 		fmt.Fprintln(r.errOut, "  --list: show every account's available reset credits with expiry (no redeem).")
-		fmt.Fprintln(r.errOut, "  --dry-run: list candidates and value verdict without redeeming.")
-		fmt.Fprintln(r.errOut, "  --local: use tokens stored on this machine even when a server is configured.")
+		fmt.Fprintln(r.errOut, "  --local: use tokens stored on this machine. When sr has already routed reset")
+		fmt.Fprintln(r.errOut, "         to a selected server, use SUBROUTER_CODEX_SERVER=local instead.")
 	}
 	all := flags.Bool("all", false, "reset every cooked account that has an available credit")
 	gto := flags.Bool("gto", false, "reset weekly-cooked account(s) ranked by the weekly wait a credit skips; never 5h-only cooks")
@@ -97,8 +97,12 @@ func (r srRunner) resetAgainstServer(ctx context.Context, args []string, fixedSe
 	if minWait > 0 && (email != "" || *gto || *list) {
 		return fmt.Errorf("--min-wait applies to the default pick, --all, and --candidates")
 	}
+	// sr routes reset to a selected server before this runs (shouldRouteSRCommand),
+	// and a routed command stays bound to that daemon (see above), so --local
+	// cannot un-route it here. Name the spelling that does: the environment
+	// override is read before routing, and §22 documents it.
 	if *local && fixedServer != nil {
-		return fmt.Errorf("--local cannot be used when this command is bound to a running server")
+		return fmt.Errorf("--local cannot be used when this command is bound to a running server; run SUBROUTER_CODEX_SERVER=local %s reset instead", r.programOrSubrouter())
 	}
 	if !*gto && *count != 1 {
 		return fmt.Errorf("-n only applies with --gto")
@@ -325,6 +329,9 @@ func (r srRunner) resetRemote(ctx context.Context, server srServerConfig, email 
 				return fmt.Errorf("no cooked account has a rate-limit reset credit available")
 			}
 			printResetResults(r.out, payload.DryRun, payload.Reset, payload.Results)
+			// #380's exit rule applies to the server's pick as much as to a
+			// named account: a pick whose redemption failed un-cooked nothing
+			// and must not exit 0 (upstream #402 made the same change).
 			return resetFailuresError(payload.Results)
 		}
 		if !serverLacksBestReset(err) {
@@ -403,56 +410,77 @@ type remoteResetPayload struct {
 	Results []remoteResetResult `json:"results"`
 }
 
+// resetRemoteQuery is one rate-limit-reset request: one account (email),
+// every cooked one (all), or with neither the server's smart pick.
+type resetRemoteQuery struct {
+	email   string
+	all     bool
+	dryRun  bool
+	minWait int64
+	// anytime redeems the named account whether or not it is at its weekly
+	// limit (PATCHES §46.8). Only `sr codex reset <name|email>` sets it; the
+	// daemon refuses it beside all or the smart pick.
+	anytime bool
+}
+
 // resetRemoteRequest performs one reset call against the server and returns the
-// decoded payload without printing, so callers (sweep, GTO) can aggregate.
+// decoded payload without printing, so callers (sweep, GTO) can aggregate. It
+// never redeems anytime: `sr reset` keeps the cooked-only rule.
 func (r srRunner) resetRemoteRequest(ctx context.Context, server srServerConfig, email string, all, dryRun bool, minWait int64) (remoteResetPayload, error) {
-	baseURL, err := serverControlBaseURL(server)
-	if err != nil {
-		return remoteResetPayload{}, err
-	}
-	u := baseURL + "/_subrouter/rate-limit-reset?"
+	payload, _, err := r.resetRemoteRequestVia(ctx, server, resetRemoteQuery{email: email, all: all, dryRun: dryRun, minWait: minWait}, false)
+	return payload, err
+}
+
+// resetRemoteRequestVia is resetRemoteRequest for any query, with which of
+// the server's paths answered (PATCHES §43.2).
+func (r srRunner) resetRemoteRequestVia(ctx context.Context, server srServerConfig, query resetRemoteQuery, quiet bool) (remoteResetPayload, serverAdminVia, error) {
 	q := url.Values{}
-	if all {
+	if query.all {
 		q.Set("all", "true")
 	}
-	if email != "" {
-		q.Set("email", email)
+	if query.email != "" {
+		q.Set("email", query.email)
 	}
-	if email == "" && !all {
+	if query.email == "" && !query.all {
 		q.Set("best", "true")
 	}
-	if dryRun {
+	if query.dryRun {
 		q.Set("dry_run", "true")
 	}
-	if minWait > 0 {
-		q.Set("min_wait_seconds", strconv.FormatInt(minWait, 10))
+	if query.minWait > 0 {
+		q.Set("min_wait_seconds", strconv.FormatInt(query.minWait, 10))
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u+q.Encode(), nil)
-	if err != nil {
-		return remoteResetPayload{}, redactServerRequestError(err, server)
+	if query.anytime && query.email != "" && !query.all {
+		q.Set("anytime", "true")
 	}
-	addServerAdminAuth(req, server)
-	secured, err := r.securedRequestClientForServer(server, baseURL, 60*time.Second)
+	res, via, err := r.doServerAdmin(ctx, server, serverAdminCall{
+		method:  http.MethodPost,
+		path:    "/_subrouter/rate-limit-reset?" + q.Encode(),
+		timeout: 60 * time.Second,
+		quiet:   quiet,
+	})
 	if err != nil {
-		return remoteResetPayload{}, err
-	}
-	res, err := secured.Do(req)
-	if err != nil {
-		return remoteResetPayload{}, redactServerRequestError(err, server)
+		redacted := redactServerRequestError(err, server)
+		if !query.dryRun && !resetRequestNeverSent(err) {
+			// Same message; the type lets `sr codex reset` say it may
+			// have landed (PATCHES §46.7).
+			return remoteResetPayload{}, via, &resetAnswerLostError{err: redacted}
+		}
+		return remoteResetPayload{}, via, redacted
 	}
 	defer res.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
 		if len(body) == 0 {
-			return remoteResetPayload{}, fmt.Errorf("rate-limit reset failed: %s", res.Status)
+			return remoteResetPayload{}, via, fmt.Errorf("rate-limit reset failed: %s", res.Status)
 		}
-		return remoteResetPayload{}, fmt.Errorf("rate-limit reset failed: %s\n%s", res.Status, bytes.TrimSpace(body))
+		return remoteResetPayload{}, via, fmt.Errorf("rate-limit reset failed: %s\n%s", res.Status, bytes.TrimSpace(body))
 	}
 	var payload remoteResetPayload
 	if err := json.Unmarshal(body, &payload); err != nil {
-		return remoteResetPayload{}, fmt.Errorf("decode reset response: %w", err)
+		return remoteResetPayload{}, via, fmt.Errorf("decode reset response: %w", err)
 	}
-	return payload, nil
+	return payload, via, nil
 }
 
 func (r srRunner) resetRemoteSweep(ctx context.Context, server srServerConfig, email string, all, dryRun bool, minWait int64) error {
@@ -517,6 +545,10 @@ func (r srRunner) pickSmartResetCandidateRemote(ctx context.Context, server srSe
 		return "", err
 	}
 	rows := usageRowsFromServerUsageStatuses(statuses)
+	// Rows come back in display order. The candidate sort below compares
+	// weekly waits alone, so input order settles a tie. Re-rank first so a
+	// tie does not turn on account names.
+	sortUsageRowsWithinHeadings(rows, usageRowRankLess)
 	type cand struct {
 		email      string
 		resetAfter int64
@@ -665,7 +697,10 @@ type remoteResetResult struct {
 	// WeeklyWaitSeconds and CreditExpiresAt come from newer servers only.
 	WeeklyWaitSeconds int64  `json:"weekly_wait_seconds,omitempty"`
 	CreditExpiresAt   string `json:"credit_expires_at,omitempty"`
-	Error             string `json:"error,omitempty"`
+	// EarlyUse: an anytime redeem of an account below its weekly limit
+	// (PATCHES §46.8).
+	EarlyUse bool   `json:"early_use,omitempty"`
+	Error    string `json:"error,omitempty"`
 	// Display names the account for people when the caller knows it; Email
 	// holds the server's stable account ID.
 	Display string `json:"-"`

@@ -236,7 +236,16 @@ func (s CodexStore) AddProviderAPIKey(provider Provider, label, key string) (Sto
 }
 
 func (s CodexStore) RefreshStoredIfExpired(ctx context.Context, client *http.Client, account StoredCodexAccount) (StoredCodexAccount, bool, error) {
-	return s.refreshStored(ctx, client, account, false, nil)
+	return s.refreshStored(ctx, client, account, false, "", nil)
+}
+
+// RefreshStoredIfRejected refreshes account's chain when the stored access
+// token is still rejectedAccessToken, the one OpenAI refused as expired, or has
+// expired. A different, unexpired token means another caller already replaced
+// the rejected one, and it is returned with no refresh. The compare runs under
+// the account lock, so callers that met the same rejection refresh once.
+func (s CodexStore) RefreshStoredIfRejected(ctx context.Context, client *http.Client, account StoredCodexAccount, rejectedAccessToken string) (StoredCodexAccount, bool, error) {
+	return s.refreshStored(ctx, client, account, false, rejectedAccessToken, nil)
 }
 
 // RefreshStoredIfExpiredBeforeRefresh calls beforeRefresh after the final
@@ -249,18 +258,27 @@ func (s CodexStore) RefreshStoredIfExpiredBeforeRefresh(
 	account StoredCodexAccount,
 	beforeRefresh func() error,
 ) (StoredCodexAccount, bool, error) {
-	return s.refreshStored(ctx, client, account, false, beforeRefresh)
+	return s.refreshStored(ctx, client, account, false, "", beforeRefresh)
 }
 
 func (s CodexStore) RefreshStored(ctx context.Context, client *http.Client, account StoredCodexAccount) (StoredCodexAccount, bool, error) {
-	return s.refreshStored(ctx, client, account, true, nil)
+	return s.refreshStored(ctx, client, account, true, "", nil)
 }
+
+// codexExchangeTimeout bounds one refresh-token exchange on a clock the caller
+// cannot stop. OpenAI rotates the refresh token on use exactly as Anthropic
+// does, so the same rule holds: a caller may leave the queue for the lock, but
+// once the old token has been presented the read of the new one is not the
+// caller's to abandon. See credentialExchangeTimeout in the Claude store for
+// the incident that motivated the pair.
+const codexExchangeTimeout = 30 * time.Second
 
 func (s CodexStore) refreshStored(
 	ctx context.Context,
 	client *http.Client,
 	account StoredCodexAccount,
 	force bool,
+	rejectedAccessToken string,
 	beforeRefresh func() error,
 ) (StoredCodexAccount, bool, error) {
 	if account.Auth.Tokens == nil {
@@ -268,8 +286,8 @@ func (s CodexStore) refreshStored(
 		return account, false, nil
 	}
 	if !s.DisableActiveAuthSync {
-		if !force && !IsJWTExpired(account.Auth.Tokens.AccessToken, 60*time.Second) {
-			logCodexRefreshSkipped(ctx, s, account, force, "access_token_fresh")
+		if reason, keep := keepCodexAccessToken(account, force, rejectedAccessToken); keep {
+			logCodexRefreshSkipped(ctx, s, account, force, reason)
 			return account, false, nil
 		}
 		if err := terminalStoredRefreshFailure(account); err != nil {
@@ -304,8 +322,8 @@ func (s CodexStore) refreshStored(
 		logCodexRefreshSkipped(ctx, s, account, force, reason)
 		return account, false, err
 	}
-	if !force && !IsJWTExpired(account.Auth.Tokens.AccessToken, 60*time.Second) {
-		logCodexRefreshSkipped(ctx, s, account, force, "access_token_fresh_after_lock")
+	if reason, keep := keepCodexAccessToken(account, force, rejectedAccessToken); keep {
+		logCodexRefreshSkipped(ctx, s, account, force, reason+"_after_lock")
 		return account, false, nil
 	}
 	if err := terminalStoredRefreshFailure(account); err != nil {
@@ -325,6 +343,10 @@ func (s CodexStore) refreshStored(
 		}
 	}
 	logCodexRefreshStart(ctx, s, previous, force)
+	// Detached from the caller from here on: the exchange, the breadcrumb and
+	// the save all complete or all time out together, on codexExchangeTimeout.
+	ctx, cancelExchange := context.WithTimeout(context.WithoutCancel(ctx), codexExchangeTimeout)
+	defer cancelExchange()
 	auth, err := RefreshCodexAuth(ctx, client, account.Auth)
 	if err != nil {
 		if recovered, ok := s.recoverRefreshedAccount(account); ok {
@@ -360,6 +382,22 @@ func (s CodexStore) refreshStored(
 	}
 	logCodexRefreshSucceeded(ctx, s, previous, account, force)
 	return account, true, nil
+}
+
+// keepCodexAccessToken reports whether refreshStored keeps account's access
+// token, and the skip reason it logs when it does.
+func keepCodexAccessToken(account StoredCodexAccount, force bool, rejectedAccessToken string) (string, bool) {
+	token := account.Auth.Tokens.AccessToken
+	switch {
+	case force, IsJWTExpired(token, 60*time.Second):
+		return "", false
+	case rejectedAccessToken == "":
+		return "access_token_fresh", true
+	case token == rejectedAccessToken:
+		return "", false
+	default:
+		return "access_token_replaced", true
+	}
 }
 
 func codexCredentialOriginAllowsActiveAuthSync(origin CodexOAuthCredentialOrigin) bool {
@@ -502,11 +540,19 @@ var afterActiveCodexAuthSyncRead func()
 
 // syncActiveCodexAuthIfAccountActive mirrors a refreshed credential into
 // ~/.codex/auth.json only if that file still holds the same identity. The
-// read-compare-write runs under lockActiveCodexAuthWrite so a concurrent
+// read-compare-write runs under lockActiveCodexAuthWrite, so a concurrent
 // SwitchActiveStored to another account cannot land between the read and the
-// write and then be overwritten. Callers hold the account's lockStoredAccount;
-// the write lock is taken inside it (see lockActiveCodexAuthWrite for order).
+// write and then be overwritten by this account's tokens. Callers hold the
+// account's lockStoredAccount; the write lock is taken inside it.
+//
+// An account that is not the active one returns before the lock, as it did
+// before the lock existed: its refresh never writes auth.json, so a lock file
+// it cannot open (one a root-run `sr` left behind) must not fail it, and it
+// must not create ~/.codex. The check is repeated under the lock.
 func syncActiveCodexAuthIfAccountActive(account StoredCodexAccount) error {
+	if active, ok, err := ReadActiveCodexAuth(); err != nil || !ok || !SameCodexOAuthIdentity(active, account.Auth) {
+		return err
+	}
 	unlock, err := lockActiveCodexAuthWrite()
 	if err != nil {
 		return err

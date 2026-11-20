@@ -10,6 +10,40 @@ Go service for routing AI coding-agent traffic across subscription accounts and 
 - Claude web `sessionKey` cookies (read from local browsers to show the prepaid extra-usage balance in `sr status`) follow the same rule: read-only, never logged, persisted only at `claude-web-sessions.json` under `storepath.CodexDir()` with mode 0600, and used only by the local CLI — never sent to the server or worker. Reading Chromium cookies may trigger a one-time macOS Keychain prompt for the browser's "Safe Storage" entry.
 - Prefer standard-library networking primitives unless a dependency removes meaningful complexity.
 
+## Never run this project's own commands against your host
+
+`sr setup`, `sr storage`, `sr server add|use`, `sr login`, `sr logout`, and
+`subrouter serve` rewrite the files the machine's agents authenticate through:
+`~/.claude/settings.json`, `~/.codex/config.toml`, and
+`~/.config/subrouter/cloud.json`. Run any of them to "just check" a change and
+the local proxy token can rotate underneath configs that are already written.
+
+That failure is total, not partial. `ANTHROPIC_AUTH_TOKEN` overrides the
+native claude.ai login, so a token the daemon rejects does not degrade a
+session — it 401s **every** running Claude Code session on the machine
+simultaneously, including the one you are working in, which means the command
+that would undo it is trapped inside a session that can no longer run it. This
+has happened three times.
+
+Use the container instead. It never mounts the host home:
+
+    make docker-test                          # whole suite
+    ./deploy/docker/test.sh ./cmd/subrouter -run TestFoo
+
+If you genuinely must exercise a real command end to end, give it a throwaway
+home rather than your own — and account for all five paths. `SUBROUTER_STATE_DIR`,
+`SUBROUTER_CLOUD_CONFIG`, and `CODEX_HOME` fall back to `HOME` when unset, but
+an exported host value OVERRIDES that fallback and punches straight through
+your `HOME` sandbox, so clear or re-point each one explicitly:
+
+    env -u SUBROUTER_STATE_DIR -u SUBROUTER_CLOUD_CONFIG -u CODEX_HOME \
+      HOME=$(mktemp -d) CLAUDE_CONFIG_DIR=$(mktemp -d) sr setup --plan
+
+Prefer a Go test around the writer over running the CLI at all. And when a
+change touches `broker.Config.Validate`, remember that tightening it
+reclassifies existing on-disk configs as invalid; see the token-preservation
+tests in `cmd/subrouter/cloud_mode_test.go`.
+
 ## The deliverable is a command Lawrence can run on his Mac
 
 Work is not done when the server is correct. It is done when there is a command

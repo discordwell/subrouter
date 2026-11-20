@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -181,18 +182,19 @@ func TestClaudeRetryCandidateSkipsTransientPauseWithoutQuotaExhaustion(t *testin
 	s.admission = testAdmissionControl(1, 2)
 	key := admissionKeyFor(accounts.ProviderClaude, "account-1", "claude-opus")
 	s.admission.observe(key, http.StatusTooManyRequests, http.Header{}, time.Now())
-	if _, _, err := s.oauthRetryCandidateWithReservation(context.Background(), accounts.ProviderClaude, "claude", "s", "", "claude-opus", map[string]struct{}{"account-0": {}}, true, false); err == nil {
+	// Upstream calls oauthRetryCandidateWithReservation (#644); the fork's
+	// failover keeps NoteRouted live debits and takes no reservation.
+	if _, err := s.oauthRetryCandidate(context.Background(), accounts.ProviderClaude, "claude", "s", "", "claude-opus", map[string]struct{}{"account-0": {}}, true, false); err == nil {
 		t.Fatal("retry selected a throttled account")
 	}
 	if s.SchedulerRef.Get().ForModel("claude-opus").Exhausted(accounts.ProviderClaude, "account-1") {
 		t.Fatal("transient pause was treated as quota exhaustion")
 	}
 	// A different model remains eligible on the same account.
-	got, reservation, err := s.oauthRetryCandidateWithReservation(context.Background(), accounts.ProviderClaude, "claude", "s", "", "claude-sonnet", map[string]struct{}{"account-0": {}}, true, false)
+	got, err := s.oauthRetryCandidate(context.Background(), accounts.ProviderClaude, "claude", "s", "", "claude-sonnet", map[string]struct{}{"account-0": {}}, true, false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	reservation.Release()
 	if got.ID != "account-1" {
 		t.Fatalf("picked %s, want account-1", got.ID)
 	}
@@ -253,48 +255,6 @@ func TestClaudeTransient429AlternateBudgetSurvivesOuterReplay(t *testing.T) {
 	}
 }
 
-func TestClaudeTransientPauseAlsoBlocksPaidExtraUsageCandidate(t *testing.T) {
-	s := transientThrottleServer(2)
-	s.SchedulerRef = selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
-		{AccountID: "account-0", Provider: accounts.ProviderClaude, WeeklyHeadroomKnown: true},
-		{AccountID: "account-1", Provider: accounts.ProviderClaude, WeeklyHeadroomKnown: true,
-			ClaudeExtraUsageEnabled: true, ClaudeExtraUsageKnown: true, ClaudeExtraUsageRemaining: 9},
-	}))
-	s.admission = testAdmissionControl(1, 2)
-	s.admission.observe(admissionKeyFor(accounts.ProviderClaude, "account-1", "claude-opus"), http.StatusTooManyRequests, http.Header{}, time.Now())
-	if _, _, err := s.oauthRetryCandidateWithReservation(context.Background(), accounts.ProviderClaude, "claude", "s", "", "claude-opus", map[string]struct{}{"account-0": {}}, true, true); err == nil {
-		t.Fatal("paid extra usage bypassed the transient throttle pause")
-	}
-}
-
-func TestClaudeExtraUsagePauseKeepsOtherFundedAccountsAvailable(t *testing.T) {
-	s := transientThrottleServer(3)
-	for _, healthyPaused := range []bool{false, true} {
-		t.Run(fmt.Sprint("healthy paused=", healthyPaused), func(t *testing.T) {
-			paused := selectacct.Score{AccountID: "account-1", Provider: accounts.ProviderClaude,
-				ClaudeExtraUsageEnabled: true, ClaudeExtraUsageKnown: true, ClaudeExtraUsageRemaining: 20}
-			if healthyPaused {
-				paused.Headroom, paused.ShortHeadroom = 1, 1
-			}
-			s.SchedulerRef = selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
-				{AccountID: "account-0", Provider: accounts.ProviderClaude}, paused,
-				{AccountID: "account-2", Provider: accounts.ProviderClaude,
-					ClaudeExtraUsageEnabled: true, ClaudeExtraUsageKnown: true, ClaudeExtraUsageRemaining: 9},
-			}))
-			s.admission = testAdmissionControl(1, 2)
-			s.admission.observe(admissionKeyFor(accounts.ProviderClaude, "account-1", "claude-opus"), http.StatusTooManyRequests, http.Header{}, time.Now())
-			got, ok := s.pickClaudeExtraUsageFallbackForRequest(s.SchedulerRef.Get().ForModel("claude-opus"), s.Accounts, "claude-opus")
-			if healthyPaused {
-				if ok {
-					t.Fatal("a healthy subscription's transient pause unlocked paid usage")
-				}
-			} else if !ok || got.ID != "account-2" {
-				t.Fatalf("fallback=(%s,%v), want other unpaused funded account", got.ID, ok)
-			}
-		})
-	}
-}
-
 func TestClaudeTransient429StillUsesConfiguredFallback(t *testing.T) {
 	s := transientThrottleServer(6)
 	calls, fallbacks := 0, 0
@@ -318,4 +278,51 @@ func TestClaudeTransient429StillUsesConfiguredFallback(t *testing.T) {
 	if resp.StatusCode != http.StatusOK || calls != 2 || fallbacks != 1 {
 		t.Fatalf("status=%d calls=%d fallbacks=%d, want fallback after one alternate", resp.StatusCode, calls, fallbacks)
 	}
+}
+
+// The fork's terminal stages -- the Opus substitution, which commits a forced
+// move, and the peer pool, which sets a hold -- run only where the local pool
+// is spent (PATCHES §11, §16). A transient throttle on the session's account
+// and one alternate is not that (P8): upstream #645 hands it back to the
+// client's backoff, and upstream's give-up there runs the Fable chain alone.
+func TestClaudeTransient429GiveUpSkipsOpusAndPeerStages(t *testing.T) {
+	s := transientThrottleServer(6)
+	calls := 0
+	var stages []string
+	served := func(stage string) func(string) (*http.Response, bool) {
+		return func(reason string) (*http.Response, bool) {
+			stages = append(stages, stage+":"+reason)
+			return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: http.NoBody}, true
+		}
+	}
+	transport := usageLimitRetryTransport{
+		server: &s, provider: accounts.ProviderClaude, account: "account-0", maxAttempts: 6,
+		method: http.MethodPost, path: "/v1/messages", poolModel: "claude-fable", budget: newAttemptBudget(20),
+		base: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			calls++
+			return transientThrottleResponse("allowed", "10"), nil
+		}),
+		opusSubstitute: served("opus"),
+		remotePool:     served("remote"),
+	}
+	resp, err := transport.RoundTrip(claudeOverloadRequest("account-0"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if len(stages) != 0 {
+		t.Fatalf("transient throttle reached %v; want no Opus or peer stage", stages)
+	}
+	if resp.StatusCode != http.StatusTooManyRequests || calls != 2 {
+		t.Fatalf("status=%d calls=%d, want the throttle's 429 after one alternate", resp.StatusCode, calls)
+	}
+}
+
+// claudeOverloadRequest is a replayable Claude Messages request carrying
+// token. Upstream defines it in its overload_stay_on_account_test.go, beside
+// the Claude 8-minute ladder tests this fork does not carry (PATCHES §27).
+func claudeOverloadRequest(token string) *http.Request {
+	req, _ := http.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", bytes.NewReader([]byte(`{"model":"claude-opus-4-8"}`)))
+	req.Header.Set("Authorization", "Bearer "+token)
+	return req
 }

@@ -40,11 +40,14 @@ func (c *quotaResetCountingTransport) count(token string) int {
 	return c.calls["Bearer "+token]
 }
 
+// futureExhaustedQuota is a weekly-cooked score in the fork's terms
+// (scoreWeeklyCooked: a live WeeklyResetAt with nothing left); upstream marks
+// it with WeeklyHeadroomKnown, which the fork's Score does not have.
 func futureExhaustedQuota(account accounts.Account, until time.Time) selectacct.Score {
 	return selectacct.Score{
 		AccountID: account.ID, Provider: account.Provider,
-		Headroom: 0, ShortHeadroom: 0, WeeklyHeadroom: 0,
-		WeeklyHeadroomKnown: true, ExhaustedResetAt: until, Fresh: true,
+		Headroom: 0, ShortHeadroom: 0, WeeklyHeadroom: 0, WeeklyRemaining: 0,
+		WeeklyResetAt: until, ExhaustedResetAt: until, Fresh: true,
 	}
 }
 
@@ -68,14 +71,9 @@ func TestKnownExhaustedQuotaSuppressesBackgroundUsageFetch(t *testing.T) {
 	if !blocked || !got.Equal(reset) {
 		t.Fatalf("all-account reset=(%v,%t), want (%v,true)", got, blocked, reset)
 	}
-	delay := server.nextUsageScoreRefreshDelay()
-	if delay < 30*time.Second || delay > 35*time.Second {
-		t.Fatalf("background recheck=%v, want a bounded recheck near the 30s score TTL", delay)
-	}
-	server.UsageScoreTTL = 2 * time.Hour
-	if delay := server.nextUsageScoreRefreshDelay(); delay > time.Minute+8*time.Second {
-		t.Fatalf("large score TTL allowed an unbounded quota recheck=%v", delay)
-	}
+	// Upstream also checks its idle refresher's next delay here
+	// (nextUsageScoreRefreshDelay); the fork has no idle refresher (PATCHES
+	// §44.3), so only the request-path skip is checked.
 	for i := 0; i < 5; i++ {
 		scores, fetched := server.scoreAccounts(context.Background(), []accounts.Account{account})
 		if fetched != 0 || len(scores) != 1 || scores[0].Headroom != 0 {
@@ -105,9 +103,6 @@ func TestKnownExhaustionDoesNotStarveOtherHealthyAccounts(t *testing.T) {
 	server := Server{AccountRef: ref, SchedulerRef: selectacct.NewSchedulerRef(scheduler), UsageScoreTTL: 30 * time.Second}
 	if _, allBlocked := server.allOAuthAccountsWaitingForReset(time.Now()); allBlocked {
 		t.Fatal("healthy account was incorrectly classified as waiting for reset")
-	}
-	if delay := server.nextUsageScoreRefreshDelay(); delay > time.Minute {
-		t.Fatalf("healthy account should still refresh on normal TTL; got %v", delay)
 	}
 	_, scored := server.scoreAccounts(context.Background(), accountsList)
 	if scored != 1 {

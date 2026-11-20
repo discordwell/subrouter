@@ -3,7 +3,9 @@ package proxy
 import (
 	"context"
 	"errors"
+	"io"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -59,7 +61,7 @@ func TestScoreFromUsageWindowsClearsExpiredQuotaReset(t *testing.T) {
 		Name: "7d", UsedPercent: 100, LimitWindowSeconds: 7 * 24 * 60 * 60,
 		ResetAt: time.Now().Add(-time.Minute),
 	}})
-	if score.Headroom <= 0 || score.WeeklyCooked() {
+	if score.Headroom <= 0 || scoreWeeklyCooked(score, time.Now()) {
 		t.Fatalf("expired quota reset stayed cooked: %+v", score)
 	}
 }
@@ -432,5 +434,79 @@ func TestAccountRefReplaceDoesNotClobberAcrossProviders(t *testing.T) {
 	}
 	if claude == nil || claude.Token != "claude-tok-2" {
 		t.Fatalf("Claude entry not updated: %+v", claude)
+	}
+}
+
+// authRecordingRoundTripper wraps usageRoundTripper and records the bearer
+// token of every request, so a test can prove WHICH credential a sweep used.
+type authRecordingRoundTripper struct {
+	inner usageRoundTripper
+	auths []string
+}
+
+func (a *authRecordingRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	a.auths = append(a.auths, req.Header.Get("Authorization"))
+	return a.inner.RoundTrip(req)
+}
+
+// The provider-blindness regression behind the pool-wide 503s. The retired
+// codex-shaped sweep in cmd/subrouter fetched every account's usage from the
+// Codex endpoint with whatever token the account struct was carrying, so every
+// Claude account 401'd on every sweep and scored headroom=0 forever; the
+// scheduler ran blind and serially burned accounts into provider rate limits.
+// The sweep must (1) route a Claude account's usage fetch through the Claude
+// path and (2) present the CURRENT stored credential, not the possibly
+// boot-stale token on the in-memory account struct.
+func TestScoreOAuthAccountsUsesTheStoredClaudeCredential(t *testing.T) {
+	transport := &authRecordingRoundTripper{inner: usageRoundTripper{responses: []*http.Response{
+		// seven_day_oauth_apps present, so the Fable probe never fires and the
+		// single recorded request is the usage fetch itself.
+		{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(
+			`{"five_hour":{"utilization":20.0,"resets_at":"2030-01-01T00:00:00+00:00"},` +
+				`"seven_day":{"utilization":5.0,"resets_at":"2030-01-02T00:00:00+00:00"},` +
+				`"seven_day_oauth_apps":{"utilization":1.0,"resets_at":"2030-01-02T00:00:00+00:00"}}`)), Header: http.Header{}},
+	}}}
+	ref := cacheTestAccountRef(t, transport)
+
+	server := Server{
+		AccountRef: ref,
+		SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler(
+			[]selectacct.Score{},
+		)),
+	}
+
+	// The account list a long-running daemon holds: same identity as the
+	// stored profile, but a token snapshot from boot that has since rotated.
+	account := accounts.Account{
+		ID:       "claude@example.com",
+		Provider: accounts.ProviderClaude,
+		AuthMode: accounts.AuthModeOAuth,
+		Token:    "boot-stale-token",
+	}
+
+	scores, scored := server.ScoreOAuthAccounts(context.Background(), []accounts.Account{account})
+	if scored != 1 {
+		t.Fatalf("scored = %d, want 1 (claude account must be scorable)", scored)
+	}
+	if len(scores) != 1 {
+		t.Fatalf("scores = %d, want 1", len(scores))
+	}
+	if !scores[0].Fresh {
+		t.Fatal("score not marked fresh despite a 200 usage fetch")
+	}
+	if scores[0].Headroom <= 0 {
+		t.Fatalf("healthy claude account scored exhausted: %+v", scores[0])
+	}
+
+	if len(transport.auths) == 0 {
+		t.Fatal("no usage request reached the (fake) Anthropic endpoint")
+	}
+	for _, auth := range transport.auths {
+		if auth == "Bearer boot-stale-token" {
+			t.Fatal("sweep used the boot-stale in-memory token; it must re-read the stored credential")
+		}
+		if auth != "Bearer tok" {
+			t.Fatalf("usage fetch used unexpected credential %q, want the stored token", auth)
+		}
 	}
 }

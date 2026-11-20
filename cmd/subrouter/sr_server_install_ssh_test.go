@@ -43,6 +43,8 @@ func (r *stdinCapturingRunner) Output(context.Context, string, []string) ([]byte
 func TestServerInstallWithoutAnyTargetNamesBothOptions(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	// Remote paths exist only on a keyed machine (PATCHES 17).
+	unlockRemoteGateForTest(t)
 	store := accounts.DefaultCodexStore()
 	if err := defaultSRServerStore(store).save(srServerFile{
 		Servers: []srServerConfig{{Name: "mac-mini", URL: "http://100.64.0.9:31415"}},
@@ -52,7 +54,7 @@ func TestServerInstallWithoutAnyTargetNamesBothOptions(t *testing.T) {
 
 	var out bytes.Buffer
 	runner := srRunner{program: "sr", store: store, in: strings.NewReader(""), out: &out, errOut: &out}
-	err := runner.run(context.Background(), []string{"server", "install", "mac-mini"})
+	err := runner.run(context.Background(), []string{"server", "install", "mac-mini", "--allow-upstream-release"})
 	if err == nil {
 		t.Fatal("expected install to fail without a target")
 	}
@@ -64,6 +66,8 @@ func TestServerInstallWithoutAnyTargetNamesBothOptions(t *testing.T) {
 func TestServerInstallOverSSHSendsTokensOnStdin(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	// Remote paths exist only on a keyed machine (PATCHES 17).
+	unlockRemoteGateForTest(t)
 	store := accounts.DefaultCodexStore()
 	if err := defaultSRServerStore(store).save(srServerFile{
 		Servers: []srServerConfig{{
@@ -78,7 +82,7 @@ func TestServerInstallOverSSHSendsTokensOnStdin(t *testing.T) {
 	var out bytes.Buffer
 	fake := &stdinCapturingRunner{}
 	runner := srRunner{program: "sr", store: store, in: strings.NewReader(""), out: &out, errOut: &out, cmd: fake}
-	if err := runner.run(context.Background(), []string{"server", "install", "mac-mini"}); err != nil {
+	if err := runner.run(context.Background(), []string{"server", "install", "mac-mini", "--allow-upstream-release"}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -130,6 +134,8 @@ func TestServerInstallOverSSHSendsTokensOnStdin(t *testing.T) {
 func TestServerAddPreservesSSHHostOnUpdate(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	// Remote paths exist only on a keyed machine (PATCHES 17).
+	unlockRemoteGateForTest(t)
 	store := accounts.DefaultCodexStore()
 
 	var out bytes.Buffer

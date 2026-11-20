@@ -14,6 +14,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -27,7 +28,10 @@ import (
 	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
 	agentgrok "github.com/manaflow-ai/subrouter/internal/agents/grok"
 	agentkimi "github.com/manaflow-ai/subrouter/internal/agents/kimi"
+	"github.com/manaflow-ai/subrouter/internal/agents/opencode"
+	"github.com/manaflow-ai/subrouter/internal/agents/pi"
 	agentqwen "github.com/manaflow-ai/subrouter/internal/agents/qwen"
+	"github.com/manaflow-ai/subrouter/internal/broker"
 	"github.com/manaflow-ai/subrouter/internal/proxy"
 	"github.com/manaflow-ai/subrouter/selectacct"
 	"github.com/manaflow-ai/subrouter/session"
@@ -663,6 +667,44 @@ func TestLocalClaudeStatusDoesNotPublishFreshCredential(t *testing.T) {
 	}
 }
 
+// A Claude Max account with no `five_hour` bucket, no Fable meter, and a Fable
+// probe that answers a headerless 429, with 4% of its week left three days
+// from the roll. The daemon routes it (PATCHES §62), so `sr status` must not
+// call it not routable.
+func TestLocalClaudeStatusRoutesAnAccountWithNoFiveHourOrFableReading(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", filepath.Join(root, "home"))
+	t.Setenv("SUBROUTER_STATE_DIR", filepath.Join(root, "state"))
+	store := accounts.DefaultCodexStore()
+	claudeStore := agentclaude.DefaultStore()
+	profile := seedClaudeStatusCredential(t, claudeStore, "pixel", agentclaude.CredentialInfo{
+		AccessToken: "current-access", RefreshToken: "current-refresh",
+		ExpiresAt: time.Now().Add(time.Hour).UnixMilli(), SubscriptionType: "max",
+	})
+	roll := time.Now().Add(72 * time.Hour).UTC().Format(time.RFC3339)
+	client := &http.Client{Transport: srRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		switch req.URL.Path {
+		case "/api/oauth/usage":
+			return srJSONResponse(req, http.StatusOK, `{"five_hour":null,"seven_day":{"utilization":96,"resets_at":"`+roll+`"},"seven_day_oauth_apps":null}`), nil
+		case "/v1/messages":
+			return srJSONResponse(req, http.StatusTooManyRequests, `{"type":"error","error":{"type":"rate_limit_error"}}`), nil
+		default:
+			return nil, fmt.Errorf("unexpected Claude status request %s %s", req.Method, req.URL)
+		}
+	})}
+	rows, err := (srRunner{store: store, client: client}).fetchUsageRows(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	row := usageRowFor(rows, accounts.ProviderClaude, profile.Name)
+	if row == nil || row.err != nil {
+		t.Fatalf("Claude status row = %+v", row)
+	}
+	if got := compactPickReason(*row); got != "4% left" {
+		t.Fatalf("sr status reads %q, want \"4%% left\": the daemon routes this account", got)
+	}
+}
+
 func TestLocalClaudeStatusPublicationFailurePreventsRefresh(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("HOME", filepath.Join(root, "home"))
@@ -698,6 +740,68 @@ func TestLocalClaudeStatusPublicationFailurePreventsRefresh(t *testing.T) {
 	}
 	if credential == nil || credential.AccessToken != "stale-access" || credential.RefreshToken != "stale-refresh" {
 		t.Fatalf("credential changed after publication failure: %+v", credential)
+	}
+}
+
+// The hint under a Claude row of `sr status` names the repair for the login
+// that profile really holds, with its own name, through the real status read
+// (PATCHES §36): the OAuth profile whose refresh the provider refused is signed
+// in again with `addr`, and both setup tokens -- the expired one and the one
+// whose 401 says nothing about its kind -- are re-minted with `add`.
+func TestLocalClaudeStatusHintNamesTheRepairForTheLogin(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", filepath.Join(root, "home"))
+	t.Setenv("SUBROUTER_STATE_DIR", filepath.Join(root, "state"))
+	t.Setenv("COLUMNS", "200")
+	// Every credential read also asks the keychain. Answer "no such item" from
+	// a stub so the test never reaches the real one.
+	bin := filepath.Join(root, "bin")
+	if err := os.MkdirAll(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bin, "security"), []byte("#!/bin/sh\nexit 44\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	store := accounts.DefaultCodexStore()
+	claudeStore := agentclaude.DefaultStore()
+	seedClaudeStatusCredential(t, claudeStore, "seven-alpha", agentclaude.CredentialInfo{
+		AccessToken: "dead-access", RefreshToken: "dead-refresh",
+		ExpiresAt: time.Now().Add(-time.Hour).UnixMilli(),
+	})
+	seedClaudeStatusCredential(t, claudeStore, "year-token", agentclaude.SetupTokenCredential(testSetupToken, time.Now()))
+	seedClaudeStatusCredential(t, claudeStore, "old-token", agentclaude.SetupTokenCredential(testSetupToken, time.Now().AddDate(-2, 0, 0)))
+
+	client := &http.Client{Transport: srRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Path == "/v1/oauth/token" {
+			return srJSONResponse(req, http.StatusBadRequest, `{"error":"invalid_grant","error_description":"Refresh token not found or invalid"}`), nil
+		}
+		return srJSONResponse(req, http.StatusUnauthorized, `{"type":"error","error":{"type":"authentication_error"}}`), nil
+	})}
+	rows, err := (srRunner{store: store, client: client}).fetchUsageRows(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Calibration: the year-long token failed with a bare 401, so only the
+	// credential kind the row carries can name `add` for it.
+	if row := usageRowFor(rows, accounts.ProviderClaude, "year-token"); row == nil || row.err == nil ||
+		strings.Contains(row.err.Error(), "setup token") || !authErrorNeedsReadd(row.err) {
+		t.Fatalf("year-token row = %+v, want a re-add error that does not name the setup token", row)
+	}
+	var out bytes.Buffer
+	displayUsageRows(&out, rows, false)
+	text := out.String()
+	for _, want := range []string{
+		"(re-auth with: sr claude addr seven-alpha)",
+		"(re-add with: sr claude add year-token)",
+		"(re-add with: sr claude add old-token)",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("status output missing %q:\n%s", want, text)
+		}
+	}
+	if strings.Contains(text, "sr add claude") || strings.Contains(text, "on that server") {
+		t.Fatalf("a local profile's hint names the wrong command:\n%s", text)
 	}
 }
 
@@ -1308,8 +1412,16 @@ func TestSRAddKeyStoresRegistryProviderInLocalStorage(t *testing.T) {
 	}
 }
 
-func TestSelectedLoopbackServingAPIWinsOverUnattestedLocalDisk(t *testing.T) {
+// Upstream (977e933) routed `sr add-key`, `sr status` and bare `sr` over HTTP
+// to the loopback daemon's "serving store" and hid this machine's own disk
+// rows. This fork's daemon and CLI share one store, and that routing was the
+// box-only view PATCHES.md 19 removed, so it was not taken in the 2026-09
+// merge: these commands act on this machine's store and never ask a loopback
+// daemon for its accounts -- even one that is configured as the default server
+// and would answer.
+func TestLocalAccountCommandsUseThisMachinesStoreNotALoopbackServingAPI(t *testing.T) {
 	t.Setenv("COLUMNS", "80")
+	t.Setenv("HOME", t.TempDir())
 	store := accounts.CodexStore{Dir: filepath.Join(t.TempDir(), "cli-state")}
 	if err := store.SaveStored(accounts.StoredCodexAccount{
 		Email: "openrouter:disk-only", Provider: accounts.ProviderOpenRouter, AddedAt: time.Now().UTC().Format(time.RFC3339),
@@ -1317,63 +1429,19 @@ func TestSelectedLoopbackServingAPIWinsOverUnattestedLocalDisk(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	var imported atomic.Bool
+	var requests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
-		switch request.URL.Path {
-		case "/_subrouter/health":
-			authorityID, err := accounts.StoreAuthorityID(store.Dir)
-			if err != nil {
-				t.Fatal(err)
-			}
-			proof := ""
-			if challenge := request.Header.Get(accounts.StoreAuthorityChallengeHeader); challenge != "" {
-				proof, err = accounts.StoreAuthorityProof(store.Dir, challenge)
-				if err != nil {
-					t.Fatal(err)
-				}
-			}
-			_, _ = fmt.Fprintf(w, `{"ok":true,"account_import":"enabled","account_store_id":%q,"account_store_proof":%q}`, authorityID, proof)
-		case "/_subrouter/account-import":
-			if request.Header.Get("Authorization") != "Bearer import-token" {
-				http.Error(w, "missing import credential", http.StatusUnauthorized)
-				return
-			}
-			if request.Method == http.MethodGet {
-				_, _ = io.WriteString(w, `{"ok":true,"providers":["openrouter"]}`)
-				return
-			}
-			var input serverAccountImportRequest
-			if err := json.NewDecoder(request.Body).Decode(&input); err != nil {
-				t.Fatal(err)
-			}
-			if input.Provider != accounts.ProviderOpenRouter || input.Codex == nil || input.Codex.Email != "openrouter:network" {
-				http.Error(w, "wrong import payload", http.StatusBadRequest)
-				return
-			}
-			imported.Store(true)
-			_, _ = io.WriteString(w, `{"ok":true}`)
-		case "/_subrouter/usage-status":
-			_, _ = io.WriteString(w, `[{
-				"id":"openrouter:network","provider":"openrouter","auth_mode":"apikey",
-				"plan_type":"credits, per token","provider_health":"auth ok",
-				"auth_checked":true,"auth_valid":true,"quota_status":"live","quota_usage_known":true,
-				"windows":[{"Name":"monthly","UsedPercent":25,"LimitWindowSeconds":2592000}],
-				"credits":{"has_credits":true,"balance":"150"}
-			}]`)
-		default:
-			http.NotFound(w, request)
-		}
+		requests.Add(1)
+		http.Error(w, "the CLI must not ask the local daemon for its accounts", http.StatusTeapot)
 	}))
 	defer server.Close()
-	attachPrivateLocalTestListener(t, server, store)
 	t.Setenv("SUBROUTER_LOCAL_BASE_URL", server.URL)
 	cloudPath := filepath.Join(t.TempDir(), "cloud.json")
 	t.Setenv("SUBROUTER_CLOUD_CONFIG", cloudPath)
 	if err := os.WriteFile(cloudPath, []byte(`{"version":1,"baseUrl":"https://cmux.com","credentialSource":"local"}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	serverStore := defaultSRServerStore(store)
-	if err := serverStore.update(func(file *srServerFile) error {
+	if err := defaultSRServerStore(store).update(func(file *srServerFile) error {
 		file.Default = "local-candidate"
 		file.Servers = []srServerConfig{{Name: "local-candidate", URL: server.URL, AccountImportToken: "import-token"}}
 		return nil
@@ -1382,35 +1450,24 @@ func TestSelectedLoopbackServingAPIWinsOverUnattestedLocalDisk(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	runner := srRunner{store: store, useServingAPI: true, in: strings.NewReader("network\napi-key-placeholder\n"), out: &out, errOut: &out, client: server.Client()}
+	runner := srRunner{store: store, in: strings.NewReader("network\napi-key-placeholder\n"), out: &out, errOut: &out, client: server.Client()}
 	if err := runner.run(t.Context(), []string{"add-key", "--provider", "openrouter"}); err != nil {
 		t.Fatal(err)
 	}
-	if !imported.Load() {
-		t.Fatal("selected serving API did not receive the account import")
+	if _, ok, err := store.FindStored("openrouter:network"); err != nil || !ok {
+		t.Fatalf("add-key did not land in this machine's store: found=%t err=%v", ok, err)
 	}
-	if _, ok, err := store.FindStored("openrouter:network"); err != nil || ok {
-		t.Fatalf("CLI disk store received serving account: found=%t err=%v", ok, err)
-	}
-	out.Reset()
-	if err := runner.run(t.Context(), []string{"status"}); err != nil {
-		t.Fatal(err)
-	}
-	text := out.String()
-	for _, want := range []string{"network", "credits", "75% left", "$150"} {
-		if !strings.Contains(text, want) {
-			t.Fatalf("server-authoritative status omits %q:\n%s", want, text)
+	for _, args := range [][]string{{"status"}, nil} {
+		out.Reset()
+		if err := runner.run(t.Context(), args); err != nil {
+			t.Fatalf("%v: %v", args, err)
+		}
+		if text := out.String(); !strings.Contains(text, "disk-only") || !strings.Contains(text, "network") {
+			t.Fatalf("%v did not render this machine's accounts:\n%s", args, text)
 		}
 	}
-	if strings.Contains(text, "disk-only") || strings.Contains(text, "Codex isolation:") {
-		t.Fatalf("server-authoritative status leaked local disk state:\n%s", text)
-	}
-	out.Reset()
-	if err := runner.run(t.Context(), nil); err != nil {
-		t.Fatal(err)
-	}
-	if text := out.String(); !strings.Contains(text, "network") || strings.Contains(text, "disk-only") {
-		t.Fatalf("bare sr did not use the serving authority:\n%s", text)
+	if requests.Load() != 0 {
+		t.Fatalf("local account commands sent %d request(s) to the loopback daemon", requests.Load())
 	}
 }
 
@@ -1454,8 +1511,8 @@ func TestFreshLocalServingDaemonKeepsOnboardingOnLocalCommandPath(t *testing.T) 
 	}
 	var out bytes.Buffer
 	runner := srRunner{
-		store: store, useServingAPI: true,
-		in: strings.NewReader("work\nsk-or-v1-test\n"), out: &out, errOut: &out,
+		store: store,
+		in:    strings.NewReader("work\nsk-or-v1-test\n"), out: &out, errOut: &out,
 		client: server.Client(),
 	}
 	if err := runner.run(t.Context(), []string{"add-key", "--provider", "openrouter"}); err != nil {
@@ -1477,129 +1534,6 @@ func TestFreshLocalServingDaemonKeepsOnboardingOnLocalCommandPath(t *testing.T) 
 	}
 	if nonHealthRequests.Load() != 0 || !strings.Contains(out.String(), "No Kimi subscription accounts configured") {
 		t.Fatalf("fresh local Kimi management contacted serving API or missed local state: requests=%d output=%q", nonHealthRequests.Load(), out.String())
-	}
-}
-
-func TestFreshLocalServingDaemonRejectsUnattestedOnboardingStore(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	for _, name := range []string{
-		"SUBROUTER_ACCOUNT_IMPORT_TOKEN", "SUBROUTER_ACCOUNT_IMPORT_TOKEN_FILE",
-		"SUBROUTER_ADMIN_TOKEN", "SUBROUTER_ADMIN_TOKEN_FILE",
-	} {
-		t.Setenv(name, "")
-	}
-	store := accounts.CodexStore{Dir: filepath.Join(home, ".subrouter", "codex", "accounts")}
-	otherStore := accounts.CodexStore{Dir: filepath.Join(home, "daemon-state", "codex", "accounts")}
-	otherAuthority, err := accounts.StoreAuthorityID(otherStore.Dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var nonHealthRequests atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
-		if request.URL.Path == "/_subrouter/health" {
-			proof := ""
-			if challenge := request.Header.Get(accounts.StoreAuthorityChallengeHeader); challenge != "" {
-				var proofErr error
-				proof, proofErr = accounts.StoreAuthorityProof(otherStore.Dir, challenge)
-				if proofErr != nil {
-					t.Fatal(proofErr)
-				}
-			}
-			_, _ = fmt.Fprintf(w, `{"ok":true,"account_import":"enabled","account_store_id":%q,"account_store_proof":%q}`, otherAuthority, proof)
-			return
-		}
-		nonHealthRequests.Add(1)
-		http.Error(w, "protected account import credential required", http.StatusUnauthorized)
-	}))
-	defer server.Close()
-	t.Setenv("SUBROUTER_LOCAL_BASE_URL", server.URL)
-	cloudPath := filepath.Join(home, "cloud.json")
-	t.Setenv("SUBROUTER_CLOUD_CONFIG", cloudPath)
-	if err := os.WriteFile(cloudPath, []byte(`{"version":1,"baseUrl":"https://cmux.com","credentialSource":"local"}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := defaultSRServerStore(store).update(func(file *srServerFile) error {
-		file.Servers = []srServerConfig{{Name: "unattested-loopback", URL: server.URL, AccountImportToken: "must-not-be-sent"}}
-		return nil
-	}); err != nil {
-		t.Fatal(err)
-	}
-
-	var out bytes.Buffer
-	runner := srRunner{
-		store: store, useServingAPI: true,
-		in: strings.NewReader("work\nsk-or-v1-test\n"), out: &out, errOut: &out,
-		client: server.Client(),
-	}
-	err = runner.run(t.Context(), []string{"add-key", "--provider", "openrouter"})
-	if err == nil || !strings.Contains(err.Error(), "local proxy account store does not match this CLI") {
-		t.Fatalf("unattested onboarding error = %v", err)
-	}
-	if nonHealthRequests.Load() != 0 {
-		t.Fatalf("unattested loopback received %d credential-bearing request(s)", nonHealthRequests.Load())
-	}
-	if _, ok, findErr := store.FindStored("openrouter:work"); findErr != nil || ok {
-		t.Fatalf("unattested onboarding mutated CLI store: found=%t err=%v", ok, findErr)
-	}
-}
-
-func TestLegacyLocalServingDaemonRejectsUnattestedOnboardingBeforeCredentials(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	store := accounts.CodexStore{Dir: filepath.Join(home, ".subrouter", "codex", "accounts")}
-	otherStore := accounts.CodexStore{Dir: filepath.Join(home, "rogue-state", "codex", "accounts")}
-	otherAuthority, err := accounts.StoreAuthorityID(otherStore.Dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var nonHealthRequests atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
-		if request.URL.Path != "/_subrouter/health" {
-			nonHealthRequests.Add(1)
-			http.Error(w, "credential sink", http.StatusUnauthorized)
-			return
-		}
-		proof := ""
-		if challenge := request.Header.Get(accounts.StoreAuthorityChallengeHeader); challenge != "" {
-			var proofErr error
-			proof, proofErr = accounts.StoreAuthorityProof(otherStore.Dir, challenge)
-			if proofErr != nil {
-				t.Fatal(proofErr)
-			}
-		}
-		_, _ = fmt.Fprintf(w, `{"ok":true,"account_import":"enabled","account_store_id":%q,"account_store_proof":%q}`, otherAuthority, proof)
-	}))
-	defer server.Close()
-	t.Setenv("SUBROUTER_LOCAL_BASE_URL", server.URL)
-	cloudPath := filepath.Join(home, "cloud.json")
-	t.Setenv("SUBROUTER_CLOUD_CONFIG", cloudPath)
-	if err := os.WriteFile(cloudPath, []byte(`{"version":1,"baseUrl":"https://cmux.com","credentialSource":"legacy"}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := defaultSRServerStore(store).update(func(file *srServerFile) error {
-		// No selected remote: this entry exists only to prove a matching legacy
-		// credential is not sent before the private local channel is established.
-		file.Servers = []srServerConfig{{Name: "unselected-local", URL: server.URL, AdminToken: "must-not-be-sent"}}
-		return nil
-	}); err != nil {
-		t.Fatal(err)
-	}
-
-	runner := srRunner{
-		store: store, useServingAPI: true,
-		in: strings.NewReader("work\nsk-or-v1-must-not-be-sent\n"), out: io.Discard, errOut: io.Discard,
-		client: server.Client(),
-	}
-	err = runner.run(t.Context(), []string{"add-key", "--provider", "openrouter"})
-	if err == nil || !strings.Contains(err.Error(), "local proxy account store does not match this CLI") {
-		t.Fatalf("unattested legacy-local onboarding error = %v", err)
-	}
-	if nonHealthRequests.Load() != 0 {
-		t.Fatalf("unattested legacy-local listener received %d credential-bearing request(s)", nonHealthRequests.Load())
-	}
-	if _, ok, findErr := store.FindStored("openrouter:work"); findErr != nil || ok {
-		t.Fatalf("unattested legacy-local onboarding mutated CLI store: found=%t err=%v", ok, findErr)
 	}
 }
 
@@ -1643,8 +1577,8 @@ func TestLegacyLocalServingDaemonKeepsUnprotectedOnboardingOnLocalStore(t *testi
 	}
 
 	runner := srRunner{
-		store: store, useServingAPI: true,
-		in: strings.NewReader("work\nsk-or-v1-local-only\n"), out: io.Discard, errOut: io.Discard,
+		store: store,
+		in:    strings.NewReader("work\nsk-or-v1-local-only\n"), out: io.Discard, errOut: io.Discard,
 		client: server.Client(),
 	}
 	if err := runner.run(t.Context(), []string{"add-key", "--provider", "openrouter"}); err != nil {
@@ -1659,123 +1593,6 @@ func TestLegacyLocalServingDaemonKeepsUnprotectedOnboardingOnLocalStore(t *testi
 	}
 	if stored.Provider != accounts.ProviderOpenRouter || stored.Auth.OpenAIAPIKey != "sk-or-v1-local-only" {
 		t.Fatalf("legacy-local onboarding stored provider=%q key_matches=%t", stored.Provider, stored.Auth.OpenAIAPIKey == "sk-or-v1-local-only")
-	}
-}
-
-func TestProtectedLocalServingDaemonKeepsOnboardingOnHTTPAuthority(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	for _, name := range []string{
-		"SUBROUTER_ACCOUNT_IMPORT_TOKEN", "SUBROUTER_ACCOUNT_IMPORT_TOKEN_FILE",
-		"SUBROUTER_ADMIN_TOKEN", "SUBROUTER_ADMIN_TOKEN_FILE",
-	} {
-		t.Setenv(name, "")
-	}
-	store := accounts.CodexStore{Dir: filepath.Join(home, ".subrouter", "codex", "accounts")}
-	authorityID, err := accounts.StoreAuthorityID(store.Dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var importRequests atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
-		switch request.URL.Path {
-		case "/_subrouter/health":
-			proof := ""
-			if challenge := request.Header.Get(accounts.StoreAuthorityChallengeHeader); challenge != "" {
-				var proofErr error
-				proof, proofErr = accounts.StoreAuthorityProof(store.Dir, challenge)
-				if proofErr != nil {
-					t.Fatal(proofErr)
-				}
-			}
-			_, _ = fmt.Fprintf(w, `{"ok":true,"account_import":"enabled","account_store_id":%q,"account_store_proof":%q}`, authorityID, proof)
-		case serverAccountImportPath:
-			importRequests.Add(1)
-			http.Error(w, "protected account import credential required", http.StatusUnauthorized)
-		default:
-			http.NotFound(w, request)
-		}
-	}))
-	defer server.Close()
-	attachPrivateLocalTestListener(t, server, store)
-	t.Setenv("SUBROUTER_LOCAL_BASE_URL", server.URL)
-	cloudPath := filepath.Join(home, "cloud.json")
-	t.Setenv("SUBROUTER_CLOUD_CONFIG", cloudPath)
-	if err := os.WriteFile(cloudPath, []byte(`{"version":1,"baseUrl":"https://cmux.com","credentialSource":"local"}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	var out bytes.Buffer
-	runner := srRunner{
-		store: store, useServingAPI: true,
-		in: strings.NewReader("work\nsk-or-v1-test\n"), out: &out, errOut: &out,
-		client: server.Client(),
-	}
-	err = runner.run(t.Context(), []string{"add-key", "--provider", "openrouter"})
-	if err == nil || !strings.Contains(err.Error(), "no protected HTTP account-import credential") {
-		t.Fatalf("protected local onboarding error = %v", err)
-	}
-	if importRequests.Load() == 0 {
-		t.Fatal("protected local onboarding bypassed the daemon HTTP authority")
-	}
-	if _, ok, findErr := store.FindStored("openrouter:work"); findErr != nil || ok {
-		t.Fatalf("protected local onboarding mutated disk directly: found=%t err=%v", ok, findErr)
-	}
-}
-
-func TestLocalServingAPIIgnoresMalformedOptionalServerRegistry(t *testing.T) {
-	var usageRequests atomic.Int32
-	var accountRequests atomic.Int32
-	store := accounts.CodexStore{Dir: filepath.Join(t.TempDir(), "cli-state")}
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
-		switch request.URL.Path {
-		case "/_subrouter/health":
-			authorityID, err := accounts.StoreAuthorityID(store.Dir)
-			if err != nil {
-				t.Fatal(err)
-			}
-			proof := ""
-			if challenge := request.Header.Get(accounts.StoreAuthorityChallengeHeader); challenge != "" {
-				proof, err = accounts.StoreAuthorityProof(store.Dir, challenge)
-				if err != nil {
-					t.Fatal(err)
-				}
-			}
-			_, _ = fmt.Fprintf(w, `{"ok":true,"account_store_id":%q,"account_store_proof":%q}`, authorityID, proof)
-		case "/_subrouter/usage-status":
-			usageRequests.Add(1)
-			_, _ = io.WriteString(w, `[]`)
-		case "/_subrouter/accounts":
-			accountRequests.Add(1)
-			_, _ = io.WriteString(w, `[]`)
-		default:
-			http.NotFound(w, request)
-		}
-	}))
-	defer server.Close()
-	attachPrivateLocalTestListener(t, server, store)
-	t.Setenv("SUBROUTER_LOCAL_BASE_URL", server.URL)
-	cloudPath := filepath.Join(t.TempDir(), "cloud.json")
-	t.Setenv("SUBROUTER_CLOUD_CONFIG", cloudPath)
-	if err := os.WriteFile(cloudPath, []byte(`{"version":1,"baseUrl":"https://cmux.com","credentialSource":"local"}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.MkdirAll(store.StoreDir(), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(defaultSRServerStore(store).Path, []byte("{"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	runner := srRunner{store: store, useServingAPI: true, out: io.Discard, errOut: io.Discard, client: server.Client()}
-	if err := runner.run(t.Context(), []string{"status"}); err != nil {
-		t.Fatalf("status with malformed optional server registry: %v", err)
-	}
-	if err := runner.run(t.Context(), []string{"list"}); err != nil {
-		t.Fatalf("list with malformed optional server registry: %v", err)
-	}
-	if usageRequests.Load() == 0 || accountRequests.Load() == 0 {
-		t.Fatalf("local serving API was not used: usage=%d accounts=%d", usageRequests.Load(), accountRequests.Load())
 	}
 }
 
@@ -1820,134 +1637,6 @@ func TestReadyLocalServingServerStartsColdDaemon(t *testing.T) {
 	}
 	if starts.Load() != 1 || !sameEndpoint(resolved.URL, server.URL) {
 		t.Fatalf("ready local server = %+v starts=%d", resolved, starts.Load())
-	}
-}
-
-func TestLocalServingCommandsRejectUnattestedListenerBeforeAdminCredential(t *testing.T) {
-	for _, args := range [][]string{nil, {"list"}, {"status"}, {"reset"}} {
-		t.Run(fmt.Sprint(args), func(t *testing.T) {
-			home := t.TempDir()
-			t.Setenv("HOME", home)
-			t.Setenv("SUBROUTER_ADMIN_TOKEN", "must-not-be-sent")
-			t.Setenv("SUBROUTER_ACCOUNT_IMPORT_TOKEN", "must-not-be-sent")
-			t.Setenv("SUBROUTER_STATE_DIR", "")
-			cloudPath := filepath.Join(home, "cloud.json")
-			t.Setenv("SUBROUTER_CLOUD_CONFIG", cloudPath)
-			if err := os.WriteFile(cloudPath, []byte(`{"version":1,"credentialSource":"local"}`), 0o600); err != nil {
-				t.Fatal(err)
-			}
-			var authenticatedRequests atomic.Int32
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
-				if request.Header.Get("Authorization") != "" || request.Header.Get("X-Subrouter-Account-Import-Token") != "" {
-					authenticatedRequests.Add(1)
-				}
-				if request.URL.Path == "/_subrouter/health" {
-					_, _ = io.WriteString(w, `{"ok":true,"account_store_id":"spoof","account_store_proof":"spoof"}`)
-					return
-				}
-				http.Error(w, "unexpected authenticated request", http.StatusForbidden)
-			}))
-			defer server.Close()
-			t.Setenv("SUBROUTER_LOCAL_BASE_URL", server.URL)
-
-			runner := srRunner{
-				store:         accounts.CodexStore{Dir: filepath.Join(home, ".subrouter", "codex", "accounts")},
-				useServingAPI: true, in: strings.NewReader(""), out: io.Discard, errOut: io.Discard,
-				client: server.Client(),
-			}
-			err := runner.run(t.Context(), args)
-			if err == nil || !strings.Contains(err.Error(), "local proxy account store does not match this CLI") {
-				t.Fatalf("unattested local command %q error = %v", args, err)
-			}
-			if authenticatedRequests.Load() != 0 {
-				t.Fatalf("unattested local command %q sent %d credentialed request(s)", args, authenticatedRequests.Load())
-			}
-		})
-	}
-}
-
-func TestServingAPIRemoteResetKeepsResolvedLoopbackServer(t *testing.T) {
-	store := accounts.CodexStore{Dir: filepath.Join(t.TempDir(), "cli-state")}
-	if err := store.SaveStored(accounts.StoredCodexAccount{
-		Email: "apikey:disk-only", AddedAt: time.Now().UTC().Format(time.RFC3339),
-		Auth: accounts.CodexAuthFile{AuthMode: "apikey", OpenAIAPIKey: "disk-placeholder"},
-	}); err != nil {
-		t.Fatal(err)
-	}
-	var requested atomic.Bool
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
-		switch request.URL.Path {
-		case "/_subrouter/health":
-			authorityID, err := accounts.StoreAuthorityID(store.Dir)
-			if err != nil {
-				t.Fatal(err)
-			}
-			proof := ""
-			if challenge := request.Header.Get(accounts.StoreAuthorityChallengeHeader); challenge != "" {
-				proof, err = accounts.StoreAuthorityProof(store.Dir, challenge)
-				if err != nil {
-					t.Fatal(err)
-				}
-			}
-			_, _ = fmt.Fprintf(w, `{"ok":true,"account_store_id":%q,"account_store_proof":%q}`, authorityID, proof)
-		case "/_subrouter/reset-credits":
-			requested.Store(true)
-			_, _ = io.WriteString(w, `{"accounts":[{"email":"server-authority","count":1,"credits":[{"status":"available"}]}]}`)
-		default:
-			http.NotFound(w, request)
-		}
-	}))
-	defer server.Close()
-	attachPrivateLocalTestListener(t, server, store)
-	t.Setenv("SUBROUTER_LOCAL_BASE_URL", server.URL)
-	cloudPath := filepath.Join(t.TempDir(), "cloud.json")
-	t.Setenv("SUBROUTER_CLOUD_CONFIG", cloudPath)
-	if err := os.WriteFile(cloudPath, []byte(`{"version":1,"baseUrl":"https://cmux.com","credentialSource":"local"}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	var out bytes.Buffer
-	runner := srRunner{store: store, useServingAPI: true, out: &out, errOut: &out, client: server.Client()}
-	if err := runner.run(t.Context(), []string{"reset", "--list"}); err != nil {
-		t.Fatal(err)
-	}
-	if !requested.Load() || !strings.Contains(out.String(), "server-authority") {
-		t.Fatalf("reset did not stay on the resolved serving API: requested=%t output=%q", requested.Load(), out.String())
-	}
-}
-
-func TestServingAPIAccountCommandDoesNotCaptureLocalOnlyCommands(t *testing.T) {
-	for _, command := range []string{"add", "add-key", "list", "status", "reset", "qwen", "kimi", "remove"} {
-		if !servingAPIAccountCommand(command) {
-			t.Fatalf("serving account command %q was not routed", command)
-		}
-	}
-	for _, command := range []string{"switch", "use", "g", "gui", "gui-switch", "gui-use", "pick", "import", "usage", "trace", "breadcrumbs", "why", "add-admin-key", "list-admin-keys", "remove-admin-key", "attach-project"} {
-		if servingAPIAccountCommand(command) {
-			t.Fatalf("local-only command %q was captured by the serving API", command)
-		}
-	}
-}
-
-func TestLocalOnboardingCommandIncludesFreshDaemonManagement(t *testing.T) {
-	for _, args := range [][]string{
-		{"add", "codex"},
-		{"add-key"},
-		{"add-api-key"},
-		{"kimi", "login", "work"},
-		{"kimi", "list"},
-		{"kimi", "remove", "work"},
-		{"qwen", "login", "work"},
-		{"qwen", "label", "work", "alice@example.com"},
-	} {
-		if !localOnboardingCommand(args) {
-			t.Fatalf("local onboarding command %q was not retained", strings.Join(args, " "))
-		}
-	}
-	for _, args := range [][]string{{"status"}, {"reset"}, {"qwen", "--account", "work"}, {"kimi", "--account", "work"}} {
-		if localOnboardingCommand(args) {
-			t.Fatalf("serving command %q was captured as local onboarding", strings.Join(args, " "))
-		}
 	}
 }
 
@@ -2594,6 +2283,8 @@ func TestSRQwenLoginPreservesCompletedAuthorizationWhenDurableSaveFails(t *testi
 func TestQwenConsoleCredentialSyncsToExplicitRemote(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	// Remote paths exist only on a keyed machine (PATCHES 17).
+	unlockRemoteGateForTest(t)
 	store := accounts.DefaultCodexStore()
 	if err := agentqwen.SaveConsoleCredential("qwen-token:work", agentqwen.ConsoleCredential{
 		AccessToken:   "console-secret",
@@ -2697,6 +2388,8 @@ func TestQwenConsoleCredentialSyncRedactsTenantKeyFromTransportError(t *testing.
 func TestSRQwenLoginTargetsSelectedRemoteAccount(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	// Remote paths exist only on a keyed machine (PATCHES 17).
+	unlockRemoteGateForTest(t)
 	store := accounts.DefaultCodexStore()
 	accountID := "qwen-token:work"
 	if err := store.SaveStored(accounts.StoredCodexAccount{
@@ -2941,6 +2634,7 @@ func TestSRSwitchPublishesOAuthIsolationDowngradeToRunningServer(t *testing.T) {
 
 	request := httptest.NewRequest(http.MethodGet, "http://subrouter.local/_subrouter/accounts", nil)
 	request.RemoteAddr = "127.0.0.1:12345"
+	// Loopback trust needs a loopback Host (PATCHES §29), as the sr CLI sends.
 	request.Host = "127.0.0.1:31415"
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
@@ -3256,6 +2950,13 @@ func TestSRSwitchSyncsOpenCodeAndPiAuth(t *testing.T) {
 	}
 }
 
+// Adding an account must not write to the machine's Codex home at all. The
+// login is what revokes a session, so "restore it afterwards" is not good
+// enough: by the time the restore runs the displaced account has already been
+// superseded server-side. Asserting the active auth file was never touched is
+// the only check that distinguishes an isolated login from a clobber-and-repair.
+// The new record must also carry upstream's isolated-login provenance, or the
+// serving daemon (RequireIsolatedOAuth) refuses it on its first request.
 func TestSRAddUsesIsolatedLoginAndLeavesActiveAccountUnchanged(t *testing.T) {
 	home := t.TempDir()
 	xdgData := t.TempDir()
@@ -3279,12 +2980,25 @@ func TestSRAddUsesIsolatedLoginAndLeavesActiveAccountUnchanged(t *testing.T) {
 	}
 	installFakeCodexLogin(t, home, addedAuth)
 
+	activePath := accounts.DefaultCodexAuthPath()
+	before, err := os.Stat(activePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	var out bytes.Buffer
 	runner := srRunner{store: store, in: strings.NewReader(""), out: &out, errOut: &out}
-	// "add" now asks which provider; this test exercises the Codex path, so it
-	// names it rather than relying on a default that no longer exists.
 	if err := runner.run(context.Background(), []string{"add", "codex"}); err != nil {
 		t.Fatal(err)
+	}
+
+	after, err := os.Stat(activePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !after.ModTime().Equal(before.ModTime()) {
+		t.Fatalf("active auth file was rewritten during add (%s -> %s); the login was not isolated",
+			before.ModTime(), after.ModTime())
 	}
 
 	active, ok, err := accounts.ReadActiveCodexAuth()
@@ -3315,68 +3029,266 @@ func TestSRAddUsesIsolatedLoginAndLeavesActiveAccountUnchanged(t *testing.T) {
 	}
 }
 
-func TestSRAutoSwitchesWhenActiveAccountIsExhausted(t *testing.T) {
+// The fork used to make the FIRST added account active on a fresh machine,
+// writing it into ~/.codex/auth.json. Under the isolated-login model (owner
+// decision 1 of the 2026-09 merge) that file belongs to the human's own Codex
+// login: a pooled chain written there is shared with the Codex app, and the
+// serving daemon then refuses it as shared_active_refresh_token. So even a
+// fresh machine's first add leaves no active auth behind.
+func TestSRAddOnFreshMachineLeavesNoActiveCodexAuth(t *testing.T) {
 	home := t.TempDir()
+	xdgData := t.TempDir()
+	piDir := filepath.Join(home, "pi-agent")
 	t.Setenv("HOME", home)
+	t.Setenv("XDG_DATA_HOME", xdgData)
+	t.Setenv("PI_CODING_AGENT_DIR", piDir)
 
 	store := accounts.DefaultCodexStore()
-	activeAuth := testCodexAuth("alice@example.com", "acct_active")
-	bestAuth := testCodexAuth("bob@example.com", "acct_best")
+	addedAuth := testCodexAuth("founders@example.com", "acct_added")
+	installFakeCodexLogin(t, home, addedAuth)
+
+	var out bytes.Buffer
+	runner := srRunner{store: store, in: strings.NewReader(""), out: &out, errOut: &out}
+	if err := runner.run(context.Background(), []string{"add", "codex"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, ok, err := accounts.ReadActiveCodexAuth(); err != nil {
+		t.Fatal(err)
+	} else if ok {
+		t.Fatal("the first added account was written into ~/.codex/auth.json")
+	}
+	added, found, err := store.FindStored("founders@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found {
+		t.Fatal("newly logged-in account was not imported")
+	}
+	if added.OAuthCredentialOrigin != accounts.CodexOAuthOriginIsolatedServerLogin {
+		t.Fatalf("OAuth origin = %q, want isolated server login", added.OAuthCredentialOrigin)
+	}
+}
+
+// Upstream's bare `sr` switched automatically when the active Codex login was
+// exhausted. A switch exports the target's refresh-token chain to ~/.codex,
+// OpenCode and pi and demotes pool records out of serving, which the
+// isolated-Codex model (decision 1) allows only on an explicit request. So
+// bare `sr` recommends and changes nothing; the answer typed at the prompt is
+// the explicit switch.
+func TestSRRecommendsButDoesNotSwitchWhenActiveCodexLoginIsExhausted(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("CODEX_HOME", filepath.Join(home, ".codex"))
+	t.Setenv("XDG_DATA_HOME", "")
+	t.Setenv("PI_CODING_AGENT_DIR", filepath.Join(home, ".pi", "agent"))
+
+	store := accounts.DefaultCodexStore()
+	// alice's pool chain and ~/.codex are separate logins (isolated model), so
+	// ~/.codex holds a personal chain of alice's account.
+	poolAlice := testCodexAuth("alice@example.com", "acct_active")
+	poolAlice.Tokens.RefreshToken = "pool-isolated-alice"
+	personalAlice := testCodexAuth("alice@example.com", "acct_active")
+	personalAlice.Tokens.RefreshToken = "personal-chain-alice"
+	poolBob := testCodexAuth("bob@example.com", "acct_best")
+	poolBob.Tokens.RefreshToken = "pool-isolated-bob"
 	for email, auth := range map[string]accounts.CodexAuthFile{
-		"alice@example.com": activeAuth,
-		"bob@example.com":   bestAuth,
+		"alice@example.com": poolAlice,
+		"bob@example.com":   poolBob,
 	} {
 		if err := store.SaveStored(accounts.StoredCodexAccount{
-			Email:   email,
-			AddedAt: time.Now().UTC().Format(time.RFC3339),
-			Auth:    auth,
+			Email:                 email,
+			AddedAt:               time.Now().UTC().Format(time.RFC3339),
+			Auth:                  auth,
+			OAuthCredentialOrigin: accounts.CodexOAuthOriginIsolatedServerLogin,
 		}); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if err := accounts.WriteActiveCodexAuth(activeAuth); err != nil {
+	if err := accounts.WriteActiveCodexAuth(personalAlice); err != nil {
 		t.Fatal(err)
+	}
+	personal := [...]string{
+		filepath.Join(home, ".codex", "auth.json"),
+		opencode.DefaultAuthPath(),
+		pi.DefaultAuthPath(),
+	}
+	read := func(path string) string {
+		body, err := os.ReadFile(path)
+		if os.IsNotExist(err) {
+			return "<missing>"
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(body)
+	}
+	var before [len(personal)]string
+	for i, path := range personal {
+		before[i] = read(path)
 	}
 
 	usageByToken := map[string]float64{
-		activeAuth.Tokens.AccessToken: 100,
-		bestAuth.Tokens.AccessToken:   1,
+		poolAlice.Tokens.AccessToken:     100,
+		personalAlice.Tokens.AccessToken: 100,
+		poolBob.Tokens.AccessToken:       1,
 	}
+	newRunner := func(in string, out *bytes.Buffer) srRunner {
+		return srRunner{
+			program: "sr",
+			store:   store,
+			in:      strings.NewReader(in),
+			out:     out,
+			errOut:  out,
+			client: &http.Client{Transport: srRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+				used := usageByToken[strings.TrimPrefix(req.Header.Get("Authorization"), "Bearer ")]
+				return usageResponse(used), nil
+			})},
+		}
+	}
+
 	var out bytes.Buffer
-	runner := srRunner{
-		store:  store,
-		in:     strings.NewReader(""),
-		out:    &out,
-		errOut: &out,
-		client: &http.Client{Transport: srRoundTripFunc(func(req *http.Request) (*http.Response, error) {
-			used := usageByToken[strings.TrimPrefix(req.Header.Get("Authorization"), "Bearer ")]
-			return usageResponse(used), nil
-		})},
-	}
-
-	if err := runner.run(context.Background(), nil); err != nil {
+	if err := newRunner("", &out).run(context.Background(), nil); err != nil {
 		t.Fatal(err)
 	}
+	for i, path := range personal {
+		if after := read(path); after != before[i] {
+			t.Fatalf("bare sr rewrote %s:\nbefore %q\nafter  %q", path, before[i], after)
+		}
+	}
+	for email, refresh := range map[string]string{
+		"alice@example.com": "pool-isolated-alice",
+		"bob@example.com":   "pool-isolated-bob",
+	} {
+		record, found, err := store.FindStored(email)
+		if err != nil || !found {
+			t.Fatalf("%s: found=%v err=%v", email, found, err)
+		}
+		if record.OAuthCredentialOrigin != accounts.CodexOAuthOriginIsolatedServerLogin {
+			t.Fatalf("bare sr demoted %s: origin %q", email, record.OAuthCredentialOrigin)
+		}
+		if record.Auth.Tokens == nil || record.Auth.Tokens.RefreshToken != refresh {
+			t.Fatalf("bare sr replaced %s's pool chain: %+v", email, record.Auth.Tokens)
+		}
+	}
+	if strings.Contains(out.String(), "Auto-switched") || strings.Contains(out.String(), "Switched to") {
+		t.Fatalf("bare sr switched on its own:\n%s", out.String())
+	}
+	for _, want := range []string{
+		"Active Codex login alice@example.com is exhausted; recommended: bob@example.com",
+		"takes it out of serving",
+		"`sr switch bob@example.com`",
+		"Switch to (#):",
+	} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("output lacks %q:\n%s", want, out.String())
+		}
+	}
 
+	// Answering the prompt IS the explicit switch.
+	out.Reset()
+	if err := newRunner("bob@example.com\n", &out).run(context.Background(), nil); err != nil {
+		t.Fatal(err)
+	}
 	active, ok, err := accounts.ReadActiveCodexAuth()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !ok {
-		t.Fatal("missing active auth")
+	if err != nil || !ok {
+		t.Fatalf("active auth: ok=%v err=%v", ok, err)
 	}
 	email, err := accounts.ExtractEmailFromJWT(active.Tokens.IDToken)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if email != "bob@example.com" {
-		t.Fatalf("active email = %q, want bob@example.com", email)
+	if email != "bob@example.com" || !strings.Contains(out.String(), "Switched to bob@example.com") {
+		t.Fatalf("the typed answer did not switch: active=%q\n%s", email, out.String())
 	}
-	if !strings.Contains(out.String(), "Auto-switched to bob@example.com") {
-		t.Fatalf("missing auto-switch confirmation:\n%s", out.String())
+}
+
+// The recommendation is about ~/.codex, so only the active CODEX row counts: an
+// exhausted active Claude profile says nothing about it.
+func TestRecommendOverExhaustedActiveReadsOnlyTheActiveCodexRow(t *testing.T) {
+	oauth := accounts.AuthModeOAuth
+	bob := srUsageRow{email: "bob@example.com", provider: accounts.ProviderCodex, authMode: oauth, gtoRecommended: true,
+		score: selectacct.Score{AccountID: "bob@example.com", Headroom: 0.9, ShortHeadroom: 0.9}}
+	claudeSpent := srUsageRow{email: "work", provider: accounts.ProviderClaude, authMode: oauth, active: true,
+		score: selectacct.Score{AccountID: "work"}}
+	aliceFresh := srUsageRow{email: "alice@example.com", provider: accounts.ProviderCodex, authMode: oauth, active: true,
+		score: selectacct.Score{AccountID: "alice@example.com", Headroom: 0.8, ShortHeadroom: 0.8}}
+	aliceSpent := srUsageRow{email: "alice@example.com", provider: accounts.ProviderCodex, authMode: oauth, active: true,
+		score: selectacct.Score{AccountID: "alice@example.com"}}
+	// gtoRecommended marks one row per provider heading: with every Codex row
+	// spent, the recommended row is a Claude profile ~/.codex cannot hold, and
+	// the recommendation must not name it (recommendedForNewSession refuses
+	// non-Codex rows).
+	claudeFresh := srUsageRow{email: "spare", provider: accounts.ProviderClaude, authMode: oauth, gtoRecommended: true,
+		score: selectacct.Score{AccountID: "spare", Headroom: 0.9, ShortHeadroom: 0.9}}
+	for _, tc := range []struct {
+		name string
+		rows []srUsageRow
+		want string
+	}{
+		{"spent Claude profile, no active Codex login", []srUsageRow{claudeSpent, bob}, ""},
+		{"spent Claude profile, fresh Codex login", []srUsageRow{claudeSpent, aliceFresh, bob}, ""},
+		{"spent Codex login", []srUsageRow{claudeSpent, aliceSpent, bob}, "Active Codex login alice@example.com is exhausted; recommended: bob@example.com"},
+		{"spent Codex login, only a Claude profile recommended", []srUsageRow{aliceSpent, claudeFresh}, ""},
+		{"spent Codex login, Claude recommended first", []srUsageRow{claudeFresh, aliceSpent, bob}, "recommended: bob@example.com"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var out bytes.Buffer
+			srRunner{program: "sr", out: &out}.recommendOverExhaustedActive(tc.rows)
+			if tc.want == "" && out.Len() != 0 {
+				t.Fatalf("recommended over a login that is not spent: %q", out.String())
+			}
+			if tc.want != "" && !strings.Contains(out.String(), tc.want) {
+				t.Fatalf("output %q lacks %q", out.String(), tc.want)
+			}
+		})
 	}
-	if strings.Contains(out.String(), "Switch to (#):") {
-		t.Fatalf("prompt should be skipped after auto-switch:\n%s", out.String())
+}
+
+// An empty pool plus a personal ~/.codex login: status, statusOne, bare `sr`
+// and pick must never pull that login into the pool (upstream auto-imported it
+// in all four). `sr import` stays the explicit way.
+func TestSRViewsNeverImportThePersonalCodexLogin(t *testing.T) {
+	// `sr <email>` is statusOne.
+	for _, args := range [][]string{{"status"}, {"alice@example.com"}, nil, {"pick"}, {"switch"}} {
+		t.Run(strings.Join(append([]string{"sr"}, args...), " "), func(t *testing.T) {
+			root := t.TempDir()
+			home := filepath.Join(root, "home")
+			t.Setenv("HOME", home)
+			t.Setenv("CODEX_HOME", filepath.Join(home, ".codex"))
+			t.Setenv("SUBROUTER_STATE_DIR", filepath.Join(root, "state"))
+			t.Setenv("SUBROUTER_CLOUD_CONFIG", filepath.Join(root, "cloud.json"))
+			t.Setenv("SUBROUTER_SESSIONS", "")
+			if err := accounts.WriteActiveCodexAuth(testCodexAuth("alice@example.com", "acct_personal")); err != nil {
+				t.Fatal(err)
+			}
+			store := accounts.CodexStore{Dir: filepath.Join(root, "state", "codex", "accounts")}
+			var out bytes.Buffer
+			runner := srRunner{
+				program: "sr",
+				store:   store,
+				in:      strings.NewReader(""),
+				out:     &out,
+				errOut:  &out,
+				kimi:    fakeKimiUsageStore{},
+				grok:    &fakeGrokStore{},
+				client: &http.Client{Transport: srRoundTripFunc(func(*http.Request) (*http.Response, error) {
+					return usageResponse(1), nil
+				})},
+			}
+			// pick and `sr <email>` refuse an empty pool; the error is not the point.
+			_ = runner.run(context.Background(), args)
+			stored, err := store.ListStored()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(stored) != 0 {
+				t.Fatalf("sr %v imported the personal ~/.codex login into the pool: %+v\n%s", args, stored, out.String())
+			}
+			if strings.Contains(out.String(), "Auto-imported") {
+				t.Fatalf("sr %v reported an import:\n%s", args, out.String())
+			}
+		})
 	}
 }
 
@@ -3853,64 +3765,19 @@ func TestSRRankRowsKeepsAPIKeyAsFallback(t *testing.T) {
 
 	rankUsageRows(rows)
 
-	if rows[0].email != "soon@example.com" {
-		t.Fatalf("first = %s, want soon@example.com", rows[0].email)
-	}
-	if rows[len(rows)-1].email != "apikey:paid" {
-		t.Fatalf("last = %s, want apikey:paid", rows[len(rows)-1].email)
-	}
-	if !rows[0].gtoRecommended {
-		t.Fatal("best row should be marked recommended")
+	if got := recommendedUsageRowEmails(rows); !slices.Equal(got, []string{"soon@example.com"}) {
+		t.Fatalf("rec rows = %v, want only soon@example.com, never the API key", got)
 	}
 }
 
-func TestSRRankRowsKeepsAvailableClaudeRowsFirst(t *testing.T) {
-	rows := []srUsageRow{
-		{
-			email:    "waiting",
-			provider: accounts.ProviderClaude,
-			score:    selectacct.Score{AccountID: "waiting", Headroom: 0, ShortHeadroom: 0, ShortResetAfterSeconds: 3600, WeeklyHeadroom: 0.5, WeeklyHeadroomKnown: true},
-		},
-		{
-			email:    "available",
-			provider: accounts.ProviderClaude,
-			score:    selectacct.Score{AccountID: "available", Headroom: 0.4, ShortHeadroom: 0.4},
-		},
+func recommendedUsageRowEmails(rows []srUsageRow) []string {
+	var emails []string
+	for _, row := range rows {
+		if row.gtoRecommended {
+			emails = append(emails, row.email)
+		}
 	}
-
-	rankUsageRows(rows)
-
-	if rows[0].email != "available" {
-		t.Fatalf("first Claude row = %s, want available", rows[0].email)
-	}
-}
-
-func TestSRRankRowsUsesSoonestSessionResetWhenWeeklyCapacityRemains(t *testing.T) {
-	rows := []srUsageRow{
-		{email: "later", provider: accounts.ProviderClaude, cooked: true,
-			score: selectacct.Score{AccountID: "later", Headroom: 0, ShortHeadroom: 0, ShortResetAfterSeconds: 3 * 3600, WeeklyHeadroom: 0.2, WeeklyHeadroomKnown: true}},
-		{email: "sooner", provider: accounts.ProviderClaude, cooked: true,
-			score: selectacct.Score{AccountID: "sooner", Headroom: 0, ShortHeadroom: 0, ShortResetAfterSeconds: 1 * 3600, WeeklyHeadroom: 0.2, WeeklyHeadroomKnown: true}},
-	}
-	rankUsageRows(rows)
-	if rows[0].email != "sooner" {
-		t.Fatalf("first Claude row = %s, want sooner", rows[0].email)
-	}
-}
-
-func TestSRRankRowsUsesSoonestWeeklyResetWhenWeeklyCapacityIsGone(t *testing.T) {
-	rows := []srUsageRow{
-		{email: "later", provider: accounts.ProviderClaude, cooked: true,
-			score:   selectacct.Score{AccountID: "later", Headroom: 0, ShortHeadroom: 0, ShortResetAfterSeconds: 3600, WeeklyHeadroom: 0, WeeklyHeadroomKnown: true},
-			windows: []accounts.UsageWindow{{Name: "5h", LimitWindowSeconds: int64(5 * time.Hour / time.Second), ResetAfterSeconds: 3600}, {Name: "7d", UsedPercent: 100, LimitWindowSeconds: int64(7 * 24 * time.Hour / time.Second), ResetAfterSeconds: 5 * 24 * 3600}}},
-		{email: "sooner", provider: accounts.ProviderClaude, cooked: true,
-			score:   selectacct.Score{AccountID: "sooner", Headroom: 0, ShortHeadroom: 0, ShortResetAfterSeconds: 3 * 3600, WeeklyHeadroom: 0, WeeklyHeadroomKnown: true},
-			windows: []accounts.UsageWindow{{Name: "5h", LimitWindowSeconds: int64(5 * time.Hour / time.Second), ResetAfterSeconds: 3 * 3600}, {Name: "7d", UsedPercent: 100, LimitWindowSeconds: int64(7 * 24 * time.Hour / time.Second), ResetAfterSeconds: 2 * 24 * 3600}}},
-	}
-	rankUsageRows(rows)
-	if rows[0].email != "sooner" {
-		t.Fatalf("first Claude row = %s, want sooner weekly reset", rows[0].email)
-	}
+	return emails
 }
 
 func TestSRRankRowsFallsBackToAPIKeyBeforeExhaustedOAuth(t *testing.T) {
@@ -3929,15 +3796,12 @@ func TestSRRankRowsFallsBackToAPIKeyBeforeExhaustedOAuth(t *testing.T) {
 
 	rankUsageRows(rows)
 
-	if rows[0].email != "apikey:paid" {
-		t.Fatalf("first = %s, want apikey:paid", rows[0].email)
-	}
-	if !rows[0].gtoRecommended {
-		t.Fatal("API-key fallback should be recommended when OAuth is exhausted")
+	if got := recommendedUsageRowEmails(rows); !slices.Equal(got, []string{"apikey:paid"}) {
+		t.Fatalf("rec rows = %v, want the API-key fallback when OAuth is exhausted", got)
 	}
 }
 
-func TestSRRankRowsKeepsTemporarilyCookedAboveCooked(t *testing.T) {
+func TestSRRankRowsRecommendsNeitherCookedNorTemporarilyCooked(t *testing.T) {
 	rows := []srUsageRow{
 		{
 			email:        "cooked@example.com",
@@ -3957,11 +3821,8 @@ func TestSRRankRowsKeepsTemporarilyCookedAboveCooked(t *testing.T) {
 
 	rankUsageRows(rows)
 
-	if rows[0].email != "temp@example.com" {
-		t.Fatalf("first = %s, want temp@example.com", rows[0].email)
-	}
-	if rows[0].gtoRecommended || rows[1].gtoRecommended {
-		t.Fatalf("unavailable rows should not be recommended: %#v", rows)
+	if got := recommendedUsageRowEmails(rows); len(got) != 0 {
+		t.Fatalf("rec rows = %v, want none: both are unavailable", got)
 	}
 }
 
@@ -4009,47 +3870,13 @@ func TestSRRankRowsGroupsProvidersSeparately(t *testing.T) {
 	}
 }
 
-func TestSRRankRowsMovesClaudeTelemetryThrottlesToBottom(t *testing.T) {
-	rows := []srUsageRow{
-		{
-			email: "throttled@example.com", provider: accounts.ProviderClaude,
-			authMode: accounts.AuthModeOAuth, usageThrottled: true,
-			score: selectacct.Score{AccountID: "throttled@example.com", Headroom: 1, ShortHeadroom: 1},
-		},
-		{
-			email: "healthy@example.com", provider: accounts.ProviderClaude,
-			authMode: accounts.AuthModeOAuth,
-			score:    selectacct.Score{AccountID: "healthy@example.com", Headroom: 0.5, ShortHeadroom: 0.5},
-		},
+func TestSRStatusShowsATelemetryThrottledCookedClaudeRowAsCooked(t *testing.T) {
+	row := srUsageRow{
+		email: "cooked@example.com", provider: accounts.ProviderClaude,
+		authMode: accounts.AuthModeOAuth, usageThrottled: true, cooked: true,
+		score: selectacct.Score{AccountID: "cooked@example.com", Headroom: 0, ShortHeadroom: 0},
 	}
-
-	rankUsageRows(rows)
-	got := []string{rows[0].email, rows[1].email}
-	want := []string{"healthy@example.com", "throttled@example.com"}
-	if !slices.Equal(got, want) {
-		t.Fatalf("ranked rows = %#v, want %#v", got, want)
-	}
-}
-
-func TestSRRankRowsPutsClaudeTelemetryThrottlesAfterCookedRows(t *testing.T) {
-	rows := []srUsageRow{
-		{
-			email: "cooked@example.com", provider: accounts.ProviderClaude,
-			authMode: accounts.AuthModeOAuth, usageThrottled: true, cooked: true,
-			score: selectacct.Score{AccountID: "cooked@example.com", Headroom: 0, ShortHeadroom: 0},
-		},
-		{
-			email: "throttled@example.com", provider: accounts.ProviderClaude,
-			authMode: accounts.AuthModeOAuth, usageThrottled: true,
-			score: selectacct.Score{AccountID: "throttled@example.com", Headroom: 1, ShortHeadroom: 1},
-		},
-	}
-
-	rankUsageRows(rows)
-	if got := []string{rows[0].email, rows[1].email}; !slices.Equal(got, []string{"cooked@example.com", "throttled@example.com"}) {
-		t.Fatalf("ranked rows = %#v, want cooked then telemetry-throttled", got)
-	}
-	if got := usageGridState(rows[0]); got != "cooked" {
+	if got := usageGridState(row); got != "cooked" {
 		t.Fatalf("cooked Claude state = %q, want cooked", got)
 	}
 }
@@ -4103,6 +3930,91 @@ func TestSRRankRowsMovesReauthRowsToLowSignalGroup(t *testing.T) {
 	if usageRowStatusTier(rows[1]) <= usageRowStatusTier((srUsageRow{usageThrottled: true})) {
 		t.Fatal("reauth rows should remain below telemetry-throttled rows")
 	}
+}
+
+// weekUsageRow is an OAuth row with a 10%-used 5h window and a weekly window
+// weeklyUsed% used that resets in weeklyReset (0: no reset time reported).
+func weekUsageRow(provider accounts.Provider, email string, weeklyUsed float64, weeklyReset time.Duration) srUsageRow {
+	short, long := "primary", "secondary"
+	if provider == accounts.ProviderClaude {
+		short, long = "5h", "7d"
+	}
+	windows := []accounts.UsageWindow{
+		{Name: short, UsedPercent: 10, LimitWindowSeconds: int64(5 * time.Hour / time.Second), ResetAfterSeconds: int64(2 * time.Hour / time.Second)},
+		{Name: long, UsedPercent: weeklyUsed, LimitWindowSeconds: int64(7 * 24 * time.Hour / time.Second), ResetAfterSeconds: int64(weeklyReset / time.Second)},
+	}
+	return srUsageRow{email: email, provider: provider, authMode: accounts.AuthModeOAuth, windows: windows, score: scoreFromWindows(email, windows)}
+}
+
+func requireListedInOrder(t *testing.T, text string, names ...string) {
+	t.Helper()
+	last := -1
+	for _, name := range names {
+		at := strings.Index(text, name)
+		if at < 0 || at < last {
+			t.Fatalf("want rows listed as %v:\n%s", names, text)
+		}
+		last = at
+	}
+}
+
+var recStateMarker = regexp.MustCompile(`\brec\b`)
+
+func TestSRStatusListsEachHeadingByWeeklyRollLongestFirst(t *testing.T) {
+	day := 24 * time.Hour
+	rows := []srUsageRow{
+		weekUsageRow(accounts.ProviderCodex, "cx-1h", 10, time.Hour),
+		weekUsageRow(accounts.ProviderClaude, "cl-3d", 30, 3*day),
+		weekUsageRow(accounts.ProviderCodex, "cx-6d", 50, 6*day),
+		weekUsageRow(accounts.ProviderClaude, "cl-1h", 10, time.Hour),
+		weekUsageRow(accounts.ProviderCodex, "cx-3d", 30, 3*day),
+		weekUsageRow(accounts.ProviderClaude, "cl-6d", 50, 6*day),
+	}
+
+	rankUsageRows(rows)
+	var out bytes.Buffer
+	displayUsageRows(&out, rows, true)
+	text := out.String()
+
+	requireListedInOrder(t, text, "cx-6d", "cx-3d", "cx-1h", "cl-6d", "cl-3d", "cl-1h")
+	// The recommendation is unchanged by the display order: the Codex account
+	// with the most headroom whose week rolls soonest, now listed last.
+	var recommended []string
+	for _, line := range strings.Split(text, "\n") {
+		if recStateMarker.MatchString(line) {
+			recommended = append(recommended, strings.TrimSpace(line))
+		}
+	}
+	if len(recommended) != 1 || !strings.Contains(recommended[0], "cx-1h") {
+		t.Fatalf("rows marked rec = %q, want only cx-1h:\n%s", recommended, text)
+	}
+	if target := recommendedUsableUsageRow(rows); target == nil || target.email != "cx-1h" {
+		t.Fatalf("sr pick target = %+v, want cx-1h", target)
+	}
+}
+
+func TestSRStatusListsRowsWithoutAWeeklyResetBelowAndErrorsLast(t *testing.T) {
+	day := 24 * time.Hour
+	broken := weekUsageRow(accounts.ProviderCodex, "broken", 10, 6*day)
+	broken.err = errors.New("401 Unauthorized")
+	authFailed := weekUsageRow(accounts.ProviderCodex, "auth-failed", 10, time.Hour)
+	authFailed.authChecked = true
+	noWeek := weekUsageRow(accounts.ProviderCodex, "no-week", 0, 0)
+	noWeek.windows = noWeek.windows[:1]
+	rows := []srUsageRow{
+		authFailed,
+		broken,
+		noWeek,
+		weekUsageRow(accounts.ProviderCodex, "unknown-roll", 30, 0),
+		weekUsageRow(accounts.ProviderCodex, "tie-less-left", 70, 2*day),
+		weekUsageRow(accounts.ProviderCodex, "tie-more-left", 20, 2*day),
+	}
+
+	rankUsageRows(rows)
+	var out bytes.Buffer
+	displayUsageRows(&out, rows, false)
+
+	requireListedInOrder(t, out.String(), "tie-more-left", "tie-less-left", "unknown-roll", "no-week", "broken", "auth-failed")
 }
 
 func TestScoreFromWindowsUsesAllDisplayedRateLimits(t *testing.T) {
@@ -4916,6 +4828,9 @@ func installFakeCodexLogin(t *testing.T, home string, auth accounts.CodexAuthFil
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Real codex writes into CODEX_HOME when it is set, falling back to
+	// ~/.codex. The fake has to honor the same precedence or it cannot show
+	// whether a login was correctly isolated away from the active session.
 	script := "#!/bin/sh\n" +
 		"test \"$1\" = login || exit 2\n" +
 		"codex_home=${CODEX_HOME:-$HOME/.codex}\n" +
@@ -4962,32 +4877,122 @@ func usageResponseWindows(primaryUsedPercent, secondaryUsedPercent float64) *htt
 	}
 }
 
+// A credential Anthropic revoked is published with no error, so the error
+// footnote never covered it, and upstream's Use cell said "re-add" -- the
+// setup-token verb, which on 2026-09-27 minted setup tokens for OAuth accounts
+// (PATCHES §36). A revoked OAuth row says re-auth and names the command.
+func TestRevokedClaudeServerRowNamesTheReauthCommand(t *testing.T) {
+	t.Setenv("COLUMNS", "200")
+	rows := usageRowsFromServerUsageStatuses([]remoteServerUsageStatus{{
+		ID: "chip-6", Email: "chip-6@corp.example", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth,
+		RevokedSince: time.Date(2026, 10, 9, 1, 0, 0, 0, time.UTC), RevokedKind: "revoked",
+	}})
+	if len(rows) != 1 || rows[0].err != nil {
+		t.Fatalf("rows = %+v, want one revoked row without an error", rows)
+	}
+	if got := compactPickReason(rows[0]); got != "re-auth" {
+		t.Fatalf("Use = %q, want re-auth for a revoked OAuth login", got)
+	}
+	var out bytes.Buffer
+	displayUsageRows(&out, rows, false)
+	text := out.String()
+	if !strings.Contains(text, "chip-6@corp.example [claude]: revoked since 10-09 01:00Z (re-auth on that server with: sr claude addr chip-6)") {
+		t.Fatalf("revoked row names no repair command:\n%s", text)
+	}
+	if strings.Contains(text, "re-add") || strings.Contains(text, "sr claude add ") {
+		t.Fatalf("revoked OAuth row names the setup-token verb:\n%s", text)
+	}
+	// An organization that disallows subscription logins is fixed by neither.
+	rows[0].revokedKind = "org_oauth_disallowed"
+	if got := compactPickReason(rows[0]); got != "use another" {
+		t.Fatalf("Use = %q for an org-disabled login, want use another", got)
+	}
+}
+
 func TestUsageErrorFootnoteShowsProviderAndReaddCommand(t *testing.T) {
 	t.Setenv("COLUMNS", "200")
+	// A server's rows are profiles on that server, built the way `sr status`
+	// builds them. The daemon publishes a Claude profile's oauthAccount address
+	// as its email, and the row shows that; the hint must name the profile ID,
+	// or `sr claude addr <email>` on the server signs in a new profile beside
+	// the dead one.
+	serverRows := usageRowsFromServerUsageStatuses([]remoteServerUsageStatus{
+		{
+			ID: "chip-5", Email: "user@corp.example", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth,
+			Error: "Claude OAuth refresh failed: 400 Bad Request: invalid_grant",
+		},
+		{
+			ID: "old-token", Email: "old@corp.example", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth,
+			Error: `Claude profile "old-token" has no usable credential: setup token expired 2026-09-01; re-add with 'sr claude add old-token'`,
+		},
+	})
+	// Calibration: the rows show the emails, so a hint built from what the
+	// row shows would name them. Since upstream #406 a server row keeps the
+	// stable ID in email and shows the login address (displayUsageAccountName).
+	if len(serverRows) != 2 || !slices.ContainsFunc(serverRows, func(row srUsageRow) bool { return displayUsageAccountName(row) == "user@corp.example" }) {
+		t.Fatalf("server rows = %+v, want two rows displaying the account emails", serverRows)
+	}
 	var out bytes.Buffer
-	displayUsageRows(&out, []srUsageRow{
+	displayUsageRows(&out, append([]srUsageRow{
 		{
 			email:    "codex-broken@example.com",
 			authMode: accounts.AuthModeOAuth,
 			err:      errors.New("usage fetch failed: 401 Unauthorized"),
 		},
 		{
-			email:    "claude-broken@example.com",
-			provider: accounts.ProviderClaude,
-			err:      errors.New("Claude OAuth refresh failed: 400 Bad Request: invalid_grant"),
+			email:         "seven-alpha",
+			provider:      accounts.ProviderClaude,
+			claudeProfile: "seven-alpha",
+			err:           errors.New("Claude OAuth refresh failed: 400 Bad Request: invalid_grant"),
+		},
+		{
+			// A setup token whose error does not say so: only the credential
+			// the row was read from knows the kind.
+			email:            "year-token",
+			provider:         accounts.ProviderClaude,
+			claudeProfile:    "year-token",
+			claudeSetupToken: true,
+			err:              errors.New("usage fetch failed: 401 Unauthorized"),
 		},
 		{
 			email:    "codex-flaky@example.com",
 			authMode: accounts.AuthModeOAuth,
 			err:      errors.New("usage fetch failed: connection refused"),
 		},
-	}, false)
+	}, serverRows...), false)
 	text := out.String()
 	if !strings.Contains(text, "codex-broken@example.com [codex]: usage fetch failed: 401 Unauthorized (re-add with: sr add)") {
 		t.Fatalf("codex 401 footnote missing provider/re-add hint:\n%s", text)
 	}
-	if !strings.Contains(text, "claude-broken@example.com [claude]: Claude OAuth refresh failed: 400 Bad Request: invalid_grant (re-add with: sr add claude)") {
-		t.Fatalf("claude invalid_grant footnote missing provider/re-add hint:\n%s", text)
+	// The Claude hint names the repair for the row's login, with its name
+	// (PATCHES §36). It said `sr add claude` for all of them: the setup-token
+	// verb, nameless, which minted setup tokens for OAuth accounts on 2026-09-27.
+	for _, want := range []string{
+		"seven-alpha [claude]: Claude OAuth refresh failed: 400 Bad Request: invalid_grant (re-auth with: sr claude addr seven-alpha)",
+		"year-token [claude]: usage fetch failed: 401 Unauthorized (re-add with: sr claude add year-token)",
+		"user@corp.example [claude]: Claude OAuth refresh failed: 400 Bad Request: invalid_grant (re-auth on that server with: sr claude addr chip-5)",
+		"(re-add on that server with: sr claude add old-token)",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("claude footnote missing %q:\n%s", want, text)
+		}
+	}
+	if strings.Contains(text, "addr user@corp.example") || strings.Contains(text, "add old@corp.example") {
+		t.Fatalf("a server row's hint names the account email, not the server's profile:\n%s", text)
+	}
+	if strings.Contains(text, "sr add claude") {
+		t.Fatalf("a Claude footnote still names the nameless setup-token verb:\n%s", text)
+	}
+	// Hosted cmux storage is the exception: there `sr add claude` is that
+	// storage's own add, the only way back in.
+	hosted := usageRowsFromHostedStatuses([]broker.UsageStatus{{
+		ID: "team-claude", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth,
+		Error: "Claude OAuth refresh failed: 400 Bad Request: invalid_grant",
+	}})
+	out.Reset()
+	displayUsageRows(&out, hosted, false)
+	if !strings.Contains(out.String(), "invalid_grant (re-add with: sr add claude)") {
+		t.Fatalf("hosted Claude footnote lost the hosted add:\n%s", out.String())
 	}
 	if strings.Contains(text, "codex-flaky@example.com [codex]: usage fetch failed: connection refused (re-add") {
 		t.Fatalf("transient error should not suggest re-add:\n%s", text)

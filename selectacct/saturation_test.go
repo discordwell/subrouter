@@ -158,8 +158,11 @@ func TestForModelMissingBucketsFollowProviderSupportDeclaration(t *testing.T) {
 	model := "provider-model"
 	unknown := Score{AccountID: "unknown", Provider: account.ProviderClaude,
 		Headroom: 0.8, ShortHeadroom: 0.8, MissingModelSupport: ModelSupportUnknown}
+	// Declared explicitly: the fork's provider default for Claude is Unknown
+	// (DefaultMissingModelSupport; Opus and Sonnet route on the account
+	// budget, PATCHES §24), where upstream's is Unsupported.
 	unsupported := Score{AccountID: "unsupported", Provider: account.ProviderClaude,
-		Headroom: 0.8, ShortHeadroom: 0.8}
+		Headroom: 0.8, ShortHeadroom: 0.8, MissingModelSupport: ModelSupportUnsupported}
 	measured := Score{AccountID: "measured", Provider: account.ProviderClaude,
 		Headroom: 0.8, ShortHeadroom: 0.8,
 		ModelScores: map[string]Score{ModelKey(model): {AccountID: "measured", Provider: account.ProviderClaude, Headroom: 0.2, ShortHeadroom: 0.2}}}
@@ -308,9 +311,9 @@ func TestExpiryAwareRoutingMatchesSnapshotOrder(t *testing.T) {
 		{ID: "erin@example.com", AuthMode: account.AuthModeOAuth},
 	}
 
-	// PickBest: this asserts the expiry-aware order; Pick samples new
-	// sessions across the whole usable band.
-	got, err := scheduler.PickBest(candidates)
+	// The fork's Pick is deterministic (PATCHES §10); upstream's spread
+	// placement (PickBest vs a sampling Pick) is not taken (§23).
+	got, err := scheduler.Pick(candidates)
 	if err != nil {
 		t.Fatal(err)
 	}

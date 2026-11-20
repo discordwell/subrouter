@@ -67,6 +67,13 @@ func (c *proxyProtocolConn) Read(buffer []byte) (int, error) {
 	return c.reader.Read(buffer)
 }
 
+func (c *proxyProtocolConn) CloseWrite() error {
+	if closer, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return closer.CloseWrite()
+	}
+	return errors.ErrUnsupported
+}
+
 func (c *proxyProtocolConn) RemoteAddr() net.Addr {
 	return c.remoteAddr
 }

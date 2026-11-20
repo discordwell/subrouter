@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
@@ -145,57 +146,78 @@ func TestAccountFetchSweepsUseOneDeadlineAcrossAllBatches(t *testing.T) {
 		},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
-			ref, available, _ := accountFetchConcurrencyFixture(t)
-			transport := &contextBlockingTransport{}
-			ref.client = &http.Client{Transport: transport}
-			ctx, cancel := context.WithTimeout(context.Background(), 75*time.Millisecond)
-			defer cancel()
-			started := time.Now()
-			testCase.run(ctx, ref, available)
-			if elapsed := time.Since(started); elapsed > time.Second {
-				t.Fatalf("sweep exceeded its shared deadline: %v", elapsed)
-			}
-			calls, maximum := transport.counts()
-			if calls != accountFetchConcurrency || maximum != accountFetchConcurrency {
-				t.Fatalf("blocked sweep calls/max = %d/%d, want %d/%d", calls, maximum, accountFetchConcurrency, accountFetchConcurrency)
-			}
+			// On the fake clock the deadline passes only once every goroutine
+			// is parked: the first batch inside RoundTrip, the rest waiting for
+			// a slot. On the wall clock a loaded host could reach 75 ms before
+			// the first batch was in flight, and the test failed with no bug.
+			synctest.Test(t, func(t *testing.T) {
+				ref, available, _ := accountFetchConcurrencyFixture(t)
+				transport := &contextBlockingTransport{}
+				ref.client = &http.Client{Transport: transport}
+				ctx, cancel := context.WithTimeout(context.Background(), 75*time.Millisecond)
+				defer cancel()
+				started := time.Now()
+				testCase.run(ctx, ref, available)
+				if elapsed := time.Since(started); elapsed > time.Second {
+					t.Fatalf("sweep exceeded its shared deadline: %v", elapsed)
+				}
+				calls, maximum := transport.counts()
+				if calls != accountFetchConcurrency || maximum != accountFetchConcurrency {
+					t.Fatalf("blocked sweep calls/max = %d/%d, want %d/%d", calls, maximum, accountFetchConcurrency, accountFetchConcurrency)
+				}
+				drainUsageWindowFlights()
+			})
 		})
 	}
 }
 
 func TestSharedScoreDeadlinePreservesSeedsForQueuedAccounts(t *testing.T) {
 	t.Parallel()
-	ref, available, _ := accountFetchConcurrencyFixture(t)
-	transport := &contextBlockingTransport{}
-	ref.client = &http.Client{Transport: transport}
-	seeded := make([]selectacct.Score, 0, len(available))
-	for _, account := range available {
-		seeded = append(seeded, selectacct.Score{
-			AccountID: account.ID,
-			Provider:  account.Provider,
-			Headroom:  0.75,
-		})
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 75*time.Millisecond)
-	defer cancel()
-	scores, scored := (Server{
-		AccountRef: ref,
-		Scheduler:  selectacct.NewScheduler(seeded),
-	}).scoreAccounts(ctx, available)
-	if scored != 0 {
-		t.Fatalf("freshly scored accounts = %d, want 0 from blocked upstream", scored)
-	}
-	if len(scores) != len(available) {
-		t.Fatalf("scores = %d, want %d", len(scores), len(available))
-	}
-	for _, score := range scores {
-		if score.Headroom != 0.75 {
-			t.Fatalf("account %s lost seeded headroom: %v", score.AccountID, score.Headroom)
+	// The same 75 ms race as TestAccountFetchSweepsUseOneDeadlineAcrossAllBatches,
+	// on the same fake clock.
+	synctest.Test(t, func(t *testing.T) {
+		ref, available, _ := accountFetchConcurrencyFixture(t)
+		transport := &contextBlockingTransport{}
+		ref.client = &http.Client{Transport: transport}
+		seeded := make([]selectacct.Score, 0, len(available))
+		for _, account := range available {
+			seeded = append(seeded, selectacct.Score{
+				AccountID: account.ID,
+				Provider:  account.Provider,
+				Headroom:  0.75,
+			})
 		}
-	}
-	if calls, maximum := transport.counts(); calls != accountFetchConcurrency || maximum != accountFetchConcurrency {
-		t.Fatalf("blocked sweep calls/max = %d/%d, want %d/%d", calls, maximum, accountFetchConcurrency, accountFetchConcurrency)
-	}
+		ctx, cancel := context.WithTimeout(context.Background(), 75*time.Millisecond)
+		defer cancel()
+		scores, scored := (Server{
+			AccountRef: ref,
+			Scheduler:  selectacct.NewScheduler(seeded),
+		}).scoreAccounts(ctx, available)
+		if scored != 0 {
+			t.Fatalf("freshly scored accounts = %d, want 0 from blocked upstream", scored)
+		}
+		if len(scores) != len(available) {
+			t.Fatalf("scores = %d, want %d", len(scores), len(available))
+		}
+		for _, score := range scores {
+			if score.Headroom != 0.75 {
+				t.Fatalf("account %s lost seeded headroom: %v", score.AccountID, score.Headroom)
+			}
+		}
+		if calls, maximum := transport.counts(); calls != accountFetchConcurrency || maximum != accountFetchConcurrency {
+			t.Fatalf("blocked sweep calls/max = %d/%d, want %d/%d", calls, maximum, accountFetchConcurrency, accountFetchConcurrency)
+		}
+		drainUsageWindowFlights()
+	})
+}
+
+// drainUsageWindowFlights lets the bubble's shared usage-window fetches end.
+// Upstream #535's flight runs on its own clock (usageStatusFetchTimeout,
+// detached from the caller), so a caller that hangs up returns while the
+// fetch it started goes on; synctest fails a test whose goroutines outlive
+// it. Sleeping past that clock on the fake one ends them.
+func drainUsageWindowFlights() {
+	time.Sleep(usageStatusFetchTimeout + time.Second)
 }
 
 func TestAccountFetchSweepsDoNotStartWorkAfterCallerDeadline(t *testing.T) {
@@ -263,37 +285,44 @@ func TestRotatedIndexesCoverPoolFromMovingStart(t *testing.T) {
 
 func TestUsageStatusesLiveRotatesStarvedTailAcrossSweeps(t *testing.T) {
 	t.Parallel()
-	ref, _, _ := accountFetchConcurrencyFixture(t)
-	blocking := &contextBlockingTransport{}
-	ref.client = &http.Client{Transport: blocking}
-	// Every fetch blocks until the sweep deadline, so exactly one batch of
-	// accounts acquires a slot per sweep. The set that acquires must move.
-	acquired := func() map[string]bool {
-		out := map[string]bool{}
-		ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
-		defer cancel()
-		for _, status := range ref.usageStatusesLive(ctx) {
-			if status.Provider == accounts.ProviderCodex && status.Error != "context deadline exceeded" {
-				out[status.ID] = true
+	// "Exactly one batch acquires" holds only if the 150 ms deadline passes
+	// after that batch is in flight. On the fake clock it passes once every
+	// goroutine is parked, so it always does; on the wall clock a loaded host
+	// could miss it and the test failed with no bug.
+	synctest.Test(t, func(t *testing.T) {
+		ref, _, _ := accountFetchConcurrencyFixture(t)
+		blocking := &contextBlockingTransport{}
+		ref.client = &http.Client{Transport: blocking}
+		// Every fetch blocks until the sweep deadline, so exactly one batch of
+		// accounts acquires a slot per sweep. The set that acquires must move.
+		acquired := func() map[string]bool {
+			out := map[string]bool{}
+			ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+			defer cancel()
+			for _, status := range ref.usageStatusesLive(ctx) {
+				if status.Provider == accounts.ProviderCodex && status.Error != "context deadline exceeded" {
+					out[status.ID] = true
+				}
+			}
+			return out
+		}
+		first := acquired()
+		second := acquired()
+		if len(first) != accountFetchConcurrency || len(second) != accountFetchConcurrency {
+			t.Fatalf("acquired per sweep = %d, %d; want %d each", len(first), len(second), accountFetchConcurrency)
+		}
+		// Spawn order rotates by the batch width, but semaphore admission among
+		// goroutines spawned in the same instant is only approximately FIFO, so
+		// allow a little overlap while requiring the served set to move.
+		same := 0
+		for id := range first {
+			if second[id] {
+				same++
 			}
 		}
-		return out
-	}
-	first := acquired()
-	second := acquired()
-	if len(first) != accountFetchConcurrency || len(second) != accountFetchConcurrency {
-		t.Fatalf("acquired per sweep = %d, %d; want %d each", len(first), len(second), accountFetchConcurrency)
-	}
-	// Spawn order rotates by the batch width, but semaphore admission among
-	// goroutines spawned in the same instant is only approximately FIFO, so
-	// allow a little overlap while requiring the served set to move.
-	same := 0
-	for id := range first {
-		if second[id] {
-			same++
+		if same > len(first)/2 {
+			t.Fatalf("second sweep re-served %d of %d accounts from the first batch: first=%v second=%v", same, len(first), first, second)
 		}
-	}
-	if same > len(first)/2 {
-		t.Fatalf("second sweep re-served %d of %d accounts from the first batch: first=%v second=%v", same, len(first), first, second)
-	}
+		drainUsageWindowFlights()
+	})
 }

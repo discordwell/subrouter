@@ -14,6 +14,7 @@ import (
 func TestSRServerInstallUsesIAPWithoutTailscale(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	unlockRemoteGateForTest(t)
 	t.Setenv("TAILSCALE_AUTH_KEY", "tailscale-auth-test-secret")
 	store := accounts.DefaultCodexStore()
 	fake := &recordingSRCommandRunner{}
@@ -28,7 +29,7 @@ func TestSRServerInstallUsesIAPWithoutTailscale(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := runner.run(context.Background(), []string{"server", "install", "community"}); err != nil {
+	if err := runner.run(context.Background(), []string{"server", "install", "community", "--allow-upstream-release"}); err != nil {
 		t.Fatal(err)
 	}
 

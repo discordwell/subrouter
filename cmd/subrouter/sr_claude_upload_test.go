@@ -160,8 +160,12 @@ func TestWriteClaudeProxyEnvCreatesSettings(t *testing.T) {
 	if env["ANTHROPIC_BASE_URL"] != "http://subrouter-team:31415" {
 		t.Fatalf("base url = %v", env["ANTHROPIC_BASE_URL"])
 	}
-	if env[claudeToolSearchEnv] != "true" {
-		t.Fatalf("%s = %v, want true", claudeToolSearchEnv, env[claudeToolSearchEnv])
+	// Upstream #463 asserts ENABLE_TOOL_SEARCH=true here. writeClaudeProxyEnv
+	// writes the user's own config dir (profileOwned=false), the settings.json
+	// plain `claude` reads, and the fork adds tool search only to profile
+	// directories (PATCHES §29.9.1; claude_tool_search_test.go).
+	if value, ok := env[claudeToolSearchEnv]; ok {
+		t.Fatalf("%s = %v written into the user's config dir", claudeToolSearchEnv, value)
 	}
 }
 
@@ -189,6 +193,111 @@ func TestWriteClaudeProxyEnvKeepsUserToolSearchChoice(t *testing.T) {
 	}
 }
 
+// An identical re-run must be a true no-op: same bytes, same mtime, no backup
+// churn. Anything else means the writer replaced settings.json underneath a
+// possibly-running Claude Code for no reason. Crash-safety of the write that
+// does happen is claude.WritePrivateFileAtomic's contract (fsync + rename),
+// covered with the credential-store tests; here we pin the no-op side.
+func TestWriteClaudeProxyEnvIdenticalRerunTouchesNothing(t *testing.T) {
+	dir := t.TempDir()
+	settingsPath := filepath.Join(dir, "settings.json")
+	if err := writeClaudeProxyEnv(dir, "http://subrouter-team:31415", ""); err != nil {
+		t.Fatal(err)
+	}
+	// The first write had no prior file, so there is nothing to back up.
+	if _, err := os.Stat(settingsPath + ".bak"); !os.IsNotExist(err) {
+		t.Fatalf("a fresh write created a backup: %v", err)
+	}
+	first, err := os.ReadFile(settingsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	past := time.Now().Add(-time.Hour).Truncate(time.Second)
+	if err := os.Chtimes(settingsPath, past, past); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeClaudeProxyEnv(dir, "http://subrouter-team:31415", ""); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(settingsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.ModTime().Equal(past) {
+		t.Fatalf("identical re-run rewrote settings.json (mtime %v, want %v)", info.ModTime(), past)
+	}
+	second, err := os.ReadFile(settingsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(first, second) {
+		t.Fatalf("identical re-run changed content:\nfirst:  %s\nsecond: %s", first, second)
+	}
+	if _, err := os.Stat(settingsPath + ".bak"); !os.IsNotExist(err) {
+		t.Fatalf("identical re-run created a backup: %v", err)
+	}
+}
+
+// A real change snapshots the prior bytes — including the user's original
+// formatting, which the canonical re-marshal loses — to settings.json.bak.
+func TestWriteClaudeProxyEnvBacksUpPriorContentOnRealChange(t *testing.T) {
+	dir := t.TempDir()
+	settingsPath := filepath.Join(dir, "settings.json")
+	seed := "{\"theme\":  \"dark\",\n  \"env\": {\"FOO\": \"bar\"}}\n"
+	if err := os.WriteFile(settingsPath, []byte(seed), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeClaudeProxyEnv(dir, "http://subrouter-team:31415", ""); err != nil {
+		t.Fatal(err)
+	}
+	backup, err := os.ReadFile(settingsPath + ".bak")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(backup) != seed {
+		t.Fatalf("backup does not hold the user's original bytes:\n%s", backup)
+	}
+	afterFirst, err := os.ReadFile(settingsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeClaudeProxyEnv(dir, "http://subrouter-other:31415", ""); err != nil {
+		t.Fatal(err)
+	}
+	backup, err = os.ReadFile(settingsPath + ".bak")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(backup, afterFirst) {
+		t.Fatalf("backup after a second change does not hold the prior content:\n%s", backup)
+	}
+}
+
+// A settings.json that cannot be parsed must fail the write and stay
+// byte-identical on disk. Merging into an empty map and writing that out would
+// replace whatever the user had with only the proxy env.
+func TestWriteClaudeProxyEnvRefusesToClobberUnparsableSettings(t *testing.T) {
+	dir := t.TempDir()
+	settingsPath := filepath.Join(dir, "settings.json")
+	corrupt := `{"env": not-json`
+	if err := os.WriteFile(settingsPath, []byte(corrupt), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeClaudeProxyEnv(dir, "http://subrouter-team:31415", ""); err == nil {
+		t.Fatal("corrupt settings.json did not fail the write")
+	}
+	body, err := os.ReadFile(settingsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != corrupt {
+		t.Fatalf("failed write modified settings.json: %s", body)
+	}
+	if _, err := os.Stat(settingsPath + ".bak"); !os.IsNotExist(err) {
+		t.Fatalf("failed write left a backup: %v", err)
+	}
+}
+
 func TestWriteClaudeProxyEnvForServerPreservesCanonicalHostname(t *testing.T) {
 	dir := t.TempDir()
 	server := srServerConfig{
@@ -203,7 +312,7 @@ func TestWriteClaudeProxyEnvForServerPreservesCanonicalHostname(t *testing.T) {
 	load := func(context.Context) ([]byte, error) {
 		return []byte(`{"Self":{"ID":"self","Online":true},"Peer":{"node-m3":{"ID":"node-m3","DNSName":"m3.example.ts.net.","TailscaleIPs":["100.88.0.9"],"Online":true}}}`), nil
 	}
-	if err := writeClaudeProxyEnvForServerWithResolvers(dir, server, lookup, load); err != nil {
+	if err := writeClaudeProxyEnvForServerWithResolvers(dir, server, false, lookup, load); err != nil {
 		t.Fatal(err)
 	}
 	body, err := os.ReadFile(filepath.Join(dir, "settings.json"))
@@ -244,6 +353,7 @@ func TestWriteClaudeProxyEnvForServerRejectsMissingNodeBeforeMutation(t *testing
 	err := writeClaudeProxyEnvForServerWithResolvers(
 		dir,
 		srServerConfig{Name: "legacy", URL: "http://remote.example:31415", TenantKey: testTenantKey},
+		false,
 		func(context.Context, string) ([]net.IPAddr, error) {
 			t.Fatal("missing exact node identity must reject before DNS")
 			return nil, nil
@@ -266,11 +376,11 @@ func TestWriteClaudeProxyEnvForServerHTTPSClearsPlaintextIdentityAtomically(t *t
 	dir := t.TempDir()
 	if err := writeClaudeProxyEnvCanonicalForServer(
 		dir, managedClaudeBlockedBaseURL, testTenantKey,
-		&srServerConfig{URL: "http://m3.example:31415", TailscaleNodeID: "node-m3"},
+		&srServerConfig{URL: "http://m3.example:31415", TailscaleNodeID: "node-m3"}, false,
 	); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeClaudeProxyEnvCanonical(dir, "https://secure.example/t/"+testTenantKey, testTenantKey); err != nil {
+	if err := writeClaudeProxyEnvCanonical(dir, "https://secure.example/t/"+testTenantKey, testTenantKey, false); err != nil {
 		t.Fatal(err)
 	}
 	body, err := os.ReadFile(filepath.Join(dir, "settings.json"))

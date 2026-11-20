@@ -194,8 +194,11 @@ func TestClaudeRequestReverifiesWeeklyCookedAccountAfterTelemetryThrottle(t *tes
 	}
 	reset := time.Now().Add(5 * time.Hour)
 	schedulerRef := selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{{
+		// Weekly-cooked in the fork's terms (scoreWeeklyCooked): a measured
+		// weekly window (live WeeklyResetAt) with nothing left. Upstream marks
+		// it with WeeklyHeadroomKnown, which the fork's Score does not have.
 		AccountID: account.ID, Provider: account.Provider, Headroom: 0, ShortHeadroom: 0,
-		WeeklyHeadroom: 0, WeeklyHeadroomKnown: true, ExhaustedResetAt: reset, Fresh: true,
+		WeeklyHeadroom: 0, WeeklyRemaining: 0, WeeklyResetAt: reset, ExhaustedResetAt: reset, Fresh: true,
 	}}))
 	schedulerRef.SetUpdatedAt(time.Time{})
 	handler := Server{
@@ -679,14 +682,9 @@ func TestClaude429FailoverUsesPoolSizedQuotaBudget(t *testing.T) {
 		}
 		accountsList = append(accountsList, accounts.Account{ID: id, Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "tok-" + id})
 		headroom := 0.90 - float64(i)*0.01
-		// New-session placement spreads across every roomy account, so the
-		// cooked accounts are walked in random order. The healthy account
-		// sits below the new-session floor, which ranks it after every
-		// roomy account: it is reached only once all seven cooked accounts
-		// were tried, which is what proves the budget is pool-sized.
-		if i == 7 {
-			headroom = 0.30
-		}
+		// Distinct ExpiryPressure values (descending with i) make each
+		// account its own pressure band, so the failover walk order is
+		// deterministic: cooked-0 .. cooked-6, then fresh-7.
 		reset := int64((i + 1) * 3600)
 		scores = append(scores, selectacct.Score{
 			AccountID: id, Provider: accounts.ProviderClaude,
@@ -706,7 +704,11 @@ func TestClaude429FailoverUsesPoolSizedQuotaBudget(t *testing.T) {
 	subrouter := httptest.NewServer(handler)
 	defer subrouter.Close()
 
-	req, err := http.NewRequest(http.MethodPost, subrouter.URL+"/v1/messages", strings.NewReader(`{"model":"claude-fable-5","messages":[]}`))
+	// A non-Fable model on purpose: a Fable request that exhausts the budget
+	// goes on to the Opus substitution stage (PATCHES.md section 11), a
+	// separate fallback that, like Bedrock, is not part of the pool's shared
+	// attempt budget and would add one more hit than this test counts.
+	req, err := http.NewRequest(http.MethodPost, subrouter.URL+"/v1/messages", strings.NewReader(`{"model":"claude-sonnet-4-5","messages":[]}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -742,6 +744,10 @@ func TestClaudeUsageWindowsClassifyFiveHourAsShort(t *testing.T) {
 		// 5h window is nearly drained and resets soon; 7d window is healthy.
 		FiveHour: &agentclaude.RateLimit{Utilization: floatPtr(95), ResetsAt: time.Now().Add(30 * time.Minute).Format(time.RFC3339)},
 		SevenDay: &agentclaude.RateLimit{Utilization: floatPtr(10), ResetsAt: time.Now().Add(5 * 24 * time.Hour).Format(time.RFC3339)},
+		// A served account always carries the Fable meter -- the reported
+		// bucket, the probe's, or fetchAccountUsageWindowsLive's unused
+		// fallback -- and it is what marks the account Claude-family.
+		SevenDayOAuthApps: &agentclaude.RateLimit{Utilization: floatPtr(0), ResetsAt: time.Now().Add(5 * 24 * time.Hour).Format(time.RFC3339)},
 	}
 	windows := claudeUsageWindows(usage)
 
@@ -773,12 +779,19 @@ func TestClaudeUsageWindowsClassifyFiveHourAsShort(t *testing.T) {
 	if score.ShortHeadroom > 0.06 {
 		t.Fatalf("ShortHeadroom = %.3f, want ~0.05 from the 5h window", score.ShortHeadroom)
 	}
-	// The 5h reset must be carried so the scheduler can compute expiry pressure.
+	// The 5h reset must be carried so the scheduler can see when the short
+	// window recovers.
 	if score.ShortResetAfterSeconds <= 0 {
 		t.Fatalf("ShortResetAfterSeconds = %d, want > 0 (5h reset)", score.ShortResetAfterSeconds)
 	}
-	if score.ExpiryPressure <= 0 {
-		t.Fatal("ExpiryPressure should be > 0 once the 5h window is classified as short")
+	// Claude ordering runs on weekly pace, not short-window pressure: the
+	// score must carry the weekly deadline and keep ExpiryPressure zero so
+	// the 5h window gates usability without driving ranking.
+	if score.WeeklyResetAt.IsZero() {
+		t.Fatal("WeeklyResetAt should be set for a Claude account (weekly pace ordering)")
+	}
+	if score.ExpiryPressure != 0 {
+		t.Fatalf("ExpiryPressure = %v, want 0 for Claude scores (pace ordering owns ranking)", score.ExpiryPressure)
 	}
 }
 
@@ -881,8 +894,13 @@ func TestClaudeFableProbeAddsHiddenOAuthAppsWindow(t *testing.T) {
 // rejection, never authoritative quota evidence: a fresh Max 20x account with
 // 0.0 utilization 429'd the bare probe live while answering 200 (with 7d_oi
 // headers) once the request looked like Claude Code. It must NOT synthesize a
-// cooked fable pool.
+// COOKED fable pool. With the usage endpoint itself reporting the fable
+// bucket as null (= unused), the account gets the null-means-unused fallback
+// instead: an UNSPENT fable window, so it stays Claude-family (the Fable
+// reservation, no 5h expiry pressure) and in fable routing. The reservation is
+// off by default since PATCHES §57, so this turns it on to see it taken out.
 func TestClaudeFableProbeIgnoresHeaderless429(t *testing.T) {
+	setFableReservationForTest(t, true)
 	usageBody := `{"five_hour":{"utilization":10.0,"resets_at":"2030-01-01T00:00:00+00:00"},"seven_day":{"utilization":60.0,"resets_at":"2030-01-02T00:00:00+00:00"}}`
 	client := &http.Client{Transport: proxyRoundTripFunc(func(req *http.Request) (*http.Response, error) {
 		switch req.URL.Path {
@@ -908,8 +926,25 @@ func TestClaudeFableProbeIgnoresHeaderless429(t *testing.T) {
 	if score.Headroom == 0 {
 		t.Fatalf("base Headroom = %.3f, a headerless probe 429 must not exhaust the account", score.Headroom)
 	}
-	if _, ok := score.ModelScores[selectacct.ModelKey(agentclaude.FableFeature)]; ok {
-		t.Fatalf("headerless probe 429 must not synthesize a fable pool: %+v", score.ModelScores)
+	fablePool, ok := score.ModelScores[selectacct.ModelKey(agentclaude.FableFeature)]
+	if !ok {
+		t.Fatalf("null fable bucket must fall back to an unused fable window, got pools %+v", score.ModelScores)
+	}
+	if fablePool.Headroom <= 0 || fablePool.ShortHeadroom <= 0 {
+		t.Fatalf("fallback fable pool = %+v, must be unspent (the hazard is a COOKED synthesis), not exhausted", fablePool)
+	}
+	if fablePool.Headroom > 0.4+1e-9 {
+		t.Fatalf("fable pool Headroom = %.3f, want capped by the 60%%-used general weekly", fablePool.Headroom)
+	}
+	// That fallback is also what marks the account Claude-family: no Opus or
+	// Sonnet window is published for a null bucket. A family account reserves
+	// the unspent Fable slice out of its non-Fable weekly headroom (with §57's
+	// switch on) and is not ranked on 5h expiry pressure.
+	if score.ExpiryPressure != 0 {
+		t.Fatalf("ExpiryPressure = %v, want 0 for a Claude-family score", score.ExpiryPressure)
+	}
+	if score.WeeklyRemaining <= 0 || score.WeeklyHeadroom >= score.WeeklyRemaining {
+		t.Fatalf("WeeklyHeadroom = %.3f, WeeklyRemaining = %.3f, want the Fable reservation taken out", score.WeeklyHeadroom, score.WeeklyRemaining)
 	}
 }
 
@@ -1105,18 +1140,24 @@ func TestClaudeHeaderless429FailsOverWithoutPoisoningScore(t *testing.T) {
 	}
 }
 
+// The controller's live mark is the fork's MarkExhaustedUntil; upstream marks
+// a weekly cooldown (MarkWeeklyExhaustedUntil), which the fork does not port
+// (PATCHES §29.3b, T3).
 func TestClaudeRetrySkipsControllerCooldown(t *testing.T) {
 	server, _ := claudeFailoverServer(t)
-	server.SchedulerRef.MarkWeeklyExhaustedUntil(accounts.ProviderClaude, "fresh@example.com", "", time.Now().Add(time.Hour))
-	_, err := server.oauthRetryCandidate(context.Background(), accounts.ProviderClaude, "claude", "session-cooldown", "", agentclaude.OpusFeature, map[string]struct{}{"cooked@example.com": {}}, false, false)
-	if err == nil || !strings.Contains(err.Error(), "controller cooldown") {
-		t.Fatalf("oauthRetryCandidate error = %v, want controller cooldown", err)
+	server.SchedulerRef.MarkExhaustedUntil(accounts.ProviderClaude, "fresh@example.com", "", time.Now().Add(time.Hour))
+	// The fork's mark reads as exhausted in the scheduler itself, so the
+	// candidate is gone before upstream's explicit-block filter would name
+	// it a "controller cooldown"; either way nothing is offered.
+	next, err := server.oauthRetryCandidate(context.Background(), accounts.ProviderClaude, "claude", "session-cooldown", "", agentclaude.OpusFeature, map[string]struct{}{"cooked@example.com": {}}, false, false)
+	if err == nil {
+		t.Fatalf("oauthRetryCandidate = %q, want no candidate while fresh@ is under a live mark", next.ID)
 	}
 }
 
 func TestClaudeExplicitWindow429StopsAtControllerCooldown(t *testing.T) {
 	server, _ := claudeFailoverServer(t)
-	server.SchedulerRef.MarkWeeklyExhaustedUntil(accounts.ProviderClaude, "fresh@example.com", "", time.Now().Add(time.Hour))
+	server.SchedulerRef.MarkExhaustedUntil(accounts.ProviderClaude, "fresh@example.com", "", time.Now().Add(time.Hour))
 	stub := &stubRoundTripper{responses: func(*http.Request) *http.Response {
 		header := http.Header{}
 		header.Set("Anthropic-Ratelimit-Unified-7d-Status", "rejected")
@@ -1138,8 +1179,10 @@ func TestClaudeExplicitWindow429StopsAtControllerCooldown(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer response.Body.Close()
-	if response.StatusCode != http.StatusServiceUnavailable || stub.calls != 1 {
-		t.Fatalf("status=%d upstream_calls=%d, want one bounded attempt and sr pool 503", response.StatusCode, stub.calls)
+	// The pool's own 429 reaches the client (PATCHES §44.4); upstream's #560
+	// pool-exhausted 503 is not taken.
+	if response.StatusCode != http.StatusTooManyRequests || stub.calls != 1 {
+		t.Fatalf("status=%d upstream_calls=%d, want one bounded attempt and the pool's own 429", response.StatusCode, stub.calls)
 	}
 }
 
@@ -1198,8 +1241,8 @@ func TestClaudeBareRejectedFableMarksOnlyFablePool(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer response.Body.Close()
-	if response.StatusCode != http.StatusServiceUnavailable {
-		t.Fatalf("status=%d, want sr pool exhaustion 503", response.StatusCode)
+	if response.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("status=%d, want the pool's own 429 (not upstream #560's 503)", response.StatusCode)
 	}
 
 	scheduler := server.SchedulerRef.Get()
@@ -1230,7 +1273,8 @@ func TestClaudeFailoverExhaustionIsLogged(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Every account the server can pick returns a rejected 429, so failover
-	// never finds a healthy account and the client gets sr's pool 503.
+	// never finds a healthy account and the client gets the last 429 (the
+	// fork's; upstream #560 answers its own pool 503 instead).
 	stub := &stubRoundTripper{responses: func(req *http.Request) *http.Response {
 		h := http.Header{}
 		h.Set("Anthropic-Ratelimit-Unified-Status", "rejected")
@@ -1259,15 +1303,8 @@ func TestClaudeFailoverExhaustionIsLogged(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer response.Body.Close()
-	if response.StatusCode != http.StatusServiceUnavailable {
-		t.Fatalf("status = %d, want sr pool exhaustion 503", response.StatusCode)
-	}
-	body, _ := io.ReadAll(response.Body)
-	if !strings.Contains(string(body), "no non-exhausted claude accounts available") || strings.Contains(string(body), "rate_limit_error") {
-		t.Fatalf("body = %q, want sr pool message without provider 429", string(body))
-	}
-	if response.Header.Get("Retry-After") == "" {
-		t.Fatal("pool exhaustion 503 missing Retry-After")
+	if response.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429 (all accounts rate-limited)", response.StatusCode)
 	}
 	logs := logBuf.String()
 	if !strings.Contains(logs, "claude rate-limit returned to client after failover exhausted") {
@@ -1280,7 +1317,11 @@ func TestClaudeFailoverExhaustionIsLogged(t *testing.T) {
 	}
 }
 
-func TestClaudeFailoverSkipsControllerCooldownAlternate(t *testing.T) {
+// Upstream ddb8744 made failover retry a marked-exhausted alternate on the
+// theory that the mark may be stale. Not taken here: the retry filter is
+// scheduler.Evicted, the same verdict that enforces the holdout (PATCHES.md
+// section 20) and that section 11's Opus substitution reads as "no capacity".
+func TestClaudeFailoverSkipsMarkedExhaustedAlternates(t *testing.T) {
 	server, store := claudeFailoverServer(t)
 	if _, err := store.Put("claude", "session-exhausted-alt", "cooked@example.com", ""); err != nil {
 		t.Fatal(err)
@@ -1290,6 +1331,9 @@ func TestClaudeFailoverSkipsControllerCooldownAlternate(t *testing.T) {
 	var calls int
 	stub := &stubRoundTripper{responses: func(req *http.Request) *http.Response {
 		calls++
+		if strings.Contains(req.Header.Get("Authorization"), "tok-fresh") {
+			t.Fatal("fresh account is marked exhausted and must not be retried")
+		}
 		h := http.Header{}
 		h.Set("Anthropic-Ratelimit-Unified-Status", "rejected")
 		h.Set("Anthropic-Ratelimit-Unified-Reset", strconv.FormatInt(time.Now().Add(time.Hour).Unix(), 10))
@@ -1310,11 +1354,11 @@ func TestClaudeFailoverSkipsControllerCooldownAlternate(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer response.Body.Close()
-	if response.StatusCode != http.StatusServiceUnavailable {
-		t.Fatalf("status=%d, want sr pool exhaustion 503", response.StatusCode)
+	if response.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("status=%d, want original 429", response.StatusCode)
 	}
 	if calls != 1 {
-		t.Fatalf("upstream calls=%d, want the controller-held alternate skipped", calls)
+		t.Fatalf("upstream calls=%d, want 1 because marked-exhausted alternates are skipped", calls)
 	}
 }
 
@@ -1488,21 +1532,22 @@ func TestClaudeFailoverSkipsDeadTokenAccount(t *testing.T) {
 			{ID: "fresh@example.com", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "tok-fresh"},
 		},
 		Sessions: store,
-		// Seed the ref with the same scores as the stub: UsageScoreTTL is 0
-		// here, so the retry path never refreshes and picks straight from
-		// this snapshot. fresh sits below the new-session floor, which ranks
-		// it after dead whatever placement spreading samples, so failover
-		// must meet the dead token first.
+		// Seed the ref with the same pressure-ordered scores as the stub:
+		// UsageScoreTTL is 0 here, so the retry path never refreshes and
+		// picks straight from this snapshot. Distinct pressures make the
+		// failover order deterministic (dead before fresh) despite placement
+		// spreading within equal-pressure bands.
 		SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
 			{AccountID: "cooked@example.com", Provider: accounts.ProviderClaude, Headroom: 0, ShortHeadroom: 0},
 			{AccountID: "dead@example.com", Provider: accounts.ProviderClaude, Headroom: 1.0, ShortHeadroom: 1.0, ShortResetAfterSeconds: 3600, ExpiryPressure: 1.0 / 3600},
-			{AccountID: "fresh@example.com", Provider: accounts.ProviderClaude, Headroom: 0.3, ShortHeadroom: 0.3, ShortResetAfterSeconds: 4 * 3600, ExpiryPressure: 0.3 / (4 * 3600)},
+			{AccountID: "fresh@example.com", Provider: accounts.ProviderClaude, Headroom: 0.9, ShortHeadroom: 0.9, ShortResetAfterSeconds: 4 * 3600, ExpiryPressure: 0.9 / (4 * 3600)},
 		})),
-		// Pick order among untried candidates: dead (room for a new session)
-		// strictly before fresh (below the floor), so failover tries the
-		// dead-token account first and must skip it.
+		// Pick order among untried candidates: dead strictly before fresh
+		// (distinct ExpiryPressure values form singleton bands, so the order
+		// is deterministic despite placement spreading), so failover tries
+		// the dead-token account first and must skip it.
 		ScoreAccounts: func(ctx context.Context, available []accounts.Account) ([]selectacct.Score, int) {
-			h := map[string]float64{"cooked@example.com": 0, "dead@example.com": 1.0, "fresh@example.com": 0.3}
+			h := map[string]float64{"cooked@example.com": 0, "dead@example.com": 1.0, "fresh@example.com": 0.9}
 			reset := map[string]int64{"dead@example.com": 3600, "fresh@example.com": 4 * 3600}
 			scores := make([]selectacct.Score, 0, len(available))
 			for _, a := range available {
@@ -1750,7 +1795,7 @@ func TestClaudeOverloadRetrySucceeds(t *testing.T) {
 		base: stub, server: &server, provider: accounts.ProviderClaude,
 		agent: "claude", session: "session-529", account: "cooked@example.com",
 		method: http.MethodPost, path: "/v1/messages", maxAttempts: 6,
-		sleep: recordSleep(&waits), overloadPolicy: claudeShortLadder,
+		sleep: recordSleep(&waits),
 	}
 	req, _ := http.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", bytes.NewReader([]byte(`{"model":"claude-opus-4-8"}`)))
 	req.Header.Set("Authorization", "Bearer tok-cooked")
@@ -1774,8 +1819,8 @@ func TestClaudeOverloadRetrySucceeds(t *testing.T) {
 }
 
 // TestClaudeOverloadRetryGivesUpAfterBudget: a sustained outage passes the 5xx
-// through after the bounded same-account ladder so the client's own backoff
-// takes over. By default it never tries another account.
+// through after the small retry budget so the client's own backoff takes over.
+// The retries stay on the account and mark nothing.
 func TestClaudeOverloadRetryGivesUpAfterBudget(t *testing.T) {
 	server, _ := claudeFailoverServer(t)
 	var calls int
@@ -1791,7 +1836,7 @@ func TestClaudeOverloadRetryGivesUpAfterBudget(t *testing.T) {
 		base: stub, server: &server, provider: accounts.ProviderClaude,
 		agent: "claude", session: "s", account: "cooked@example.com",
 		method: http.MethodPost, path: "/v1/messages", maxAttempts: 6,
-		sleep: recordSleep(&waits), overloadPolicy: claudeShortLadder,
+		sleep: recordSleep(&waits),
 	}
 	req, _ := http.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", bytes.NewReader([]byte(`{}`)))
 	req.Header.Set("Authorization", "Bearer tok-cooked")
@@ -1803,8 +1848,8 @@ func TestClaudeOverloadRetryGivesUpAfterBudget(t *testing.T) {
 	if response.StatusCode != 529 {
 		t.Fatalf("status = %d, want 529 passed through after budget", response.StatusCode)
 	}
-	if calls != 1+claudeShortLadderRetries {
-		t.Fatalf("upstream calls = %d, want %d", calls, 1+claudeShortLadderRetries)
+	if calls != 1+providerOverloadMaxRetries {
+		t.Fatalf("upstream calls = %d, want %d", calls, 1+providerOverloadMaxRetries)
 	}
 	if server.SchedulerRef.Get().Exhausted(accounts.ProviderClaude, "cooked@example.com") {
 		t.Fatal("a sustained overload must NOT mark the account exhausted")
@@ -1840,7 +1885,7 @@ func TestClaudeOverloadRetryPreservesFailoverAccount(t *testing.T) {
 		base: stub, server: &server, provider: accounts.ProviderClaude,
 		agent: "claude", session: "session-mix", account: "cooked@example.com",
 		method: http.MethodPost, path: "/v1/messages", maxAttempts: 6,
-		sleep: recordSleep(&waits), overloadPolicy: claudeShortLadder,
+		sleep: recordSleep(&waits),
 	}
 	req, _ := http.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", bytes.NewReader([]byte(`{}`)))
 	req.Header.Set("Authorization", "Bearer tok-cooked")
@@ -1921,7 +1966,7 @@ func TestClaudeRejected5xxFailsOverNotOverloadRetried(t *testing.T) {
 		base: stub, server: &server, provider: accounts.ProviderClaude,
 		agent: "claude", session: "session-r5", account: "cooked@example.com",
 		method: http.MethodPost, path: "/v1/messages", poolModel: "claude-opus-4", maxAttempts: 6,
-		sleep: recordSleep(&waits), overloadPolicy: claudeShortLadder,
+		sleep: recordSleep(&waits),
 	}
 	req, _ := http.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", bytes.NewReader([]byte(`{}`)))
 	req.Header.Set("Authorization", "Bearer tok-cooked")
@@ -2145,31 +2190,6 @@ func TestClaudeExhaustedByResponseIgnoresPoolScopedRejection(t *testing.T) {
 	}
 }
 
-// Fresh accounts report opus/sonnet weekly buckets as null (unused). They must
-// still carry 0%-used pool windows so ForModel never zero-fills them out of
-// opus routing once another account grows a real opus window.
-func TestClaudeUsageWindowsSynthesizeUnusedOpusSonnetPools(t *testing.T) {
-	usage := &agentclaude.UsageResponse{
-		FiveHour:          &agentclaude.RateLimit{Utilization: floatPtr(10), ResetsAt: time.Now().Add(time.Hour).Format(time.RFC3339)},
-		SevenDay:          &agentclaude.RateLimit{Utilization: floatPtr(20), ResetsAt: time.Now().Add(5 * 24 * time.Hour).Format(time.RFC3339)},
-		SevenDayOAuthApps: &agentclaude.RateLimit{Utilization: floatPtr(100), ResetsAt: time.Now().Add(5 * 24 * time.Hour).Format(time.RFC3339)},
-	}
-	windows := claudeUsageWindows(usage)
-	score := scoreFromUsageWindows(accounts.ProviderClaude, "fresh", windows)
-
-	opusScore, ok := score.ModelScores[selectacct.ModelKey(agentclaude.OpusFeature)]
-	if !ok {
-		t.Fatalf("missing synthesized opus pool: %+v", score.ModelScores)
-	}
-	// Pool score includes the base windows, so 7d at 20%% caps it at 0.8.
-	if opusScore.Headroom < 0.79 || opusScore.Headroom > 0.81 {
-		t.Fatalf("opus pool Headroom = %.3f, want ~0.8 (base 7d), fable exhaustion must not leak in", opusScore.Headroom)
-	}
-	if _, ok := score.ModelScores[selectacct.ModelKey(agentclaude.SonnetFeature)]; !ok {
-		t.Fatalf("missing synthesized sonnet pool: %+v", score.ModelScores)
-	}
-}
-
 func TestClaudeExtraUsageDoesNotIncreaseSubscriptionHeadroom(t *testing.T) {
 	limit, used, utilization := 2500.0, 500.0, 20.0
 	windows := claudeUsageWindows(&agentclaude.UsageResponse{
@@ -2183,275 +2203,47 @@ func TestClaudeExtraUsageDoesNotIncreaseSubscriptionHeadroom(t *testing.T) {
 	if score.Headroom != 0 || score.ShortHeadroom != 0 {
 		t.Fatalf("subscription score = headroom %.2f short %.2f, want cooked despite extra usage", score.Headroom, score.ShortHeadroom)
 	}
-	if !score.ClaudeExtraUsageEnabled || !score.ClaudeExtraUsageKnown || score.ClaudeExtraUsageRemaining != 2000 {
-		t.Fatalf("extra usage score metadata = %+v, want enabled with 2000 cents remaining", score)
-	}
 }
 
-func TestPickClaudeExtraUsageFallbackRequiresWholePoolCookedAndBalance(t *testing.T) {
-	accountsInPool := []accounts.Account{
-		{ID: "paid", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth},
-		{ID: "other", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth},
-	}
-	paid := selectacct.Score{AccountID: "paid", Provider: accounts.ProviderClaude, Headroom: 0, ShortHeadroom: 0, WeeklyHeadroom: 0, WeeklyHeadroomKnown: true,
-		ClaudeExtraUsageEnabled: true, ClaudeExtraUsageKnown: true, ClaudeExtraUsageRemaining: 12}
-	other := selectacct.Score{AccountID: "other", Provider: accounts.ProviderClaude, Headroom: 0, ShortHeadroom: 0, WeeklyHeadroom: 0, WeeklyHeadroomKnown: true}
-	if got, ok := pickClaudeExtraUsageFallback(selectacct.NewScheduler([]selectacct.Score{paid, other}), accountsInPool); !ok || got.ID != "paid" {
-		t.Fatalf("fallback = %+v, %v; want paid", got, ok)
-	}
-	poolScheduler := selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{paid, other}))
-	poolScheduler.MarkExhausted(accounts.ProviderClaude, "paid", selectacct.ModelKey(agentclaude.OpusFeature))
-	poolScheduler.MarkExhausted(accounts.ProviderClaude, "other", selectacct.ModelKey(agentclaude.OpusFeature))
-	if got, ok := pickClaudeExtraUsageFallback(poolScheduler.Get().ForModel(agentclaude.OpusFeature), accountsInPool); !ok || got.ID != "paid" {
-		t.Fatalf("model-pool fallback = %+v, %v; want paid with preserved extra metadata", got, ok)
-	}
-	mixedPool := selectacct.NewScheduler([]selectacct.Score{
-		paid,
-		{AccountID: "other", Provider: accounts.ProviderClaude, Headroom: 0, ShortHeadroom: 0, WeeklyHeadroom: 0, WeeklyHeadroomKnown: true,
-			ModelScores: map[string]selectacct.Score{
-				selectacct.ModelKey(agentclaude.OpusFeature): {
-					AccountID: "other", Provider: accounts.ProviderClaude, Headroom: 0, ShortHeadroom: 0, WeeklyHeadroom: 0, WeeklyHeadroomKnown: true,
-				},
-			}},
-	}).ForModel(agentclaude.OpusFeature)
-	if got, ok := pickClaudeExtraUsageFallback(mixedPool, accountsInPool); !ok || got.ID != "paid" {
-		t.Fatalf("mixed model-pool fallback = %+v, %v; want paid metadata preserved on missing model overlay", got, ok)
-	}
-
-	// Cost order: extra usage (tier 3) comes before the client's paid
-	// Bedrock route, so a subscription that is unusable only on its 5h
-	// window no longer blocks it.
-	other.Headroom, other.ShortHeadroom, other.WeeklyHeadroom = 0.5, 0, 0.5
-	if got, ok := pickClaudeExtraUsageFallback(selectacct.NewScheduler([]selectacct.Score{paid, other}), accountsInPool); !ok || got.ID != "paid" {
-		t.Fatalf("session-cooked pool fallback = %+v, %v; want paid", got, ok)
-	}
-	sessionOnly := paid
-	sessionOnly.Headroom, sessionOnly.WeeklyHeadroom = 0.5, 0.5
-	if got, ok := pickClaudeExtraUsageFallback(selectacct.NewScheduler([]selectacct.Score{sessionOnly, other}), accountsInPool); !ok || got.ID != "paid" {
-		t.Fatalf("session-cooked funded account fallback = %+v, %v; want paid", got, ok)
-	}
-	// The funded account must itself be unusable, or it would serve the
-	// request from plan quota.
-	usable := paid
-	usable.Headroom, usable.ShortHeadroom, usable.WeeklyHeadroom = 0.5, 0.5, 0.5
-	if _, ok := pickClaudeExtraUsageFallback(selectacct.NewScheduler([]selectacct.Score{usable, other}), accountsInPool); ok {
-		t.Fatal("extra usage became eligible while the funded account had plan quota")
-	}
-	// An unknown balance never authorizes paid use.
-	unknown := paid
-	unknown.ClaudeExtraUsageKnown = false
-	if _, ok := pickClaudeExtraUsageFallback(selectacct.NewScheduler([]selectacct.Score{unknown, other}), accountsInPool); ok {
-		t.Fatal("extra usage with an unknown balance became eligible")
-	}
-	other.WeeklyHeadroom = 0
-
-	other.Headroom, other.ShortHeadroom, other.WeeklyHeadroom = 0.5, 0.5, 0.5
-	if _, ok := pickClaudeExtraUsageFallback(selectacct.NewScheduler([]selectacct.Score{paid, other}), accountsInPool); ok {
-		t.Fatal("extra usage became eligible while another subscription still had quota")
-	}
-
-	other.Headroom, other.ShortHeadroom = 0, 0
-	paid.ClaudeExtraUsageRemaining = 0
-	if _, ok := pickClaudeExtraUsageFallback(selectacct.NewScheduler([]selectacct.Score{paid, other}), accountsInPool); ok {
-		t.Fatal("zero-balance extra usage became eligible")
-	}
-	paid.ClaudeExtraUsageRemaining = 12
-	paid.ClaudeExtraUsageEnabled = false
-	if _, ok := pickClaudeExtraUsageFallback(selectacct.NewScheduler([]selectacct.Score{paid, other}), accountsInPool); ok {
-		t.Fatal("disabled extra usage became eligible")
-	}
-}
-
-func TestClaudeRejectedPaidResponseAcceptedOnlyAfterWholePoolCooked(t *testing.T) {
-	for _, tc := range []struct {
-		name          string
-		otherHeadroom float64
-		otherWeekly   float64
-		withAPIKey    bool
-		wantAccepted  bool
-	}{
-		{name: "all subscriptions cooked", otherHeadroom: 0, otherWeekly: 0, wantAccepted: true},
-		{name: "another subscription available", otherHeadroom: 1, otherWeekly: 1, wantAccepted: false},
-		{name: "another subscription only session-cooked", otherHeadroom: 0, otherWeekly: 0.5, wantAccepted: true},
-		{name: "an API key can still take it", otherHeadroom: 0, otherWeekly: 0, withAPIKey: true, wantAccepted: false},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			server := Server{
-				Accounts: []accounts.Account{
-					{ID: "paid", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth},
-					{ID: "other", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth},
-				},
-				SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
-					{AccountID: "paid", Provider: accounts.ProviderClaude, Headroom: 0, ShortHeadroom: 0, WeeklyHeadroom: 0, WeeklyHeadroomKnown: true,
-						ClaudeExtraUsageEnabled: true, ClaudeExtraUsageKnown: true, ClaudeExtraUsageRemaining: 9},
-					{AccountID: "other", Provider: accounts.ProviderClaude, Headroom: tc.otherHeadroom, ShortHeadroom: tc.otherHeadroom, WeeklyHeadroom: tc.otherWeekly, WeeklyHeadroomKnown: true},
-				})),
-			}
-			if tc.withAPIKey {
-				server.Accounts = append(server.Accounts, accounts.Account{ID: "claude:credits", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeAPIKey})
-			}
-			stub := &stubRoundTripper{responses: func(*http.Request) *http.Response {
-				header := http.Header{}
-				header.Set("Anthropic-Ratelimit-Unified-Status", "rejected")
-				header.Set("Anthropic-Ratelimit-Unified-Overage-In-Use", "true")
-				return &http.Response{StatusCode: http.StatusOK, Header: header, Body: io.NopCloser(strings.NewReader(`{"id":"paid"}`))}
-			}}
-			transport := usageLimitRetryTransport{base: stub, server: &server, provider: accounts.ProviderClaude,
-				account: "paid", maxAttempts: 1, budget: newAttemptBudget(0)}
-			req, err := http.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", strings.NewReader(`{}`))
-			if err != nil {
-				t.Fatal(err)
-			}
-			req.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(strings.NewReader(`{}`)), nil }
-			response, err := transport.RoundTrip(req)
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer response.Body.Close()
-			accepted := response.Header.Get("X-Subrouter-Claude-Extra-Usage") == "true"
-			if accepted != tc.wantAccepted {
-				t.Fatalf("accepted = %v, want %v; headers=%v", accepted, tc.wantAccepted, response.Header)
-			}
-			if tc.wantAccepted && response.Header.Get("Anthropic-Ratelimit-Unified-Status") != "allowed" {
-				t.Fatalf("client status = %q, want allowed", response.Header.Get("Anthropic-Ratelimit-Unified-Status"))
-			}
-		})
-	}
-}
-
-func TestClaudeExtraUsageDoesNotRevisitCooldownAccount(t *testing.T) {
-	server, store := claudeFailoverServer(t)
-	if _, err := store.Put("claude", "session-paid-revisit", "cooked@example.com", ""); err != nil {
-		t.Fatal(err)
-	}
-	server.SchedulerRef = selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
-		{AccountID: "cooked@example.com", Provider: accounts.ProviderClaude, Headroom: 1, ShortHeadroom: 1, WeeklyHeadroom: 0, WeeklyHeadroomKnown: true,
-			ClaudeExtraUsageEnabled: true, ClaudeExtraUsageKnown: true, ClaudeExtraUsageRemaining: 9},
-		{AccountID: "fresh@example.com", Provider: accounts.ProviderClaude, Headroom: 1, ShortHeadroom: 1, WeeklyHeadroom: 1, WeeklyHeadroomKnown: true},
-	}))
-
-	var paidHits, ordinaryHits int
-	stub := &stubRoundTripper{responses: func(req *http.Request) *http.Response {
-		header := http.Header{}
-		header.Set("Anthropic-Ratelimit-Unified-Status", "rejected")
-		if strings.Contains(req.Header.Get("Authorization"), "tok-cooked") {
-			paidHits++
-			header.Set("Anthropic-Ratelimit-Unified-Overage-In-Use", "true")
-			return &http.Response{StatusCode: http.StatusOK, Header: header,
-				Body: io.NopCloser(strings.NewReader(fmt.Sprintf(`{"id":"paid-%d"}`, paidHits)))}
-		}
-		ordinaryHits++
-		// The 7d rejection header is what authorizes the paid revisit: a
-		// session-level 429 alone must never cook the weekly window.
-		header.Set("Anthropic-Ratelimit-Unified-7d-Status", "rejected")
-		return &http.Response{StatusCode: http.StatusTooManyRequests, Header: header,
-			Body: io.NopCloser(strings.NewReader(realisticAnthropic429Body))}
-	}}
-	transport := usageLimitRetryTransport{
-		base: stub, server: &server, provider: accounts.ProviderClaude,
-		agent: "claude", session: "session-paid-revisit", account: "cooked@example.com",
-		method: http.MethodPost, path: "/v1/messages", maxAttempts: 3,
-		budget: newAttemptBudget(2),
-	}
-	req, err := http.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", strings.NewReader(`{}`))
-	if err != nil {
-		t.Fatal(err)
-	}
-	req.Header.Set("Authorization", "Bearer tok-cooked")
-	req.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(strings.NewReader(`{}`)), nil }
-	response, err := transport.RoundTrip(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer response.Body.Close()
-	body, err := io.ReadAll(response.Body)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if paidHits != 1 || ordinaryHits != 1 {
-		t.Fatalf("upstream hits paid=%d ordinary=%d, want one bounded attempt per account", paidHits, ordinaryHits)
-	}
-	if response.StatusCode != http.StatusTooManyRequests || response.Header.Get("X-Subrouter-Claude-Extra-Usage") != "" {
-		t.Fatalf("cooldown response = status %d headers %v, want bounded 429 without extra-usage retry", response.StatusCode, response.Header)
-	}
-	if strings.Contains(string(body), `"paid-2"`) {
-		t.Fatalf("body = %q, unexpectedly contains a second paid attempt", body)
-	}
-}
-
-// A session-level 429 (no weekly evidence in the unified headers) unlocks the
-// paid fallback once every subscription is unusable: extra usage is tier 3 of
-// the cost order and the alternative is the client's paid Bedrock route.
-func TestClaudeExtraUsageUnlockedBySessionOnlyRejection(t *testing.T) {
-	server, store := claudeFailoverServer(t)
-	if _, err := store.Put("claude", "session-paid-session-only", "fresh@example.com", ""); err != nil {
-		t.Fatal(err)
-	}
-	server.SchedulerRef = selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
-		// The funded account is cooked only on its 5h window; its weekly
-		// window still has quota.
-		{AccountID: "cooked@example.com", Provider: accounts.ProviderClaude, Headroom: 0.5, ShortHeadroom: 0, WeeklyHeadroom: 0.5, WeeklyHeadroomKnown: true,
-			ClaudeExtraUsageEnabled: true, ClaudeExtraUsageKnown: true, ClaudeExtraUsageRemaining: 9},
-		{AccountID: "fresh@example.com", Provider: accounts.ProviderClaude, Headroom: 1, ShortHeadroom: 1, WeeklyHeadroom: 1, WeeklyHeadroomKnown: true},
-	}))
-
-	stub := &stubRoundTripper{responses: func(req *http.Request) *http.Response {
-		header := http.Header{}
-		header.Set("Anthropic-Ratelimit-Unified-Status", "rejected")
-		if strings.Contains(req.Header.Get("Authorization"), "tok-cooked") {
-			header.Set("Anthropic-Ratelimit-Unified-Overage-In-Use", "true")
-			return &http.Response{StatusCode: http.StatusOK, Header: header,
-				Body: io.NopCloser(strings.NewReader(`{"id":"paid"}`))}
-		}
-		return &http.Response{StatusCode: http.StatusTooManyRequests, Header: header,
-			Body: io.NopCloser(strings.NewReader(realisticAnthropic429Body))}
-	}}
-	transport := usageLimitRetryTransport{
-		base: stub, server: &server, provider: accounts.ProviderClaude,
-		agent: "claude", session: "session-paid-session-only", account: "fresh@example.com",
-		method: http.MethodPost, path: "/v1/messages", maxAttempts: 3,
-		budget: newAttemptBudget(2),
-	}
-	req, err := http.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", strings.NewReader(`{}`))
-	if err != nil {
-		t.Fatal(err)
-	}
-	req.Header.Set("Authorization", "Bearer tok-fresh")
-	req.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(strings.NewReader(`{}`)), nil }
-	response, err := transport.RoundTrip(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer response.Body.Close()
-	if response.Header.Get("X-Subrouter-Claude-Extra-Usage") != "true" {
-		t.Fatalf("status %d headers %v; want the session-cooked pool served from extra usage", response.StatusCode, response.Header)
-	}
-}
-
-func TestClaudeExtraUsageRevisitRefreshFailureIsAttemptedOnce(t *testing.T) {
+// Paid Claude extra usage (upstream 2269757) is deliberately not wired into
+// routing here: nothing may spend money once the subscriptions are cooked. A
+// rejected response that reports overage in use is therefore never rewritten to
+// "allowed", whatever the rest of the pool looks like.
+func TestClaudeRejectedOverageResponseIsNeverAccepted(t *testing.T) {
 	server := Server{
 		Accounts: []accounts.Account{
-			{ID: "paid", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "tok-paid"},
-			{ID: "other", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "tok-other"},
+			{ID: "paid", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth},
+			{ID: "other", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth},
 		},
 		SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
-			{AccountID: "paid", Provider: accounts.ProviderClaude, Headroom: 0, ShortHeadroom: 0, WeeklyHeadroom: 0, WeeklyHeadroomKnown: true,
-				ClaudeExtraUsageEnabled: true, ClaudeExtraUsageKnown: true, ClaudeExtraUsageRemaining: 9},
-			{AccountID: "other", Provider: accounts.ProviderClaude, Headroom: 0, ShortHeadroom: 0, WeeklyHeadroom: 0, WeeklyHeadroomKnown: true},
+			{AccountID: "paid", Provider: accounts.ProviderClaude, Headroom: 0, ShortHeadroom: 0},
+			{AccountID: "other", Provider: accounts.ProviderClaude, Headroom: 0, ShortHeadroom: 0},
 		})),
 	}
-	refreshes := 0
-	server.RefreshAccountFn = func(_ context.Context, account accounts.Account) (accounts.Account, error) {
-		refreshes++
-		return accounts.Account{}, fmt.Errorf("Claude OAuth refresh failed: 400 Bad Request: invalid_grant")
+	stub := &stubRoundTripper{responses: func(*http.Request) *http.Response {
+		header := http.Header{}
+		header.Set("Anthropic-Ratelimit-Unified-Status", "rejected")
+		header.Set("Anthropic-Ratelimit-Unified-7d-Status", "rejected")
+		header.Set("Anthropic-Ratelimit-Unified-Overage-In-Use", "true")
+		return &http.Response{StatusCode: http.StatusOK, Header: header, Body: io.NopCloser(strings.NewReader(`{"id":"paid"}`))}
+	}}
+	transport := usageLimitRetryTransport{base: stub, server: &server, provider: accounts.ProviderClaude,
+		account: "paid", maxAttempts: 1, budget: newAttemptBudget(0)}
+	req, err := http.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatal(err)
 	}
-	tried := map[string]struct{}{"paid": {}, "other": {}}
-	_, err := server.oauthRetryCandidate(t.Context(), accounts.ProviderClaude, "claude", "session-paid-refresh", "", "", tried, false, true)
-	if err == nil {
-		t.Fatal("paid fallback with a dead credential unexpectedly succeeded")
+	req.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(strings.NewReader(`{}`)), nil }
+	response, err := transport.RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if refreshes != 1 {
-		t.Fatalf("paid fallback refresh attempts = %d, want exactly 1", refreshes)
+	defer response.Body.Close()
+	if response.Header.Get("X-Subrouter-Claude-Extra-Usage") != "" {
+		t.Fatalf("paid extra usage was accepted: headers=%v", response.Header)
+	}
+	if got := response.Header.Get("Anthropic-Ratelimit-Unified-Status"); got == "allowed" {
+		t.Fatalf("rejected overage response was rewritten to %q", got)
 	}
 }
 

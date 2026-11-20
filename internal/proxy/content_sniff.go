@@ -13,6 +13,18 @@ import (
 // Codex turn as an opaque body: token usage read it as JSON and found
 // nothing, the capacity and stream-failure peek (codexEventStream) skipped
 // it, and the session commit waited for EOF instead of the terminal event.
+//
+// Fork (PATCHES section 27, fix-ups 389-1 and 389-2): this file is upstream
+// #450 (5d997cf, unchanged at c9303d3) as written, installed where upstream
+// installs it, but for Codex only: proxyHandler wraps s.transport() in
+// sniffContentTypeTransport when the request is Codex, under the
+// usage-limit, replay, capacity and fallback layers, and the egress replays
+// go through it too (codexEgressTransports). Upstream wraps every
+// provider's transport; that is the owner's call, and Codex is the provider
+// whose streams arrive unlabelled. Fix-up 389-1 labelled only at the capacity
+// layer (now removed), which left the usage-limit layer below it reading
+// an opaque body: a quota or model-compatibility move it made committed at
+// EOF, so a stream that failed after output pinned the session anyway.
 
 type sniffedBodyKind int
 

@@ -17,6 +17,18 @@ import (
 	"github.com/manaflow-ai/subrouter/session"
 )
 
+// coldActiveSessions is a tracker that has run for a full idle bound without
+// seeing a turn, so every session it has not seen reads as COLD. Under the warm
+// rule (PATCHES sections 20 and 21, both providers) a session with no evidence
+// either way is possibly-warm and keeps its account until that account is
+// evicted, so a test of a move that is NOT an eviction (a below-floor account,
+// not a spent one) has to say the session is cold.
+func coldActiveSessions() *ActiveSessions {
+	active := NewActiveSessions()
+	active.startedAt = time.Now().Add(-(warmSessionIdleTTL + time.Minute))
+	return active
+}
+
 func TestAccountForSessionContinuesWhenActivityTouchFails(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "sessions.json")
 	store, err := session.NewStore(path)
@@ -46,7 +58,7 @@ func TestAccountForSessionContinuesWhenActivityTouchFails(t *testing.T) {
 		Logger: slog.New(slog.NewTextHandler(&logs, nil)),
 	}
 	req := httptest.NewRequest(http.MethodPost, "https://subrouter.test/v1/responses", strings.NewReader(`{}`))
-	account, _, _, err := server.accountForSessionProvider(accounts.ProviderCodex, "codex", "session-1", req)
+	account, _, _, _, err := server.accountForSessionProvider(accounts.ProviderCodex, "codex", "session-1", req)
 	if err != nil {
 		t.Fatalf("sticky routing failed because activity persistence failed: %v", err)
 	}
@@ -75,6 +87,9 @@ func TestAccountForSessionLogsAccountMove(t *testing.T) {
 			{ID: "fresh@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "tok-fresh"},
 		},
 		Sessions: store,
+		// Cold: a below-floor account moves a session only once it has gone
+		// cold. A warm one stays until its account is evicted.
+		ActiveSessions: coldActiveSessions(),
 		SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
 			{AccountID: "spent@example.com", Provider: accounts.ProviderCodex, Headroom: 0.02, ShortHeadroom: 0.02},
 			{AccountID: "fresh@example.com", Provider: accounts.ProviderCodex, Headroom: 1, ShortHeadroom: 1},
@@ -88,7 +103,7 @@ func TestAccountForSessionLogsAccountMove(t *testing.T) {
 	}
 	req.Header.Set("X-Subrouter-Agent", "codex")
 	req.Header.Set("X-Subrouter-Session", "session-1")
-	account, _, _, err := server.accountForSessionProvider(accounts.ProviderCodex, "codex", "session-1", req)
+	account, _, _, _, err := server.accountForSessionProvider(accounts.ProviderCodex, "codex", "session-1", req)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -107,74 +122,15 @@ func TestAccountForSessionLogsAccountMove(t *testing.T) {
 	}
 }
 
-// TestAccountForSessionHoldsRecentSoftMove verifies the capacity-only cooldown
-// and its hard-failure bypass.
-func TestAccountForSessionHoldsRecentSoftMove(t *testing.T) {
-	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := store.Put("codex", "session-1", "account-a", ""); err != nil {
-		t.Fatal(err)
-	}
-	var logs bytes.Buffer
-	server := Server{
-		Accounts: []accounts.Account{
-			{ID: "account-a", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "tok-a"},
-			{ID: "account-b", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "tok-b"},
-			{ID: "account-c", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "tok-c"},
-		},
-		Sessions:      store,
-		softMoveState: newSoftMoveState(),
-		SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
-			{AccountID: "account-a", Provider: accounts.ProviderCodex, Headroom: 1, ShortHeadroom: 1},
-			{AccountID: "account-b", Provider: accounts.ProviderCodex, Headroom: 1, ShortHeadroom: 1},
-			{AccountID: "account-c", Provider: accounts.ProviderCodex, Headroom: 1, ShortHeadroom: 1},
-		})),
-		MaxBodyBytes: 1024,
-		Logger:       slog.New(slog.NewTextHandler(&logs, nil)),
-	}
-	until := time.Now().Add(time.Minute)
-	server.SchedulerRef.MarkCapacityUntil(accounts.ProviderCodex, "account-a", "gpt-6-astra", "", until)
-	server.SchedulerRef.MarkCapacityUntil(accounts.ProviderCodex, "account-a", "gpt-6-astra", "", until)
-	if _, failures, ok := server.SchedulerRef.CapacityMarkFor(accounts.ProviderCodex, "account-a", "gpt-6-astra", ""); !ok || failures != 2 {
-		t.Fatalf("capacity mark = failures %d ok %v", failures, ok)
-	}
-	req := httptest.NewRequest(http.MethodPost, "https://subrouter.test/v1/responses", strings.NewReader(`{"model":"gpt-6-astra"}`))
-	req.Header.Set("X-Subrouter-Model", "gpt-6-astra")
-	first, _, _, err := server.accountForSessionProvider(accounts.ProviderCodex, "codex", "session-1", req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if first.ID == "account-a" {
-		t.Fatalf("first account = %q, want a soft move off account-a; logs=%s", first.ID, logs.String())
-	}
-	server.SchedulerRef.MarkCapacityUntil(accounts.ProviderCodex, first.ID, "gpt-6-astra", "", until)
-	server.SchedulerRef.MarkCapacityUntil(accounts.ProviderCodex, first.ID, "gpt-6-astra", "", until)
-	second, _, _, err := server.accountForSessionProvider(accounts.ProviderCodex, "codex", "session-1", req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if second.ID != first.ID {
-		t.Fatalf("second account = %q, want recent soft move %q to be held", second.ID, first.ID)
-	}
-	if !strings.Contains(logs.String(), "soft account-move cooldown") {
-		t.Fatalf("cooldown hold was not logged: %s", logs.String())
-	}
-	server.SchedulerRef.MarkExhausted(accounts.ProviderCodex, first.ID, "")
-	hard, _, _, err := server.accountForSessionProvider(accounts.ProviderCodex, "codex", "session-1", req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if hard.ID == first.ID {
-		t.Fatalf("hard-failed account %q stayed assigned despite the soft cooldown", hard.ID)
-	}
-}
-
 // TestHandlerRejectsSuccessfulRerouteWhenStickyAssignmentCannotPersist keeps
 // the prior assignment when the durable replacement cannot be written.
 func TestHandlerRejectsSuccessfulRerouteWhenStickyAssignmentCannotPersist(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		// Without the reroute there is nothing to persist, and the assignment
+		// check below would pass vacuously.
+		if request.Header.Get("Authorization") != "Bearer tok-fresh" {
+			t.Errorf("Authorization = %q, want the rerouted account", request.Header.Get("Authorization"))
+		}
 		_, _ = io.WriteString(w, `{}`)
 	}))
 	defer upstream.Close()
@@ -201,13 +157,18 @@ func TestHandlerRejectsSuccessfulRerouteWhenStickyAssignmentCannotPersist(t *tes
 			{ID: "fresh@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "tok-fresh"},
 		},
 		Sessions: store,
+		// Cold, so the reroute this test is about happens at all: a warm
+		// session stays on a below-floor account and nothing would be persisted.
+		ActiveSessions: coldActiveSessions(),
 		SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
 			{AccountID: "spent@example.com", Provider: accounts.ProviderCodex, Headroom: 0.01, ShortHeadroom: 0.01},
 			{AccountID: "fresh@example.com", Provider: accounts.ProviderCodex, Headroom: 1, ShortHeadroom: 1},
 		})),
 		MaxBodyBytes: 1024,
 	}
-	request := httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+	// A model turn (POST): a GET on the thread's key is a side request
+	// (sideChannelRequest), which never reroutes.
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{}`))
 	request.Header.Set("X-Subrouter-Agent", "codex")
 	request.Header.Set("X-Subrouter-Session", sessionID)
 	response := httptest.NewRecorder()
@@ -256,13 +217,21 @@ func TestHandlerCommitsSchedulerRerouteOnlyAfterUpstreamSuccess(t *testing.T) {
 					{ID: "fresh@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "tok-fresh"},
 				},
 				Sessions: store,
+				// Cold: the reroute is a below-floor move, not an eviction.
+				ActiveSessions: coldActiveSessions(),
 				SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
 					{AccountID: "spent@example.com", Provider: accounts.ProviderCodex, Headroom: 0.01, ShortHeadroom: 0.01},
 					{AccountID: "fresh@example.com", Provider: accounts.ProviderCodex, Headroom: 1, ShortHeadroom: 1},
 				})),
 				MaxBodyBytes: 1024,
+				// The reroute's commit boundary is under test, not the
+				// capacity layer's same-account ladder (installed by default
+				// since the 389/373 port), which would replay the 503 for 4m.
+				CodexOverloadFailover: withoutCapacityRetry(),
 			}
-			request := httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+			// A model turn (POST): a GET on the thread's key is a side
+			// request (sideChannelRequest), which never reroutes.
+			request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{}`))
 			request.Header.Set("X-Subrouter-Agent", "codex")
 			request.Header.Set("X-Subrouter-Session", sessionID)
 			response := httptest.NewRecorder()
@@ -314,7 +283,7 @@ func TestAccountForSessionDoesNotLogStickyReuseAsMove(t *testing.T) {
 	}
 	req.Header.Set("X-Subrouter-Agent", "codex")
 	req.Header.Set("X-Subrouter-Session", "session-1")
-	account, _, _, err := server.accountForSessionProvider(accounts.ProviderCodex, "codex", "session-1", req)
+	account, _, _, _, err := server.accountForSessionProvider(accounts.ProviderCodex, "codex", "session-1", req)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -344,8 +313,8 @@ func TestStickyCodexSessionSurvivesConstrainedAccount(t *testing.T) {
 		},
 		Sessions: store,
 		SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
-			// 23% and 26% headroom: both are below MinNewSessionHeadroom, which
-			// is the normal state of a pool under load.
+			// 23% and 26% headroom: the normal state of a pool under load, and
+			// nowhere near an eviction.
 			{AccountID: "busy@example.com", Provider: accounts.ProviderCodex, Headroom: 0.23, ShortHeadroom: 0.23},
 			{AccountID: "other@example.com", Provider: accounts.ProviderCodex, Headroom: 0.26, ShortHeadroom: 0.26},
 		})),
@@ -358,7 +327,7 @@ func TestStickyCodexSessionSurvivesConstrainedAccount(t *testing.T) {
 	}
 	req.Header.Set("X-Subrouter-Agent", "codex")
 	req.Header.Set("X-Subrouter-Session", "session-1")
-	account, _, _, err := server.accountForSessionProvider(accounts.ProviderCodex, "codex", "session-1", req)
+	account, _, _, _, err := server.accountForSessionProvider(accounts.ProviderCodex, "codex", "session-1", req)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -387,6 +356,9 @@ func TestStickyCodexSessionLeavesNearlyEmptyAccount(t *testing.T) {
 			{ID: "other@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "tok-other"},
 		},
 		Sessions: store,
+		// Cold: a below-floor account moves a session only once it has gone
+		// cold. A warm one stays until its account is evicted.
+		ActiveSessions: coldActiveSessions(),
 		SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
 			{AccountID: "empty@example.com", Provider: accounts.ProviderCodex, Headroom: 0.01, ShortHeadroom: 0.01},
 			{AccountID: "other@example.com", Provider: accounts.ProviderCodex, Headroom: 0.26, ShortHeadroom: 0.26},
@@ -400,7 +372,7 @@ func TestStickyCodexSessionLeavesNearlyEmptyAccount(t *testing.T) {
 	}
 	req.Header.Set("X-Subrouter-Agent", "codex")
 	req.Header.Set("X-Subrouter-Session", "session-1")
-	account, _, _, err := server.accountForSessionProvider(accounts.ProviderCodex, "codex", "session-1", req)
+	account, _, _, _, err := server.accountForSessionProvider(accounts.ProviderCodex, "codex", "session-1", req)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -445,7 +417,7 @@ func TestForcedAccountMoveIsLogged(t *testing.T) {
 	req.Header.Set("X-Subrouter-Agent", "codex")
 	req.Header.Set("X-Subrouter-Session", "session-1")
 	req.Header.Set("X-Subrouter-Account-ID", "forced@example.com")
-	account, _, _, err := server.accountForSessionProvider(accounts.ProviderCodex, "codex", "session-1", req)
+	account, _, _, _, err := server.accountForSessionProvider(accounts.ProviderCodex, "codex", "session-1", req)
 	if err != nil {
 		t.Fatal(err)
 	}

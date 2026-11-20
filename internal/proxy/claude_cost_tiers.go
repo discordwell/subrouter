@@ -14,33 +14,29 @@ import (
 	"github.com/manaflow-ai/subrouter/selectacct"
 )
 
-// Claude cost order. Claude traffic spends the cheapest money first:
+// Claude cost tiers, for status output (upstream #569/#570, adapted):
 //
 //  1. plan: Claude Max/Pro subscription quota (OAuth and setup-token
 //     profiles). Already paid for.
 //  2. api-credits: Anthropic API keys. Each is expected to belong to a
 //     Console organization funded by free monthly credits, so it costs no
 //     money until its balance is spent.
-//  3. extra-usage: a subscription's paid overage, bounded by the account's
-//     own monthly spend limit and never used on an unknown balance. Used
-//     only when every plan is unusable for the request (5h, weekly, or model
-//     pool exhausted) and no untried, unheld API key can take it.
-//  4. not in subrouter: with tiers 1-3 spent the pool answers its own 503
-//     with Retry-After, which `cr claude` turns into its Bedrock route.
 //
-// The order is enforced in three places: selectacct's selection tiers rank
-// plan before API keys before exhausted plans; the placement and failover
-// paths reach the extra-usage fallback only from an exhausted plan pick and
-// only when no API key is available; and a spent credit balance holds its key
-// out of routing (MarkCreditExhaustedUntil) so the pool can reach tier 3.
+// With both spent the pool answers its own 503. Upstream's third tier, a
+// subscription's paid extra usage, is never selected or retried onto here
+// (PATCHES §23: nothing spends money), and its credit promotion (an API key
+// whose grant would lapse unspent ranked ahead of plans) is not taken
+// either: routing ranks on the fork's comparator (§10). What this file keeps
+// is the metering and display of an API key's credit, the hold that takes a
+// key with a spent balance out of routing until its re-probe or period end,
+// and the revoked-credential overlay (#576, #625).
 const (
 	claudeCostTierPlan       = "plan"
 	claudeCostTierAPICredits = "api-credits"
-	claudeCostTierExtraUsage = "extra-usage"
 )
 
 // ClaudeCostOrder is the human form of the order above, for status output.
-const ClaudeCostOrder = "plan > API credits > extra usage > 503 (client falls back to Bedrock)"
+const ClaudeCostOrder = "plan > API credits > 503 (paid extra usage is never used)"
 
 // claudeCreditExhaustionHold is how long a key whose credit balance is spent
 // stays out of routing before one request probes it again. Anthropic does not
@@ -138,35 +134,15 @@ func (s Server) markClaudeCreditExhausted(accountID string) {
 		until = s.claudeCosts.markExhausted(accountID)
 	}
 	if s.SchedulerRef != nil {
-		s.SchedulerRef.MarkCreditExhaustedUntil(schedulerAccountProvider(accounts.ProviderClaude), accountID, until)
+		// Upstream's MarkCreditExhaustedUntil (#569) is not in this fork's
+		// selectacct; the account-wide unavailable mark holds the key out the
+		// same way and reads back through ExhaustedUntilFor.
+		s.SchedulerRef.MarkAccountUnavailableUntil(schedulerAccountProvider(accounts.ProviderClaude), accountID, until)
 	}
 	if s.Logger != nil {
 		s.Logger.Warn("claude API key credit balance spent; holding it out until re-probe or period end",
 			"account", accountID, "until", until.UTC().Format(time.RFC3339))
 	}
-}
-
-// claudeAPIKeyCandidateAvailable reports whether any Claude API key among
-// candidates can still take a request: not exhausted and not held out by a
-// live controller mark. Callers pass only untried candidates.
-func (s Server) claudeAPIKeyCandidateAvailable(scheduler selectacct.Scheduler, candidates []accounts.Account, poolModel string) bool {
-	now := time.Now()
-	for _, candidate := range candidates {
-		if accountProviderOrCodex(candidate) != accounts.ProviderClaude || candidate.AuthMode != accounts.AuthModeAPIKey {
-			continue
-		}
-		provider := schedulerAccountProvider(candidate.Provider)
-		if scheduler.Exhausted(provider, candidate.ID) {
-			continue
-		}
-		if s.SchedulerRef != nil {
-			if _, blocked := s.SchedulerRef.ExplicitBlockedUntilFor(provider, candidate.ID, poolModel, now); blocked {
-				continue
-			}
-		}
-		return true
-	}
-	return false
 }
 
 // withClaudeCostTiers labels every Claude status row with the cost tier the
@@ -175,7 +151,6 @@ func (s Server) claudeAPIKeyCandidateAvailable(scheduler selectacct.Scheduler, c
 func (s Server) withClaudeCostTiers(statuses []AccountUsageStatus) []AccountUsageStatus {
 	out := append([]AccountUsageStatus(nil), statuses...)
 	s.ensureClaudeCreditKeys(s.accountListContext(context.Background()))
-	scheduler := s.scheduler()
 	now := time.Now()
 	var views map[string]claudeCreditView
 	costFile := newClaudeCostStateFile()
@@ -193,14 +168,13 @@ func (s Server) withClaudeCostTiers(statuses []AccountUsageStatus) []AccountUsag
 			out[i].CostTierRank = 2
 			if view, ok := views[out[i].ID]; ok {
 				out[i].Credit = claudeCreditStatusFromView(view)
-				if view.Promoted {
-					out[i].CostTierRank = 0
-				}
 				if !view.HeldUntil.IsZero() {
 					out[i].CreditsExhaustedUntil = view.HeldUntil.UTC()
 				}
-			} else if until, held := s.SchedulerRef.CreditExhaustedUntil(accounts.ProviderClaude, out[i].ID, now); held {
-				out[i].CreditsExhaustedUntil = until.UTC()
+			} else if s.SchedulerRef != nil {
+				if until, held := s.SchedulerRef.ExhaustedUntilFor(schedulerAccountProvider(accounts.ProviderClaude), out[i].ID, ""); held && until.After(now) {
+					out[i].CreditsExhaustedUntil = until.UTC()
+				}
 			}
 		case accounts.AuthModeOAuth:
 			out[i].CostTier = claudeCostTierPlan
@@ -208,15 +182,6 @@ func (s Server) withClaudeCostTiers(statuses []AccountUsageStatus) []AccountUsag
 			if since, revoked := claudeRevokedSince(costFile, out[i].ID, s.claudeCredentialIdentity(out[i].ID)); revoked {
 				out[i].RevokedSince = since.UTC()
 				out[i].RevokedKind = costFile.Revoked[out[i].ID].kind()
-				continue
-			}
-			if s.SchedulerRef == nil {
-				continue
-			}
-			score := scheduler.ScoreFor(accounts.ProviderClaude, out[i].ID)
-			if scheduler.Exhausted(accounts.ProviderClaude, out[i].ID) && claudeExtraUsageEligible(score) {
-				out[i].CostTier = claudeCostTierExtraUsage
-				out[i].CostTierRank = 3
 			}
 		}
 	}
@@ -233,7 +198,10 @@ type ClaudeCreditStatus struct {
 	ExpiresAt    time.Time `json:"expires_at"`
 	Defaulted    bool      `json:"defaulted,omitempty"`
 	Pace         string    `json:"pace"`
-	Promoted     bool      `json:"promoted,omitempty"`
+	// Promoted is upstream's credit promotion (#570). This fork's routing
+	// never promotes a key (see the tier comment above), so it never sets
+	// it; the field stays for the wire.
+	Promoted bool `json:"promoted,omitempty"`
 }
 
 func claudeCreditStatusFromView(view claudeCreditView) *ClaudeCreditStatus {
@@ -247,7 +215,6 @@ func claudeCreditStatusFromView(view claudeCreditView) *ClaudeCreditStatus {
 		ExpiresAt:    view.ExpiresAt.UTC(),
 		Defaulted:    view.Defaulted,
 		Pace:         view.Pace,
-		Promoted:     view.Promoted,
 	}
 }
 
@@ -319,16 +286,16 @@ func (s Server) withClaudeCostOverlay(base selectacct.Scheduler) selectacct.Sche
 	scores := make([]selectacct.Score, 0, len(file.Keys)+len(file.Revoked))
 	for id, state := range file.Keys {
 		view := evaluateClaudeCredit(id, *state, now)
+		if view.HeldUntil.IsZero() {
+			// Upstream also overlaid a funded key's credit expiry and
+			// promotion here (#570); routing does not promote (see above).
+			continue
+		}
 		score := base.ScoreFor(accounts.ProviderClaude, id)
 		score.AccountID, score.Provider = id, accounts.ProviderClaude
 		score.MissingModelSupport = selectacct.ModelSupportUnknown
-		score.CreditExpiresAt = view.ExpiresAt
-		score.CreditPromoted = view.Promoted
-		if !view.HeldUntil.IsZero() {
-			score.Headroom, score.ShortHeadroom, score.ModelScores = 0, 0, nil
-			score.ExhaustedResetAt, score.ExhaustedResetUnknown = view.HeldUntil, false
-			score.CreditPromoted = false
-		}
+		score.Headroom, score.ShortHeadroom, score.ModelScores = 0, 0, nil
+		score.ExhaustedResetAt, score.ExhaustedResetUnknown = view.HeldUntil, false
 		scores = append(scores, score)
 	}
 	for id := range file.Revoked {
@@ -342,10 +309,15 @@ func (s Server) withClaudeCostOverlay(base selectacct.Scheduler) selectacct.Sche
 		// credential and drops this overlay. The far reset keeps failover
 		// from treating it as a last-resort candidate.
 		score.ExhaustedResetAt, score.ExhaustedResetUnknown = now.Add(365*24*time.Hour), false
-		score.ClaudeExtraUsageEnabled = false
 		scores = append(scores, score)
 	}
-	return base.WithScores(scores)
+	// One copy-then-modify WithScore per overlaid account: the fork's
+	// selectacct has no upstream WithScores, and WithScore keeps every other
+	// field of the view (reserves, live counts, machine view).
+	for _, score := range scores {
+		base = base.WithScore(score)
+	}
+	return base
 }
 
 // claudeCostStore returns the server's Claude cost store, falling back to
@@ -451,7 +423,7 @@ func (s Server) handleClaudeKeyCredit(w http.ResponseWriter, r *http.Request) {
 		}
 		if s.SchedulerRef != nil {
 			// An operator update ends any spent-balance hold.
-			s.SchedulerRef.MarkCreditExhaustedUntil(accounts.ProviderClaude, id, time.Now())
+			s.SchedulerRef.MarkAccountUnavailableUntil(schedulerAccountProvider(accounts.ProviderClaude), id, time.Now())
 		}
 		writeJSON(w, claudeCreditStatusFromView(s.claudeCosts.views(time.Now())[id]))
 	default:

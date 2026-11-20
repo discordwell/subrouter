@@ -7,14 +7,20 @@ import (
 )
 
 // parseFlagsAnywhere parses flags that appear before or after positional
-// arguments and returns the positionals in order. The standard flag package
-// stops at the first positional, which made `sr reset <email> --dry-run`
-// silently redeem a real credit. Everything after a literal "--" stays
-// positional.
+// arguments and returns the positionals in order. Everything after a literal
+// "--" stays positional.
+//
+// Go's flag package stops at the first positional argument and hands back the
+// rest untouched, so a flag typed after a name was not an error -- it was
+// silently a positional nobody read. On `sr reset` that turned the spelling
+// `sr reset <email> --dry-run` (and `<email> --list`) into a real redemption
+// of a one-time ChatGPT Pro reset credit: dryRun and list stayed false and
+// the request went out without dry_run. A credit does not come back, so the
+// preview flag has to work wherever the user types it.
 //
 // Do not use this for commands that pass trailing arguments through to a
-// child process (sr claude, sr codex, sr kimi/qwen launchers, supervise, ...):
-// those must leave the child's flags alone.
+// child process (sr claude, sr codex, the kimi/qwen launchers, supervise,
+// ...): those must leave the child's flags alone.
 func parseFlagsAnywhere(flags *flag.FlagSet, args []string) ([]string, error) {
 	var positional []string
 	for {
@@ -36,7 +42,9 @@ func parseFlagsAnywhere(flags *flag.FlagSet, args []string) ([]string, error) {
 
 // parseFlagsNoPositionals parses flags for a command that takes none, and
 // rejects stray positionals instead of silently ignoring every flag after
-// them.
+// them. `sr setup junk --plan` used to drop --plan -- the flag that promises
+// to change nothing -- and go on to write cloud.json and mint the local proxy
+// token before the review screen was ever shown.
 func parseFlagsNoPositionals(flags *flag.FlagSet, args []string) error {
 	positional, err := parseFlagsAnywhere(flags, args)
 	if err != nil {

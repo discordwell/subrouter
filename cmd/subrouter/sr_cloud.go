@@ -34,8 +34,25 @@ func (r srRunner) cloudLogin(ctx context.Context, args []string) error {
 	hostedURL := flags.String("hosted-url", "", "override the hosted Subrouter origin")
 	teamSelector := flags.String("team", "", "team ID or name to select after login")
 	noBrowser := flags.Bool("no-browser", false, "print the approval URL without opening it")
-	if err := parseFlagsNoPositionals(flags, args); err != nil {
+	// Flags parse anywhere (upstream's parseFlagsNoPositionals, #380), but the
+	// positionals are inspected here rather than refused there, so the
+	// provider hint below is still reached.
+	positional, err := parseFlagsAnywhere(flags, args)
+	if err != nil {
 		return err
+	}
+	// `sr login` takes no account, and it used to ignore one silently -- so
+	// `sr login claude main` started the cmux.com sign-in, which rewrites
+	// cloud.json, when the operator wanted a Claude re-auth. Refuse before
+	// anything is read or opened.
+	if len(positional) > 0 {
+		program := r.programOrSubrouter()
+		if command, isProvider := accountCommandFor(positional[0]); isProvider {
+			return fmt.Errorf("`%s login` signs this machine in to cmux.com and takes no account; "+
+				"to sign in an account use `%s %s`",
+				program, program, strings.TrimSpace(strings.Join(append([]string{command}, positional[1:]...), " ")))
+		}
+		return fmt.Errorf("unexpected arguments: %s", strings.Join(positional, " "))
 	}
 
 	path, err := broker.DefaultConfigPath()
@@ -328,9 +345,42 @@ func cloudModeConfig() (broker.Config, error) {
 	if err != nil {
 		return broker.Config{}, err
 	}
+	// Locked machines resolve Local whatever cloud.json says. This matters more
+	// than it looks: EffectiveCredentialSource returns Legacy for an empty
+	// source that is not Ready(), and Legacy is the branch that routes commands
+	// at a remote. Without this, a stale or empty cloud.json would send work
+	// down paths whose commands are hidden -- a broken machine rather than a
+	// local one.
+	//
+	// LoadConfigRaw, not LoadConfig: a cloud.json left saying "hosted" fails
+	// validation ("requires a valid tenant key"), and returning that error would
+	// hand a locked machine a hard failure on every command over a setting it is
+	// no longer allowed to act on. Raw parses without validating and preserves
+	// LocalProxyToken, which is the same reason 5 reaches for it -- and no write
+	// happens here, so nothing can remint the token.
+	//
+	// Gated here, in the single loader every consumer already calls, rather than
+	// in broker: the broker package has no business knowing a key file exists.
+	if !remoteUnlocked() {
+		config, err := broker.LoadConfigRaw(path)
+		if err != nil {
+			return config, err
+		}
+		config.CredentialSource = broker.CredentialSourceLocal
+		return config, nil
+	}
 	return broker.LoadConfig(path)
 }
 
+// loadCloudConfigForLogin loads the cloud config for the commands that are
+// allowed to replace an unusable one. Recovery must never rotate the local
+// proxy secret behind the daemon's clients: a config that parses still holds
+// the token the daemon is enforcing, even when Validate rejects it (every
+// tightening of Validate turns yesterday's valid config into "corrupt"), so
+// that token is carried into the recovered config. Only a config that does not
+// parse at all has nothing to keep — its original bytes are backed up first,
+// because they may hold the only copy of the secret every client config on the
+// machine still references.
 func loadCloudConfigForLogin(path string) (broker.Config, bool, error) {
 	config, err := broker.LoadConfig(path)
 	if err == nil {
@@ -343,10 +393,84 @@ func loadCloudConfigForLogin(path string) (broker.Config, bool, error) {
 	if !info.Mode().IsRegular() {
 		return broker.Config{}, false, err
 	}
-	return broker.Config{
+	recovered := broker.Config{
 		Version: 1,
 		BaseURL: broker.DefaultBaseURL,
-	}, true, nil
+	}
+	raw, rawErr := broker.LoadConfigRaw(path)
+	if rawErr == nil {
+		recovered.LocalProxyToken = raw.LocalProxyToken
+		// The recorded credential source survives recovery only when it is one
+		// of the known values and the recovered config remains valid with it.
+		// An unknown value must not be carried (it is exactly what Validate
+		// rejected), and "hosted" alone fails validation without its tenant
+		// key, so it is dropped rather than wedging every later SaveConfig.
+		switch raw.CredentialSource {
+		case broker.CredentialSourceTeam, broker.CredentialSourceLocal,
+			broker.CredentialSourceLegacy, broker.CredentialSourceHosted:
+			candidate := recovered
+			candidate.CredentialSource = raw.CredentialSource
+			if candidate.Validate() == nil {
+				recovered = candidate
+			}
+		}
+		// The proxy secret is carried, but the login/team fields are not: a
+		// command that saves this recovery overwrites the only copy of them.
+		// Preserve the original bytes so a session is recoverable by hand.
+		if backupPath, ok := backUpRecoveredConfig(path); ok {
+			fmt.Fprintf(
+				os.Stderr,
+				"warning: the cmux.com config %s no longer passes validation; the local proxy\n"+
+					"secret was carried forward and the original file was copied to %s.\n",
+				path,
+				backupPath,
+			)
+		}
+		return recovered, true, nil
+	}
+	backupPath, backedUp := backUpRecoveredConfig(path)
+	saved := "Its original bytes could NOT be backed up — if this file held the local\nproxy secret, note it now before any command rewrites the file."
+	if backedUp {
+		saved = fmt.Sprintf("Its original bytes were saved to %s.", backupPath)
+	}
+	fmt.Fprintf(
+		os.Stderr,
+		"WARNING: the cmux.com config %s does not parse.\n%s\n"+
+			"Commands that rewrite this file will mint a NEW local proxy secret and\n"+
+			"re-point the Codex and Claude Code client configs on this machine at it.\n",
+		path,
+		saved,
+	)
+	return recovered, true, nil
+}
+
+// backUpRecoveredConfig copies the current bytes of path to path+".corrupt"
+// before a recovery flow overwrites them, returning the backup path and
+// whether the copy actually landed. Failures are reported on stderr but never
+// block recovery: the backup is evidence preservation, not a gate.
+func backUpRecoveredConfig(path string) (string, bool) {
+	backupPath := path + ".corrupt"
+	body, readErr := os.ReadFile(path)
+	if readErr != nil {
+		fmt.Fprintf(
+			os.Stderr,
+			"WARNING: could not read %s to back it up before recovery: %v\n",
+			path,
+			readErr,
+		)
+		return backupPath, false
+	}
+	if writeErr := os.WriteFile(backupPath, body, 0o600); writeErr != nil {
+		fmt.Fprintf(
+			os.Stderr,
+			"WARNING: could not back up %s to %s: %v\n",
+			path,
+			backupPath,
+			writeErr,
+		)
+		return backupPath, false
+	}
+	return backupPath, true
 }
 
 func cloudServerProxyToken(config broker.Config) string {
@@ -365,6 +489,33 @@ func cloudClientProxyToken(config broker.Config, targetBaseURL string) string {
 		return ""
 	}
 	return strings.TrimSpace(config.LocalProxyToken)
+}
+
+// resolveSetupCredentialSource picks the storage a setup run will use. An
+// explicit --storage always wins; an already-configured machine keeps whatever
+// it recorded; and a machine that has never been set up keeps its credentials on
+// itself. Defaulting a first run to a remote vault would upload OAuth refresh
+// tokens before the user has approved anything, and no later command can call
+// those back, so handing them over has to be asked for by name with
+// --storage hosted or 'sr login'.
+func resolveSetupCredentialSource(config broker.Config, storage string) (broker.CredentialSource, error) {
+	if strings.TrimSpace(storage) != "" {
+		source, err := parseCredentialSource(storage, false)
+		if err != nil {
+			return source, err
+		}
+		// `setup` stays visible on a locked machine, so --storage is the one
+		// flag that could still name a destination off this machine. Refuse it
+		// with the parser's own vocabulary rather than mentioning a gate.
+		if !remoteUnlocked() && source != broker.CredentialSourceLocal {
+			return "", fmt.Errorf("unsupported credential storage %q", strings.TrimSpace(storage))
+		}
+		return source, nil
+	}
+	if config.CredentialSource == "" && !config.Ready() {
+		return broker.CredentialSourceLocal, nil
+	}
+	return config.EffectiveCredentialSource(), nil
 }
 
 func (r srRunner) cloudSetup(ctx context.Context, args []string) error {
@@ -392,12 +543,13 @@ func (r srRunner) cloudSetup(ctx context.Context, args []string) error {
 		}
 	}
 	sort.Strings(forwarded)
-	// `--plan` promises to change nothing, so it must not fall through to the
-	// login and storage writes below.
-	if *planOnly {
-		return runSetup(ctx, r.store, forwarded, r.out)
-	}
 
+	// Reading the config before the --plan return is safe because
+	// loadCloudConfigForLogin never touches cloud.json itself — on a broken
+	// config it writes only the cloud.json.corrupt evidence copy, which
+	// preserves bytes rather than changing state. Resolving the credential
+	// source here rather than after it is what lets --plan preview --storage,
+	// which it used to parse and then discard.
 	path, err := broker.DefaultConfigPath()
 	if err != nil {
 		return err
@@ -406,22 +558,21 @@ func (r srRunner) cloudSetup(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	if recovered {
+	if recovered && !*planOnly {
 		fmt.Fprintln(
 			r.errOut,
 			"warning: replacing an unreadable cmux.com config during setup",
 		)
 	}
-	source := config.EffectiveCredentialSource()
-	if strings.TrimSpace(*storage) != "" {
-		source, err = parseCredentialSource(*storage, false)
-		if err != nil {
-			return err
-		}
-	} else if *noLogin && config.CredentialSource == "" && !config.Ready() {
-		source = broker.CredentialSourceLocal
-	} else if config.CredentialSource == "" && !config.Ready() {
-		source = broker.CredentialSourceHosted
+	source, err := resolveSetupCredentialSource(config, *storage)
+	if err != nil {
+		return err
+	}
+
+	// `--plan` promises to change nothing, so it renders the resolved plan and
+	// stops short of the login and config writes below.
+	if *planOnly {
+		return runSetup(ctx, r.store, forwarded, source, r.out)
 	}
 
 	if source == broker.CredentialSourceHosted && !*noLogin && !config.HostedReady() {
@@ -441,11 +592,18 @@ func (r srRunner) cloudSetup(ctx context.Context, args []string) error {
 	if err := broker.SaveConfig(path, config); err != nil {
 		return err
 	}
+	// Setup is the key ceremony: SaveConfig never mints a local proxy secret,
+	// so guarantee one here, before runSetup starts the daemon and writes the
+	// client configs that must carry it. Minting only when absent keeps a
+	// re-run of setup from rotating a secret the daemon already enforces.
+	if _, err := broker.EnsureLocalProxyToken(path); err != nil {
+		return err
+	}
 	setupArgs := append([]string{}, forwarded...)
 	if *noInstall {
 		setupArgs = append(setupArgs, "--no-install")
 	}
-	return runSetup(ctx, r.store, setupArgs, r.out)
+	return runSetup(ctx, r.store, setupArgs, source, r.out)
 }
 
 func (r srRunner) cloudLogout(ctx context.Context) error {
@@ -522,6 +680,18 @@ func (r srRunner) cloudLogout(ctx context.Context) error {
 	config.TenantKey = ""
 	config.TenantCapabilities = nil
 	config.CredentialSource = broker.CredentialSourceLocal
+	// Logout lands the machine on the enforcing local source, so it is a key
+	// ceremony like any other switch into local: a machine that logged in
+	// without ever running setup has no secret yet, and saving local+tokenless
+	// would leave an installed daemon refusing to start until 'sr setup'.
+	// Minting in the same write keeps the switch atomic.
+	if strings.TrimSpace(config.LocalProxyToken) == "" {
+		token, err := broker.NewLocalProxyToken()
+		if err != nil {
+			return err
+		}
+		config.LocalProxyToken = token
+	}
 	if err := broker.SaveConfig(path, config); err != nil {
 		return err
 	}
@@ -730,13 +900,151 @@ func (r srRunner) cloudStorage(args []string) error {
 		}
 	}
 	config.CredentialSource = source
+	// Switching INTO a source the daemon enforces a token for is a key
+	// ceremony: mint one only if the machine has none. This includes the
+	// true-corruption recovery above, which then self-heals end to end — the
+	// new secret is written to the client configs below, the daemon restart
+	// picks it up, and the probe afterwards proves they agree. Minting BEFORE
+	// the save lands the source switch and the secret in one atomic write; a
+	// second write could fail and strand the file source-switched but
+	// tokenless, which the daemon then refuses to serve.
+	if (source == broker.CredentialSourceLocal || source == broker.CredentialSourceTeam) &&
+		strings.TrimSpace(config.LocalProxyToken) == "" {
+		token, err := broker.NewLocalProxyToken()
+		if err != nil {
+			return err
+		}
+		config.LocalProxyToken = token
+	}
 	if err := broker.SaveConfig(path, config); err != nil {
 		return err
 	}
 	if err := r.printCredentialSource(config); err != nil {
 		return err
 	}
-	return restartInstalledDaemon()
+	// Codex needs no rewrite here: its config.toml carries only base URLs, and
+	// `sr codex` injects the current token from cloud.json at every launch.
+	// Claude Code is different — settings.json persists ANTHROPIC_AUTH_TOKEN,
+	// so a switch that changes which secret the daemon enforces would strand it
+	// on a stale token with no fallback (the proxy env overrides its login).
+	// Rewrite it only when it already routes through this machine's daemon;
+	// hijacking a settings.json that routes elsewhere (or does not exist) is
+	// setup's decision, not a storage switch's.
+	if cloudServerProxyToken(config) != "" && claudeSettingsRoutedThroughLocalDaemon() {
+		if _, err := writeClaudeProxyEnvForLocal(); err != nil {
+			return fmt.Errorf(
+				"credential storage switched, but rewriting Claude Code's proxy env failed: %w",
+				err,
+			)
+		}
+	}
+	restarted, err := restartInstalledDaemonReporting()
+	if err != nil {
+		return err
+	}
+	return r.verifyLocalProxyToken(config, restarted)
+}
+
+// verifyLocalProxyToken proves the daemon accepts the secret the client
+// configs were just given, so a mismatch is learned about now instead of at
+// every agent's next request. The probe is a HEAD to the proxy root: 204 means
+// authorized, 401 means rejected. It only runs against a daemon this command
+// just restarted, or an explicitly overridden local base URL — with neither
+// there is no daemon of ours to ask, and the next daemon start re-checks.
+func (r srRunner) verifyLocalProxyToken(config broker.Config, restarted bool) error {
+	token := cloudClientProxyToken(config, localBaseURL())
+	if token == "" {
+		return nil
+	}
+	overridden := strings.TrimSpace(os.Getenv("SUBROUTER_LOCAL_BASE_URL")) != ""
+	if !restarted && !overridden {
+		fmt.Fprintln(
+			r.out,
+			"note: no installed daemon to verify the local proxy secret against; the next daemon start checks it",
+		)
+		return nil
+	}
+	if r.client == nil {
+		return nil
+	}
+	target := codexProxyRootURL(localBaseURL())
+	// A daemon that was just kickstarted needs a moment to listen again;
+	// without a restart there is nothing to wait for.
+	deadline := time.Now()
+	if restarted {
+		deadline = deadline.Add(3 * time.Second)
+	}
+	var response *http.Response
+	for {
+		request, err := http.NewRequest(http.MethodHead, target, nil)
+		if err != nil {
+			return err
+		}
+		request.Header.Set("Authorization", "Bearer "+token)
+		var doErr error
+		response, doErr = r.client.Do(request)
+		if doErr == nil {
+			break
+		}
+		if !time.Now().Before(deadline) {
+			fmt.Fprintf(
+				r.out,
+				"note: could not reach the local daemon at %s to verify the proxy secret (%v); skipped\n",
+				target,
+				doErr,
+			)
+			return nil
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	defer response.Body.Close()
+	switch response.StatusCode {
+	case http.StatusNoContent:
+		fmt.Fprintf(r.out, "Local proxy secret verified against the daemon at %s.\n", target)
+		return nil
+	case http.StatusUnauthorized:
+		// Not returned as an error: the config writes above are complete and
+		// mutually consistent, and a daemon running with
+		// --require-session-leases rejects this probe even when the secret
+		// matches, so a hard failure here would falsely fail healthy machines.
+		// The warning is the point — the user learns now, with the repair
+		// commands in hand, instead of at the next 401ing agent request.
+		program := r.programOrSubrouter()
+		fmt.Fprintf(
+			r.errOut,
+			"WARNING: the daemon at %s rejected the local proxy secret that was just configured (HTTP 401).\n"+
+				"If the daemon requires session leases, this probe is always rejected and this may be a false alarm.\n"+
+				"Otherwise the running daemon is enforcing a DIFFERENT secret than %s holds, and every\n"+
+				"Codex and Claude Code request through it will fail until they agree. To repair, run:\n"+
+				"  %s daemon restart\n"+
+				"and if the warning persists:\n"+
+				"  %s setup\n",
+			target,
+			describeCloudConfigPath(),
+			program,
+			program,
+		)
+		return nil
+	default:
+		fmt.Fprintf(
+			r.out,
+			"note: unexpected status %d verifying the local proxy secret against %s; run '%s doctor' if agents cannot connect\n",
+			response.StatusCode,
+			target,
+			r.programOrSubrouter(),
+		)
+		return nil
+	}
+}
+
+// describeCloudConfigPath names the cloud config for messages without letting
+// a path-resolution error mask the warning it appears in.
+func describeCloudConfigPath() string {
+	path, err := broker.DefaultConfigPath()
+	if err != nil {
+		return "the cmux.com config"
+	}
+	return path
 }
 
 func (r srRunner) printCredentialSource(config broker.Config) error {
@@ -853,7 +1161,11 @@ func usageRowsFromHostedStatuses(statuses []broker.UsageStatus) []srUsageRow {
 			UsageFetchedAt:     status.UsageFetchedAt,
 		})
 	}
-	return usageRowsFromServerUsageStatuses(wire)
+	rows := usageRowsFromServerUsageStatuses(wire)
+	for i := range rows {
+		rows[i].hostedAccount = true
+	}
+	return rows
 }
 
 func (r srRunner) cloudAccount(ctx context.Context, args []string) error {
@@ -1178,6 +1490,10 @@ func (r srRunner) hostedClaudeAdd(
 			return err
 		},
 	}
+	// Hosted onboarding exists to upload: both arms take the ephemeral branch,
+	// which always runs pushAfterAdd and keeps no local profile, so nothing is
+	// left in two places. A setup token is the default (upstream #305, owner
+	// decision 4); --oauth selects the browser login.
 	if options.oauth {
 		return runner.addOAuth(ctx, options.name)
 	}
@@ -1439,7 +1755,7 @@ func (r srRunner) cloudAccountImport(
 		// is kept for rollback, just where the daemon will not refresh it.
 		if upload.kind != "codex" {
 			if upload.kind == "claude" {
-				if err := r.routeClaudeConfigDirThroughHosted(upload.configDir); err != nil {
+				if err := r.routeClaudeConfigDirThroughHosted(upload.configDir, upload.profileOwned); err != nil {
 					return fmt.Errorf("Claude credential uploaded, but local proxy routing failed: %w", err)
 				}
 			}
@@ -1464,7 +1780,10 @@ func (r srRunner) cloudAccountImport(
 	return restartInstalledDaemon()
 }
 
-func (r srRunner) routeClaudeConfigDirThroughHosted(configDir string) error {
+// profileOwned is true for a Subrouter profile directory and false for the
+// user's own ~/.claude (localAccountUploads' "default" upload): only a
+// profile directory may carry tool search (claudeRoutedToolSearch).
+func (r srRunner) routeClaudeConfigDirThroughHosted(configDir string, profileOwned bool) error {
 	configDir = strings.TrimSpace(configDir)
 	if configDir == "" {
 		return errors.New("Claude credential source directory is missing")
@@ -1487,14 +1806,17 @@ func (r srRunner) routeClaudeConfigDirThroughHosted(configDir string) error {
 	if !ok || server.Name != "cmux" || strings.TrimSpace(server.TenantKey) == "" {
 		return fmt.Errorf("hosted cmux remote is not selected")
 	}
-	return writeClaudeProxyEnvForServer(filepath.Clean(configDir), server)
+	return writeClaudeProxyEnvForServer(filepath.Clean(configDir), server, profileOwned)
 }
 
 type localAccountUpload struct {
 	kind      string
 	label     string
 	configDir string
-	body      broker.AccountUpload
+	// profileOwned marks configDir as a Subrouter profile directory rather
+	// than the user's own ~/.claude, which plain `claude` reads.
+	profileOwned bool
+	body         broker.AccountUpload
 }
 
 func selectLocalAccountUpload(
@@ -1609,6 +1931,7 @@ func localAccountUploads(
 		}
 		if upload, ok := claudeAccountUpload(profile.Name, credential); ok {
 			upload.configDir = configDir
+			upload.profileOwned = true
 			out = append(out, upload)
 			seenClaude[claudeCredentialIdentity(credential)] = true
 		}
@@ -1776,15 +2099,31 @@ func restartInstalledDaemon() error {
 	return restartInstalledDaemonWith(controller, err)
 }
 
+// restartInstalledDaemonReporting also reports whether a daemon was actually
+// restarted, so callers can decide whether there is a fresh daemon worth
+// probing for token agreement.
+func restartInstalledDaemonReporting() (bool, error) {
+	controller, err := newServiceController()
+	return restartInstalledDaemonWithReport(controller, err)
+}
+
 func restartInstalledDaemonWith(
 	controller serviceController,
 	controllerErr error,
 ) error {
+	_, err := restartInstalledDaemonWithReport(controller, controllerErr)
+	return err
+}
+
+func restartInstalledDaemonWithReport(
+	controller serviceController,
+	controllerErr error,
+) (bool, error) {
 	if controllerErr != nil || controller == nil || !controller.installed() {
-		return nil
+		return false, nil
 	}
 	if err := controller.restart(); err != nil {
-		return fmt.Errorf("restart local daemon: %w", err)
+		return false, fmt.Errorf("restart local daemon: %w", err)
 	}
-	return nil
+	return true, nil
 }

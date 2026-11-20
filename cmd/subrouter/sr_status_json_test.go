@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"math"
+	"os"
 	"slices"
 	"sort"
 	"strings"
@@ -45,8 +47,13 @@ func TestSRStatusAccountStateMapping(t *testing.T) {
 		{"rec", func() srUsageRow { r := healthy; r.gtoRecommended = true; return r }, srStatusStateRec},
 		{"active", func() srUsageRow { r := healthy; r.active = true; return r }, srStatusStateActive},
 		{"active rec", func() srUsageRow { r := healthy; r.active = true; r.gtoRecommended = true; return r }, srStatusStateActive},
-		{"protected", func() srUsageRow { return srStatusCodexRow(10, 75) }, srStatusStateProtected},
-		{"active protected", func() srUsageRow { r := srStatusCodexRow(10, 75); r.active = true; return r }, srStatusStateActive},
+		// Upstream's protected row is 25% weekly left, under its flat 40% floor.
+		// The fork has no flat floor (PATCHES §23): "protected" is the router's
+		// own no-new-session verdict ("not routable"), here a 5h window under
+		// MinShortHeadroomFloor that is not yet fully consumed (not temp).
+		{"protected", func() srUsageRow { return srStatusCodexRow(97, 20) }, srStatusStateProtected},
+		{"active protected", func() srUsageRow { r := srStatusCodexRow(97, 20); r.active = true; return r }, srStatusStateActive},
+		{"low weekly is not protected", func() srUsageRow { return srStatusCodexRow(10, 75) }, srStatusStateReady},
 		{"temp", func() srUsageRow { return srStatusCodexRow(100, 20) }, srStatusStateTemp},
 		{"cooked", func() srUsageRow { return srStatusCodexRow(0, 100) }, srStatusStateCooked},
 		{"active cooked", func() srUsageRow { r := srStatusCodexRow(0, 100); r.active = true; return r }, srStatusStateCooked},
@@ -148,12 +155,32 @@ func srStatusSortedKeys(object map[string]any) []string {
 	return keys
 }
 
-func TestSRStatusJSONSchemaAgainstFixture(t *testing.T) {
-	before := time.Now().UTC().Truncate(time.Second)
-	text, err := runSRStatusAgainstFixture(t, []string{"status", "--json"})
+// srStatusJSONFromFixture renders the recorded usage-status fixture through
+// the --json writer. Upstream gets there with `sr status --json` on a Legacy
+// machine, which answers with the selected server's JSON alone. In this fork
+// `sr status --json` is this machine's accounts (server null; status in
+// sr.go), written by the same writeSRStatusJSON, so the fixture drives that
+// writer directly, as server rows the way serverStatusJSONFor converts them.
+func srStatusJSONFromFixture(t *testing.T, server string) string {
+	t.Helper()
+	body, err := os.ReadFile(srStatusUsageFixture)
 	if err != nil {
 		t.Fatal(err)
 	}
+	var statuses []remoteServerUsageStatus
+	if err := json.Unmarshal(body, &statuses); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if err := writeSRStatusJSON(&out, usageRowsFromServerUsageStatuses(statuses), server, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	return out.String()
+}
+
+func TestSRStatusJSONSchemaAgainstFixture(t *testing.T) {
+	before := time.Now().UTC().Truncate(time.Second)
+	text := srStatusJSONFromFixture(t, "team")
 	status, raw := decodeSRStatusJSON(t, text)
 
 	if got, want := srStatusSortedKeys(raw), []string{"generated_at", "providers", "schema_version", "server"}; !slices.Equal(got, want) {
@@ -200,7 +227,9 @@ func TestSRStatusJSONSchemaAgainstFixture(t *testing.T) {
 		"codex-a2":  {state: "active", plan: "pro", session: 95, weekly: 20, hasSessionPct: true, hasWeeklyPct: true, hasSessionTime: true},
 		"codex-a3":  {state: "cooked", plan: "team", session: 100, weekly: 0, hasSessionPct: true, hasWeeklyPct: true},
 		"claude-a4": {state: "active", session: 99, weekly: 73, hasSessionPct: true, hasWeeklyPct: true, hasSessionTime: true},
-		"claude-a5": {state: "protected", session: 80, weekly: 30, hasSessionPct: true, hasWeeklyPct: true, hasSessionTime: true, extraUSD: 0.98, hasExtra: true},
+		// Upstream: "protected" (30% weekly left, under its flat 40% floor). The
+		// fork has no flat floor; the router gives this account new sessions.
+		"claude-a5": {state: "ready", session: 80, weekly: 30, hasSessionPct: true, hasWeeklyPct: true, hasSessionTime: true, extraUSD: 0.98, hasExtra: true},
 		"claude-a6": {state: "temp", session: 0, weekly: 34, hasSessionPct: true, hasWeeklyPct: true, hasSessionTime: true},
 		"claude-a7": {state: "cooked", session: 100, weekly: 0, hasSessionPct: true, hasWeeklyPct: true, hasSessionTime: true, extraUSD: 37.5, hasExtra: true},
 		"claude-a8": {state: "error"},

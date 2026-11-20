@@ -35,22 +35,13 @@ type bedrockCostSummaryView struct {
 // fetchBedrockSummary pulls the server's AWS Bedrock cost/throttle summary.
 func (r srRunner) fetchBedrockSummary(ctx context.Context, server srServerConfig) (bedrockCostSummaryView, error) {
 	var summary bedrockCostSummaryView
-	baseURL, err := serverControlBaseURL(server)
+	res, _, err := r.doServerAdmin(ctx, server, serverAdminCall{
+		method:  http.MethodGet,
+		path:    "/_subrouter/bedrock-cost",
+		timeout: 15 * time.Second,
+	})
 	if err != nil {
 		return summary, err
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/_subrouter/bedrock-cost", nil)
-	if err != nil {
-		return summary, redactServerRequestError(err, server)
-	}
-	addServerAdminAuth(req, server)
-	secured, err := r.securedRequestClientForServer(server, baseURL, 15*time.Second)
-	if err != nil {
-		return summary, err
-	}
-	res, err := secured.Do(req)
-	if err != nil {
-		return summary, redactServerRequestError(err, server)
 	}
 	defer res.Body.Close()
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
@@ -164,22 +155,13 @@ type azureCodexCostSummaryView struct {
 // fetchAzureCodexSummary pulls the server's Azure Codex spend summary.
 func (r srRunner) fetchAzureCodexSummary(ctx context.Context, server srServerConfig) (azureCodexCostSummaryView, error) {
 	var summary azureCodexCostSummaryView
-	baseURL, err := serverControlBaseURL(server)
+	res, _, err := r.doServerAdmin(ctx, server, serverAdminCall{
+		method:  http.MethodGet,
+		path:    "/_subrouter/azure-codex-cost",
+		timeout: 15 * time.Second,
+	})
 	if err != nil {
 		return summary, err
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/_subrouter/azure-codex-cost", nil)
-	if err != nil {
-		return summary, redactServerRequestError(err, server)
-	}
-	addServerAdminAuth(req, server)
-	secured, err := r.securedRequestClientForServer(server, baseURL, 15*time.Second)
-	if err != nil {
-		return summary, err
-	}
-	res, err := secured.Do(req)
-	if err != nil {
-		return summary, redactServerRequestError(err, server)
 	}
 	defer res.Body.Close()
 	if res.StatusCode < 200 || res.StatusCode >= 300 {

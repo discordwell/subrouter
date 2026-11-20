@@ -42,6 +42,70 @@ func TestSaveConfigUsesOwnerOnlyPermissions(t *testing.T) {
 	}
 }
 
+// EnsureLocalProxyToken is the one place a local proxy secret may be minted,
+// and it must be idempotent: a second ceremony returning a different token
+// would rotate the secret behind every client config already written.
+func TestEnsureLocalProxyTokenMintsOnlyWhenAbsent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cloud.json")
+
+	first, err := EnsureLocalProxyToken(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.LocalProxyToken == "" {
+		t.Fatal("fresh path minted no token")
+	}
+
+	second, err := EnsureLocalProxyToken(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.LocalProxyToken != first.LocalProxyToken {
+		t.Fatalf(
+			"second ceremony rotated the token: %q then %q",
+			first.LocalProxyToken,
+			second.LocalProxyToken,
+		)
+	}
+
+	loaded, err := LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.LocalProxyToken != first.LocalProxyToken {
+		t.Fatal("minted token was not persisted")
+	}
+}
+
+// LoadConfigRaw is what lets recovery tell "not JSON" apart from "JSON that a
+// validation rule rejects": the second still carries the enforced secret.
+func TestLoadConfigRawParsesWhatValidateRejects(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cloud.json")
+	body := []byte(`{"version":1,"baseUrl":"https://cmux.test",` +
+		`"localProxyToken":"secret-a","credentialSource":"bogus"}`)
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadConfig(path); err == nil {
+		t.Fatal("fixture no longer fails validation; pick another invalid field")
+	}
+	raw, err := LoadConfigRaw(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if raw.LocalProxyToken != "secret-a" {
+		t.Fatalf("raw token = %q, want the on-disk secret", raw.LocalProxyToken)
+	}
+
+	missing, err := LoadConfigRaw(filepath.Join(t.TempDir(), "missing.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if missing.Version != 1 || missing.BaseURL != DefaultBaseURL {
+		t.Fatalf("missing file = %+v, want the fresh default", missing)
+	}
+}
+
 func TestCredentialSourceMigratesTeamConfigAndAllowsExplicitLocal(t *testing.T) {
 	config := Config{
 		AccessToken:  "stack-access",

@@ -207,7 +207,10 @@ fi
   --gcp-project "${project_id}" \
   --default
 
+# This script installs upstream's tagged release by design, so it names that
+# outcome: `sr server install` refuses it otherwise (the fork's PATCHES 37).
 "${sr_bin}" server install "${server_name}" \
+  --allow-upstream-release \
   --version "${subrouter_version}"
 
 if [[ "${topology}" == "fresh-prepared" ]]; then

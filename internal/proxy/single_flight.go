@@ -24,8 +24,9 @@ type flightResult struct {
 }
 
 type flightCall struct {
-	wg     sync.WaitGroup
-	result flightResult
+	wg      sync.WaitGroup
+	waiters int
+	result  flightResult
 }
 
 type singleFlight struct {
@@ -46,19 +47,28 @@ func (s *singleFlight) do(key string, fetch func() flightResult) (flightResult, 
 	}
 	s.mu.Lock()
 	if call, ok := s.calls[key]; ok {
+		call.waiters++
 		s.mu.Unlock()
 		call.wg.Wait()
 		return call.result, true
 	}
 	// Waiters read this if fetch panics before producing a result: they
-	// shared a failed flight, so they get a failure, not an empty success.
+	// shared a failed flight, so they get a failure, not an empty success (a
+	// zero flightResult is status 0 and no body, which the proxy writes out as
+	// an empty 200).
 	call := &flightCall{result: flightFailedResult()}
 	call.wg.Add(1)
 	s.calls[key] = call
 	s.mu.Unlock()
 
 	// Release the key even if fetch panics, or every waiter and every later
-	// caller for it blocks forever. The panic still reaches this caller.
+	// caller for it blocks forever: the entry stays in the map with its
+	// WaitGroup never done, and nothing but a restart removes it. That is a
+	// real path, not a hypothetical one. httputil.ReverseProxy panics with
+	// http.ErrAbortHandler when an upstream body breaks mid-copy (a reset, a
+	// gzip error, a laptop waking from sleep), and the proxy's flight runs it
+	// under a request that keeps http.ServerContextKey. The panic still
+	// reaches this caller; only the key and the waiters are freed.
 	defer func() {
 		s.mu.Lock()
 		delete(s.calls, key)
@@ -67,6 +77,18 @@ func (s *singleFlight) do(key string, fetch func() flightResult) (flightResult, 
 	}()
 	call.result = fetch()
 	return call.result, false
+}
+
+// waiting reports how many callers are parked on a fetch another caller is
+// running.
+func (s *singleFlight) waiting() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	waiters := 0
+	for _, call := range s.calls {
+		waiters += call.waiters
+	}
+	return waiters
 }
 
 // flightFailedResult is the shared answer for a flight that could not

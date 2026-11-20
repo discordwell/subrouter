@@ -515,7 +515,7 @@ func TestClaudeExhaustedPoolStickyFailsWithoutRerouteLog(t *testing.T) {
 	}
 	req.Header.Set("X-Subrouter-Agent", "claude")
 	req.Header.Set("X-Subrouter-Session", "session-1")
-	if _, _, _, err := server.accountForSessionProvider(accounts.ProviderClaude, "claude", "session-1", req); err == nil {
+	if _, _, _, _, err := server.accountForSessionProvider(accounts.ProviderClaude, "claude", "session-1", req); err == nil {
 		t.Fatal("expected selection to fail with the whole pool exhausted")
 	}
 	if strings.Contains(logBuf.String(), "rerouting cold sticky session") {

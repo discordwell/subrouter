@@ -20,28 +20,49 @@ type SchedulerRef struct {
 	accountGeneration  uint64
 	refreshGeneration  uint64
 	scoreRevision      uint64
+	// legacyFinishInvalidated preserves the historical tokenless FinishRefresh
+	// API for callers that publish without BeginRefreshIfStale. New concurrent
+	// code uses the generation-aware methods below.
+	legacyFinishInvalidated bool
+	// scored says the ref holds scores worth routing on while a refresh runs
+	// (Scored). It is set by construction, by every publish and by every
+	// finished refresh, and cleared only by SetUpdatedAt(time.Time{}). An
+	// account-generation advance zeroes updatedAt but leaves it alone: that
+	// makes the scores stale, not absent.
+	scored bool
 	// exhaustedUntil expires request-time exhaustion marks. A mark set from a
 	// rejected upstream response is only true until the account's rate-limit
 	// window resets; without an expiry a recovered account stayed zero-scored
 	// until the next SUCCESSFUL usage refresh, which under load can fail for
 	// hours, leaving real quota unroutable while clients got 429s.
 	exhaustedUntil map[string]time.Time
-	// weeklyExhaustedUntil is the subset of marks whose upstream response
-	// proved the weekly window cooked (7d status rejected). Status views and
-	// WeeklyCooked read it.
-	// Entries are always paired with an exhaustedUntil mark and share its
-	// expiry.
-	weeklyExhaustedUntil map[string]time.Time
-	// markSeq numbers exhaustion marks as they are set (exhaustedMarkSeq
-	// holds each mark's number). A score publish may only supersede a mark
-	// its measurement could have seen: a 429 that lands while a refresh is
-	// fetching usage is newer than every score in that refresh, so the
-	// refresh must not read its pre-429 headroom as recovery.
-	// refreshMarkSeq is markSeq when the in-flight full refresh began;
-	// revisionMarkSeq is markSeq when the current scoreRevision was first
-	// read, the start of any Set/Merge computed at that revision.
+	// A score publish may only supersede an exhaustion mark with evidence its
+	// measurement could have seen (upstream #398, adapted; PATCHES.md §29): a
+	// 429 that lands after the usage reading behind a Fresh score is newer
+	// than that score, so the score's headroom is not recovery. Two orders
+	// decide "newer", in this priority:
+	//
+	//   - exhaustedMarkedAt is when each mark was set. A score that carries
+	//     Score.MeasuredAt -- every score this daemon builds from a usage
+	//     reading -- supersedes only marks set before that instant. This is
+	//     the order that matters here: our scores are routinely published
+	//     well after they were measured (the 2-minute window cache, the 30 s
+	//     sweep cache every usage-status read republishes, PATCHES.md §26),
+	//     so when a publish BEGAN says little about when its headroom was
+	//     true.
+	//   - markSeq numbers marks as they are set (exhaustedMarkSeq holds each
+	//     mark's number), upstream's rule, kept for scores that carry no
+	//     measurement time: refreshMarkSeq is markSeq when the in-flight full
+	//     refresh began, revisionMarkSeq is markSeq when the current
+	//     scoreRevision was first read, the start of any Set/Merge computed
+	//     at that revision. Only marks at or below that number can be
+	//     superseded.
+	//
+	// Upstream's weekly-mark half is not ported: this fork skipped T3 and
+	// has no weekly-cooked mark to reconcile.
 	markSeq            uint64
 	exhaustedMarkSeq   map[string]uint64
+	exhaustedMarkedAt  map[string]time.Time
 	refreshMarkSeq     uint64
 	revisionMarkSeq    uint64
 	revisionMarkSeqSet bool
@@ -52,19 +73,22 @@ type SchedulerRef struct {
 	credentialExhaustedUntil map[string]time.Time
 	credentialFingerprints   map[string]string
 	credentialRevision       uint64
+	// accountAliases is AccountAliases() of the account list last published
+	// with the credential fingerprints, attached to every Get so reserves
+	// configured by email or label resolve for accounts whose ID is an opaque
+	// "codex-owner-<hash>". Replaced wholesale, never mutated in place, so
+	// schedulers already handed out keep a consistent table.
+	accountAliases map[string][]string
 	// accountUnavailableUntil records account-state exclusions, such as an
 	// organization disabling OAuth. Neither healthy quota evidence nor token
 	// rotation proves that account state recovered, so those events must not
 	// clear this overlay.
 	accountUnavailableUntil map[string]time.Time
 	// credentialUnavailable records persistent authorization or entitlement
-	// denials for the exact credential that observed them. A credential reload
-	// changes the fingerprint, which makes the old denial inactive immediately.
+	// denials for the exact credential that observed them (upstream #585). A
+	// credential reload changes the fingerprint, which makes the old denial
+	// inactive immediately.
 	credentialUnavailable map[string]struct{}
-	// creditExhaustedUntil labels the accountUnavailableUntil entries that
-	// came from a spent API credit balance, so status views can say why a
-	// key is held out. It never affects routing on its own.
-	creditExhaustedUntil map[string]time.Time
 	// incompatibleUntil records account/model exclusions learned from upstream
 	// entitlement errors. Usage refreshes cannot supersede these marks because
 	// quota headroom says nothing about whether an account supports a model.
@@ -78,25 +102,32 @@ type SchedulerRef struct {
 	// by LiveDebitPerRequest per routed request so concurrent traffic spreads
 	// instead of herding onto the snapshot's best account until it cooks.
 	routedSinceRefresh map[string]int
-	// placementReservations counts picks that have been made but have not yet
-	// crossed the caller's upstream-success boundary. They steer concurrent
-	// placements immediately, then become routedSinceRefresh on Commit or are
-	// discarded on Release.
-	placementReservations map[string]int
-	// inflight counts physical upstream attempts whose response is still open,
-	// keyed by ScoreKey. Unlike routedSinceRefresh it is instantaneous and is
-	// never cleared by a usage refresh.
-	inflight map[string]int
-	// lastDemand is when a request for each provider was last routed or
-	// turned away for lack of a usable account. Unlike routedSinceRefresh it
-	// survives refreshes, so it answers "is anyone asking right now?".
-	lastDemand map[account.Provider]time.Time
 	// capacityUntil holds capacity (load-shedding) marks per account and
 	// (model, service tier). They are deliberately not an exhaustion overlay:
-	// see capacity.go.
+	// see capacity.go. Living beside the snapshot, they survive Set() and
+	// usage refreshes, and they are never persisted across restarts.
 	capacityUntil map[capacityMarkKey]capacityMark
-	// placement counts where work actually went since process start; it has
-	// its own lock (see placement_stats.go).
+	// rateLimitedUntil holds rate-limit marks per account (ScoreKey): a
+	// request-rate refusal that ranks the account last for new placements
+	// and never evicts (rate_limit_marks.go). Never persisted either.
+	rateLimitedUntil map[string]time.Time
+	// placementReservations counts picks that have been made but have not yet
+	// crossed the caller's upstream-success boundary (PickAndReserve, upstream
+	// #642). They steer concurrent placements immediately, then become
+	// routedSinceRefresh on Commit or are discarded on Release.
+	placementReservations map[string]int
+	// inflight counts physical upstream attempts whose response is still open,
+	// keyed by ScoreKey (BeginInflight, upstream #449). Unlike
+	// routedSinceRefresh it is instantaneous and is never cleared by a usage
+	// refresh. Diagnostics only: ranking does not read it (InflightCounts).
+	inflight map[string]int
+	// lastDemand is when a request for each provider was last routed or
+	// turned away for lack of a usable account (upstream #392). Unlike
+	// routedSinceRefresh it survives refreshes, so it answers "is anyone
+	// asking right now?".
+	lastDemand map[account.Provider]time.Time
+	// placement counts where work actually went since process start
+	// (upstream #388); it has its own lock (see placement_stats.go).
 	placement placementStats
 }
 
@@ -105,6 +136,7 @@ func NewSchedulerRef(scheduler Scheduler) *SchedulerRef {
 	return &SchedulerRef{
 		scheduler: scheduler,
 		updatedAt: now,
+		scored:    true,
 		placement: placementStats{since: now},
 	}
 }
@@ -115,18 +147,24 @@ func (r *SchedulerRef) Get() Scheduler {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	scheduler := applyExhaustionMarks(r.scheduler, r.exhaustedUntil, now)
-	scheduler = applyWeeklyExhaustionMarks(scheduler, r.weeklyExhaustedUntil, now)
 	scheduler = applyExhaustionMarks(scheduler, r.activeCredentialExhaustionLocked(), now)
 	scheduler = applyExhaustionMarks(scheduler, r.accountUnavailableUntil, now)
 	scheduler = applyPersistentCredentialMarks(scheduler, r.activeCredentialUnavailableLocked())
-	return applyExhaustionMarks(scheduler, r.incompatibleUntil, now)
+	scheduler = applyExhaustionMarks(scheduler, r.incompatibleUntil, now)
+	// Aliases ride on every read rather than on the stored snapshot: a usage
+	// refresh publishes a freshly built Scheduler, which must not be able to
+	// drop the table that lets an email-keyed holdout find a codex-owner id.
+	if r.accountAliases != nil {
+		scheduler = scheduler.withAccountAliasMap(r.accountAliases)
+	}
+	return scheduler
 }
 
 // RefreshSeed returns the measured scheduler snapshot, including live routing
 // debits but excluding temporary exclusion overlays. A usage refresh carries
 // stale scores forward when an account cannot be fetched; seeding that work
 // from Get would bake an overlay's zero into the replacement snapshot if the
-// overlay expired between scoring and FinishRefreshForAccountGeneration. Routing reads must use
+// overlay expired between scoring and FinishRefresh. Routing reads must use
 // Get, while refresh construction must use this base-only view.
 func (r *SchedulerRef) RefreshSeed() Scheduler {
 	if r == nil {
@@ -138,9 +176,10 @@ func (r *SchedulerRef) RefreshSeed() Scheduler {
 }
 
 // PlacementReservation is the live-load reservation returned by
-// PickAndReserve. Commit turns the reservation into the same routed-request
-// debit recorded by NoteRouted. Release removes it when account preparation
-// fails before the request is routed. Either method is idempotent.
+// PickAndReserve (upstream #642, #650). Commit turns the reservation into the
+// same routed-request debit recorded by NoteRouted. Release removes it when
+// account preparation fails before the request is routed. Either method is
+// idempotent.
 type PlacementReservation struct {
 	ref        *SchedulerRef
 	key        string
@@ -199,9 +238,15 @@ func (p *PlacementReservation) Release() {
 
 // PickAndReserve chooses an account and reserves its live placement load as
 // one atomic operation. The scheduler passed by the caller supplies the
-// immutable selection state (for example the model pool, active session
-// counts, and capacity marks); the live debit and in-flight maps are replaced
-// with the latest values held by this ref while its lock is held.
+// immutable selection state (for example the model pool, session counts,
+// reserves, the machine view and capacity marks); its live debits are
+// replaced with the latest values held by this ref -- committed routes plus
+// pending reservations -- while its lock is held.
+//
+// Upstream also attaches its in-flight counts here (WithInflightCounts, #449),
+// a headroom penalty per open attempt. This fork does not: live concurrency
+// enters ranking as Score.LiveSessions through the session-spread discount,
+// and an open attempt has spent nothing (Score.spreadAdjusted, PATCHES §10).
 //
 // The caller must Commit or Release the returned reservation. A committed
 // reservation replaces the later NoteRouted call for that request.
@@ -228,7 +273,7 @@ func (r *SchedulerRef) pickAndReserve(scheduler Scheduler, candidates []account.
 	}
 
 	r.mu.Lock()
-	scheduler = scheduler.WithLiveDebits(r.liveDebitsLocked()).WithInflightCounts(r.inflight)
+	scheduler = scheduler.WithLiveDebits(r.liveDebitsLocked())
 	picked, err := scheduler.Pick(candidates)
 	if err != nil {
 		r.mu.Unlock()
@@ -457,6 +502,9 @@ func (r *SchedulerRef) clearExpiredRouteMarksLocked(
 	}
 	for _, key := range keys {
 		delete(r.recoveryProbeReady, key)
+		if until := r.exhaustedUntil[key]; !until.IsZero() && !until.After(now) {
+			r.dropExhaustedMarkLocked(key)
+		}
 	}
 	for _, marks := range []map[string]time.Time{
 		r.exhaustedUntil,
@@ -515,14 +563,6 @@ func (r *SchedulerRef) pruneExpired(now time.Time) {
 		}
 	}
 	if !anyExpired {
-		for _, until := range r.weeklyExhaustedUntil {
-			if !until.After(now) {
-				anyExpired = true
-				break
-			}
-		}
-	}
-	if !anyExpired {
 		for _, until := range r.credentialExhaustedUntil {
 			if !until.After(now) {
 				anyExpired = true
@@ -565,13 +605,7 @@ func (r *SchedulerRef) pruneExpired(now time.Time) {
 				r.recoveryProbeReady[probeKey] = struct{}{}
 			}
 		}
-		delete(r.exhaustedUntil, key)
-		delete(r.exhaustedMarkSeq, key)
-	}
-	for key, until := range r.weeklyExhaustedUntil {
-		if !until.After(now) {
-			delete(r.weeklyExhaustedUntil, key)
-		}
+		r.dropExhaustedMarkLocked(key)
 	}
 	for key, until := range r.credentialExhaustedUntil {
 		if !until.After(now) {
@@ -581,11 +615,6 @@ func (r *SchedulerRef) pruneExpired(now time.Time) {
 	for key, until := range r.accountUnavailableUntil {
 		if !until.After(now) {
 			delete(r.accountUnavailableUntil, key)
-		}
-	}
-	for key, until := range r.creditExhaustedUntil {
-		if !until.After(now) {
-			delete(r.creditExhaustedUntil, key)
 		}
 	}
 	for key, until := range r.incompatibleUntil {
@@ -610,7 +639,7 @@ func (r *SchedulerRef) scoreForExhaustionKeyLocked(key string) (Score, bool) {
 		if exists {
 			return modelScore, true
 		}
-		if r.scheduler.hasModelScore(poolKey) {
+		if r.scheduler.hasModelScore(poolKey) && score.missingModelSupport() != ModelSupportUnknown {
 			return Score{}, false
 		}
 	}
@@ -631,7 +660,7 @@ func (r *SchedulerRef) recoveryProbeKeysForExpiredMarkLocked(key string) []strin
 		if exists && modelScore.exhausted() {
 			return []string{key}
 		}
-		if !r.scheduler.hasModelScore(poolKey) && score.exhausted() {
+		if !exists && (!r.scheduler.hasModelScore(poolKey) || score.missingModelSupport() == ModelSupportUnknown) && score.exhausted() {
 			return []string{key}
 		}
 		return nil
@@ -703,6 +732,7 @@ func (r *SchedulerRef) setLockedForScoreKeys(scheduler Scheduler, scoreKeys map[
 	if touchUpdatedAt {
 		r.updatedAt = time.Now()
 	}
+	r.scored = true
 	r.bumpScoreRevisionLocked()
 }
 
@@ -741,37 +771,45 @@ func (r *SchedulerRef) AdvanceAccountGenerationWithAccounts(generation, credenti
 	for _, candidate := range accounts {
 		r.credentialFingerprints[ScoreKey(candidate.Provider, candidate.ID)] = credentialFingerprint(candidate.CredentialIdentity())
 	}
+	r.accountAliases = AccountAliases(accounts)
 }
 
 // pruneExhaustedMarksForAccountsLocked removes quota marks for accounts that
-// disappeared from the latest account snapshot. Marks for accounts that remain
-// present are intentionally left untouched so a stale or missing usage refresh
-// cannot make a recently rejected account eligible again.
+// disappeared from the latest account snapshot (upstream #561). Marks for
+// accounts that remain present are intentionally left untouched so a stale or
+// missing usage refresh cannot make a recently rejected account eligible
+// again: a refresh that carries no score for an account keeps its mark
+// (retainExhaustedExpiriesForScoreKeysLocked), and this is where a mark whose
+// account is gone ends. A persistent credential denial for a removed account
+// goes with it.
 func (r *SchedulerRef) pruneExhaustedMarksForAccountsLocked(accounts []account.Account) {
 	present := make(map[string]struct{}, len(accounts))
 	for _, candidate := range accounts {
 		present[ScoreKey(candidate.Provider, candidate.ID)] = struct{}{}
 	}
-	for _, marks := range []map[string]time.Time{r.exhaustedUntil, r.weeklyExhaustedUntil} {
-		for key := range marks {
-			scoreKey, _, _, ok := exhaustionKeyParts(key)
-			if !ok {
-				delete(marks, key)
-				continue
-			}
-			if _, exists := present[scoreKey]; !exists {
-				delete(marks, key)
-			}
-		}
-	}
-	for key := range r.exhaustedMarkSeq {
+	absent := func(key string) bool {
 		scoreKey, _, _, ok := exhaustionKeyParts(key)
 		if !ok {
-			delete(r.exhaustedMarkSeq, key)
-			continue
+			return true
 		}
-		if _, exists := present[scoreKey]; !exists {
+		_, exists := present[scoreKey]
+		return !exists
+	}
+	for key := range r.exhaustedUntil {
+		if absent(key) {
+			r.dropExhaustedMarkLocked(key)
+		}
+	}
+	// The ordering stamps normally go with their mark; an orphan whose mark
+	// is already gone is swept here too.
+	for key := range r.exhaustedMarkSeq {
+		if absent(key) {
 			delete(r.exhaustedMarkSeq, key)
+		}
+	}
+	for key := range r.exhaustedMarkedAt {
+		if absent(key) {
+			delete(r.exhaustedMarkedAt, key)
 		}
 	}
 	for key := range r.credentialUnavailable {
@@ -807,12 +845,16 @@ func (r *SchedulerRef) SyncAccountCredentials(generation, credentialRevision uin
 	for _, candidate := range accounts {
 		r.credentialFingerprints[ScoreKey(candidate.Provider, candidate.ID)] = credentialFingerprint(candidate.CredentialIdentity())
 	}
+	r.accountAliases = AccountAliases(accounts)
 	return true
 }
 
 func (r *SchedulerRef) advanceAccountGenerationLocked(generation uint64) {
 	if generation == r.accountGeneration {
 		return
+	}
+	if r.refreshing {
+		r.legacyFinishInvalidated = true
 	}
 	r.accountGeneration = generation
 	r.refreshing = false
@@ -831,6 +873,9 @@ func (r *SchedulerRef) SetForAccountGeneration(scheduler Scheduler, generation u
 // ScoreRevision identifies the measured score snapshot independently of the
 // account generation. Callers capture it before slow score work and present it
 // when publishing so a newer same-generation measurement cannot be replaced.
+//
+// The first read at a revision also records where work computed at it began
+// in mark order (revisionMarkSeq), for scores that carry no MeasuredAt.
 func (r *SchedulerRef) ScoreRevision() uint64 {
 	if r == nil {
 		return 0
@@ -853,6 +898,7 @@ func (r *SchedulerRef) bumpScoreRevisionLocked() {
 
 // revisionSinceSeqLocked is the mark number a Set/Merge at the current
 // revision measured after: marks numbered above it are newer than its scores.
+// A publish whose revision was never read (a plain Set) began now.
 func (r *SchedulerRef) revisionSinceSeqLocked() uint64 {
 	if r.revisionMarkSeqSet {
 		return r.revisionMarkSeq
@@ -881,6 +927,62 @@ func (r *SchedulerRef) SetForAccountGenerationAtScoreRevision(
 		r.refreshing = false
 		r.refreshInvalidated = false
 	}
+	return true
+}
+
+// PublishWithoutRefreshForAccountGenerationAtScoreRevision publishes a
+// scheduler rebuilt from the CACHED usage sweep -- what every usage-status and
+// pool-board read does -- without counting as the scheduled usage refresh. It
+// has the same generation and score-revision guard as
+// SetForAccountGenerationAtScoreRevision, and differs in exactly the two ways
+// that let a reader starve the refresh:
+//
+//   - It leaves the refresh clock (updatedAt) alone. The live debits are
+//     cleared only by FinishRefresh, which runs only after BeginRefreshIfStale
+//     finds updatedAt older than the usage-score TTL, and a republication does
+//     NOT clear them. Stamping updatedAt here meant any reader faster than the
+//     TTL -- a peer daemon's capacity probe re-reads usage-status every 10 s
+//     (remotePoolAdminTTL) while it has traffic, the pool board every 5 s --
+//     kept the scheduler looking fresh indefinitely: the refresh never fired,
+//     and every account this daemon routed to sank a further
+//     LiveDebitPerRequest per request until it failed the new-session gate on
+//     our own optimism alone. Measured scores kept updating underneath (the
+//     sweep cache expires on its own clock); only the debit on top grew.
+//     Observed on the box 2026-09-28 while the laptop probed it: debits held
+//     for minutes, not seconds, and a measured-healthy account read as below
+//     the new-session gate (ops/PATCHES.md §26).
+//   - It does not cancel a refresh already in flight. Set marks an in-flight
+//     refresh invalidated so its older view cannot overwrite a newer
+//     measurement, but this is a republication, drawn from the same
+//     FetchUsageWindowsCached cache the refresh itself reads. Invalidating on
+//     it discarded the refresh -- and with it the only debit clear -- whenever
+//     a read landed inside the sweep's few seconds, which a 10 s reader does
+//     often and a faster one does every time. The price of letting the
+//     refresh land instead: an account whose sweep row was newer than what the
+//     refresh saw (a window-cache entry that turned over mid-sweep, or the
+//     refresh's carried-forward seed when it could not fetch the account)
+//     reads the refresh's view until the next read republishes the sweep row.
+//
+// This is the rule MergeScoresForAccountGeneration already follows for the
+// clock (a partial provider refresh does not make the snapshot look fresh):
+// only the scheduled refresh, which also supersedes the debits, may postpone
+// the next one. It does not clear the debits itself on purpose: it republishes
+// the same cached measurement on every read, and clearing there would erase
+// real, not-yet-measured traffic every time a peer looked.
+func (r *SchedulerRef) PublishWithoutRefreshForAccountGenerationAtScoreRevision(
+	scheduler Scheduler,
+	generation uint64,
+	scoreRevision uint64,
+) bool {
+	if r == nil {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if generation != r.accountGeneration || scoreRevision != r.scoreRevision {
+		return false
+	}
+	r.setLockedForScoreKeys(scheduler, nil, false)
 	return true
 }
 
@@ -934,8 +1036,11 @@ func (r *SchedulerRef) MergeScoresForAccountGenerationAtScoreRevision(
 // refresh, by evidence class:
 //   - A pool-scoped mark has no matching refreshed pool score: keep the expiry;
 //     the refresh has no evidence about that pool.
-//   - A matching score shows headroom (or the account is gone): the mark is
-//     superseded; drop the expiry.
+//   - A matching score shows FRESH headroom: the mark is superseded; drop the
+//     expiry. No score at all is not evidence of recovery (upstream #560):
+//     the mark is kept until it lapses, and a mark whose account left the
+//     snapshot is pruned there (pruneExhaustedMarksForAccountsLocked,
+//     upstream #561).
 //   - Carried-forward zero (the account's own usage fetch failed, seed dragged
 //     along, Fresh=false): keep the existing expiry. Clearing it would make the
 //     request-time mark permanent again, recreating the stranded-recovered-
@@ -946,34 +1051,20 @@ func (r *SchedulerRef) MergeScoresForAccountGenerationAtScoreRevision(
 //     request-time expiry can never lapse a freshly-observed zero back to the
 //     optimistic default. Expiries only extend here, never shorten, so an
 //     authoritative long reset from a rejected response still holds.
-//   - A mark numbered above sinceSeq was set after the incoming scores were
-//     measured; headroom in them is older than the mark and supersedes
-//     nothing.
-//
-// Weekly marks follow their paired mark, and a fresh score that measured
-// weekly headroom also drops one: the upstream rejection it came from has
-// been overtaken, and a stale weekly mark would authorize paid fallback.
+//   - A mark set after the incoming score's usage reading (MeasuredAt, or for
+//     a score without one, numbered above sinceSeq) is newer than that
+//     score: the score supersedes nothing, however healthy it reads. See
+//     markNewerThanEvidenceLocked.
 func (r *SchedulerRef) retainExhaustedExpiriesLocked(sinceSeq uint64) {
 	r.retainExhaustedExpiriesForScoreKeysLocked(nil, sinceSeq)
 }
 
 func (r *SchedulerRef) retainExhaustedExpiriesForScoreKeysLocked(scoreKeys map[string]struct{}, sinceSeq uint64) {
 	now := time.Now()
-	dropMark := func(key string) {
-		delete(r.exhaustedUntil, key)
-		delete(r.weeklyExhaustedUntil, key)
-		delete(r.exhaustedMarkSeq, key)
-	}
-	for key := range r.weeklyExhaustedUntil {
-		// A weekly mark is only meaningful beside its exhaustion mark.
-		if _, paired := r.exhaustedUntil[key]; !paired {
-			delete(r.weeklyExhaustedUntil, key)
-		}
-	}
 	for key := range r.exhaustedUntil {
 		scoreKey, _, poolKey, ok := exhaustionKeyParts(key)
 		if !ok {
-			dropMark(key)
+			r.dropExhaustedMarkLocked(key)
 			continue
 		}
 		if scoreKeys != nil {
@@ -981,29 +1072,43 @@ func (r *SchedulerRef) retainExhaustedExpiriesForScoreKeysLocked(scoreKeys map[s
 				continue
 			}
 		}
-		if r.exhaustedMarkSeq[key] > sinceSeq {
-			continue
-		}
 		score, ok := r.scheduler.scores[scoreKey]
+		// A model pool's score comes from the same usage reading as its
+		// account, so it inherits the account's measurement time unless it
+		// carries its own.
+		measuredAt := score.MeasuredAt
 		if ok && poolKey != "" {
 			modelScore, modelOK := score.ModelScores[poolKey]
 			if !modelOK {
 				continue
 			}
 			score = modelScore
+			if !score.MeasuredAt.IsZero() {
+				measuredAt = score.MeasuredAt
+			}
 		}
-		if ok && score.Fresh && score.WeeklyHeadroomKnown && score.WeeklyHeadroom > 0 {
-			delete(r.weeklyExhaustedUntil, key)
+		if r.markNewerThanEvidenceLocked(key, measuredAt, sinceSeq) {
+			continue
 		}
 		switch {
-		case !ok || !score.Fresh:
-			// A missing or stale refresh did not measure this account's
-			// recovery. Keep an upstream rejection mark until a fresh score
-			// proves headroom, otherwise a throttled usage endpoint can make a
-			// cooked account immediately eligible again.
+		case !ok:
+			// A publish that carries no score for the account did not
+			// measure its recovery (upstream #560): keep the upstream
+			// rejection until it lapses, or until the account leaves the
+			// snapshot (pruneExhaustedMarksForAccountsLocked, upstream #561).
 			continue
 		case !score.exhausted():
-			dropMark(key)
+			// Only FRESH headroom supersedes a mark. A carried seed showing
+			// headroom is not evidence the account recovered -- it is the
+			// previous snapshot dragged forward past a failed usage fetch,
+			// which is precisely the state an upstream 429 contradicts. This
+			// is the mirror of the carried-forward-zero rule below: neither
+			// direction may be decided by a score nobody measured. A mark
+			// still lapses on its own expiry, so a genuine recovery costs at
+			// most DefaultExhaustedTTL of caution rather than stranding.
+			if score.Fresh {
+				r.dropExhaustedMarkLocked(key)
+			}
 		case score.Fresh:
 			until := now.Add(DefaultExhaustedTTL)
 			if score.ShortResetAfterSeconds > 0 {
@@ -1019,6 +1124,42 @@ func (r *SchedulerRef) retainExhaustedExpiriesForScoreKeysLocked(scoreKeys map[s
 			}
 		}
 	}
+}
+
+// markNewerThanEvidenceLocked reports whether the exhaustion mark at key was
+// set after the usage reading behind an incoming score, which then may not
+// supersede it -- neither drop it on headroom nor re-anchor it.
+//
+// A score that says when it was measured is ordered on that alone. The
+// order upstream #398 uses -- when the publish BEGAN (sinceSeq) -- is not
+// enough here, because our publishes routinely carry older readings: the
+// scheduled refresh reads the 2-minute window cache, and every usage-status
+// read republishes the 30 s sweep cache (PATCHES.md §26). A refresh that
+// began a second after a 429, or a peer's probe seven seconds after it,
+// published headroom read before the rejection and deleted a 5 h mark;
+// routing went straight back into the account upstream had just refused. The
+// measurement instant is when the fetch STARTED (a cache entry records the
+// moment before its fetch), so a reading in flight when the 429 lands counts
+// as older than it. Equal instants keep the mark.
+//
+// A score with no measurement time (tests, peer-built or persisted scores
+// that predate the field) falls back to upstream's numbering. A mark with no
+// stamp -- one the recovery probe re-derived from a fresh zero score -- is as
+// supersedable as the score it came from.
+func (r *SchedulerRef) markNewerThanEvidenceLocked(key string, measuredAt time.Time, sinceSeq uint64) bool {
+	if !measuredAt.IsZero() {
+		markedAt, stamped := r.exhaustedMarkedAt[key]
+		return stamped && !measuredAt.After(markedAt)
+	}
+	return r.exhaustedMarkSeq[key] > sinceSeq
+}
+
+// dropExhaustedMarkLocked removes an exhaustion mark together with the
+// stamps that order it against incoming scores.
+func (r *SchedulerRef) dropExhaustedMarkLocked(key string) {
+	delete(r.exhaustedUntil, key)
+	delete(r.exhaustedMarkSeq, key)
+	delete(r.exhaustedMarkedAt, key)
 }
 
 // DefaultExhaustedTTL bounds an exhaustion mark when the upstream response gave
@@ -1050,36 +1191,19 @@ func (r *SchedulerRef) markExhaustedUntilLocked(provider account.Provider, accou
 		r.exhaustedUntil = make(map[string]time.Time)
 	}
 	key := poolScopedExhaustionKey(provider, accountID, poolKey)
-	// A session-level rejection cannot shorten a weekly-cooked block the
-	// account is already known to be under.
-	if weekly := r.weeklyExhaustedUntil[key]; weekly.After(until) {
-		until = weekly
-	}
 	r.exhaustedUntil[key] = until
+	now := time.Now()
 	r.markSeq++
 	if r.exhaustedMarkSeq == nil {
 		r.exhaustedMarkSeq = make(map[string]uint64)
 	}
 	r.exhaustedMarkSeq[key] = r.markSeq
+	if r.exhaustedMarkedAt == nil {
+		r.exhaustedMarkedAt = make(map[string]time.Time)
+	}
+	r.exhaustedMarkedAt[key] = now
 	delete(r.recoveryProbeReady, key)
-	r.updatedAt = time.Now()
-}
-
-// MarkWeeklyExhaustedUntil records an exhaustion mark whose upstream response
-// proved the WEEKLY window is cooked (anthropic-ratelimit-unified-7d-status:
-// rejected), not merely the 5h session window. Only weekly-cooked evidence
-// keeps the hold through the weekly reset.
-func (r *SchedulerRef) MarkWeeklyExhaustedUntil(provider account.Provider, accountID, poolKey string, until time.Time) {
-	if accountID == "" {
-		return
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.markExhaustedUntilLocked(provider, accountID, poolKey, until)
-	if r.weeklyExhaustedUntil == nil {
-		r.weeklyExhaustedUntil = make(map[string]time.Time)
-	}
-	r.weeklyExhaustedUntil[poolScopedExhaustionKey(provider, accountID, poolKey)] = until
+	r.updatedAt = now
 }
 
 // MarkCredentialExhaustedUntil records a terminal credential failure only if
@@ -1150,6 +1274,7 @@ func (r *SchedulerRef) MarkCredentialExhaustedForSnapshot(
 		for _, candidate := range accounts {
 			r.credentialFingerprints[ScoreKey(candidate.Provider, candidate.ID)] = credentialFingerprint(candidate.CredentialIdentity())
 		}
+		r.accountAliases = AccountAliases(accounts)
 	}
 	if publishesSnapshot {
 		r.pruneExhaustedMarksForAccountsLocked(accounts)
@@ -1169,9 +1294,11 @@ func (r *SchedulerRef) MarkCredentialExhaustedForSnapshot(
 }
 
 // MarkCredentialUnavailableForSnapshot permanently excludes the exact
-// credential that received a persistent authorization or entitlement denial.
-// A later credential update changes the fingerprint and restores eligibility;
-// usage refreshes cannot supersede the denial.
+// credential that received a persistent authorization or entitlement denial
+// (upstream #585). A later credential update changes the fingerprint and
+// restores eligibility; usage refreshes cannot supersede the denial. Like
+// MarkCredentialExhaustedForSnapshot it publishes the snapshot it was
+// observed against, aliases included.
 func (r *SchedulerRef) MarkCredentialUnavailableForSnapshot(
 	provider account.Provider,
 	accountID string,
@@ -1200,6 +1327,7 @@ func (r *SchedulerRef) MarkCredentialUnavailableForSnapshot(
 		for _, candidate := range accounts {
 			r.credentialFingerprints[ScoreKey(candidate.Provider, candidate.ID)] = credentialFingerprint(candidate.CredentialIdentity())
 		}
+		r.accountAliases = AccountAliases(accounts)
 	}
 	if publishesSnapshot {
 		r.pruneExhaustedMarksForAccountsLocked(accounts)
@@ -1275,39 +1403,6 @@ func (r *SchedulerRef) MarkAccountUnavailableUntil(provider account.Provider, ac
 	r.updatedAt = time.Now()
 }
 
-// MarkCreditExhaustedUntil holds an API-key account out of routing because
-// its prepaid credit balance is spent. The balance belongs to the provider
-// organization, not to the key string or a quota window, so neither a usage
-// refresh nor a key rotation clears it; only expiry does, after which one
-// request probes the key again.
-func (r *SchedulerRef) MarkCreditExhaustedUntil(provider account.Provider, accountID string, until time.Time) {
-	if r == nil || accountID == "" {
-		return
-	}
-	r.MarkAccountUnavailableUntil(provider, accountID, until)
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.creditExhaustedUntil == nil {
-		r.creditExhaustedUntil = make(map[string]time.Time)
-	}
-	r.creditExhaustedUntil[poolScopedExhaustionKey(provider, accountID, "")] = until
-}
-
-// CreditExhaustedUntil reports a live MarkCreditExhaustedUntil hold.
-func (r *SchedulerRef) CreditExhaustedUntil(provider account.Provider, accountID string, now time.Time) (time.Time, bool) {
-	if r == nil {
-		return time.Time{}, false
-	}
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	key := poolScopedExhaustionKey(provider, accountID, "")
-	until := r.creditExhaustedUntil[key]
-	if !until.After(now) || !r.accountUnavailableUntil[key].After(now) {
-		return time.Time{}, false
-	}
-	return until, true
-}
-
 // MarkModelIncompatibleUntil excludes one account from one model until the
 // supplied expiry. Unlike quota exhaustion, usage-score refreshes cannot clear
 // this mark because they do not carry entitlement evidence.
@@ -1377,16 +1472,19 @@ func (r *SchedulerRef) expiryMarksLocked() map[string]time.Time {
 	return marks
 }
 
+// applyPersistentCredentialMarks zeroes every account whose current credential
+// carries a persistent denial (upstream #585). It has no expiry: the denial
+// ends only when the credential changes (activeCredentialUnavailableLocked).
 func applyPersistentCredentialMarks(base Scheduler, blocked map[string]struct{}) Scheduler {
 	if len(blocked) == 0 {
 		return base
 	}
-	next := Scheduler{
-		scores:        make(map[string]Score, len(base.scores)+len(blocked)),
-		sessionCounts: base.sessionCounts,
-		liveDebits:    base.liveDebits,
-		capacity:      base.capacity,
-	}
+	// Copy-then-modify, like applyExhaustionMarks: an overlay replaces scores
+	// and nothing else, so it must not drop the counts, reserves, aliases or
+	// machine view it was handed. (Upstream's literal keeps only the counts,
+	// the debits and the capacity marks.)
+	next := base
+	next.scores = make(map[string]Score, len(base.scores)+len(blocked))
 	for key, score := range base.scores {
 		next.scores[key] = copyScore(score)
 	}
@@ -1398,7 +1496,9 @@ func applyPersistentCredentialMarks(base Scheduler, blocked map[string]struct{})
 		score := next.scores[scoreKey]
 		if score.AccountID == "" {
 			_, accountID, _ := strings.Cut(scoreKey, "\x00")
-			score = Score{AccountID: accountID, Provider: provider, Headroom: 1, ShortHeadroom: 1, WeeklyHeadroom: 1}
+			// No WeeklyHeadroom default: in this fork 0 means "weekly
+			// unmeasured" and fails open (PATCHES.md section 10).
+			score = Score{AccountID: accountID, Provider: provider, Headroom: 1, ShortHeadroom: 1}
 		}
 		score.Provider = provider
 		score.Headroom = 0
@@ -1426,12 +1526,10 @@ func applyExhaustionMarks(base Scheduler, exhaustedUntil map[string]time.Time, n
 	if len(exhaustedUntil) == 0 {
 		return base
 	}
-	next := Scheduler{
-		scores:        make(map[string]Score, len(base.scores)),
-		sessionCounts: base.sessionCounts,
-		liveDebits:    base.liveDebits,
-		capacity:      base.capacity,
-	}
+	// Copy-then-modify: an overlay replaces scores and nothing else, so it must
+	// not drop the counts, reserves, aliases or machine view it was handed.
+	next := base
+	next.scores = make(map[string]Score, len(base.scores))
 	for key, score := range base.scores {
 		next.scores[key] = copyScore(score)
 	}
@@ -1440,8 +1538,14 @@ func applyExhaustionMarks(base Scheduler, exhaustedUntil map[string]time.Time, n
 		if !until.After(now) {
 			continue
 		}
-		_, _, poolKey, ok := exhaustionKeyParts(key)
-		if ok && poolKey != "" && !base.hasModelScore(poolKey) {
+		// A pool a mark introduces is copied onto the other accounts only
+		// where absence would zero-fill them. A Claude or Antigravity account
+		// without the pool already routes on its account-wide score
+		// (absentPoolInheritsAccountScore), so a copy would only publish a
+		// pool with no limit behind it; the marked account still gets its own
+		// exhausted pool below.
+		_, provider, poolKey, ok := exhaustionKeyParts(key)
+		if ok && poolKey != "" && !base.hasModelScore(poolKey) && !absentPoolInheritsAccountScore(provider) {
 			introducedPools[poolKey] = true
 		}
 	}
@@ -1472,9 +1576,9 @@ func applyExhaustionMarks(base Scheduler, exhaustedUntil map[string]time.Time, n
 		score := next.scores[scoreKey]
 		if score.AccountID == "" {
 			_, accountID, _ := strings.Cut(scoreKey, "\x00")
-			// A mark for an account with no measured score is session-level
-			// evidence only; weekly stays fail-closed at "not cooked".
-			score = Score{AccountID: accountID, Provider: provider, Headroom: 1, ShortHeadroom: 1, WeeklyHeadroom: 1}
+			// No WeeklyHeadroom default: in this fork 0 means "weekly
+			// unmeasured" and fails open (PATCHES.md section 10).
+			score = Score{AccountID: accountID, Provider: provider, Headroom: 1, ShortHeadroom: 1}
 		}
 		score.Provider = provider
 		score.Headroom = 0
@@ -1494,7 +1598,7 @@ func applyExhaustionMarks(base Scheduler, exhaustedUntil map[string]time.Time, n
 		score := next.scores[scoreKey]
 		if score.AccountID == "" {
 			_, accountID, _ := strings.Cut(scoreKey, "\x00")
-			score = Score{AccountID: accountID, Provider: provider, Headroom: 1, ShortHeadroom: 1, WeeklyHeadroom: 1}
+			score = Score{AccountID: accountID, Provider: provider, Headroom: 1, ShortHeadroom: 1}
 		}
 		score.Provider = provider
 		score.ModelScores = copyModelScores(score.ModelScores)
@@ -1512,64 +1616,6 @@ func applyExhaustionMarks(base Scheduler, exhaustedUntil map[string]time.Time, n
 		poolScore.ShortHeadroom = 0
 		score.ModelScores[poolKey] = poolScore
 		next.scores[scoreKey] = score
-	}
-	return next
-}
-
-// applyWeeklyExhaustionMarks zeroes WeeklyHeadroom for accounts (or model
-// pools) whose upstream response proved the weekly window cooked. Ordinary
-// exhaustion marks leave WeeklyHeadroom untouched: a session-level 429 must
-// never read as weekly evidence.
-func applyWeeklyExhaustionMarks(base Scheduler, weeklyUntil map[string]time.Time, now time.Time) Scheduler {
-	if len(weeklyUntil) == 0 {
-		return base
-	}
-	next := Scheduler{
-		scores:        make(map[string]Score, len(base.scores)),
-		sessionCounts: base.sessionCounts,
-		liveDebits:    base.liveDebits,
-		capacity:      base.capacity,
-	}
-	for key, score := range base.scores {
-		next.scores[key] = copyScore(score)
-	}
-	for key, until := range weeklyUntil {
-		if !until.After(now) {
-			continue
-		}
-		scoreKey, provider, poolKey, ok := exhaustionKeyParts(key)
-		if !ok {
-			continue
-		}
-		if poolKey == "" {
-			score := next.scores[scoreKey]
-			if score.AccountID == "" {
-				// Unscored: keep the optimistic defaults applyExhaustionMarks
-				// uses; only the weekly reading changes.
-				_, accountID, _ := strings.Cut(scoreKey, "\x00")
-				score = Score{AccountID: accountID, Headroom: 1, ShortHeadroom: 1}
-			}
-			score.Provider = provider
-			score.WeeklyHeadroom = 0
-			score.WeeklyHeadroomKnown = true
-			for pool, modelScore := range score.ModelScores {
-				modelScore.WeeklyHeadroom = 0
-				modelScore.WeeklyHeadroomKnown = true
-				score.ModelScores[pool] = modelScore
-			}
-			next.scores[scoreKey] = score
-			continue
-		}
-		score := next.scores[scoreKey]
-		if score.AccountID == "" {
-			continue
-		}
-		if poolScore, exists := score.ModelScores[poolKey]; exists {
-			poolScore.WeeklyHeadroom = 0
-			poolScore.WeeklyHeadroomKnown = true
-			score.ModelScores[poolKey] = poolScore
-			next.scores[scoreKey] = score
-		}
 	}
 	return next
 }
@@ -1598,12 +1644,8 @@ func stripCarriedForwardExhaustionOverlaysForScoreKeys(current, base Scheduler, 
 	if len(exhaustedUntil) == 0 {
 		return current
 	}
-	next := Scheduler{
-		scores:        make(map[string]Score, len(current.scores)),
-		sessionCounts: current.sessionCounts,
-		liveDebits:    current.liveDebits,
-		capacity:      current.capacity,
-	}
+	next := current
+	next.scores = make(map[string]Score, len(current.scores))
 	for key, score := range current.scores {
 		next.scores[key] = copyScore(score)
 	}
@@ -1625,7 +1667,12 @@ func stripCarriedForwardExhaustionOverlaysForScoreKeys(current, base Scheduler, 
 					}
 				}
 				modelScore, modelOK := candidate.ModelScores[poolKey]
-				if !modelOK || modelScore.Fresh {
+				// A freshly measured score was rebuilt from its windows, so a
+				// pool it carries is a bucket the provider reported, never an
+				// overlay: model sub-scores are not stamped Fresh themselves,
+				// and a Claude Opus/Sonnet bucket is the one kind of pool the
+				// base snapshot may legitimately lack while a mark is live.
+				if !modelOK || modelScore.Fresh || candidate.Fresh {
 					continue
 				}
 				candidate.ModelScores = copyModelScores(candidate.ModelScores)
@@ -1676,8 +1723,32 @@ func (r *SchedulerRef) Stale(ttl time.Duration) bool {
 	return r.updatedAt.IsZero() || time.Since(r.updatedAt) >= ttl
 }
 
+// Scored reports whether the ref holds scores a request may route on while a
+// stale-score refresh runs elsewhere (PATCHES section 44): true once it was
+// built with NewSchedulerRef, published to, or a refresh finished on it, and
+// false for a zero SchedulerRef or after SetUpdatedAt(time.Time{}), the
+// explicit "re-score before routing" of a redeemed rate-limit reset.
+//
+// It is not "updatedAt is set". An account-generation advance zeroes updatedAt
+// on every account reload -- after any `sr` command that changes the account
+// files, and the startup coordinator's reload -- so the next request starts a
+// sweep; the scores it keeps are still the best reading of every account that
+// remains, and one the reload added reads optimistic until that sweep lands,
+// as every account does at daemon start (fallbackScores).
+func (r *SchedulerRef) Scored() bool {
+	if r == nil {
+		return false
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.scored
+}
+
 // UpdatedAt reports when the scores were last stamped by a refresh (successful
-// or not) or Set. The zero time means the scheduler has never been scored.
+// or not), a Set or a mark (upstream #378). The zero time means a refresh is
+// due before the next read is fresh: never scored, an account-generation
+// advance, or SetUpdatedAt(time.Time{}). Whether the ref holds scores worth
+// routing on is Scored's question, not this one's (PATCHES §44.3).
 func (r *SchedulerRef) UpdatedAt() time.Time {
 	if r == nil {
 		return time.Time{}
@@ -1713,10 +1784,35 @@ func (r *SchedulerRef) BeginRefreshIfStaleForAccountGeneration(ttl time.Duration
 	return true
 }
 
-// FinishRefreshForAccountGeneration publishes a refresh begun by
-// BeginRefreshIfStaleForAccountGeneration. It is the only way to finish a
-// refresh: the generation token rejects a result computed from an older
-// account snapshot even when a newer refresh has since begun.
+func (r *SchedulerRef) FinishRefresh(scheduler Scheduler, update bool) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.legacyFinishInvalidated {
+		r.legacyFinishInvalidated = false
+		return
+	}
+	if r.refreshing && r.refreshInvalidated {
+		r.refreshInvalidated = false
+		r.refreshing = false
+		return
+	}
+	if r.refreshing && r.refreshGeneration != r.accountGeneration {
+		return
+	}
+	if !r.refreshing {
+		// The tokenless API publishes without a Begin (upstream dropped it;
+		// this fork keeps it). Such a publish began now, so it orders after
+		// every mark already set, not after whatever refreshMarkSeq an older
+		// refresh left behind -- which would keep marks its scores have
+		// genuinely overtaken.
+		r.refreshMarkSeq = r.markSeq
+	}
+	r.finishRefreshLocked(scheduler, update)
+}
+
 func (r *SchedulerRef) FinishRefreshForAccountGeneration(scheduler Scheduler, update bool, generation uint64) bool {
 	if r == nil {
 		return false
@@ -1748,13 +1844,15 @@ func (r *SchedulerRef) finishRefreshLocked(scheduler Scheduler, update bool) {
 		r.bumpScoreRevisionLocked()
 	}
 	r.updatedAt = time.Now()
+	r.scored = true
 	r.refreshing = false
 	r.refreshInvalidated = false
 }
 
 // NoteRouted records that one request was routed to the account, debiting its
 // live score until the next successful usage refresh. It also feeds the
-// cumulative routed-request count in PlacementStats.
+// provider's demand clock (LastDemand) and the cumulative routed-request count
+// in PlacementStats.
 func (r *SchedulerRef) NoteRouted(provider account.Provider, accountID string) {
 	if r == nil || accountID == "" {
 		return
@@ -1828,7 +1926,11 @@ func (r *SchedulerRef) BeginInflight(provider account.Provider, accountID string
 }
 
 // InflightCounts returns a snapshot of live physical upstream attempts by
-// ScoreKey for Scheduler.WithInflightCounts.
+// ScoreKey, for diagnostics (pool state on recorded upstream errors). Ranking
+// does not read it: upstream's Scheduler.WithInflightCounts headroom penalty
+// (#449) is not ported, because live concurrency already enters ranking as
+// Score.LiveSessions (WithLiveSessionCounts) and an open attempt has spent
+// nothing (Score.spreadAdjusted, PATCHES §10).
 func (r *SchedulerRef) InflightCounts() map[string]int {
 	if r == nil {
 		return nil
@@ -1845,8 +1947,30 @@ func (r *SchedulerRef) InflightCounts() map[string]int {
 	return out
 }
 
+// RefundRouted takes back one NoteRouted for a request the upstream never
+// served (a DNS or dial failure, a server error). The proxy's hold retries
+// such a request many times (PATCHES §58), and an outage also stops the
+// usage refresh that would clear the debits, so without the refund a held
+// request alone would read its account as spent. Never below zero: a refresh
+// in between has already cleared the debit.
+func (r *SchedulerRef) RefundRouted(provider account.Provider, accountID string) {
+	if r == nil || accountID == "" {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	key := ScoreKey(provider, accountID)
+	switch count := r.routedSinceRefresh[key]; {
+	case count > 1:
+		r.routedSinceRefresh[key] = count - 1
+	case count == 1:
+		delete(r.routedSinceRefresh, key)
+	}
+}
+
 // LiveDebits returns the per-account routed-request counts since the last
-// successful refresh, for Scheduler.WithLiveDebits.
+// successful refresh, plus placements reserved and not yet committed
+// (PickAndReserve), for Scheduler.WithLiveDebits.
 func (r *SchedulerRef) LiveDebits() map[string]int {
 	if r == nil {
 		return nil
@@ -1860,10 +1984,41 @@ func (r *SchedulerRef) Touch() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.updatedAt = time.Now()
+	r.scored = true
 }
 
+// SetUpdatedAt dates the scores. The zero time also clears Scored, so the next
+// request re-scores before it routes (see Scored).
 func (r *SchedulerRef) SetUpdatedAt(updatedAt time.Time) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.updatedAt = updatedAt
+	r.scored = !updatedAt.IsZero()
+}
+
+// ClearExhausted drops every exhaustion mark held against one account, across
+// all model pools. It is the inverse of MarkExhausted, and exists for the one
+// event that makes a mark provably wrong before its expiry: the account's quota
+// was restored out of band -- a redeemed rate-limit-reset credit. Letting the
+// mark stand there would waste the credit, because routing would keep skipping
+// the account it just paid to revive until the mark lapsed on its own schedule.
+//
+// It deliberately does NOT touch incompatibleUntil: a reset restores quota, and
+// says nothing about whether the account is entitled to a model. Nor the
+// credential or account-state exclusions (credentialExhaustedUntil,
+// accountUnavailableUntil): a reset credit revives quota, not a dead token or
+// an organization that disabled OAuth.
+func (r *SchedulerRef) ClearExhausted(provider account.Provider, accountID string) {
+	if r == nil || accountID == "" {
+		return
+	}
+	prefix := ScoreKey(provider, accountID) + "\x00"
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for key := range r.exhaustedUntil {
+		if strings.HasPrefix(key, prefix) {
+			r.dropExhaustedMarkLocked(key)
+		}
+	}
+	r.updatedAt = time.Now()
 }

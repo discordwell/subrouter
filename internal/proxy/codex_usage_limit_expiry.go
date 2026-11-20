@@ -32,26 +32,34 @@ type codexUsageLimitDetails struct {
 // which case the caller keeps its default hold-out. The result is clamped to
 // [now+1m, now+8d] like the Claude header path.
 func codexUsageLimitExpiry(body []byte, now time.Time) (time.Time, bool) {
+	until, _, ok := codexUsageLimitHold(body, now)
+	return until, ok
+}
+
+// codexUsageLimitHold is codexUsageLimitExpiry plus whether the refusal is
+// workspace-level (credits depleted, spend cap). That distinction outlives the
+// expiry calculation: see holdCodexAccountForLimit.
+func codexUsageLimitHold(body []byte, now time.Time) (until time.Time, workspace bool, ok bool) {
 	var event map[string]any
 	if err := json.Unmarshal(body, &event); err != nil {
-		return time.Time{}, false
+		return time.Time{}, false, false
 	}
 	// HTTP bodies name the limit in error.type; stream events name it in a
 	// code under error or response.error. Accept either shape.
 	if !usageLimitMap(event) && codexTurnFailureClass(body) != codexFailureQuota {
-		return time.Time{}, false
+		return time.Time{}, false, false
 	}
 	details := codexUsageLimitDetailsFromMap(event)
-	until := time.Time{}
+	workspace = codexWorkspaceLimitType(details.RateLimitReachedType)
 	switch {
 	case details.ResetsInSeconds > 0:
 		until = now.Add(time.Duration(details.ResetsInSeconds * float64(time.Second)))
 	case !details.ResetsAt.IsZero():
 		until = details.ResetsAt
-	case codexWorkspaceLimitType(details.RateLimitReachedType):
+	case workspace:
 		until = now.Add(codexWorkspaceExhaustionTTL)
 	default:
-		return time.Time{}, false
+		return time.Time{}, false, false
 	}
 	if min := now.Add(time.Minute); until.Before(min) {
 		until = min
@@ -59,7 +67,7 @@ func codexUsageLimitExpiry(body []byte, now time.Time) (time.Time, bool) {
 	if max := now.Add(8 * 24 * time.Hour); until.After(max) {
 		until = max
 	}
-	return until, true
+	return until, workspace, true
 }
 
 // codexWorkspaceLimitType reports a rate_limit_reached_type that names a
@@ -138,13 +146,34 @@ func (s Server) markCodexAccountExhaustedFromBody(provider accounts.Provider, ac
 		return
 	}
 	if provider == accounts.ProviderCodex {
-		if until, ok := codexUsageLimitExpiry(body, time.Now()); ok {
+		if until, workspace, ok := codexUsageLimitHold(body, time.Now()); ok {
 			s.logCodexUsageLimitHoldout(accountID, poolKey, body, until)
-			s.SchedulerRef.MarkExhaustedUntil(schedulerAccountProvider(provider), accountID, poolKey, until)
+			s.holdCodexAccountForLimit(provider, accountID, poolKey, until, workspace)
 			return
 		}
 	}
 	s.markAccountExhausted(provider, accountID, poolKey)
+}
+
+// holdCodexAccountForLimit records a Codex usage-limit hold until its expiry.
+//
+// A workspace-level refusal (credits depleted, spend cap) is invisible in a
+// subscription seat's usage windows: the usage endpoint keeps reporting the
+// member's own rolling quota, which can read healthy while every request is
+// refused. (A usage-based seat, which has no rolling quota, does publish its
+// own spend cap, as its spend window: PATCHES.md §42.) A FRESH usage reading
+// is allowed to end an ordinary exhaustion mark early, so
+// on its own the hold would last until the next sweep and then route traffic
+// straight back into the refusal. The workspace hold is therefore also
+// recorded as account unavailability, which only its expiry ends -- a usage
+// refresh, a token rotation and a redeemed reset credit all leave it standing,
+// and none of them lifts a spend cap either.
+func (s Server) holdCodexAccountForLimit(provider accounts.Provider, accountID, poolKey string, until time.Time, workspace bool) {
+	schedulerProvider := schedulerAccountProvider(provider)
+	s.SchedulerRef.MarkExhaustedUntil(schedulerProvider, accountID, poolKey, until)
+	if workspace {
+		s.SchedulerRef.MarkAccountUnavailableUntil(schedulerProvider, accountID, until)
+	}
 }
 
 // markAccountExhaustedFromResponseBodyForAccount is the HTTP-path variant:
@@ -155,9 +184,9 @@ func (s Server) markAccountExhaustedFromResponseBodyForAccount(account accounts.
 		return
 	}
 	if account.Provider == accounts.ProviderCodex && status != 401 && status != 403 {
-		if until, ok := codexUsageLimitExpiry(body, time.Now()); ok {
+		if until, workspace, ok := codexUsageLimitHold(body, time.Now()); ok {
 			s.logCodexUsageLimitHoldout(account.ID, poolKey, body, until)
-			s.SchedulerRef.MarkExhaustedUntil(schedulerAccountProvider(account.Provider), account.ID, poolKey, until)
+			s.holdCodexAccountForLimit(account.Provider, account.ID, poolKey, until, workspace)
 			return
 		}
 	}

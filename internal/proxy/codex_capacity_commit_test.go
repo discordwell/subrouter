@@ -15,6 +15,11 @@ import (
 	"github.com/manaflow-ai/subrouter/session"
 )
 
+// Session commits by the capacity layer (upstream manaflow-ai/subrouter #389,
+// codex_capacity_commit_test.go as at c9303d3, verbatim; PATCHES section 27).
+// The layer now commits a move only once the turn completes, and credits the
+// account that actually answered (#371).
+
 // codexWriteDeltaThenFailed is a 2xx stream that shows output and then fails
 // the turn. The failure is post-output, so no layer may replay it, and the
 // turn never completed, so it must not pin the session either.

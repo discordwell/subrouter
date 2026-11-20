@@ -136,6 +136,9 @@ func setupHostTest(t *testing.T, serverURL string) (srRunner, *hostFakeHost, *by
 	t.Setenv("SUBROUTER_SERVER", "")
 	t.Setenv("SUBROUTER_CODEX_SERVER", "")
 	t.Setenv("SUBROUTER_CLOUD_CONFIG", filepath.Join(home, "cloud.json"))
+	// attach shares a server-configured pool; keyless, the PATCHES 17 gate
+	// resolves this machine to Local (C6) and attach refuses it.
+	unlockRemoteGateForTest(t)
 	store := accounts.DefaultCodexStore()
 	if err := os.MkdirAll(store.StoreDir(), 0o700); err != nil {
 		t.Fatal(err)
@@ -158,6 +161,36 @@ func setupHostTest(t *testing.T, serverURL string) (srRunner, *hostFakeHost, *by
 	return srRunner{store: store, out: &out, errOut: &out, cmd: fake}, fake, &out, agents
 }
 
+// Upstream merge 2026-11: `sr host` (#437/#440) is not dispatched in this fork.
+// attach installs upstream's release (or a github.com/manaflow-ai build) on the
+// other machine and writes a reverse-tunnel LaunchAgent here, outside the
+// PATCHES 17 gate -- the same reason §37.3 refuses `sr server install`'s
+// release. The file stays for serverHeading and the attach marker, so the
+// tests below drive runner.host directly; this one pins that the verb is
+// unreachable from the command line and touches nothing.
+func TestSRHostIsNotDispatched(t *testing.T) {
+	runner, fake, out, agents := setupHostTest(t, "http://127.0.0.1:31415")
+	for _, args := range [][]string{{"host", "attach", "devbox"}, {"host", "status"}, {"host", "watch", "--once"}} {
+		if err := runner.run(context.Background(), args); err == nil {
+			t.Fatalf("sr %s ran:\n%s", strings.Join(args, " "), out)
+		}
+	}
+	fake.mu.Lock()
+	calls := len(fake.calls)
+	fake.mu.Unlock()
+	if calls != 0 {
+		t.Fatalf("an undispatched sr host ran commands: %v", fake.calls)
+	}
+	if entries, err := os.ReadDir(agents); err == nil && len(entries) > 0 {
+		t.Fatalf("an undispatched sr host wrote LaunchAgents: %v", entries)
+	}
+	for _, verb := range []string{"host", "hosts"} {
+		if _, ok := directSRCommands[verb]; ok {
+			t.Fatalf("the sr binary dispatches %q as a direct command", verb)
+		}
+	}
+}
+
 func TestParseHostVisibility(t *testing.T) {
 	version, rollout := parseHostVisibility("health=ok\nversion=v0.1.141\nrollout=canary 25%\n")
 	if version != "v0.1.141" || rollout != "canary 25%" {
@@ -167,7 +200,7 @@ func TestParseHostVisibility(t *testing.T) {
 
 func TestHostAttachFallsBackToTunnelForLoopbackPool(t *testing.T) {
 	runner, fake, out, agents := setupHostTest(t, "http://127.0.0.1:31415")
-	if err := runner.run(context.Background(), []string{"host", "attach", "devbox"}); err != nil {
+	if err := runner.host(context.Background(), []string{"attach", "devbox"}); err != nil {
 		t.Fatalf("attach: %v\n%s", err, out)
 	}
 	plist, err := os.ReadFile(filepath.Join(agents, "ai.manaflow.subrouter.host.devbox.plist"))
@@ -202,7 +235,7 @@ func TestHostAttachFallsBackToTunnelForLoopbackPool(t *testing.T) {
 	}
 
 	// A second attach keeps the running tunnel.
-	if err := runner.run(context.Background(), []string{"host", "attach", "devbox"}); err != nil {
+	if err := runner.host(context.Background(), []string{"attach", "devbox"}); err != nil {
 		t.Fatalf("re-attach: %v\n%s", err, out)
 	}
 	if fake.commands("launchctl", "bootstrap") != 1 || fake.commands("launchctl", "bootout") != 0 {
@@ -213,7 +246,7 @@ func TestHostAttachFallsBackToTunnelForLoopbackPool(t *testing.T) {
 func TestHostAttachPrefersDirectRoute(t *testing.T) {
 	runner, fake, out, agents := setupHostTest(t, "http://127.0.0.1:31415")
 	fake.reachable["http://100.64.0.10:31415"] = true
-	err := runner.run(context.Background(), []string{"host", "attach", "devbox", "--url", "http://10.0.0.9:31415", "--url", "http://100.64.0.10:31415/v1"})
+	err := runner.host(context.Background(), []string{"attach", "devbox", "--url", "http://10.0.0.9:31415", "--url", "http://100.64.0.10:31415/v1"})
 	if err != nil {
 		t.Fatalf("attach: %v\n%s", err, out)
 	}
@@ -231,7 +264,7 @@ func TestHostAttachPrefersDirectRoute(t *testing.T) {
 
 func TestHostAttachDirectOnlyFailsWithoutRoute(t *testing.T) {
 	runner, fake, _, _ := setupHostTest(t, "http://127.0.0.1:31415")
-	err := runner.run(context.Background(), []string{"host", "attach", "devbox", "--route", "direct"})
+	err := runner.host(context.Background(), []string{"attach", "devbox", "--route", "direct"})
 	if err == nil || !strings.Contains(err.Error(), "--url") {
 		t.Fatalf("err = %v", err)
 	}
@@ -243,7 +276,7 @@ func TestHostAttachDirectOnlyFailsWithoutRoute(t *testing.T) {
 func TestHostAttachRefusesBusyHostPort(t *testing.T) {
 	runner, fake, _, _ := setupHostTest(t, "http://127.0.0.1:31415")
 	fake.portBusy = true
-	err := runner.run(context.Background(), []string{"host", "attach", "devbox"})
+	err := runner.host(context.Background(), []string{"attach", "devbox"})
 	if err == nil || !strings.Contains(err.Error(), "already answers") {
 		t.Fatalf("err = %v", err)
 	}
@@ -254,7 +287,7 @@ func TestHostAttachRefusesBusyHostPort(t *testing.T) {
 
 func TestHostAttachTunnelRefusesHTTPS(t *testing.T) {
 	runner, _, _, _ := setupHostTest(t, "https://pool.example.com")
-	err := runner.run(context.Background(), []string{"host", "attach", "devbox"})
+	err := runner.host(context.Background(), []string{"attach", "devbox"})
 	if err == nil || !strings.Contains(err.Error(), "plain http") {
 		t.Fatalf("err = %v", err)
 	}
@@ -262,10 +295,10 @@ func TestHostAttachTunnelRefusesHTTPS(t *testing.T) {
 
 func TestHostDetachStopsTunnelAndForgetsHost(t *testing.T) {
 	runner, fake, out, agents := setupHostTest(t, "http://127.0.0.1:31415")
-	if err := runner.run(context.Background(), []string{"host", "attach", "devbox"}); err != nil {
+	if err := runner.host(context.Background(), []string{"attach", "devbox"}); err != nil {
 		t.Fatalf("attach: %v\n%s", err, out)
 	}
-	if err := runner.run(context.Background(), []string{"host", "detach", "devbox"}); err != nil {
+	if err := runner.host(context.Background(), []string{"detach", "devbox"}); err != nil {
 		t.Fatalf("detach: %v\n%s", err, out)
 	}
 	if fake.loaded {
@@ -282,18 +315,18 @@ func TestHostDetachStopsTunnelAndForgetsHost(t *testing.T) {
 		t.Fatalf("host still recorded")
 	}
 	// Detaching again is a no-op.
-	if err := runner.run(context.Background(), []string{"host", "detach", "devbox"}); err != nil {
+	if err := runner.host(context.Background(), []string{"detach", "devbox"}); err != nil {
 		t.Fatal(err)
 	}
 }
 
 func TestHostStatusReportsRouteAndHealth(t *testing.T) {
 	runner, _, out, _ := setupHostTest(t, "http://127.0.0.1:31415")
-	if err := runner.run(context.Background(), []string{"host", "attach", "devbox"}); err != nil {
+	if err := runner.host(context.Background(), []string{"attach", "devbox"}); err != nil {
 		t.Fatalf("attach: %v\n%s", err, out)
 	}
 	out.Reset()
-	if err := runner.run(context.Background(), []string{"host", "status"}); err != nil {
+	if err := runner.host(context.Background(), []string{"status"}); err != nil {
 		t.Fatal(err)
 	}
 	for _, want := range []string{"devbox: pool-a through this machine's tunnel", "tunnel:  running", "pool:    ok"} {
@@ -308,7 +341,7 @@ func TestHostAttachRejectsLocalStorage(t *testing.T) {
 	if err := os.WriteFile(os.Getenv("SUBROUTER_CLOUD_CONFIG"), []byte(`{"version":1,"credentialSource":"local"}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	err := runner.run(context.Background(), []string{"host", "attach", "devbox"})
+	err := runner.host(context.Background(), []string{"attach", "devbox"})
 	if err == nil || !strings.Contains(err.Error(), "local") {
 		t.Fatalf("err = %v", err)
 	}
@@ -317,7 +350,7 @@ func TestHostAttachRejectsLocalStorage(t *testing.T) {
 func TestHostAttachRejectsOptionLikeHost(t *testing.T) {
 	runner, _, _, _ := setupHostTest(t, "http://127.0.0.1:31415")
 	for _, host := range []string{"-oProxyCommand=x", "a b", "x;y"} {
-		if err := runner.run(context.Background(), []string{"host", "attach", "--", host}); err == nil {
+		if err := runner.host(context.Background(), []string{"attach", "--", host}); err == nil {
 			t.Fatalf("accepted host %q", host)
 		}
 	}
@@ -439,7 +472,7 @@ mkdir -p "$GOBIN"; printf x > "$GOBIN/subrouter"; chmod +x "$GOBIN/subrouter"
 
 func TestHostAttachRecordsRouteOnHost(t *testing.T) {
 	runner, fake, out, _ := setupHostTest(t, "http://127.0.0.1:31415")
-	if err := runner.run(context.Background(), []string{"host", "attach", "devbox"}); err != nil {
+	if err := runner.host(context.Background(), []string{"attach", "devbox"}); err != nil {
 		t.Fatalf("attach: %v\n%s", err, out)
 	}
 	var marker string

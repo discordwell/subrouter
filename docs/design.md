@@ -203,8 +203,10 @@ Codex has both shorter rolling and daily/weekly style windows, so using the mini
 
 In serve mode, the periodic `--sr-switch-interval` sweep refreshes the usage
 scores used for routing. It never rewrites local Codex, OpenCode, or pi auth;
-only an explicit account-manager command can change active auth. Set the
-interval to `0` to disable scheduled score refresh.
+only an explicit account-manager command can change active auth. (This fork's
+sweep also rotates the active Claude profile name in the profile registry; that
+exports no credential.) Set the interval to `0` to disable scheduled score
+refresh.
 
 ## Account sources
 
@@ -219,11 +221,12 @@ Claude Code:
 
 - Read profile metadata from `~/.subrouter/codex/claude.json`.
 - Read per-profile credentials from `~/.subrouter/codex/claude/<profile>` or macOS Keychain using Claude Code's `Claude Code-credentials-<hash>` service naming.
-- Profile switching, env output, run, remove, and login are native Go commands under `sr claude`. `sr add claude` stores a one-year `claude setup-token` credential (access token, recorded expiry, `user:inference` scope, no refresh token); `sr claude login` keeps the refreshable browser OAuth credential. Every refresh path no-ops without a refresh token, so a setup token is used until its expiry and then fails closed with a terminal `no usable credential` error naming the re-add command.
-- Bare `sr claude` manages local profiles. `sr claude proxy [claude args...]` is
-  the explicit profileless pooled launcher: it uses the selected Subrouter
-  server, needs no local daemon when that server is remote, and passes Claude
-  arguments through unchanged.
+- Profile switching, env output, run, remove, and login are native Go commands under `sr claude`. `sr add claude <name>` (and `sr claude login <name>`, which folds to it) stores the refreshable browser OAuth credential. Only an explicit `sr add claude <name> --setup-token` stores a one-year `claude setup-token` credential instead (access token, recorded expiry, `user:inference` scope, no refresh token). Every refresh path no-ops without a refresh token, so a setup token is used until its expiry and then fails closed with a terminal `no usable credential` error naming the re-add command.
+- `sr claude` launches pooled Claude Code through the local daemon, which
+  prefers local accounts and spills to the selected server only when they run
+  low (`ops/PATCHES.md` §15/§16). `sr claude proxy [claude args...]` is the
+  explicit profileless pooled launcher and passes Claude arguments through
+  unchanged.
 
 Gemini:
 

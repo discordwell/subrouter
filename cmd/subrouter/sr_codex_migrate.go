@@ -22,13 +22,16 @@ const codexIsolationRemediation = "sr codex migrate-isolation"
 const codexIsolatedEnrollmentCommand = "sr codex enroll-isolated"
 const codexIsolationComparisonRemediation = "verify candidate and retiring credential stores before activation"
 const codexIsolationAllowSharedEnv = "SUBROUTER_CODEX_ISOLATION_ALLOW_SHARED"
-const codexAccountUsage = "sr codex isolation-check [--json] [--retiring-state-dir PATH] [--allow-shared-active ACCOUNT]..., sr codex migrate-isolation [--device-auth], sr codex enroll-isolated --retiring-state-dir PATH [--device-auth] [--only ACCOUNT]..., or sr codex attest-legacy [--state-dir PATH] [--dry-run] [--only ACCOUNT]..."
+const codexAccountUsage = "sr codex isolation-check [--json] [--retiring-state-dir PATH] [--allow-shared-active ACCOUNT]..., sr codex migrate-isolation [--device-auth], sr codex enroll-isolated --retiring-state-dir PATH [--device-auth] [--only ACCOUNT]..., sr codex attest-legacy [--state-dir PATH] [--dry-run] [--only ACCOUNT]..., or sr codex reset <name|email>"
 
 var errCodexIsolationCheckFailed = errors.New("codex credential isolation preflight failed")
 
 func isCodexAccountCommand(args []string) bool {
 	return len(args) > 1 && args[0] == "codex" &&
-		(args[1] == "isolation-check" || args[1] == "migrate-isolation" || args[1] == "enroll-isolated" || args[1] == "attest-legacy")
+		(args[1] == "isolation-check" || args[1] == "migrate-isolation" || args[1] == "enroll-isolated" || args[1] == "attest-legacy" ||
+			// `sr codex reset <account>` (PATCHES §46); the launcher would
+			// otherwise start Codex with "reset" as its prompt.
+			args[1] == "reset")
 }
 
 func isCodexIsolationCheckCommand(args []string) bool {
@@ -506,6 +509,8 @@ func (r srRunner) codexAccount(ctx context.Context, args []string) error {
 		return r.enrollCodexIsolation(ctx, args[1:])
 	case "attest-legacy":
 		return r.attestLegacyCodexCredentials(ctx, args[1:])
+	case "reset":
+		return r.codexReset(ctx, args[1:])
 	default:
 		return fmt.Errorf("unknown Codex account command %q; usage: %s", args[0], codexAccountUsage)
 	}

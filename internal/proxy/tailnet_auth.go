@@ -19,8 +19,17 @@ type TailnetAuthorizer interface {
 // outside the configured allowlist, falls through to the token rules rather
 // than being rejected here: enabling tailnet auth adds a way in, it does not
 // remove the existing ones.
+//
+// An Authorizer with neither users nor tags would accept every peer the tailnet
+// can route to, making each one an admin. Startup refuses that configuration;
+// this refuses it again at the gate, so a construction path that skips the
+// startup check fails closed instead of open.
 func (s Server) authorizeTailnet(r *http.Request) (tailnet.Identity, bool) {
 	if s.TailnetAuth == nil || r == nil {
+		return tailnet.Identity{}, false
+	}
+	if authorizer, ok := s.TailnetAuth.(*tailnet.Authorizer); ok &&
+		(authorizer == nil || (len(authorizer.Users) == 0 && len(authorizer.Tags) == 0)) {
 		return tailnet.Identity{}, false
 	}
 	return s.TailnetAuth.Authorize(r.Context(), r.RemoteAddr)

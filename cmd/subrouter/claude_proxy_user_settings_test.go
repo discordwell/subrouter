@@ -14,18 +14,20 @@ import (
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	"github.com/manaflow-ai/subrouter/internal/agents/claude"
+	"github.com/manaflow-ai/subrouter/internal/storepath"
 )
+
+// Upstream #435's unit tests, adapted: every claude.RoutingEnvKeys entry is
+// owned whether or not the launch sets it, and a launch with no env of its own
+// must not get the user's raw env back. Upstream #483's tests that merge the
+// proxy home's own settings into the overlay with the user's scalars winning
+// (TestWithClaudeUserSettingsKeepsProxyConfigChoicesAndRoutingCase,
+// TestClaudeProxySettingsRefreshAndMergeHomeValues) are not here: this fork
+// keeps the directory's own single-value choices (PATCHES 29.9.2).
 
 func TestWithClaudeUserSettingsCarriesHooksAndKeepsRoutingAuthoritative(t *testing.T) {
 	userSettings := filepath.Join(t.TempDir(), "settings.json")
-	if err := os.WriteFile(userSettings, []byte(`{
-		"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "guard.sh"}]}]},
-		"permissions": {"allow": ["Bash(ls:*)"]},
-		"theme": "dark",
-		"apiKeyHelper": "print-other-key",
-		"statusLine": {"type": "command", "command": "user-status"},
-		"env": {"USER_ONLY": "kept", "ANTHROPIC_BASE_URL": "https://elsewhere.example"}
-	}`), 0o600); err != nil {
+	if err := os.WriteFile(userSettings, []byte(userClaudeSettingsFixture), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	launch, err := proxyClaudeLaunchSettings("http://127.0.0.1:31415", "token", "/tmp/proxy-config")
@@ -36,48 +38,17 @@ func TestWithClaudeUserSettingsCarriesHooksAndKeepsRoutingAuthoritative(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	body, err = withClaudeSessionStatusLine(body, "", "/tmp/store")
-	if err != nil {
-		t.Fatal(err)
-	}
 	var merged map[string]any
 	if err := json.Unmarshal(body, &merged); err != nil {
 		t.Fatal(err)
 	}
-	hooks, _ := merged["hooks"].(map[string]any)
-	if _, ok := hooks["PreToolUse"]; !ok {
-		t.Fatalf("user hooks missing from launch settings: %s", body)
-	}
-	if merged["theme"] != "dark" || merged["permissions"] == nil {
-		t.Fatalf("user settings missing: %s", body)
-	}
-	if _, ok := merged["apiKeyHelper"]; ok {
-		t.Fatalf("credential helper leaked into proxy launch: %s", body)
-	}
 	env, _ := merged["env"].(map[string]any)
-	if env["USER_ONLY"] != "kept" {
-		t.Fatalf("user env dropped: %s", body)
+	assertUserSettingsCarried(t, merged, env)
+	if merged["theme"] != "dark" {
+		t.Fatalf("user theme missing: %s", body)
 	}
 	if env["ANTHROPIC_BASE_URL"] != "http://127.0.0.1:31415" || env["ANTHROPIC_AUTH_TOKEN"] != "token" || env["CLAUDE_CONFIG_DIR"] != "/tmp/proxy-config" {
 		t.Fatalf("routing env not authoritative: %s", body)
-	}
-}
-
-func TestWithClaudeUserSettingsLetsSRStatusLineWin(t *testing.T) {
-	userSettings := filepath.Join(t.TempDir(), "settings.json")
-	if err := os.WriteFile(userSettings, []byte(`{"statusLine": {"type": "command", "command": "user-status"}}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	launch, err := json.Marshal(map[string]any{"env": map[string]string{}, "statusLine": map[string]any{"type": "command", "command": "sr-status"}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	body, err := withClaudeUserSettings(launch, userSettings, "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(string(body), "sr-status") || strings.Contains(string(body), "user-status") {
-		t.Fatalf("status line = %s, want sr's", body)
 	}
 }
 
@@ -99,19 +70,187 @@ func TestWithClaudeUserSettingsIgnoresMissingOrInvalidFile(t *testing.T) {
 	}
 }
 
-func TestClaudeProxyUserSettingsPathIgnoresHermeticStoresAndOptOut(t *testing.T) {
-	if got := claudeProxyUserSettingsPath(t.TempDir()); got != "" {
-		t.Fatalf("hermetic store read user settings at %q", got)
+func TestWithClaudeUserSettingsKeepsOwnConfigChoicesAndRoutingCase(t *testing.T) {
+	dir := t.TempDir()
+	userSettings := filepath.Join(dir, "user.json")
+	if err := os.WriteFile(userSettings, []byte(`{
+		"theme": "dark",
+		"model": "user-model",
+		"hooks": {"SessionStart": []},
+		"env": {"anthropic_base_url": "https://elsewhere.example", "USER_ONLY": "kept"}
+	}`), 0o600); err != nil {
+		t.Fatal(err)
 	}
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	storeDir := claude.DefaultStore().Dir
-	if got, want := claudeProxyUserSettingsPath(storeDir), filepath.Join(home, ".claude", "settings.json"); got != want {
-		t.Fatalf("user settings path = %q, want %q", got, want)
+	ownSettings := filepath.Join(dir, "own.json")
+	if err := os.WriteFile(ownSettings, []byte(`{"theme": "light", "hooks": {"Stop": []}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	launch := []byte(`{"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:1"}}`)
+	body, err := withClaudeUserSettings(launch, userSettings, ownSettings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var merged map[string]any
+	if err := json.Unmarshal(body, &merged); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := merged["theme"]; ok {
+		t.Fatalf("user theme hid the profile's own choice: %s", body)
+	}
+	if hooks, _ := merged["hooks"].(map[string]any); merged["model"] != "user-model" || hooks["SessionStart"] == nil {
+		t.Fatalf("user settings missing: %s", body)
+	}
+	env, _ := merged["env"].(map[string]any)
+	if _, ok := env["anthropic_base_url"]; ok || env["ANTHROPIC_BASE_URL"] != "http://127.0.0.1:1" || env["USER_ONLY"] != "kept" {
+		t.Fatalf("env = %v, want routing keys owned by sr in any case", env)
+	}
+}
+
+// Upstream kept the user's raw env whenever the combined env came out empty.
+// A direct profile launch has no env of its own, so a user env holding only
+// the cutover's routing keys would have been carried whole.
+func TestWithClaudeUserSettingsNeverRestoresTheUsersRoutingEnv(t *testing.T) {
+	userSettings := filepath.Join(t.TempDir(), "settings.json")
+	if err := os.WriteFile(userSettings, []byte(`{"theme":"dark","env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:31415","ANTHROPIC_AUTH_TOKEN":"the-daemon-token"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	body, err := withClaudeUserSettings([]byte(`{}`), userSettings, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(body), "the-daemon-token") || strings.Contains(string(body), "ANTHROPIC_BASE_URL") {
+		t.Fatalf("a launch with no env of its own got the user's routing env back: %s", body)
+	}
+	if string(body) != `{"theme":"dark"}` {
+		t.Fatalf("body = %s, want only the theme", body)
+	}
+}
+
+func TestClaudeUserSettingsPathSkipsLaunchesThatAlreadyReadIt(t *testing.T) {
+	withoutEnvForTest(t, claudeProxyUserSettingsEnv)
+	shared := t.TempDir()
+	if err := os.WriteFile(filepath.Join(shared, "settings.json"), []byte(`{}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	profile := t.TempDir()
+	if got, want := claudeUserSettingsPathFor(shared, profile), filepath.Join(shared, "settings.json"); got != want {
+		t.Fatalf("profile launch path = %q, want %q", got, want)
+	}
+	for name, configDir := range map[string]string{
+		"no profile (the child reads ~/.claude itself)": "",
+		"the shared home itself":                        shared,
+	} {
+		if got := claudeUserSettingsPathFor(shared, configDir); got != "" {
+			t.Fatalf("%s: path = %q, want none (hooks would run twice)", name, got)
+		}
+	}
+	linked := t.TempDir()
+	if err := os.Symlink(filepath.Join(shared, "settings.json"), filepath.Join(linked, "settings.json")); err != nil {
+		t.Fatal(err)
+	}
+	if got := claudeUserSettingsPathFor(shared, linked); got != "" {
+		t.Fatalf("profile whose settings.json links to the user's: path = %q, want none", got)
+	}
+	if got := claudeUserSettingsPathFor("", profile); got != "" {
+		t.Fatalf("store with no shared home: path = %q, want none", got)
 	}
 	t.Setenv(claudeProxyUserSettingsEnv, "off")
-	if got := claudeProxyUserSettingsPath(storeDir); got != "" {
+	if got := claudeUserSettingsPathFor(shared, profile); got != "" {
 		t.Fatalf("opted-out launch read user settings at %q", got)
+	}
+}
+
+func TestClaudeProxyUserSettingsPathIgnoresHermeticStores(t *testing.T) {
+	withoutEnvForTest(t, claudeProxyUserSettingsEnv)
+	home := sandboxHostConfig(t)
+	if got := claudeProxyUserSettingsPath(t.TempDir(), t.TempDir()); got != "" {
+		t.Fatalf("hermetic store read user settings at %q", got)
+	}
+	if got, want := claudeProxyUserSettingsPath(claude.DefaultStore().Dir, t.TempDir()), filepath.Join(home, ".claude", "settings.json"); got != want {
+		t.Fatalf("user settings path = %q, want %q", got, want)
+	}
+}
+
+// --setting-sources picks which of the user/project/local sources load, and
+// flag settings load regardless, so a caller who left "user" out must not get
+// it back through sr's --settings file.
+func TestClaudeProxyLaunchHonorsSettingSources(t *testing.T) {
+	clearClaudeCacheTTLEnv(t)
+	home := sandboxHostConfig(t)
+	writeUserClaudeSettings(t, home)
+	recordDir := writeRecordingClaudeCLI(t)
+	runner := srRunner{
+		program: "sr",
+		store:   accounts.CodexStore{Dir: filepath.Join(storepath.CodexDir(), "accounts")},
+		in:      strings.NewReader(""), out: io.Discard, errOut: io.Discard,
+	}
+	for _, args := range [][]string{{"--setting-sources", "project"}, {"--setting-sources=project,local"}} {
+		if err := runner.runProxyClaude(t.Context(), args, "http://127.0.0.1:31415/v1", "tok", t.TempDir(), "", ""); err != nil {
+			t.Fatal(err)
+		}
+		doc, _ := readRecordedLaunchSettings(t, filepath.Join(recordDir, "settings.json"))
+		if _, ok := doc["hooks"]; ok {
+			t.Fatalf("%q: the user's settings rode in although the caller chose the sources: %v", args, doc)
+		}
+	}
+	if err := runner.runProxyClaude(t.Context(), []string{"--", "--setting-sources", "project"}, "http://127.0.0.1:31415/v1", "tok", t.TempDir(), "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if doc, _ := readRecordedLaunchSettings(t, filepath.Join(recordDir, "settings.json")); doc["hooks"] == nil {
+		t.Fatalf("a --setting-sources after -- is a prompt, not a flag, yet the user's settings were dropped: %v", doc)
+	}
+}
+
+// The user's settings now ride in the private --settings file, so a
+// promptCacheTtl there is the user's TTL decision (§21): Claude Code's env
+// beats the setting, so injecting 1h into the environment would override it.
+func TestClaudeProxyLaunchKeepsTheUsersPromptCacheTTLSetting(t *testing.T) {
+	clearClaudeCacheTTLEnv(t)
+	home := sandboxHostConfig(t)
+	dir := filepath.Join(home, ".claude")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "settings.json"), []byte(`{"promptCacheTtl":"5m"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	recordDir := writeRecordingClaudeCLI(t)
+	runner := srRunner{
+		program: "sr",
+		store:   accounts.CodexStore{Dir: filepath.Join(storepath.CodexDir(), "accounts")},
+		in:      strings.NewReader(""), out: io.Discard, errOut: io.Discard,
+	}
+	if err := runner.runProxyClaude(t.Context(), nil, "http://127.0.0.1:31415/v1", "tok", t.TempDir(), "", ""); err != nil {
+		t.Fatal(err)
+	}
+	doc, _ := readRecordedLaunchSettings(t, filepath.Join(recordDir, "settings.json"))
+	if doc["promptCacheTtl"] != "5m" {
+		t.Fatalf("calibration: the user's promptCacheTtl did not ride in the launch settings: %v", doc)
+	}
+	body, err := os.ReadFile(filepath.Join(recordDir, "env"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, val := countEnvKey(strings.Split(strings.TrimSpace(string(body)), "\n"), claudePromptCacheTTLEnv); n != 0 {
+		t.Fatalf("the launcher injected %s=%s over the user's promptCacheTtl", claudePromptCacheTTLEnv, val)
+	}
+}
+
+func TestWithClaudeUserSettingsLetsSRStatusLineWin(t *testing.T) {
+	userSettings := filepath.Join(t.TempDir(), "settings.json")
+	if err := os.WriteFile(userSettings, []byte(`{"statusLine": {"type": "command", "command": "user-status"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	launch, err := json.Marshal(map[string]any{"env": map[string]string{}, "statusLine": map[string]any{"type": "command", "command": "sr-status"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := withClaudeUserSettings(launch, userSettings, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), "sr-status") || strings.Contains(string(body), "user-status") {
+		t.Fatalf("status line = %s, want sr's", body)
 	}
 }
 
@@ -164,42 +303,6 @@ func TestAccountPickerUsageDoesNotWaitOnSlowServer(t *testing.T) {
 	}
 }
 
-func TestWithClaudeUserSettingsKeepsProxyConfigChoicesAndRoutingCase(t *testing.T) {
-	dir := t.TempDir()
-	userSettings := filepath.Join(dir, "user.json")
-	if err := os.WriteFile(userSettings, []byte(`{
-		"theme": "dark",
-		"model": "user-model",
-		"hooks": {"SessionStart": []},
-		"env": {"anthropic_base_url": "https://elsewhere.example", "USER_ONLY": "kept"}
-	}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	proxySettings := filepath.Join(dir, "proxy.json")
-	if err := os.WriteFile(proxySettings, []byte(`{"theme": "light", "hooks": {"Stop": []}}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	launch := []byte(`{"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:1"}}`)
-	body, err := withClaudeUserSettings(launch, userSettings, proxySettings)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var merged map[string]any
-	if err := json.Unmarshal(body, &merged); err != nil {
-		t.Fatal(err)
-	}
-	if merged["theme"] != "dark" {
-		t.Fatalf("shared theme did not replace stale home choice: %s", body)
-	}
-	if hooks, _ := merged["hooks"].(map[string]any); merged["model"] != "user-model" || hooks["SessionStart"] == nil {
-		t.Fatalf("user settings missing: %s", body)
-	}
-	env, _ := merged["env"].(map[string]any)
-	if _, ok := env["anthropic_base_url"]; ok || env["ANTHROPIC_BASE_URL"] != "http://127.0.0.1:1" || env["USER_ONLY"] != "kept" {
-		t.Fatalf("env = %v, want routing keys owned by sr in any case", env)
-	}
-}
-
 func TestWithClaudeUserSettingsAllowsSharedProjectMemory(t *testing.T) {
 	root := t.TempDir()
 	projects := filepath.Join(root, "projects")
@@ -226,51 +329,6 @@ func TestWithClaudeUserSettingsAllowsSharedProjectMemory(t *testing.T) {
 	directories, _ := permissions["additionalDirectories"].([]any)
 	if len(directories) != 2 || directories[0] != "/tmp/other" || directories[1] != projects {
 		t.Fatalf("additionalDirectories = %v, want user and shared projects", directories)
-	}
-}
-
-func TestClaudeProxySettingsRefreshAndMergeHomeValues(t *testing.T) {
-	root := t.TempDir()
-	user := filepath.Join(root, "user.json")
-	home := filepath.Join(root, "home.json")
-	userBody := `{"model":"new","env":{"USER":"new"},"hooks":{"Stop":[{"hooks":[{"type":"command","command":"shared"}]}]},"permissions":{"allow":["Read(shared)"],"deny":["Read(secret)"]}}`
-	homeBody := `{"model":"old","effortLevel":"high","env":{"HOME_ONLY":"kept","USER":"old"},"hooks":{"Stop":[{"hooks":[{"type":"command","command":"home"}]}]},"permissions":{"allow":["Read(home)"]}}`
-	for path, body := range map[string]string{user: userBody, home: homeBody} {
-		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
-			t.Fatal(err)
-		}
-	}
-	launch := []byte(`{"env":{"ANTHROPIC_BASE_URL":"http://localhost"},"hooks":{"Stop":[{"hooks":[{"type":"command","command":"sr"}]}]}}`)
-	for _, model := range []string{"new", "newer"} {
-		if err := os.WriteFile(user, []byte(strings.ReplaceAll(userBody, `"new"`, `"`+model+`"`)), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		body, err := withClaudeUserSettings(launch, user, home)
-		if err != nil {
-			t.Fatal(err)
-		}
-		var got map[string]any
-		if err := json.Unmarshal(body, &got); err != nil {
-			t.Fatal(err)
-		}
-		if got["model"] != model || got["effortLevel"] != "high" {
-			t.Fatalf("settings = %s", body)
-		}
-		hooks := got["hooks"].(map[string]any)["Stop"].([]any)
-		if len(hooks) != 3 {
-			t.Fatalf("lost hooks: %s", body)
-		}
-		env := got["env"].(map[string]any)
-		if env["USER"] != model || env["HOME_ONLY"] != "kept" || env["ANTHROPIC_BASE_URL"] != "http://localhost" {
-			t.Fatalf("env: %s", body)
-		}
-		permissions := got["permissions"].(map[string]any)
-		if len(permissions["allow"].([]any)) != 2 || len(permissions["deny"].([]any)) != 1 {
-			t.Fatalf("permissions: %s", body)
-		}
-	}
-	if got, err := os.ReadFile(home); err != nil || string(got) != homeBody {
-		t.Fatal("overwrote Claude's settings")
 	}
 }
 
@@ -313,6 +371,11 @@ func TestClaudeProxyMemoryDirectoryResolvesSymlinksAndDeduplicates(t *testing.T)
 	}
 }
 
+// Upstream #498's managed-launch test, adapted to this fork's runClaude, which
+// layers the user's settings with withClaudeUserSettings directly (PATCHES
+// 29.9.2): a routed profile keeps sr's route, and a direct one gets none of
+// the user's routing keys back (upstream's withManagedClaudeUserSettings let
+// the user's ANTHROPIC_BASE_URL through to a direct launch).
 func TestManagedClaudeLaunchCarriesUserSettings(t *testing.T) {
 	userPath := filepath.Join(t.TempDir(), "settings.json")
 	if err := os.WriteFile(userPath, []byte(`{
@@ -336,10 +399,10 @@ func TestManagedClaudeLaunchCarriesUserSettings(t *testing.T) {
 		baseURL string
 	}{
 		{name: "routed", body: launch, baseURL: "https://router.example"},
-		{name: "unrouted", body: nil, baseURL: "https://not-the-router.example"},
+		{name: "direct", body: []byte(`{}`), baseURL: ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			body, err := withManagedClaudeUserSettings(tc.body, userPath, nil)
+			body, err := withClaudeUserSettings(tc.body, userPath, "")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -351,8 +414,8 @@ func TestManagedClaudeLaunchCarriesUserSettings(t *testing.T) {
 			if env["CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS"] != "200" || env["CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH"] != "5" {
 				t.Fatalf("user env missing: %v", env)
 			}
-			if env["ANTHROPIC_BASE_URL"] != tc.baseURL {
-				t.Fatalf("ANTHROPIC_BASE_URL = %v, want %s", env["ANTHROPIC_BASE_URL"], tc.baseURL)
+			if got, _ := env["ANTHROPIC_BASE_URL"].(string); got != tc.baseURL {
+				t.Fatalf("ANTHROPIC_BASE_URL = %q, want %q", got, tc.baseURL)
 			}
 			if _, ok := settings["forceLoginMethod"]; ok {
 				t.Fatal("credential-source setting must be dropped")
@@ -361,8 +424,5 @@ func TestManagedClaudeLaunchCarriesUserSettings(t *testing.T) {
 				t.Fatalf("non-env user setting missing: %v", settings)
 			}
 		})
-	}
-	if body, err := withManagedClaudeUserSettings(nil, "", nil); err != nil || body != nil {
-		t.Fatalf("disabled merge must leave an unrouted launch without settings, got %s, %v", body, err)
 	}
 }

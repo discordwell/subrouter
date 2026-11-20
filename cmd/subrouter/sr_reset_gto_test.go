@@ -2,8 +2,10 @@ package main
 
 import (
 	"bytes"
+	"net/http"
 	"regexp"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -45,7 +47,7 @@ func TestGTOResetCandidatesRankByWeeklyWaitAndSkipShortOnly(t *testing.T) {
 		codexRow("early-cook@x.com", weeklyCookedWindows(3600*24*5), true, false, credit(2)),
 		codexRow("no-credit@x.com", weeklyCookedWindows(3600*24*6), true, false, &accounts.ComplimentaryResetInfo{Known: true, Available: false}),
 	}
-	usable, cands := gtoResetCandidates(rows)
+	usable, cands, _ := gtoResetCandidates(rows)
 	if usable != 1 {
 		t.Fatalf("usableNow = %d, want 1 (a 5h-cooked account is not usable either)", usable)
 	}
@@ -77,6 +79,49 @@ func TestAssessResetValue(t *testing.T) {
 	}
 	if _, ok := assessResetValue(0, nil); ok {
 		t.Fatal("no candidates should not be worthwhile")
+	}
+}
+
+// Local --gto ranks from one usage read and redeems straight through wham
+// later, so the read just before the redeem is the last check before a credit
+// is spent (upstream #402). An account whose weekly window came back in
+// between is skipped, reported as a failure, and nothing is consumed. The
+// same fixture without the change is redeemed: see the calibration in
+// TestResetLocalGTONeverSpendsACreditOnASpendCap.
+func TestResetLocalGTORechecksLiveUsageBeforeSpending(t *testing.T) {
+	wham := &localResetWham{rateLimit: map[string]any{
+		"allowed":        true,
+		"limit_reached":  false,
+		"primary_window": map[string]any{"used_percent": 100, "limit_window_seconds": 604800, "reset_after_seconds": 440286},
+	}}
+	runner, out := localResetRunner(t, "recovered@example.com", wham)
+	served := wham.client().Transport
+	var usageReads atomic.Int32
+	runner.client = &http.Client{Transport: srRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		res, err := served.RoundTrip(req)
+		if req.URL.Path == "/backend-api/wham/usage" && usageReads.Add(1) == 1 {
+			// The ranking read saw the week spent; it comes back before
+			// the read that precedes the redeem.
+			wham.mu.Lock()
+			wham.rateLimit = map[string]any{
+				"allowed":        true,
+				"limit_reached":  false,
+				"primary_window": map[string]any{"used_percent": 10, "limit_window_seconds": 604800, "reset_after_seconds": 600000},
+			}
+			wham.mu.Unlock()
+		}
+		return res, err
+	})}
+
+	err := runner.reset(t.Context(), []string{"--gto"})
+	if got := wham.consumes(); got != 0 {
+		t.Fatalf("--gto spent %d credit(s) on an account whose week came back before the redeem\n%s", got, out.String())
+	}
+	if n := usageReads.Load(); n < 2 {
+		t.Fatalf("usage reads = %d, want the ranking read and a re-read before the redeem\n%s", n, out.String())
+	}
+	if err == nil || !strings.Contains(out.String(), "no longer weekly-cooked") {
+		t.Fatalf("err = %v, want the skipped redeem reported as a failure\n%s", err, out.String())
 	}
 }
 

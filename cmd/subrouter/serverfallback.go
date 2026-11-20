@@ -231,9 +231,42 @@ func fallbackHTTPClient() *http.Client {
 	}
 }
 
-// claudeLaunchesAgent reports whether `sr claude <args>` launches Claude Code.
-// Bare invocation is the pooled interactive launcher. The explicit proxy form
-// is also profileless; all other forms retain profile-management semantics.
+// claudeManagementSubcommands never launch the agent, so they must not trigger
+// a daemon autostart.
+//
+// addr, move and rename are this fork's provider-first verbs (2026-09 grammar
+// pass). Missing here, `sr claude move x` would be read as a LAUNCH of a
+// profile named "move" -- a daemon autostart and a Claude session instead of
+// a move.
+var claudeManagementSubcommands = map[string]struct{}{
+	"add": {}, "addr": {}, "login": {},
+	"move": {}, "rename": {},
+	"list": {}, "ls": {}, "status": {},
+	"switch": {}, "use": {},
+	"remove": {}, "rm": {},
+	"env":  {},
+	"pick": {},
+	// reset spends a saved usage-limit reset through a daemon (PATCHES §46);
+	// read as a launch it would start a session on a profile named "reset".
+	"reset": {},
+	"push":  {}, "upload": {},
+	"proxy-scope": {},
+	"help":        {}, "-h": {}, "--help": {},
+}
+
+// claudeLaunchesAgent reports whether `sr claude <args>` will start Claude Code.
+// No arguments means the interactive launcher, which does.
+//
+// Every launching form -- bare, `--flag`, `run`, `<name>` and upstream's
+// profileless `proxy` -- answers true, because srRunner.claude gates the
+// PATCHES 15 local-first spill (and so the PATCHES 16 peer fall-through, which
+// needs the client pointed at 127.0.0.1) on this predicate. Upstream narrowed
+// it to bare and `proxy` only (f39439a); taken as-is that sent `sr claude
+// --flag` and `sr claude <name>` straight to a local profile, past the daemon.
 func claudeLaunchesAgent(args []string) bool {
-	return len(args) == 0 || args[0] == "proxy"
+	if len(args) == 0 {
+		return true
+	}
+	_, management := claudeManagementSubcommands[args[0]]
+	return !management
 }

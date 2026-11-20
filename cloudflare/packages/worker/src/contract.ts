@@ -48,7 +48,6 @@ export interface UsageWindow {
   readonly limit_window_seconds?: number
   readonly reset_after_seconds?: number
   readonly feature?: string
-  readonly extra_usage?: ClaudeExtraUsage
 }
 
 export interface CreditsInfo {
@@ -61,17 +60,6 @@ export interface ProviderUsageStatus {
   readonly plan_type?: string
   readonly windows?: ReadonlyArray<UsageWindow>
   readonly credits?: CreditsInfo
-  readonly extra_usage?: ClaudeExtraUsage
-}
-
-export interface ClaudeExtraUsage {
-  readonly is_enabled: boolean
-  readonly monthly_limit?: number
-  readonly used_credits?: number
-  readonly utilization?: number
-  readonly disabled_reason?: string
-  readonly credits_balance?: number
-  readonly auto_reload?: boolean
 }
 
 export interface StoredAccountContract extends Account {
@@ -416,14 +404,10 @@ const fetchClaudeUsage = async (
   if (windows.length === 0) {
     throw new Error("Claude usage quota is unknown: account utilization was not reported")
   }
-  if (payload.extra_usage) {
-    windows.push({
-      name: "extra",
-      used_percent: typeof payload.extra_usage.utilization === "number" ? payload.extra_usage.utilization : 0,
-      extra_usage: payload.extra_usage,
-    })
+  if (payload.extra_usage?.is_enabled && typeof payload.extra_usage.utilization === "number") {
+    windows.push({ name: "extra", used_percent: payload.extra_usage.utilization })
   }
-  return { plan_type: "claude", windows, ...(payload.extra_usage ? { extra_usage: payload.extra_usage } : {}) }
+  return { plan_type: "claude", windows }
 }
 
 interface CodexUsageResponse {
@@ -522,7 +506,10 @@ interface ClaudeUsageResponse {
   readonly seven_day?: ClaudeRateLimit
   readonly seven_day_opus?: ClaudeRateLimit
   readonly seven_day_sonnet?: ClaudeRateLimit
-  readonly extra_usage?: ClaudeExtraUsage
+  readonly extra_usage?: {
+    readonly is_enabled?: boolean
+    readonly utilization?: number
+  }
 }
 
 interface ClaudeRateLimit {

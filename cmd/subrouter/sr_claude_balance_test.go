@@ -16,6 +16,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	"github.com/manaflow-ai/subrouter/internal/storepath"
@@ -93,6 +94,9 @@ func claudeWebTestServer(t *testing.T, email, orgID string, balanceCents float64
 
 func claudeWebTestEnv(t *testing.T) {
 	t.Helper()
+	// The enrichment is opt-in (claudeWebBalanceEnabled); these tests exercise
+	// it with the opt-in set.
+	t.Setenv(claudeWebBalanceOptInEnv, "1")
 	t.Setenv("SUBROUTER_STATE_DIR", t.TempDir())
 	// CodexDir() runs a legacy-migration check against ~/.codex-accounts; give
 	// tests a temp HOME so they never read the real one.
@@ -316,6 +320,37 @@ func TestEnrichClaudeRowsWithWebBalances(t *testing.T) {
 	}
 }
 
+// Upstream's paid-extra-usage display was skipped in the 2026-09 merge: without
+// the opt-in, `sr status` must not read browser cookies or the Keychain, must
+// not call claude.ai, and must hand pushClaudeWebBalances nothing to send to
+// the box.
+func TestEnrichClaudeRowsWithWebBalancesIsOffWithoutOptIn(t *testing.T) {
+	claudeWebTestEnv(t)
+	t.Setenv(claudeWebBalanceOptInEnv, "")
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+	claudeWebBaseURL = server.URL
+	claudeWebDiscoverSessionKeys = func(context.Context) []claudeWebSessionKeyCandidate {
+		t.Error("browser cookie discovery ran without the opt-in")
+		return []claudeWebSessionKeyCandidate{{SessionKey: "sk-ant-discovered", Source: "test"}}
+	}
+	saveClaudeWebSessions([]claudeWebSession{{SessionKey: "sk-ant-stored", Email: "user@example.com"}})
+	rows := []srUsageRow{{email: "user@example.com", provider: accounts.ProviderClaude, authMode: accounts.AuthModeOAuth}}
+	if fresh := enrichClaudeRowsWithWebBalancesFresh(context.Background(), rows); len(fresh) != 0 {
+		t.Fatalf("fresh balances without the opt-in = %v; pushClaudeWebBalances would send them to the box", fresh)
+	}
+	if rows[0].extraUsage != nil {
+		t.Fatalf("row enriched without the opt-in: %+v", rows[0].extraUsage)
+	}
+	if requests != 0 {
+		t.Fatalf("claude.ai was called %d time(s) without the opt-in", requests)
+	}
+}
+
 func TestEnrichClaudeRowsWithWebBalancesNoClaudeRows(t *testing.T) {
 	claudeWebTestEnv(t)
 	claudeWebDiscoverSessionKeys = func(context.Context) []claudeWebSessionKeyCandidate {
@@ -471,8 +506,29 @@ func TestClaudeStatusTableHasOneExtraUsageColumn(t *testing.T) {
 			t.Fatalf("status output missing %q:\n%s", want, out.String())
 		}
 	}
-	if strings.Contains(out.String(), "?") {
-		t.Fatalf("status output shows an unknown marker beside a known balance:\n%s", out.String())
+	// Upstream checks the whole table for "?". The fork's Claude table also
+	// carries the 1x reset column (PATCHES §46), which shows "?" for an
+	// account whose saved-reset state was never read -- these rows carry no
+	// usage read at all. The claim is about the Extra usage cells, so check
+	// those: everything from the column's start rightwards.
+	lines := strings.Split(out.String(), "\n")
+	col := -1
+	for _, line := range lines {
+		if i := strings.Index(line, "Extra usage"); i >= 0 {
+			col = utf8.RuneCountInString(line[:i])
+			break
+		}
+	}
+	if col < 0 {
+		t.Fatalf("no Extra usage header:\n%s", out.String())
+	}
+	for _, line := range lines {
+		if !strings.Contains(line, "@example.com") {
+			continue
+		}
+		if cells := []rune(line); len(cells) > col && strings.Contains(string(cells[col:]), "?") {
+			t.Fatalf("status output shows an unknown marker beside a known balance:\n%s", out.String())
+		}
 	}
 }
 
@@ -712,6 +768,28 @@ func TestPushClaudeWebBalances(t *testing.T) {
 
 	runner := srRunner{}
 	config := srServerConfig{Name: "test", URL: server.URL, requestClient: server.Client()}
+
+	// This fork's gating (2026-09 merge; upstream pushes unconditionally): the
+	// push is a write to the box from a read command, so it needs BOTH the
+	// PATCHES 17 remote unlock and the web-balance opt-in. Each alone pushes
+	// nothing.
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("SUBROUTER_STATE_DIR", t.TempDir())
+	resetRemoteGateCache()
+	t.Cleanup(resetRemoteGateCache)
+	t.Setenv(claudeWebBalanceOptInEnv, "1")
+	runner.pushClaudeWebBalances(context.Background(), config, map[string]float64{"user@example.com": 365})
+	if len(got) != 0 {
+		t.Fatalf("a keyless machine pushed balances to the box: %+v", got)
+	}
+	unlockRemoteGateForTest(t)
+	t.Setenv(claudeWebBalanceOptInEnv, "")
+	runner.pushClaudeWebBalances(context.Background(), config, map[string]float64{"user@example.com": 365})
+	if len(got) != 0 {
+		t.Fatalf("balances were pushed without the %s opt-in: %+v", claudeWebBalanceOptInEnv, got)
+	}
+
+	t.Setenv(claudeWebBalanceOptInEnv, "1")
 	runner.pushClaudeWebBalances(context.Background(), config, map[string]float64{"user@example.com": 365})
 	if len(got) != 1 || got[0].Email != "user@example.com" || got[0].BalanceCents != 365 {
 		t.Fatalf("pushes = %+v", got)

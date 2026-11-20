@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
+	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
 	"github.com/manaflow-ai/subrouter/internal/broker"
 	"github.com/manaflow-ai/subrouter/internal/tenant"
 	"github.com/manaflow-ai/subrouter/selectacct"
@@ -236,19 +237,80 @@ func (s *tenantCredentialLeaseStore) handleIssue(
 		http.Error(w, "credential lease unavailable", http.StatusServiceUnavailable)
 		return
 	}
-	writeJSON(w, map[string]any{
-		"teamId": t.ID,
-		"lease": map[string]any{
-			"leaseId": leaseID, "accountId": account.ID,
-			"provider": provider, "authMode": account.AuthMode,
-			"token": account.Token, "providerAccountId": account.AccountID,
-			"label": account.Label, "email": account.Email,
-			"credentialGeneration": generation,
-			"sessionToken":         input.SessionToken,
-			"issuedAt":             issuedAt.Format(time.RFC3339Nano),
-			"expiresAt":            expiresAt.Format(time.RFC3339Nano),
-		},
-	})
+	// Built key by key rather than from a struct so the borrower's hard reject
+	// list (refreshToken, idToken, credentials, tokens, apiKey — see
+	// broker.leaseWire.UnmarshalJSON) cannot be reached by a future field
+	// rename on accounts.Account.
+	wire := map[string]any{
+		"leaseId": leaseID, "accountId": account.ID,
+		"provider": provider, "authMode": account.AuthMode,
+		"token": account.Token,
+		"label": account.Label, "email": account.Email,
+		"credentialGeneration": generation,
+		"sessionToken":         input.SessionToken,
+		"issuedAt":             issuedAt.Format(time.RFC3339Nano),
+		"expiresAt":            expiresAt.Format(time.RFC3339Nano),
+	}
+	if account.AccountID != "" {
+		// Codex refuses a request whose ChatGPT-Account-ID does not match the
+		// token, so the borrower cannot spend this credential without it.
+		wire["providerAccountId"] = account.AccountID
+	}
+	if credentialExpiresAt, ok := leasedCredentialExpiry(r.Context(), server, provider, account); ok {
+		wire["credentialExpiresAt"] = credentialExpiresAt.Format(time.RFC3339Nano)
+	}
+	writeJSON(w, map[string]any{"teamId": t.ID, "lease": wire})
+}
+
+// leasedCredentialExpiry reports when the leased token itself stops working,
+// which the lease TTL does not track: a 5-minute lease can hand out an access
+// token with 30 seconds left on it, and without this the borrower only learns
+// that from a 401 mid-request. Reported only when actually known — omitting the
+// field costs the borrower a retry, while a guessed one retires a live token.
+// Keyed on the requested provider, not account.Provider, because a legacy
+// account carries an empty provider yet is leased and spent as Codex.
+func leasedCredentialExpiry(
+	ctx context.Context,
+	server *Server,
+	provider accounts.Provider,
+	account accounts.Account,
+) (time.Time, bool) {
+	switch provider {
+	case accounts.ProviderClaude:
+		return claudeCredentialExpiry(ctx, server, account)
+	case accounts.ProviderCodex:
+		// Nothing on disk records a Codex expiry; the access token is a JWT and
+		// publishes its own.
+		millis, ok := accounts.JWTExpiryMillis(account.Token)
+		if !ok || millis <= 0 {
+			return time.Time{}, false
+		}
+		return time.UnixMilli(millis).UTC(), true
+	default:
+		return time.Time{}, false
+	}
+}
+
+// claudeCredentialExpiry reads the expiry Claude stores beside the credential.
+// profileAccount records that profile's config directory as the account Source,
+// and that path is the whole handle the store needs to read it back.
+func claudeCredentialExpiry(
+	ctx context.Context,
+	server *Server,
+	account accounts.Account,
+) (time.Time, bool) {
+	if account.Source == "" {
+		return time.Time{}, false
+	}
+	store := agentclaude.Store{}
+	if server.AccountRef != nil {
+		store = server.AccountRef.claudeStore
+	}
+	credential, err := store.ReadCredential(ctx, account.Source)
+	if err != nil || credential == nil || credential.ExpiresAt <= 0 {
+		return time.Time{}, false
+	}
+	return time.UnixMilli(credential.ExpiresAt).UTC(), true
 }
 
 func setTenantCredentialLeaseRetryAfter(w http.ResponseWriter, retryAt time.Time) {
@@ -419,7 +481,8 @@ func pickTenantCredentialLeaseAccount(
 	model := tenantCredentialLeasePoolModel(provider, input.Model, baseScheduler)
 	scheduler := baseScheduler.ForModel(model)
 	if server.Sessions != nil {
-		scheduler = scheduler.WithSessionCounts(SchedulerActiveSessionCounts(server.Sessions))
+		scheduler = scheduler.WithSessionCounts(SchedulerSessionCounts(server.Sessions)).
+			WithLiveSessionCounts(SchedulerActiveSessionCounts(server.Sessions, server.ActiveSessions))
 	}
 	// Forced, sticky, and preferred routing never grant permission to reuse a
 	// cooled credential. Filtering must happen first; if every candidate is

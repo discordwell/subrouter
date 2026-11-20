@@ -48,8 +48,10 @@ func srStatusFixtureServer(t *testing.T, fixturePaths ...string) *httptest.Serve
 }
 
 // runSRStatusAgainstFixture runs `sr <args>` against a default remote server
-// that serves the fixture, the path `sr status` takes on a client whose
-// credential storage points at a team router.
+// that serves the fixture. In this fork `sr status` renders this machine's
+// accounts first and then one section per configured server (PATCHES 19), so
+// the fixture shows up as the "Server: team" section after an empty local
+// view; upstream renders the selected server alone.
 func runSRStatusAgainstFixture(t *testing.T, args []string, fixturePaths ...string) (string, error) {
 	t.Helper()
 	if os.Getenv("COLUMNS") == "" {
@@ -59,6 +61,9 @@ func runSRStatusAgainstFixture(t *testing.T, args []string, fixturePaths ...stri
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("SUBROUTER_CLOUD_CONFIG", filepath.Join(home, "cloud.json"))
+	// A default server is a remote path: keyless, the PATCHES 17 gate ignores
+	// servers.json and this would render an empty local view.
+	unlockRemoteGateForTest(t)
 	store := accounts.DefaultCodexStore()
 	server := srStatusFixtureServer(t, fixturePaths...)
 	if err := defaultSRServerStore(store).save(srServerFile{
@@ -142,7 +147,11 @@ func assertSRStatusQuotaTable(t *testing.T) {
 }
 
 // TestSRStatusTextMatchesGolden pins the human `sr status` table byte for
-// byte, so machine-readable output can be added without moving a column.
+// byte, so machine-readable output can be added without moving a column. The
+// golden is this fork's view (upstream merge 2026-11): the local section, then
+// the server's (unnumbered, as printRemoteAccountSections renders it), the
+// Claude 1x reset column (PATCHES §46), "not routable" instead of upstream's
+// flat "protected < 40%" floor, and the §36 repair hint.
 func TestSRStatusTextMatchesGolden(t *testing.T) {
 	got, err := runSRStatusAgainstFixture(t, []string{"status"})
 	if err != nil {

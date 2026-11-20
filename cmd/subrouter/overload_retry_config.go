@@ -9,6 +9,11 @@ import (
 	"github.com/manaflow-ai/subrouter/internal/proxy"
 )
 
+// The Codex same-account capacity ladder's operator knobs, from upstream
+// manaflow-ai/subrouter's overload_retry_config.go (#389, as at c9303d3). The
+// Claude reader in that file (SUBROUTER_CLAUDE_OVERLOAD_*) is not ported: the
+// fork has not taken upstream's Claude overload ladder (PATCHES section 27).
+
 // overloadMaxWaitFromEnvironment reads a same-account overload wall-clock
 // cap: a Go duration, where 0 means no cap (wait until the client
 // disconnects). Unset returns ok=false so the default applies.
@@ -46,22 +51,4 @@ func overloadIntervalFromEnvironment(key string) (time.Duration, error) {
 		return 0, fmt.Errorf("%s=%q: the retry interval must be at least %s", key, raw, proxy.OverloadRetryMinInterval)
 	}
 	return d, nil
-}
-
-// claudeOverloadRetryConfigFromEnvironment reads the Claude same-account
-// overload ladder: SUBROUTER_CLAUDE_OVERLOAD_MAX_WAIT (default 8m; 0 = no
-// cap), SUBROUTER_CLAUDE_OVERLOAD_RETRY_INTERVAL (default 15s, at least
-// 500ms) and SUBROUTER_CLAUDE_OVERLOAD_RETRY_HEADER=1, which lets clients
-// shape their own wait with the X-Subrouter-Retry header.
-func claudeOverloadRetryConfigFromEnvironment() (*proxy.ClaudeOverloadRetryConfig, error) {
-	config := &proxy.ClaudeOverloadRetryConfig{AllowHeader: envTrue("SUBROUTER_CLAUDE_OVERLOAD_RETRY_HEADER")}
-	maxWait, unbounded, _, err := overloadMaxWaitFromEnvironment("SUBROUTER_CLAUDE_OVERLOAD_MAX_WAIT")
-	if err != nil {
-		return nil, err
-	}
-	config.MaxWait, config.Unbounded = maxWait, unbounded
-	if config.Interval, err = overloadIntervalFromEnvironment("SUBROUTER_CLAUDE_OVERLOAD_RETRY_INTERVAL"); err != nil {
-		return nil, err
-	}
-	return config, nil
 }

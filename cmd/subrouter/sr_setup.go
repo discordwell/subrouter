@@ -25,7 +25,7 @@ const setupWaitTimeout = 15 * time.Second
 // runSetup brings this machine to a working state and is safe to re-run. It
 // installs the supervised daemon if missing, starts it, waits for health, and
 // then reports the single most useful next step.
-func runSetup(ctx context.Context, store accounts.CodexStore, args []string, out io.Writer) error {
+func runSetup(ctx context.Context, store accounts.CodexStore, args []string, source broker.CredentialSource, out io.Writer) error {
 	flags := flag.NewFlagSet("setup", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	var skipInstall bool
@@ -40,8 +40,9 @@ func runSetup(ctx context.Context, store accounts.CodexStore, args []string, out
 	}
 
 	plan, err := planForSetup(ctx, store, setupPlanOptions{
-		wantBackground: !noBackground,
-		wantConfig:     !noConfig,
+		wantBackground:   !noBackground,
+		wantConfig:       !noConfig,
+		credentialSource: source,
 	})
 	if err != nil {
 		return err
@@ -78,7 +79,7 @@ func runSetup(ctx context.Context, store accounts.CodexStore, args []string, out
 		switch runtime.GOOS {
 		case "darwin":
 			fmt.Fprintln(out, "installing the local daemon...")
-			if err := installDaemon(nil); err != nil {
+			if err := installDaemonForSetup(out); err != nil {
 				return fmt.Errorf("install daemon: %w", err)
 			}
 		case "linux":
@@ -133,6 +134,24 @@ func runSetup(ctx context.Context, store accounts.CodexStore, args []string, out
 	}
 	fmt.Fprintf(out, "daemon healthy at %s\n", local)
 
+	// The review screen offers to route Codex and Claude Code through Subrouter,
+	// so setup has to actually do it. Applying it only after the health check
+	// keeps a client from being pointed at a daemon that never came up.
+	if plan.selected(actionConfigCodex) {
+		path, err := writeCodexConfigForLocal()
+		if err != nil {
+			return fmt.Errorf("configure Codex: %w", err)
+		}
+		fmt.Fprintf(out, "configured Codex in %s\n", path)
+	}
+	if plan.selected(actionConfigClaude) {
+		path, err := writeClaudeProxyEnvForLocal()
+		if err != nil {
+			return fmt.Errorf("configure Claude Code: %w", err)
+		}
+		fmt.Fprintf(out, "configured Claude Code in %s\n", path)
+	}
+
 	cloudConfig, err := cloudModeConfig()
 	if err != nil {
 		return err
@@ -166,7 +185,12 @@ func runSetup(ctx context.Context, store accounts.CodexStore, args []string, out
 		return err
 	}
 	if len(list) == 0 {
-		fmt.Fprintf(out, "\nNo accounts yet. Add one with:\n  %s add\n", programBase())
+		fmt.Fprintf(
+			out,
+			"\nNo accounts yet, so Codex and Claude Code were left pointing at their providers.\nAdd an account, then re-run setup to route them here:\n  %s add\n  %s setup\n",
+			programBase(),
+			programBase(),
+		)
 		return nil
 	}
 	fmt.Fprintf(out, "\n%d account(s) available. Try:\n  %s codex\n  %s claude\n", len(list), programBase(), programBase())
@@ -324,6 +348,15 @@ func runDoctor(ctx context.Context, store accounts.CodexStore, out io.Writer) er
 // reporting logic rather than this machine's launchd state.
 func runDoctorWith(ctx context.Context, controller serviceController, controllerErr error, store accounts.CodexStore, out io.Writer) error {
 	checks := []doctorCheck{}
+	// First, because it explains every other line here (PATCHES §47): from a
+	// shell whose macOS login session has ended the daemon still answers, so
+	// nothing below would fail, while every Keychain, TLS and launchd step sr
+	// takes from this shell does.
+	if session := probeLoginSession(); !session.usable {
+		checks = append(checks, doctorCheck{"fail", "login session", joinSentences(capitalize(session.situation())+".",
+			session.hostClause(), "Here sr runs only help, status, doctor, a few read-only listings and `claude|codex reset`, "+
+				"and refuses every other verb (exit 2).", session.remedy())})
+	}
 	client := fallbackHTTPClient()
 	local := localBaseURL()
 	cloudConfig, cloudConfigErr := cloudModeConfig()
@@ -364,7 +397,11 @@ func runDoctorWith(ctx context.Context, controller serviceController, controller
 	} else {
 		checks = append(checks, doctorCheck{"warn", "local daemon", fmt.Sprintf("%s is not answering; run '%s daemon start'", local, programBase())})
 	}
-	checks = append(checks, doctorVersionChecks(ctx, local)...)
+	// Upstream's doctorVersionChecks (sr_doctor_version.go) are not wired:
+	// every remedy they print is upstream's release installer ('sr update',
+	// subrouter-deploy.sh install-release), which this fork refuses
+	// (PATCHES §23, §37.3), and an unstamped fork build would always read
+	// as a provenance warning.
 
 	if teamReady {
 		if localOK {
@@ -433,6 +470,15 @@ func runDoctorWith(ctx context.Context, controller serviceController, controller
 		}
 	}
 
+	// Claude Code's own settings.json, the file setup writes: the first-party
+	// socket recipe there sends every prompt as cleartext HTTP to
+	// api.anthropic.com instead of through the pool (PATCHES §36).
+	if claudeDir, dirErr := defaultClaudeConfigDir(); dirErr != nil {
+		checks = append(checks, doctorCheck{"warn", "Claude settings", fmt.Sprintf("%v; the socket-recipe check did not run", dirErr)})
+	} else {
+		checks = append(checks, claudeSettingsDoctorCheck(ctx, filepath.Join(claudeDir, "settings.json"), codexProxyRootURL(local)))
+	}
+
 	failed := false
 	for _, check := range checks {
 		fmt.Fprintf(out, "%s  %-20s %s\n", doctorMark(check.status), check.title, check.detail)
@@ -463,6 +509,11 @@ func remoteAccountImportChecks(
 	if !ok {
 		return nil
 	}
+	// The path too: the preflight goes where serverLoginOne sends a Codex
+	// login's, the public admin path only for an unpinned plaintext entry
+	// with a usable one (PATCHES §51.5).
+	_, publicOK, _ := publicAdminFor(server)
+	runner.credentialUploadPublicOnly = unpinnedPlaintextServer(server) && publicOK
 	if err := runner.ensureServerAccountImportAvailable(ctx, server); err != nil {
 		return []doctorCheck{{"fail", "server account import", err.Error()}}
 	}

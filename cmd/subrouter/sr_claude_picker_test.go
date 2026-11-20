@@ -70,7 +70,9 @@ func TestClaudeAccountPickerOrdersByHealthAndDefaultsToHealthiest(t *testing.T) 
 		"default (profile name)",
 		"Unusable, cannot be picked: 4, 5",
 		"invalid_grant",
-		"sr add claude",
+		// Upstream's hint is "sr add claude"; the fork names the profile's own
+		// repair (PATCHES §36, claudeUsageRowRepair): re-auth it in place.
+		"sr claude addr default",
 		"restricted by Anthropic",
 		"protected",
 	} {

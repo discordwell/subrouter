@@ -1,27 +1,28 @@
+Local (this machine)
+No accounts configured. Run 'subrouter add' to add one.
 Server: team (http://SERVER)
 
-Codex accounts                                                                         
-#    Account          Plan  State   Use                        5h      7d      1x reset
-───  ───────────────  ────  ──────  ─────────────────────────  ──────  ──────  ────────
-1    a1@example.test  pro   rec     63% left, 5h reset 1h      90%/1h  63%/3d  4 left  
-2    a2@example.test  pro   active  20% left, protected < 40%  95%/2h  20%/1d  unknown 
-3    a3@example.test  team  cooked  cooked, cannot switch      100%    0%/2d   unknown 
+Codex accounts                                                                
+Account          Plan  State   Use                    5h      7d      1x reset
+───────────────  ────  ──────  ─────────────────────  ──────  ──────  ────────
+a1@example.test  pro   rec     63% left, 5h reset 1h  90%/1h  63%/3d  4 left  
+a3@example.test  team  cooked  cooked, cannot switch  100%    0%/2d   unknown 
+a2@example.test  pro   active  20% left, 5h reset 2h  95%/2h  20%/1d  unknown 
 
-Claude profiles                                                                        
-#    Account    State   Use                        5h          7d         Extra usage  
-───  ─────────  ──────  ─────────────────────────  ──────────  ─────────  ─────────────
-1    claude-a4  active  73% left                   99%/4h49m   73%/6d16h               
-2    claude-a5          30% left, protected < 40%  80%/1h59m   30%/5d22h  $0.98        
-3    claude-a6  temp    temp cooked, cannot start  0%/9m       34%/6d4h                
-4    claude-a7  cooked  cooked, cannot switch      100%/4h59m  0%/4d4h    $12.50/$50.00
-5    claude-a8  error   usage unavailable                                              
+Claude profiles                                                                             
+Account    State   Use                        5h          7d         1x reset  Extra usage  
+─────────  ──────  ─────────────────────────  ──────────  ─────────  ────────  ─────────────
+claude-a4  active  73% left                   99%/4h49m   73%/6d16h  ?                      
+claude-a6  temp    temp cooked, cannot start  0%/9m       34%/6d4h   ?                      
+claude-a5          30% left                   80%/1h59m   30%/5d22h  ?         $0.98        
+claude-a7  cooked  cooked, cannot switch      100%/4h59m  0%/4d4h    ?         $12.50/$50.00
+claude-a8  error   usage unavailable                                 ?                      
 
-Kimi API-key accounts                                                    
-#    Account                 Plan      State       Use                   
-───  ──────────────────────  ────────  ──────────  ──────────────────────
-1    main                    API key   unchecked   OAuth quota only      
+Kimi API-key accounts                                               
+Account                 Plan      State       Use                   
+──────────────────────  ────────  ──────────  ──────────────────────
+main                    API key   unchecked   OAuth quota only      
 
-  claude-a8 [claude]: Claude OAuth refresh failed: 400 Bad Request: invalid_grant (re-add with: sr add claude)
+  claude-a8 [claude]: Claude OAuth refresh failed: 400 Bad Request: invalid_grant (re-auth on that server with: sr claude addr claude-a8)
 
 Total: 3 Codex, 5 Claude profiles, 1 Kimi (9 accounts)
-Plain 'kimi' uses its local direct configuration; use 'sr kimi' for the routed Subrouter Kimi key pool.

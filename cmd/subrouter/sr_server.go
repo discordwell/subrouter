@@ -95,14 +95,16 @@ This machine's daemon:
 
 Named servers:
   %[1]s list
-  %[1]s add <name> --url <url> [--default] [--tailscale-node-id <id>] [--admin-token <token>] [--account-import-token <token>] [--tenant-key srt_<hex>] [--ssh-host <user@host>] [--gcp-instance <name> --gcp-zone <zone> --gcp-project <project>]
+  %[1]s add <name> --url <url> [--default] [--tailscale-node-id <id>] [--admin-token <token>] [--account-import-token <token>] [--proxy-token <token>] [--tenant-key srt_<hex>] [--ssh-host <user@host>] [--gcp-instance <name> --gcp-zone <zone> --gcp-project <project>]
   %[1]s use <name|local> [--no-codex-config]
   %[1]s current
   %[1]s clear-default
   %[1]s rename <old> <new>
   %[1]s remove <name>
   %[1]s status <name>            Usage for a named remote server
-  %[1]s install <name> [--version latest]   Install or rotate credentials over gcloud or --ssh-host
+  %[1]s set-public <name> [--url <https-url>] [--fingerprint <hex>] [--token-file <path|->] [--keep-token] [--clear]
+                                 Public admin path for when <name>'s private URL is out of reach, and for Claude uploads and Codex login uploads to an unpinned plain-http entry (a named admin token, piped in, never printed)
+  %[1]s install <name> [--version latest]   Install or rotate credentials over gcloud or --ssh-host (refused on this fork: it installs upstream's release)
   %[1]s login <name> [--device-auth]
   %[1]s sync <name> [--device-auth] [--all] [--email <email>] [--dry-run] [--yes]
 
@@ -145,6 +147,16 @@ type srServerConfig struct {
 	// AccountImportToken grants only protected HTTP account import. Keeping it
 	// separate prevents a self-service login from gaining administrator access.
 	AccountImportToken string `json:"accountImportToken,omitempty"`
+	// ProxyToken is a credential that SPENDS this server's pool: a named
+	// membership token (PATCHES §43), which does nothing else, or the static
+	// proxy token.
+	// A tool that writes a client's base URL and bearer for this server
+	// (ops/bin/claudemode) writes this one, so the admin secret no
+	// longer lands in every settings.json that points at the box. sr itself
+	// does not send it yet: several of its launch paths choose a transport by
+	// whether the entry has a tenant key (secureTenantServerURLWithResolvers),
+	// and would carry this over plain HTTP to any host.
+	ProxyToken string `json:"proxyToken,omitempty"`
 	// SSHHost installs and rotates credentials on a host that is reachable over
 	// plain SSH rather than through gcloud, such as a macOS worker on a
 	// Tailscale network. It is the install transport only; ordinary traffic and
@@ -158,6 +170,53 @@ type srServerConfig struct {
 	// It is deliberately process-local and must never be persisted with remote
 	// server configuration.
 	requestClient *http.Client
+
+	// PublicURL is this server's internet-reachable TLS address, used when the
+	// tailnet is not available. URL above stays the PREFERRED path: it is
+	// faster, already trusted, and exposes nothing.
+	//
+	// A second address rather than a replacement, because the failure this
+	// exists for is intermittent -- a VPN kill switch blocks the tailnet
+	// while leaving everything routed through its own tunnel reachable, so a
+	// box has to be addressable both ways on the same day.
+	PublicURL string `json:"publicUrl,omitempty"`
+
+	// Fingerprint pins the certificate served at PublicURL: lowercase hex
+	// SHA-256 of the DER leaf, printed by the box at startup.
+	//
+	// REQUIRED for PublicURL to be usable. Boxes are self-signed, so without a
+	// pin the dialer falls back to CA validation and refuses them -- which is
+	// the fail-closed direction, but it means an entry with a PublicURL and no
+	// Fingerprint simply will not connect.
+	Fingerprint string `json:"fingerprint,omitempty"`
+
+	// PublicAdminToken is a NAMED admin-role access token (srk_..., minted on
+	// the box with `subrouter token mint <name> --role admin`), sent only to
+	// PublicURL, pinned by Fingerprint, and only when URL cannot be used
+	// (PATCHES §43.2, doServerAdmin). The box serves its public admin routes
+	// to this and to nothing else when it runs with SUBROUTER_PUBLIC_ADMIN=1.
+	// AdminToken is never sent there: the box refuses the static admin token
+	// on the public listener by design. Set with `sr server set-public`, which
+	// never prints it; `sr server list` never does either.
+	PublicAdminToken string `json:"publicAdminToken,omitempty"`
+}
+
+// peerAddresses returns this server's addresses in PREFERENCE ORDER, tailnet
+// first.
+//
+// Returning an ordered list rather than a single resolved address is the shape
+// multibox needs: with N peers the daemon has to try each peer's addresses in
+// turn, and a caller that has already collapsed to one string cannot fall back.
+// Choosing that shape now avoids migrating servers.json twice.
+func (c srServerConfig) peerAddresses() []string {
+	var addresses []string
+	if url := strings.TrimSpace(c.URL); url != "" {
+		addresses = append(addresses, url)
+	}
+	if url := strings.TrimSpace(c.PublicURL); url != "" {
+		addresses = append(addresses, url)
+	}
+	return addresses
 }
 
 type srServerFile struct {
@@ -209,6 +268,8 @@ func (r srRunner) server(ctx context.Context, args []string) error {
 			return fmt.Errorf("usage: %s status [name]", command)
 		}
 		return r.serverStatus(ctx, store, args[1])
+	case "set-public":
+		return r.serverSetPublic(store, args[1:])
 	case "install":
 		return r.serverInstall(ctx, store, args[1:])
 	case "login", "add-account", "add-auth":
@@ -456,6 +517,10 @@ func (r srRunner) serverList(store srServerStore) error {
 		if server.TailscaleNodeID != "" {
 			tailscaleIdentity = "tailscale:" + server.TailscaleNodeID
 		}
+		// The public admin path is named by its URL; its token never prints.
+		if strings.TrimSpace(server.PublicAdminToken) != "" {
+			suffix = "\tpublic-admin:" + redactedServerURL(server.PublicURL) + suffix
+		}
 		fmt.Fprintf(r.out, "%s\t%s\t%s\t%s\t%s%s\n", server.Name, redactedServerURL(server.URL), server.GCPInstance, server.GCPZone, tailscaleIdentity, suffix)
 	}
 	return nil
@@ -463,7 +528,7 @@ func (r srRunner) serverList(store srServerStore) error {
 
 func (r srRunner) serverAdd(store srServerStore, args []string) error {
 	command := r.serverCommand()
-	usage := fmt.Errorf("usage: %s add <name> --url <url> [--default] [--tailscale-node-id <id>] [--admin-token <token>] [--account-import-token <token>] [--ssh-host <user@host>] [--gcp-instance <name> --gcp-zone <zone> --gcp-project <project>] [--no-codex-config]", command)
+	usage := fmt.Errorf("usage: %s add <name> --url <url> [--default] [--tailscale-node-id <id>] [--admin-token <token>] [--account-import-token <token>] [--proxy-token <token>] [--ssh-host <user@host>] [--gcp-instance <name> --gcp-zone <zone> --gcp-project <project>] [--no-codex-config]", command)
 	if len(args) == 0 {
 		return usage
 	}
@@ -477,7 +542,10 @@ func (r srRunner) serverAdd(store srServerStore, args []string) error {
 	sshHost := flags.String("ssh-host", "", "SSH destination used by server install for hosts that are not GCP instances, such as user@mac-mini")
 	adminToken := flags.String("admin-token", "", "admin token for non-loopback _subrouter endpoints")
 	accountImportToken := flags.String("account-import-token", "", "token limited to protected HTTP account import")
+	proxyToken := flags.String("proxy-token", "", "token that only spends this server's pool (a named membership token); what claudemode writes into Claude Code settings")
 	tenantKey := flags.String("tenant-key", "", "tenant key (srt_...) scoping this entry to one tenant on a multi-tenant server")
+	publicURL := flags.String("public-url", "", "internet-reachable TLS URL used when the tailnet is unavailable, such as https://box.example:31415")
+	fingerprint := flags.String("fingerprint", "", "SHA-256 certificate pin for --public-url, printed by the box at startup (required for it to be usable)")
 	makeDefault := flags.Bool("default", false, "make this the default server for sr codex")
 	writeCodexConfig, noCodexConfig := addCodexConfigSwitchFlags(flags)
 	name, err := parseFlagsOneName(flags, args, usage)
@@ -489,7 +557,10 @@ func (r srRunner) serverAdd(store srServerStore, args []string) error {
 	}
 	adminTokenSet := false
 	accountImportTokenSet := false
+	proxyTokenSet := false
 	tenantKeySet := false
+	publicURLSet := false
+	fingerprintSet := false
 	sshHostSet := false
 	tailscaleNodeIDSet := false
 	flags.Visit(func(flag *flag.Flag) {
@@ -502,8 +573,17 @@ func (r srRunner) serverAdd(store srServerStore, args []string) error {
 		if flag.Name == "account-import-token" {
 			accountImportTokenSet = true
 		}
+		if flag.Name == "proxy-token" {
+			proxyTokenSet = true
+		}
 		if flag.Name == "tenant-key" {
 			tenantKeySet = true
+		}
+		if flag.Name == "public-url" {
+			publicURLSet = true
+		}
+		if flag.Name == "fingerprint" {
+			fingerprintSet = true
 		}
 		if flag.Name == "tailscale-node-id" {
 			tailscaleNodeIDSet = true
@@ -524,6 +604,16 @@ func (r srRunner) serverAdd(store srServerStore, args []string) error {
 	if (*gcpInstance == "") != (*gcpZone == "") {
 		return fmt.Errorf("--gcp-instance and --gcp-zone must be set together")
 	}
+	// Refuse at add time rather than letting it fail as a connection error
+	// later. Boxes are self-signed, so a public URL with no pin falls back to CA
+	// validation and is simply refused -- correct, but the operator would be
+	// debugging a handshake instead of reading this.
+	if strings.TrimSpace(*publicURL) != "" && fingerprintSet && strings.TrimSpace(*fingerprint) == "" {
+		return fmt.Errorf("--public-url needs --fingerprint: the box is self-signed, so without a pin the connection is refused")
+	}
+	if strings.TrimSpace(*fingerprint) != "" && !validCertificateFingerprint(*fingerprint) {
+		return fmt.Errorf("--fingerprint must be 64 hex characters (SHA-256), as printed by the box at startup")
+	}
 	next := srServerConfig{
 		Name:               name,
 		URL:                strings.TrimRight(*serverURL, "/"),
@@ -534,9 +624,13 @@ func (r srRunner) serverAdd(store srServerStore, args []string) error {
 		SSHHost:            strings.TrimSpace(*sshHost),
 		AdminToken:         *adminToken,
 		AccountImportToken: strings.TrimSpace(*accountImportToken),
+		ProxyToken:         strings.TrimSpace(*proxyToken),
 		TenantKey:          strings.TrimSpace(*tenantKey),
+		PublicURL:          strings.TrimRight(strings.TrimSpace(*publicURL), "/"),
+		Fingerprint:        strings.ToLower(strings.TrimSpace(*fingerprint)),
 	}
 	replaced := false
+	droppedPublicAdminToken := false
 	if err := store.update(func(file *srServerFile) error {
 		for i := range file.Servers {
 			if file.Servers[i].Name == name {
@@ -547,8 +641,29 @@ func (r srRunner) serverAdd(store srServerStore, args []string) error {
 				if !accountImportTokenSet {
 					next.AccountImportToken = file.Servers[i].AccountImportToken
 				}
+				if !proxyTokenSet {
+					next.ProxyToken = file.Servers[i].ProxyToken
+				}
 				if !tenantKeySet {
 					next.TenantKey = file.Servers[i].TenantKey
+				}
+				// Omitted means "leave it alone", like the tokens above. Without
+				// this, re-running `sr server add` to change a URL would silently
+				// drop the pin and the public path would stop connecting.
+				if !publicURLSet {
+					next.PublicURL = file.Servers[i].PublicURL
+				}
+				if !fingerprintSet {
+					next.Fingerprint = file.Servers[i].Fingerprint
+				}
+				// Only `sr server set-public` sets it. It is bound to the
+				// endpoint and pin it was set with: a re-add that points
+				// the public path elsewhere drops it rather than send a
+				// token minted on one box to another (PATCHES §43.2).
+				if samePublicEndpoint(file.Servers[i], next) {
+					next.PublicAdminToken = file.Servers[i].PublicAdminToken
+				} else if strings.TrimSpace(file.Servers[i].PublicAdminToken) != "" {
+					droppedPublicAdminToken = true
 				}
 				if !sshHostSet {
 					next.SSHHost = file.Servers[i].SSHHost
@@ -581,6 +696,10 @@ func (r srRunner) serverAdd(store srServerStore, args []string) error {
 		fmt.Fprintf(r.out, "Updated server: %s\n", name)
 	} else {
 		fmt.Fprintf(r.out, "Added server: %s\n", name)
+	}
+	if droppedPublicAdminToken {
+		fmt.Fprintf(r.out, "Public admin token removed for %s: it was set for the old public URL or pin. Pipe a token minted on the new box into `%s set-public %s --token-file -`.\n",
+			name, command, name)
 	}
 	if *makeDefault {
 		fmt.Fprintf(r.out, "Default Codex server: %s\n", name)
@@ -707,6 +826,19 @@ func (r srRunner) useCMUXLocal(store srServerStore, args []string) error {
 	if !nextConfig.TeamModeReady() {
 		return fmt.Errorf("cmux local egress requires login and a hosted tenant; run 'sr login'")
 	}
+	// Team mode enforces the local proxy token and SaveConfig never mints one,
+	// so this switch is a key ceremony: without a secret the restarted daemon
+	// refuses to start. Minting only when absent keeps the secret stable, and
+	// minting BEFORE the save keeps the switch to one atomic write — a failed
+	// second write would strand the file team-sourced but tokenless, past the
+	// point this function's rollback protects.
+	if strings.TrimSpace(nextConfig.LocalProxyToken) == "" {
+		token, err := broker.NewLocalProxyToken()
+		if err != nil {
+			return err
+		}
+		nextConfig.LocalProxyToken = token
+	}
 	if err := broker.SaveConfig(configPath, nextConfig); err != nil {
 		return err
 	}
@@ -735,9 +867,21 @@ func (r srRunner) useCMUXLocal(store srServerStore, args []string) error {
 		}
 		fmt.Fprintf(r.out, "Codex config: %s\n", path)
 	}
+	// Claude Code persists its token in settings.json, so when it already
+	// routes through this daemon it must be handed the enforced secret now;
+	// Codex reads the token live from cloud.json at each launch.
+	if cloudServerProxyToken(nextConfig) != "" && claudeSettingsRoutedThroughLocalDaemon() {
+		if _, err := writeClaudeProxyEnvForLocal(); err != nil {
+			return rollbackAll(fmt.Errorf("rewriting Claude Code's proxy env failed: %w", err))
+		}
+	}
 	fmt.Fprintln(r.out, "Default Codex server: cmux-local")
 	fmt.Fprintf(r.out, "Credential storage: team (%s, %s)\n", nextConfig.TeamName, nextConfig.TeamID)
-	return restartInstalledDaemon()
+	restarted, err := restartInstalledDaemonReporting()
+	if err != nil {
+		return err
+	}
+	return r.verifyLocalProxyToken(nextConfig, restarted)
 }
 
 func (r srRunner) serverCurrent(store srServerStore) error {
@@ -853,6 +997,18 @@ func explicitLocalServerTarget() bool {
 }
 
 func (r srRunner) selectedRemoteServer() (srServerConfig, bool, error) {
+	// The gate for every client-side remote path. All twelve call sites reach a
+	// machine other than this one through here or its defaultRemoteServer alias
+	// -- spill, auto-push, push, reset, status, claude launch, claude-aws,
+	// spend, pick -- so locking the funnel closes them without touching any of
+	// them, and a thirteenth caller added later is closed the day it is written.
+	//
+	// Reports "no server configured" rather than an error: the callers already
+	// handle that, and it is the honest answer on a machine where the remote
+	// does not exist.
+	if !remoteUnlocked() {
+		return srServerConfig{}, false, nil
+	}
 	store := defaultSRServerStore(r.store)
 	if serverName := explicitServerTarget(); serverName != "" {
 		if isLocalServerName(serverName) {
@@ -1032,6 +1188,19 @@ func (r srRunner) namedRemoteServer(ctx context.Context, store srServerStore, na
 	return r.healRemoteServerContext(ctx, store, server)
 }
 
+// namedAdminServer is namedRemoteServer for an admin command, whose requests
+// can fall back to the entry's public admin path (healAdminServer).
+func (r srRunner) namedAdminServer(ctx context.Context, store srServerStore, name string) (srServerConfig, error) {
+	server, ok, err := store.find(name)
+	if err != nil {
+		return srServerConfig{}, err
+	}
+	if !ok {
+		return srServerConfig{}, fmt.Errorf("Subrouter server %q not found", name)
+	}
+	return r.healAdminServer(ctx, store, server)
+}
+
 func (r srRunner) programOrSubrouter() string {
 	if strings.TrimSpace(r.program) != "" {
 		return r.program
@@ -1105,7 +1274,7 @@ func (r srRunner) serverRemove(store srServerStore, name string) error {
 }
 
 func (r srRunner) serverStatus(ctx context.Context, store srServerStore, name string) error {
-	server, err := r.namedRemoteServer(ctx, store, name)
+	server, err := r.namedAdminServer(ctx, store, name)
 	if err != nil {
 		return err
 	}
@@ -1113,26 +1282,28 @@ func (r srRunner) serverStatus(ctx context.Context, store srServerStore, name st
 }
 
 func (r srRunner) serverStatusFor(ctx context.Context, server srServerConfig) error {
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	// The trailing sections are independent server reads. Start them now so
-	// they overlap the usage fetch and the Claude balance enrichment instead
-	// of adding one round trip each after the table prints.
-	sections := r.startServerStatusSections(ctx, server,
-		srRunner.printDeploymentVisibilityStatus,
-		srRunner.printBedrockStatus,
-		srRunner.printAzureCodexStatus,
-		srRunner.printCodexCapacityStatus,
-		srRunner.printTokenUsageStatus,
-	)
-	usage, available, err := r.fetchServerUsageStatuses(ctx, server)
+	usage, available, via, err := r.fetchServerUsageStatusesVia(ctx, server)
 	if err != nil {
 		return err
 	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	// The trailing sections are independent server reads. Start them now so
+	// they overlap the Claude balance enrichment and the table instead of
+	// adding one round trip each after it prints. Not before the usage read
+	// (upstream #462 started them first): a refused status then sends
+	// nothing more, and the spend sections find the private URL's reach
+	// already remembered, so one command pays for an unreachable private URL
+	// once (PATCHES 43.2).
+	sections := r.startServerStatusSections(ctx, server, serverStatusSectionPrinters(via)...)
 	if available {
 		rows := usageRowsFromServerUsageStatuses(usage)
-		fresh := enrichClaudeRowsWithWebBalancesFresh(ctx, rows)
-		fmt.Fprintln(r.out, r.serverHeading(server))
+		// Opt-in only: see claudeWebBalanceEnabled (sr_claude_balance.go).
+		var fresh map[string]float64
+		if claudeWebBalanceEnabled() {
+			fresh = enrichClaudeRowsWithWebBalancesFresh(ctx, rows)
+		}
+		fmt.Fprintln(r.out, r.serverHeadingVia(server, via))
 		displayUsageRowsPerGroup(r.out, rows)
 		printAccountCountSummary(r.out, rows)
 		printKimiCLIOnlyStatusHint(r.out, rows)
@@ -1143,7 +1314,7 @@ func (r srRunner) serverStatusFor(ctx context.Context, server srServerConfig) er
 		r.pushClaudeWebBalances(ctx, server, fresh)
 		return nil
 	}
-	res, err := r.fetchServerAccountsResponse(ctx, server)
+	res, _, err := r.fetchServerAccountsResponseVia(ctx, server, false)
 	if err != nil {
 		return err
 	}
@@ -1155,7 +1326,7 @@ func (r srRunner) serverStatusFor(ctx context.Context, server srServerConfig) er
 	if err == nil {
 		fmt.Fprintln(r.out)
 		// Older daemons may fall back to the accounts endpoint. Keep the
-		// deployment header visible even when usage rows are unavailable.
+		// sections visible even when usage rows are unavailable.
 		for _, section := range sections {
 			if section == nil {
 				continue
@@ -1194,11 +1365,11 @@ func (r srRunner) listServerAccounts(ctx context.Context, server srServerConfig,
 	if err != nil {
 		return err
 	}
-	remoteAccounts, err := r.fetchServerAccounts(ctx, server)
+	remoteAccounts, via, err := r.fetchServerAccountsVia(ctx, server, true)
 	if err != nil {
 		return err
 	}
-	fmt.Fprintln(r.out, r.serverHeading(server))
+	fmt.Fprintln(r.out, r.serverHeadingVia(server, via))
 	if len(remoteAccounts) == 0 {
 		fmt.Fprintln(r.out, "No accounts configured on server.")
 		return nil
@@ -1334,7 +1505,7 @@ func (r srRunner) pickRemoteAccount(ctx context.Context, server srServerConfig) 
 }
 
 func (r srRunner) statusOneRemote(ctx context.Context, server srServerConfig, selector string) error {
-	usage, available, err := r.fetchServerUsageStatuses(ctx, server)
+	usage, available, via, err := r.fetchServerUsageStatusesVia(ctx, server)
 	if err != nil {
 		return err
 	}
@@ -1351,11 +1522,11 @@ func (r srRunner) statusOneRemote(ctx context.Context, server srServerConfig, se
 		if len(matches) == 0 {
 			return fmt.Errorf("no server account found for %s", selector)
 		}
-		fmt.Fprintln(r.out, r.serverHeading(server))
+		fmt.Fprintln(r.out, r.serverHeadingVia(server, via))
 		displayUsageRows(r.out, matches, false)
 		return nil
 	}
-	remoteAccounts, err := r.fetchServerAccounts(ctx, server)
+	remoteAccounts, via, err := r.fetchServerAccountsVia(ctx, server, true)
 	if err != nil {
 		return err
 	}
@@ -1369,7 +1540,7 @@ func (r srRunner) statusOneRemote(ctx context.Context, server srServerConfig, se
 	if len(matches) == 0 {
 		return fmt.Errorf("no server account found for %s", selector)
 	}
-	fmt.Fprintln(r.out, r.serverHeading(server))
+	fmt.Fprintln(r.out, r.serverHeadingVia(server, via))
 	for _, account := range matches {
 		name := remoteAccountDisplayName(account.ID, account.Label, account.Email, account.AuthMode)
 		fmt.Fprintf(r.out, "  %s  %s/%s\n", displayAccountName(name), account.Provider, account.AuthMode)
@@ -1443,27 +1614,48 @@ type remoteServerUsageStatus struct {
 	Credit                *proxy.ClaudeCreditStatus `json:"credit,omitempty"`
 	RevokedSince          time.Time                 `json:"revoked_since,omitzero"`
 	RevokedKind           string                    `json:"revoked_kind,omitempty"`
+	// SweepCut is the daemon's mark on a row its sweep ran out of time on
+	// before measuring it this pass (proxy.AccountUsageStatus.SweepCut): its
+	// numbers, if any, are the last good ones. It was missing here, so a
+	// strict decode of a full status failed on it and every reader took a cut
+	// row for a measured one (PATCHES §47; the wire test pins every field).
+	SweepCut bool `json:"sweep_cut,omitempty"`
+	// The daemon fields the 2026-11 upstream merge added to
+	// proxy.AccountUsageStatus (session activity, upstream's weekly-cooked
+	// verdict, the warn-mode reset advice and Codex capacity marks). Decoded so
+	// this type takes every field the daemon publishes (the §47 wire test);
+	// no table reads them yet.
+	ActiveSessions     int                         `json:"active_sessions,omitempty"`
+	RecentSessions     int                         `json:"recent_sessions,omitempty"`
+	FirstSessionAt     *time.Time                  `json:"first_session_at,omitempty"`
+	LastSessionAt      *time.Time                  `json:"last_session_at,omitempty"`
+	WeeklyCooked       bool                        `json:"weekly_cooked,omitempty"`
+	WeeklyCookedWindow string                      `json:"weekly_cooked_window,omitempty"`
+	ResetAdvice        *proxy.ResetCreditAdvice    `json:"reset_advice,omitempty"`
+	CapacityMarks      []proxy.AccountCapacityMark `json:"capacity_marks,omitempty"`
+	// Normalized is the scheduler's own provider-independent view of this
+	// account. Raw Windows carry provider vocabulary that is easy to misread
+	// across providers, so consumers deciding capacity should prefer this.
+	// Absent from servers older than the patch that publishes it, and absent
+	// means unknown — never treat a missing normalized view as "no headroom".
+	Normalized *proxy.NormalizedUsage `json:"normalized,omitempty"`
 }
 
 func (r srRunner) fetchServerAccountsResponse(ctx context.Context, server srServerConfig) (*http.Response, error) {
-	baseURL, err := serverControlBaseURL(server)
-	if err != nil {
-		return nil, err
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/_subrouter/accounts", nil)
-	if err != nil {
-		return nil, redactServerRequestError(err, server)
-	}
-	addServerAdminAuth(req, server)
-	secured, err := r.securedRequestClientForServer(server, baseURL, 15*time.Second)
-	if err != nil {
-		return nil, err
-	}
-	res, err := secured.Do(req)
-	if err != nil {
-		return nil, redactServerRequestError(err, server)
-	}
-	return res, nil
+	res, _, err := r.fetchServerAccountsResponseVia(ctx, server, false)
+	return res, err
+}
+
+// fetchServerAccountsResponseVia is GET /_subrouter/accounts, and which of
+// the server's paths answered it (PATCHES §43.2). quiet leaves saying so to
+// the caller.
+func (r srRunner) fetchServerAccountsResponseVia(ctx context.Context, server srServerConfig, quiet bool) (*http.Response, serverAdminVia, error) {
+	return r.doServerAdmin(ctx, server, serverAdminCall{
+		method:  http.MethodGet,
+		path:    "/_subrouter/accounts",
+		timeout: 15 * time.Second,
+		quiet:   quiet,
+	})
 }
 
 // remoteAccountDisplayName names a server account for people: the server's
@@ -1484,43 +1676,38 @@ func remoteAccountNameKey(account remoteServerAccount) string {
 }
 
 func (r srRunner) fetchServerAccounts(ctx context.Context, server srServerConfig) ([]remoteServerAccount, error) {
-	res, err := r.fetchServerAccountsResponse(ctx, server)
+	out, _, err := r.fetchServerAccountsVia(ctx, server, false)
+	return out, err
+}
+
+func (r srRunner) fetchServerAccountsVia(ctx context.Context, server srServerConfig, quiet bool) ([]remoteServerAccount, serverAdminVia, error) {
+	res, via, err := r.fetchServerAccountsResponseVia(ctx, server, quiet)
 	if err != nil {
-		return nil, err
+		return nil, via, err
 	}
 	defer res.Body.Close()
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
-		return nil, fmt.Errorf("server accounts failed: %s", res.Status)
+		return nil, via, fmt.Errorf("server accounts failed: %s", res.Status)
 	}
 	var out []remoteServerAccount
 	if err := json.NewDecoder(res.Body).Decode(&out); err != nil {
-		return nil, err
+		return nil, via, err
 	}
-	return out, nil
+	return out, via, nil
 }
 
 func (r srRunner) fetchServerAccountStatuses(ctx context.Context, server srServerConfig, forceRefresh bool) ([]remoteServerAccountStatus, bool, error) {
-	baseURL, err := serverControlBaseURL(server)
-	if err != nil {
-		return nil, false, err
-	}
-	statusURL := baseURL + "/_subrouter/account-status"
 	method := http.MethodGet
 	if forceRefresh {
 		method = http.MethodPost
 	}
-	req, err := http.NewRequestWithContext(ctx, method, statusURL, nil)
-	if err != nil {
-		return nil, false, redactServerRequestError(err, server)
-	}
-	addServerAdminAuth(req, server)
-	secured, err := r.securedRequestClientForServer(server, statusURL, 15*time.Second)
+	res, _, err := r.doServerAdmin(ctx, server, serverAdminCall{
+		method:  method,
+		path:    "/_subrouter/account-status",
+		timeout: 15 * time.Second,
+	})
 	if err != nil {
 		return nil, false, err
-	}
-	res, err := secured.Do(req)
-	if err != nil {
-		return nil, false, redactServerRequestError(err, server)
 	}
 	defer res.Body.Close()
 	if res.StatusCode >= 200 && res.StatusCode < 300 {
@@ -1549,53 +1736,84 @@ func (r srRunner) fetchServerAccountStatuses(ctx context.Context, server srServe
 }
 
 func (r srRunner) fetchServerUsageStatuses(ctx context.Context, server srServerConfig) ([]remoteServerUsageStatus, bool, error) {
-	return r.fetchServerUsageStatusesQuery(ctx, server, "refresh=1")
+	out, available, _, err := r.fetchServerUsageStatusesAt(ctx, server, false)
+	return out, available, err
 }
 
-// fetchServerUsageSnapshot reads the controller's last usage sweep. The
-// server seeds the snapshot once when none exists, then serves it without
-// starting another provider sweep or changing routing scores.
-func (r srRunner) fetchServerUsageSnapshot(ctx context.Context, server srServerConfig) ([]remoteServerUsageStatus, bool, error) {
-	return r.fetchServerUsageStatusesQuery(ctx, server, "snapshot=1")
+// fetchServerUsageStatusesVia is fetchServerUsageStatuses for a caller that
+// says in its own output which of the server's paths answered (PATCHES §43.2).
+func (r srRunner) fetchServerUsageStatusesVia(ctx context.Context, server srServerConfig) ([]remoteServerUsageStatus, bool, serverAdminVia, error) {
+	return r.fetchServerUsageStatusesAt(ctx, server, true)
 }
 
-func (r srRunner) fetchServerUsageStatusesQuery(ctx context.Context, server srServerConfig, query string) ([]remoteServerUsageStatus, bool, error) {
-	baseURL, err := serverControlBaseURL(server)
+func (r srRunner) fetchServerUsageStatusesAt(ctx context.Context, server srServerConfig, quiet bool) ([]remoteServerUsageStatus, bool, serverAdminVia, error) {
+	res, via, err := r.doServerAdmin(ctx, server, serverAdminCall{
+		method:  http.MethodGet,
+		path:    "/_subrouter/usage-status",
+		timeout: 15 * time.Second,
+		quiet:   quiet,
+		// A move's check that the server can use the account (PATCHES §51).
+		publicOnly: r.credentialUploadPublicOnly,
+	})
 	if err != nil {
-		return nil, false, err
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/_subrouter/usage-status?"+query, nil)
-	if err != nil {
-		return nil, false, redactServerRequestError(err, server)
-	}
-	addServerAdminAuth(req, server)
-	timeout := 15 * time.Second
-	if query == "refresh=1" {
-		// The controller gets up to 30 seconds to check the whole pool.
-		// Allow a large usage response to finish on the client side.
-		timeout = 40 * time.Second
-	}
-	secured, err := r.securedRequestClientForServer(server, baseURL, timeout)
-	if err != nil {
-		return nil, false, err
-	}
-	res, err := secured.Do(req)
-	if err != nil {
-		return nil, false, redactServerRequestError(err, server)
+		return nil, false, via, err
 	}
 	defer res.Body.Close()
 	if res.StatusCode >= 200 && res.StatusCode < 300 {
 		var out []remoteServerUsageStatus
 		if err := json.NewDecoder(res.Body).Decode(&out); err != nil {
-			return nil, true, err
+			return nil, true, via, err
 		}
-		return out, true, nil
+		return out, true, via, nil
 	}
 	_, _ = io.Copy(io.Discard, res.Body)
 	if res.StatusCode == http.StatusNotFound || res.StatusCode == http.StatusMethodNotAllowed {
-		return nil, false, nil
+		return nil, false, via, nil
 	}
-	return nil, true, fmt.Errorf("server usage status failed: %s", res.Status)
+	return nil, true, via, fmt.Errorf("server usage status failed: %s", res.Status)
+}
+
+// serverHeading is "Server: home (http://100.64.0.9:31415)", or, when the
+// public admin path answered, "Server: home (via public admin,
+// https://box.example:31416)".
+func serverHeading(server srServerConfig, via serverAdminVia) string {
+	if via == viaPublicAdmin {
+		return fmt.Sprintf("Server: %s (via public admin, %s)", server.Name, redactedServerURL(server.PublicURL))
+	}
+	return fmt.Sprintf("Server: %s (%s)", server.Name, redactedServerURL(server.URL))
+}
+
+// serverHeadingVia is the heading of a command that knows which of the
+// server's paths answered: serverHeading's public admin heading when that
+// path did, else r.serverHeading, which also names this machine's
+// host-attach route to the server.
+func (r srRunner) serverHeadingVia(server srServerConfig, via serverAdminVia) string {
+	if via == viaPublicAdmin {
+		return serverHeading(server, via)
+	}
+	return r.serverHeading(server)
+}
+
+// serverStatusSectionPrinters are the best-effort blocks `sr server status`
+// prints after the usage table. The spend blocks read through doServerAdmin.
+// The capacity and token-usage blocks dial the private URL directly and
+// read routes the box never serves on its public listener, so they are
+// skipped when the public admin path answered: the private URL was just
+// found out of reach (PATCHES 43.2). Upstream's deployment block is not
+// here: its warning tells the operator to run `sr update`, which installs
+// upstream's release over this fork's binary (PATCHES 37.3).
+func serverStatusSectionPrinters(via serverAdminVia) []func(srRunner, context.Context, srServerConfig) {
+	printers := []func(srRunner, context.Context, srServerConfig){
+		srRunner.printBedrockStatus,
+		srRunner.printAzureCodexStatus,
+	}
+	// Upstream also prints its Codex capacity shedding block
+	// (printCodexCapacityStatus, #382) here; this fork's daemon has no
+	// shedding tracker (PATCHES §27), so that block is not carried.
+	if via != viaPublicAdmin {
+		printers = append(printers, srRunner.printTokenUsageStatus)
+	}
+	return printers
 }
 
 // serverUsageDisplayAccount prefers the server's own identity string, then
@@ -1674,6 +1892,11 @@ func usageRowsFromServerUsageStatuses(statuses []remoteServerUsageStatus) []srUs
 		}
 		if status.ProviderModels != nil {
 			row.providerModels = *status.ProviderModels
+		}
+		if status.Provider == accounts.ProviderClaude {
+			// The profile's name on the server, for the re-add hint; email
+			// above prefers the account's address (PATCHES §36).
+			row.serverClaudeProfile = strings.TrimSpace(status.ID)
 		}
 		if status.AuthMode == accounts.AuthModeOAuth && status.Provider == accounts.ProviderGrok && status.AuthChecked {
 			row.providerHealth = "auth error"
@@ -1764,15 +1987,9 @@ func addServerAdminAuth(req *http.Request, server srServerConfig) {
 // in usage-status. Display-only: every failure is silent, and the whole push
 // runs under its own short timeout off the status display path.
 func (r srRunner) pushClaudeWebBalances(ctx context.Context, server srServerConfig, balances map[string]float64) {
-	if len(balances) == 0 {
-		return
-	}
-	baseURL, err := protectedServerControlBaseURL(server)
-	if err != nil {
-		return
-	}
-	secured, err := r.securedRequestClientForServer(server, baseURL, 2*time.Second)
-	if err != nil {
+	// A write to the box from a read command: never on a keyless machine
+	// (PATCHES 17), and only when the operator opted in to the balance scrape.
+	if len(balances) == 0 || !remoteUnlocked() || !claudeWebBalanceEnabled() {
 		return
 	}
 	pushCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
@@ -1782,13 +1999,15 @@ func (r srRunner) pushClaudeWebBalances(ctx context.Context, server srServerConf
 		if err != nil {
 			continue
 		}
-		req, err := http.NewRequestWithContext(pushCtx, http.MethodPost, baseURL+"/_subrouter/claude-web-balance", bytes.NewReader(body))
-		if err != nil {
-			continue
-		}
-		req.Header.Set("Content-Type", "application/json")
-		addServerAdminAuth(req, server)
-		res, err := secured.Do(req)
+		res, _, err := r.doServerAdmin(pushCtx, server, serverAdminCall{
+			method:    http.MethodPost,
+			path:      "/_subrouter/claude-web-balance",
+			body:      body,
+			header:    http.Header{"Content-Type": {"application/json"}},
+			timeout:   2 * time.Second,
+			protected: true,
+			quiet:     true,
+		})
 		if err != nil {
 			continue
 		}
@@ -1796,6 +2015,15 @@ func (r srRunner) pushClaudeWebBalances(ctx context.Context, server srServerConf
 		res.Body.Close()
 	}
 }
+
+// errUpstreamReleaseInstall is why `server install` refuses by default. Both of
+// its paths pipe publicInstallScriptURL, upstream's install.sh, which puts
+// upstream's release binary at /usr/local/bin/subrouter in place of this
+// fork's and then runs that binary's installer: the host loses every patch in
+// ops/PATCHES.md, and reports healthy. This fork publishes no release of its
+// own to point the script at; its hosts are deployed from a source build.
+// PATCHES section 37.
+var errUpstreamReleaseInstall = errors.New("it pipes upstream's install.sh, which replaces this fork's binary with upstream's release (manaflow-ai/subrouter) and none of this fork's patches")
 
 func (r srRunner) serverInstall(ctx context.Context, store srServerStore, args []string) error {
 	command := r.serverCommand()
@@ -1805,6 +2033,7 @@ func (r srRunner) serverInstall(ctx context.Context, store srServerStore, args [
 	}
 	flags := flag.NewFlagSet(command+" install", flag.ContinueOnError)
 	flags.SetOutput(r.errOut)
+	allowUpstream := flags.Bool("allow-upstream-release", false, "install upstream's public release binary (manaflow-ai/subrouter) over the host's. Not for this fork's hosts: it removes every fork patch")
 	version := flags.String("version", "latest", "Subrouter release version to install")
 	addr := flags.String("addr", "0.0.0.0:31415", "server listen address")
 	srSwitchInterval := "10m"
@@ -1814,6 +2043,17 @@ func (r srRunner) serverInstall(ctx context.Context, store srServerStore, args [
 	name, err := parseFlagsOneName(flags, args, usage)
 	if err != nil {
 		return err
+	}
+	// Before anything else, and in particular before ensureServerControlTokens
+	// mints and saves tokens: a refused install changes nothing. The server is
+	// not looked up yet, so the message covers both kinds of host. The
+	// override is named, since upstream's own callers (deploy/gcp) need it,
+	// but not offered as the way forward.
+	if !*allowUpstream {
+		return fmt.Errorf(
+			"refusing to install %s: %w. This fork deploys a Linux box from a source build and has no remote macOS deploy (ops/deploy/macos/deploy-laptop.sh upgrades only the Mac it runs on). --allow-upstream-release is only for a host meant to run upstream's release instead of this fork",
+			name, errUpstreamReleaseInstall,
+		)
 	}
 	server, ok, err := store.find(name)
 	if err != nil {
@@ -1831,8 +2071,11 @@ func (r srRunner) serverInstall(ctx context.Context, store srServerStore, args [
 	}
 	// Forward only the serve flags the operator passed. install-systemd keeps
 	// the host's existing address, interval and extra args for anything not
-	// passed; forwarding this command's defaults would silently rebind a
-	// reinstall or credential rotation to 0.0.0.0:31415.
+	// passed (applyExistingSystemdServeDefaults); forwarding this command's
+	// defaults would make every one of them "explicit" and silently rebind a
+	// reinstall or credential rotation to 0.0.0.0:31415 with a 10m sweep. On a
+	// fresh host the two sets of defaults are identical, so a first install is
+	// unchanged.
 	var serveFlags []string
 	flags.Visit(func(f *flag.Flag) {
 		switch f.Name {
@@ -1845,8 +2088,10 @@ func (r srRunner) serverInstall(ctx context.Context, store srServerStore, args [
 		}
 	})
 	if !hasGCPTarget && len(serveFlags) > 0 {
-		// The SSH path may land on install-launchd, which has no such flags;
-		// refuse rather than drop them silently.
+		// The SSH path never forwarded these, and it may land on
+		// install-launchd, which has no such flags. Accepting them and
+		// dropping them told the operator the change was made; refuse before
+		// generating tokens or running anything instead.
 		return fmt.Errorf(
 			"--addr, --sr-switch-interval and --extra-args are not supported when installing %s over SSH; configure them on the host (install-systemd keeps the existing values)",
 			server.Name,
@@ -2008,7 +2253,7 @@ func (r srRunner) serverSync(ctx context.Context, store srServerStore, args []st
 	if err != nil {
 		return err
 	}
-	server, err := r.namedRemoteServer(ctx, store, name)
+	server, err := r.namedAdminServer(ctx, store, name)
 	if err != nil {
 		return err
 	}
@@ -2072,7 +2317,9 @@ func (r srRunner) serverSync(ctx context.Context, store srServerStore, args []st
 
 	fmt.Fprintln(r.out, r.serverHeading(server))
 	if !statusAvailable {
-		fmt.Fprintln(r.out, "Account status: unavailable on this server version; run sr server install "+server.Name+" to enable refresh-token checks.")
+		// Not `sr server install`: on this fork that is refused, and its
+		// override installs upstream's release over the server (PATCHES 37).
+		fmt.Fprintln(r.out, "Account status: unavailable on this server version; upgrade "+server.Name+" to a current build to enable refresh-token checks (this fork deploys from source).")
 	}
 	printEmailGroup(r.out, "Missing on server", missing)
 	printEmailGroup(r.out, "Already on server", present)
@@ -2230,6 +2477,13 @@ func printStatusGroup(w io.Writer, label string, emails []string, statuses map[s
 }
 
 func (r srRunner) serverLoginOne(ctx context.Context, server srServerConfig, deviceAuth bool, expectedEmail string) error {
+	// An unpinned plaintext entry with a usable public admin path hears this
+	// whole upload -- the preflight below and the POST that carries the new
+	// refresh token -- over that path only, never its plaintext URL, as a
+	// Claude upload does. Without one it routes as before: upstream never
+	// refused a Codex login there (PATCHES §51.5). r is this call's copy.
+	public, publicOK, _ := publicAdminFor(server)
+	r.credentialUploadPublicOnly = unpinnedPlaintextServer(server) && publicOK
 	// Fail before opening OAuth when the server cannot securely accept the
 	// resulting refresh-token chain. A completed login must never be discarded
 	// because an old server only knows the retired SSH upload path.
@@ -2309,8 +2563,23 @@ func (r srRunner) serverLoginOne(ctx context.Context, server srServerConfig, dev
 	})
 	stopProgress()
 	if uploadErr != nil {
-		r.printUploadOutcome(false, fmt.Sprintf("Upload of %s to server %s failed.", email, server.Name))
+		failed := fmt.Sprintf("Upload of %s to server %s failed.", email, server.Name)
+		if r.credentialUploadPublicOnly {
+			// As on any failed upload, the new chain lived only in loginHome,
+			// which the defer removes; nothing fell back to the plaintext URL.
+			// A POST that certainly did nothing waits on the public path; any
+			// other failure, such as the box refusing the import, on the box.
+			if nothing, _ := requestDidNothing(uploadErr); nothing {
+				failed += fmt.Sprintf(" The new login was not kept on this machine: sign in again once %s's public admin path answers.", server.Name)
+			} else {
+				failed += fmt.Sprintf(" The new login was not kept on this machine: sign in again once %s accepts the import (the error below says why it did not).", server.Name)
+			}
+		}
+		r.printUploadOutcome(false, failed)
 		return uploadErr
+	}
+	if r.credentialUploadPublicOnly {
+		r.notePublicOnlyUpload(email, server, public)
 	}
 	r.printUploadOutcome(true, fmt.Sprintf("Uploaded %s to server %s.", email, server.Name))
 	if account.Email != email {
@@ -2414,4 +2683,22 @@ func writerIsTerminal(w io.Writer) bool {
 
 func shellQuote(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
+}
+
+// validCertificateFingerprint checks the SHAPE of a pin before it is stored.
+//
+// A truncated or mistyped pin can never match, and the resulting failure is a
+// TLS handshake error that says nothing about the paste being short. Catching it
+// at `sr server add` costs one line and saves that debugging session.
+func validCertificateFingerprint(value string) bool {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if len(value) != 64 {
+		return false
+	}
+	for _, r := range value {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
+			return false
+		}
+	}
+	return true
 }

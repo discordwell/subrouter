@@ -1,0 +1,151 @@
+#!/usr/bin/env bash
+# sr-triage -- why does `sr` do nothing? Read-only. Prints no secret VALUES.
+# Safe: never runs bare interactive `sr`, never switches an account, never writes
+# outside its own temp dir.
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/sr-triage.XXXXXX") && [ -d "$TMP" ] || { echo "mktemp failed" >&2; exit 2; }
+# PROBE is the sr a bound is running. Ctrl-C stops this script but not it (a
+# background job of a non-interactive shell ignores SIGINT), so exit stops it.
+PROBE=""
+trap 'rm -rf "$TMP"; [ -z "$PROBE" ] || kill -KILL "$PROBE" 2>/dev/null' EXIT
+
+# bounded SECONDS COMMAND... -- run it, stopped after SECONDS with exit 124, as
+# timeout(1) would. Stock macOS has no timeout(1), and alarm(2) is no stand-in:
+# a Go binary catches SIGALRM and ignores it. So poll, then TERM, then KILL.
+bounded() {
+  local limit=$(($1 * 10)) pid ticks=0
+  shift
+  "$@" &
+  pid=$!
+  PROBE=$pid
+  while kill -0 "$pid" 2>/dev/null; do
+    if [ "$ticks" -ge "$limit" ]; then
+      kill -TERM "$pid" 2>/dev/null
+      ticks=0
+      while kill -0 "$pid" 2>/dev/null && [ "$ticks" -lt 20 ]; do sleep 0.1; ticks=$((ticks + 1)); done
+      kill -KILL "$pid" 2>/dev/null
+      wait "$pid" 2>/dev/null
+      PROBE=""
+      return 124
+    fi
+    sleep 0.1
+    ticks=$((ticks + 1))
+  done
+  PROBE=""
+  wait "$pid"
+}
+
+echo "=== 1. is sr even reachable ==="
+printf 'type:      '; type sr 2>&1 | head -2
+printf 'which:     '; command -v sr || echo "NOT ON PATH"
+# setup installs ~/bin/subrouter and the ~/bin/sr shim, and macOS does not put
+# ~/bin on PATH: an install whose daemon is down is not "never installed".
+SR="$(command -v sr 2>/dev/null)"
+if [ -z "$SR" ] && [ -x "$HOME/bin/sr" ]; then
+  SR="$HOME/bin/sr"
+  echo "           installed at $SR, but ~/bin is not on PATH: call it by that path, or add ~/bin to PATH"
+fi
+PLIST="$HOME/Library/LaunchAgents/ai.manaflow.subrouter.plist"
+AGENT_BIN="$(python3 -c 'import plistlib, sys; print((plistlib.load(open(sys.argv[1], "rb")).get("ProgramArguments") or [""])[0])' "$PLIST" 2>/dev/null)"
+printf 'agent bin: %s\n' "${AGENT_BIN:-(no LaunchAgent program)}"
+BIN="$SR"
+[ -n "$BIN" ] || { [ -x "$HOME/bin/subrouter" ] && BIN="$HOME/bin/subrouter"; }
+[ -n "$BIN" ] || BIN="$AGENT_BIN"
+[ -L "$BIN" ] && printf 'symlink -> %s\n' "$(readlink "$BIN")"
+REAL="$(readlink -f "$BIN" 2>/dev/null || echo "$BIN")"
+if [ -n "$REAL" ] && [ -f "$REAL" ]; then
+  printf 'binary:    %s (%s bytes, %s)\n' "$REAL" "$(wc -c <"$REAL" | tr -d ' ')" "$(date -r "$REAL" '+%Y-%m-%d %H:%M' 2>/dev/null)"
+  printf 'build:     '; go version -m "$REAL" 2>/dev/null | grep -m1 vcs.revision | awk '{print $NF}' || echo "no VCS stamp"
+  printf 'signed:    '; codesign -d --verbose=2 "$REAL" 2>&1 | grep -m1 -E '^Identifier' || echo "UNSIGNED"
+else
+  echo "binary:    MISSING (dangling symlink or not installed)"
+fi
+# A terminal that outlived a logout (Superset's pty-daemon, a tmux server) keeps
+# its shells in the ENDED login session: launchd, the Keychain and user lookup
+# are all unreachable from them, and `sr` there misreports every credential
+# (PATCHES §47). managername fails there; it prints Aqua in a live GUI login.
+HAVE_LAUNCHCTL=0; command -v launchctl >/dev/null 2>&1 && HAVE_LAUNCHCTL=1
+if [ "$HAVE_LAUNCHCTL" = 1 ]; then
+  LD_MGR=$(launchctl managername 2>&1); LD_MGR_RC=$?
+  printf 'session:   launchctl managername: %s (rc %s); id -un: %s\n' "${LD_MGR:-no output}" "$LD_MGR_RC" "$(id -un 2>&1)"
+  if [ "$LD_MGR_RC" -ne 0 ]; then
+    echo "           >>> this shell belongs to a login session that has ended: run sr from a new Terminal.app window (a new Superset tab shares the ended session)"
+  elif [ "$LD_MGR" != Aqua ]; then
+    echo "           not the GUI (Aqua) session: deploy-laptop.sh and rollback-laptop-peer.sh refuse to restart the daemon from here"
+  fi
+fi
+
+echo
+echo "=== 2. does dispatch work at all (exit code matters) ==="
+if [ -n "$SR" ]; then
+  bounded 20 "$SR" --help </dev/null >"$TMP/help" 2>"$TMP/helperr"
+  echo "sr --help: exit=$? stdout=$(wc -l <"$TMP/help" | tr -d ' ') lines stderr=$(wc -c <"$TMP/helperr" | tr -d ' ') bytes"
+  head -2 "$TMP/helperr" 2>/dev/null
+else
+  echo "sr --help: not run (no sr found)"
+fi
+
+echo
+echo "=== 3. THE GATE (§17) -- no key means the box does not exist ==="
+STORE="${SUBROUTER_STATE_DIR:-$HOME/.subrouter}/codex"
+printf 'store dir:   %s %s\n' "$STORE" "$([ -d "$STORE" ] && echo exists || echo MISSING)"
+printf 'remote.key:  '; if [ -f "$STORE/remote.key" ]; then
+  printf 'present (mode %s, %s bytes)\n' "$(stat -f %Lp "$STORE/remote.key" 2>/dev/null)" "$(wc -c <"$STORE/remote.key" | tr -d ' ')"
+else printf '>>> ABSENT <<<  gated build => sr server/remote/tenant/login vanish, servers.json IGNORED\n'; fi
+printf 'servers.json: '; [ -f "$STORE/servers.json" ] && echo "present ($(python3 -c "import json;print(len(json.load(open('$STORE/servers.json')).get('servers',[])))" 2>/dev/null) servers)" || echo "absent"
+printf 'help shows remote verbs? '
+if [ -z "$SR" ]; then echo "not checked (no sr found)"
+else grep -qE "^  sr (server|remote|tenant) " "$TMP/help" && echo "YES (unlocked)" || echo "NO  => LOCKED (or no key)"; fi
+
+echo
+echo "=== 4. accounts this machine actually holds ==="
+printf 'local claude profiles: '; python3 -c "import json,os;p=os.path.expanduser('$STORE/claude.json');print(len(json.load(open(p)).get('profiles',{})) if os.path.exists(p) else 'no claude.json')" 2>/dev/null
+printf 'local codex auth:      '; [ -f "${CODEX_HOME:-$HOME/.codex}/auth.json" ] && echo present || echo absent
+printf 'sr status:             '
+if [ -n "$SR" ]; then
+  bounded 45 "$SR" status </dev/null >"$TMP/st" 2>"$TMP/sterr"; echo "exit=$? stdout=$(wc -l <"$TMP/st" | tr -d ' ') lines"
+  sed -n '1,4p' "$TMP/st"; head -2 "$TMP/sterr"
+else
+  echo "not run (no sr found)"
+fi
+
+echo
+echo "=== 5. environment that silently wins ==="
+for v in ANTHROPIC_BASE_URL ANTHROPIC_AUTH_TOKEN ANTHROPIC_API_KEY CLAUDE_CONFIG_DIR CODEX_HOME \
+         SUBROUTER_CODEX_SERVER SUBROUTER_CODEX_ACCOUNT_ID SUBROUTER_CODEX_USER_EMAIL \
+         SUBROUTER_STATE_DIR SUBROUTER_CLOUD_CONFIG SUBROUTER_REMOTE_POOL SUBROUTER_REMOTE_POOL_TOKEN; do
+  val="${!v-}"
+  if [ -n "$val" ]; then
+    case "$v" in *TOKEN*|*KEY*) echo "  $v = <set, ${#val} chars, redacted>";;
+                 *) echo "  $v = $val";; esac
+  fi
+done | grep . || echo "  (none set)"
+echo "  -- rc files exporting these (INCLUDING ~/.zshenv, which quickstart does NOT scan), names only:"
+# Names, never values: a value is as likely to be a key as a URL, and an export
+# can hold several assignments.
+for f in ~/.zshenv ~/.zshrc ~/.bashrc ~/.zprofile ~/.bash_profile ~/.profile; do
+  [ -f "$f" ] && awk -v f="$f" '/export (ANTHROPIC_|CODEX_HOME|CLAUDE_CONFIG_DIR|SUBROUTER_)/ {
+    names = ""
+    for (i = 1; i <= NF; i++) {
+      n = $i; sub(/=.*/, "", n)
+      if (n ~ /^(ANTHROPIC_|CODEX_HOME|CLAUDE_CONFIG_DIR|SUBROUTER_)[A-Za-z0-9_]*$/) names = names " " n "=<not shown>"
+    }
+    printf "  %s:%d: export%s\n", f, NR, names
+  }' "$f" 2>/dev/null
+done
+
+echo
+echo "=== 6. daemon ==="
+# Only rc 113 means "not loaded". A shell launchd refuses gets 141 for every
+# label, one that does not exist included.
+printf 'launchd:  '
+if [ "$HAVE_LAUNCHCTL" = 1 ]; then
+  LD_OUT=$(launchctl print "gui/$(id -u)/ai.manaflow.subrouter" 2>&1); LD_RC=$?
+  case "$LD_RC" in
+    0) printf '%s\n' "$LD_OUT" | grep -m1 "state = " || echo "loaded (no state line)" ;;
+    113) echo "job NOT loaded (launchctl print rc 113)" ;;
+    *) echo "UNKNOWN: launchctl print rc $LD_RC ($(printf '%s' "$LD_OUT" | head -1)); launchctl managername: ${LD_MGR:-no output} (rc $LD_MGR_RC). launchd is unreachable from this shell, so this says nothing about the job" ;;
+  esac
+else
+  echo "no launchctl (not macOS)"
+fi
+printf 'health:   '; curl -s -m 5 http://127.0.0.1:31415/_subrouter/health >/dev/null 2>&1 && echo "OK" || echo "no daemon on 127.0.0.1:31415"

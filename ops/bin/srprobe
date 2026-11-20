@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+# srprobe — send a CLAUDE CODE SHAPED request through a subrouter daemon.
+#
+# A bare POST /v1/messages is refused by Anthropic with
+#   429 {"type":"rate_limit_error","message":"Error"}
+# which reads exactly like quota exhaustion and is NOT. It is request-shape
+# rejection: an OAuth subscription credential only serves a first-party-shaped
+# request. On 2026-08-12 that false signal produced a whole fictional diagnosis
+# ("the pool is out of Opus") against a pool that was healthy the entire time.
+#
+# The load-bearing bits are the anthropic-beta pair, the claude-cli user-agent,
+# and the Claude Code system block. Drop any of them and premium models 429
+# while claude-haiku-4-5 keeps returning 200 -- which is what makes the failure
+# look per-model instead of per-request.
+#
+#   srprobe [-u URL] [-m MODEL] [-s SESSION] [-a ACCOUNT] [-p PROMPT]
+#
+# Exits non-zero unless the upstream returned 200.
+set -uo pipefail
+
+URL="http://127.0.0.1:31415"
+MODEL="claude-opus-5-5"
+SESSION="srprobe-$$"
+ACCOUNT=""
+PROMPT="Reply with exactly: ok"
+
+while getopts "u:m:s:a:p:" opt; do
+  case "$opt" in
+    u) URL="$OPTARG" ;;
+    m) MODEL="$OPTARG" ;;
+    s) SESSION="$OPTARG" ;;
+    a) ACCOUNT="$OPTARG" ;;
+    p) PROMPT="$OPTARG" ;;
+    *) echo "usage: srprobe [-u URL] [-m MODEL] [-s SESSION] [-a ACCOUNT] [-p PROMPT]" >&2; exit 2 ;;
+  esac
+done
+
+# Anthropic checks the Claude Code version in the user-agent per model: Opus 5.5
+# answers 400 "Claude Code 2.1.228 does not support this model; version 2.1.280
+# or newer is required" to an older one, which reads like a routing fault. Send
+# the installed Claude Code's version so the probe ages with the CLI instead of
+# going stale. SRPROBE_CLAUDE_VERSION overrides it; with no `claude` on PATH the
+# fallback is the newest version this script was checked against.
+CLAUDE_VERSION="${SRPROBE_CLAUDE_VERSION:-}"
+if [ -z "$CLAUDE_VERSION" ]; then
+  CLAUDE_VERSION=$(claude --version </dev/null 2>/dev/null | awk 'NR == 1 && $1 ~ /^[0-9]+\.[0-9]+\.[0-9]+$/ { print $1 }')
+fi
+CLAUDE_VERSION="${CLAUDE_VERSION:-2.1.283}"
+
+# Loopback needs no token; a tailnet peer does. Pick whichever matches the URL.
+if [[ "$URL" == *"127.0.0.1"* || "$URL" == *"localhost"* ]]; then
+  TOKEN=$(python3 -c "import json,os;print(json.load(open(os.path.expanduser('~/.config/subrouter/cloud.json')))['localProxyToken'])" 2>/dev/null)
+else
+  TOKEN=$(plutil -p "$HOME/Library/LaunchAgents/ai.manaflow.subrouter.plist" 2>/dev/null | awk -F'"' '/REMOTE_POOL_TOKEN/{print $4}')
+fi
+
+body=$(python3 - "$MODEL" "$PROMPT" <<'PY'
+import json, sys
+model, prompt = sys.argv[1], sys.argv[2]
+print(json.dumps({
+    "model": model,
+    "max_tokens": 32,
+    # Required. Without this block the request is not a first-party one and
+    # premium models are refused with a misleading 429.
+    "system": [{"type": "text",
+                "text": "You are Claude Code, Anthropic's official CLI for Claude."}],
+    "messages": [{"role": "user", "content": prompt}],
+}))
+PY
+)
+
+out=$(mktemp)
+args=(-s -m 120 -o "$out" -w "%{http_code}" -X POST "$URL/v1/messages"
+  -H "Content-Type: application/json"
+  -H "Authorization: Bearer $TOKEN"
+  -H "anthropic-version: 2023-06-01"
+  -H "anthropic-beta: oauth-2025-04-20,claude-code-20250219"
+  -H "user-agent: claude-cli/$CLAUDE_VERSION (external, cli)"
+  -H "x-app: cli"
+  -H "X-Subrouter-Agent: claude"
+  -H "X-Subrouter-Session: $SESSION")
+[ -n "$ACCOUNT" ] && args+=(-H "X-Subrouter-Account-ID: $ACCOUNT")
+
+code=$(curl "${args[@]}" -d "$body")
+text=$(python3 - "$out" <<'PY'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    print("<unparseable>"); raise SystemExit
+if "content" in d:
+    print(d["content"][0].get("text", "").strip())
+else:
+    e = d.get("error", {})
+    print(f"{e.get('type','?')}: {str(e.get('message',''))[:80]}")
+PY
+)
+rm -f "$out"
+
+printf "%-14s %-26s HTTP %s  %s\n" "${SESSION}" "$MODEL" "$code" "$text"
+[ "$code" = "200" ]

@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -30,8 +32,10 @@ type serviceController interface {
 
 // launchdController manages the per-user LaunchAgent written by install-daemon.
 type launchdController struct {
-	label  string
-	home   string
+	label string
+	home  string
+	// runner is the taskRunner interface rather than commandRunner so a test
+	// can substitute a recorder; production always passes commandRunner{}.
 	runner taskRunner
 }
 
@@ -48,22 +52,44 @@ func (c launchdController) domain() string {
 	return fmt.Sprintf("gui/%d", os.Getuid())
 }
 
+// start brings the agent up WITHOUT disturbing one that is already running.
+//
+// Its callers are `sr up` / `sr server up`, `sr setup` right after it installs
+// the agent, and -- the one that made this matter -- the launcher autostart
+// (ensureLocalHealthy), which calls it whenever a 1.5 s health probe misses.
+// A probe misses on a daemon that is merely busy or draining, not only on one
+// that is down. The old fallback treated every bootstrap failure as "already
+// loaded" and ran `kickstart -k`, and -k means KILL the running instance and
+// start a new one: a slow health probe at `sr claude` / `sr codex` launch
+// killed the healthy daemon and every live session it was serving.
+//
+// launchctl bootstrap fails ("5: Input/output error") for an agent that is
+// already loaded, and for real errors too (a bad plist, a wrong domain). `print`
+// tells them apart: it succeeds only for a loaded service. Loaded -> kickstart
+// WITHOUT -k, which starts a loaded-but-stopped agent and is a no-op for a
+// running one. Not loaded -> the bootstrap error is the real error, reported
+// as is instead of being papered over with a kickstart.
+//
+// A daemon that is running but wedged is therefore left alone here; `sr
+// restart` (restartLaunchAgent) is the verb that kills and replaces it.
 func (c launchdController) start() error {
+	if err := requireAquaLaunchd(); err != nil {
+		return err
+	}
 	service := c.domain() + "/" + c.label
 	if err := c.runner.Run("launchctl", "bootstrap", c.domain(), c.plist()); err != nil {
-		// Bootstrap also fails when the agent is already loaded. Only then is
-		// it not a failure; any other bootstrap error is reported as is.
 		if c.runner.Run("launchctl", "print", service) != nil {
 			return err
 		}
-		// Kickstart without -k starts a loaded-but-stopped agent and leaves a
-		// running (healthy) daemon alone instead of killing it.
 		return c.runner.Run("launchctl", "kickstart", service)
 	}
 	return nil
 }
 
 func (c launchdController) stop() error {
+	if err := requireAquaLaunchd(); err != nil {
+		return err
+	}
 	return c.runner.Run("launchctl", "bootout", c.domain(), c.plist())
 }
 
@@ -71,10 +97,48 @@ func (c launchdController) restart() error {
 	return restartLaunchAgent(c.plist(), c.label, c.runner)
 }
 
+// remove refuses outside the GUI login before it boots anything out or
+// deletes the plist: `sr cleanup` used to ignore a bootout launchd refused and
+// delete the plist anyway, printing "removed" while the job kept running.
 func (c launchdController) remove() error {
+	if err := requireAquaLaunchd(); err != nil {
+		return err
+	}
 	_ = c.runner.Run("launchctl", "bootout", c.domain(), c.plist())
 	if err := os.Remove(c.plist()); err != nil && !os.IsNotExist(err) {
 		return err
+	}
+	return nil
+}
+
+// requireAquaLaunchd is the preflight before anything this file or
+// restartLaunchAgent asks of launchd in gui/<uid> (PATCHES §47): `launchctl
+// managername` must exit 0 and answer "Aqua", the logged-in GUI session the
+// agent lives in. It returns an error, and the caller runs nothing, otherwise.
+//
+// The half-done case is the one that hurts. From a shell whose login session
+// has ended, launchctl refuses (managername exit 153, print exit 141
+// "Reentrancy avoided"); from an ssh or other background session it answers
+// "Background", and there bootout of the gui/<uid> agent works while the
+// bootstrap after it is refused. Either way a restart that boots out first
+// leaves the daemon down, and nothing in that shell can bring it back.
+func requireAquaLaunchd() error {
+	name, code, err := launchctlManagerName()
+	switch {
+	case err != nil:
+		return fmt.Errorf("launchd was not asked to do anything: `launchctl managername` did not run (%v), so this shell's launchd session is unknown", err)
+	case code != 0:
+		detail := ""
+		if name != "" {
+			detail = ": " + name
+		}
+		return fmt.Errorf("launchd was not asked to do anything: `launchctl managername` exits %d%s -- this shell belongs to a macOS login "+
+			"session that has ended, where launchctl refuses, so a bootout could land and the bootstrap after it fail, leaving the daemon "+
+			"down. %s", code, detail, endedSessionRemedyHere())
+	case name != "Aqua":
+		return fmt.Errorf("launchd was not asked to do anything: this shell's launchd session is %q, not the GUI login (\"Aqua\"). "+
+			"From an ssh or background session a bootout of gui/%d works and the bootstrap after it is refused, leaving the daemon down. "+
+			"Run this from a terminal in the logged-in desktop session", name, os.Getuid())
 	}
 	return nil
 }
@@ -124,9 +188,10 @@ func (c systemdController) start() error {
 
 // units lists what a lifecycle action acts on. The system install is socket
 // activated: stopping only the service leaves subrouter.socket listening, and
-// the next connection starts the service again. The socket goes first so it
-// cannot re-activate the service while it is being stopped. The per-user unit
-// has no socket.
+// the next connection starts the service again, so `sr down` did not keep it
+// down. The socket goes first so it cannot re-activate the service while the
+// service is being stopped. The per-user unit (install_systemd_user.go) has no
+// socket, so its commands must not name one.
 func (c systemdController) units() []string {
 	if c.userInstalled() {
 		return []string{c.service}
@@ -151,6 +216,9 @@ func (c systemdController) remove() error {
 		return c.runner.Run("systemctl", args...)
 	}
 	_ = run(append([]string{"disable", "--now"}, c.units()...)...)
+	// Removing only the .service left the .socket unit file behind, still
+	// enabled and listening -- and refuseSystemSystemdConflict then blocks a
+	// later `sr setup` on the very leftover this remove was meant to clear.
 	config := systemdConfig{ServiceName: c.service}
 	files := []string{systemdUnitPath(config), systemdSocketPath(config)}
 	if userUnit {
@@ -256,16 +324,30 @@ func runServerLifecycleWith(
 func runServerHealth(ctx context.Context, out io.Writer) error {
 	client := fallbackHTTPClient()
 	local := localBaseURL()
-	fmt.Fprintf(out, "%-40s %s\n", local, healthLabel(serverHealthy(ctx, client, local)))
+	fmt.Fprintf(out, "%-40s %s\n", local, serverHealthLabel(ctx, client, local))
 
 	configured, err := defaultCodexBaseURLForHealth()
 	if err != nil {
 		return err
 	}
 	if configured != "" && !sameEndpoint(configured, local) {
-		fmt.Fprintf(out, "%-40s %s\n", configured, healthLabel(serverHealthy(ctx, client, configured)))
+		fmt.Fprintf(out, "%-40s %s\n", configured, serverHealthLabel(ctx, client, configured))
 	}
 	return nil
+}
+
+// serverHealthLabel probes one address. An https one is not probed from a
+// process that cannot use macOS login services (PATCHES §47): this client
+// verifies with the platform verifier, which fails there at the handshake, and
+// UNREACHABLE would blame a server nobody asked. `sr daemon status` and `sr
+// server status` are allowed in such a shell on this condition: they send no
+// TLS request from it.
+func serverHealthLabel(ctx context.Context, client *http.Client, baseURL string) string {
+	if parsed, err := url.Parse(strings.TrimSpace(baseURL)); err == nil && strings.EqualFold(parsed.Scheme, "https") &&
+		!probeLoginSession().usable {
+		return "not checked (no TLS from this shell)"
+	}
+	return healthLabel(serverHealthy(ctx, client, baseURL))
 }
 
 func healthLabel(ok bool) string {

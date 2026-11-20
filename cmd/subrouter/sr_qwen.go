@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -450,22 +449,15 @@ func (r srRunner) syncQwenConsoleToServer(ctx context.Context, root string, serv
 	if err != nil {
 		return err
 	}
-	baseURL, err := protectedServerControlBaseURL(server)
-	if err != nil {
-		return err
-	}
-	endpoint := baseURL + "/_subrouter/qwen-console"
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
-	if err != nil {
-		return redactServerRequestError(err, server)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	addServerAccountImportAuth(req, server)
-	securedClient, err := r.securedRequestClientForServer(server, endpoint, 15*time.Second)
-	if err != nil {
-		return fmt.Errorf("sync Qwen console credential to server %s: %w", server.Name, err)
-	}
-	res, err := securedClient.Do(req)
+	res, _, err := r.doServerAdmin(ctx, server, serverAdminCall{
+		method:      http.MethodPost,
+		path:        "/_subrouter/qwen-console",
+		body:        body,
+		header:      http.Header{"Content-Type": {"application/json"}},
+		timeout:     15 * time.Second,
+		protected:   true,
+		privateAuth: addServerAccountImportAuth,
+	})
 	if err != nil {
 		return fmt.Errorf("sync Qwen console credential to server %s: %w", server.Name, redactServerRequestError(err, server))
 	}

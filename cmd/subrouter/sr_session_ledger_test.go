@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -316,40 +317,11 @@ func TestRenderSessionStatusLabelsClaudeAPIKeyRoute(t *testing.T) {
 	}
 }
 
-func TestClaudeFlagsLaunchPooled(t *testing.T) {
-	if !claudeFlagsLaunchPooled([]string{"--resume", "abc"}, "") {
-		t.Fatal("--resume without an active profile should launch pooled")
-	}
-	if claudeFlagsLaunchPooled([]string{"--resume", "abc"}, "work") {
-		t.Fatal("an active profile keeps the legacy profile launch")
-	}
-	for _, args := range [][]string{nil, {"proxy"}, {"list"}, {"--help"}, {"-h"}} {
-		if claudeFlagsLaunchPooled(args, "") {
-			t.Fatalf("claudeFlagsLaunchPooled(%v) = true", args)
-		}
-	}
-}
-
-func TestSRClaudeResumeWithoutProfileRoutesToPooledLauncher(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	t.Setenv("CLAUDE_CONFIG_DIR", "")
-	// Point the local daemon at a closed port so the pooled path stops at its
-	// health probe instead of reaching a developer's daemon or launching Claude.
-	closed := httptest.NewServer(http.NotFoundHandler())
-	closedURL := closed.URL
-	closed.Close()
-	t.Setenv("SUBROUTER_LOCAL_BASE_URL", closedURL)
-	var out, errOut bytes.Buffer
-	runner := srRunner{store: accounts.DefaultCodexStore(), out: &out, errOut: &errOut}
-	err := runner.claude(context.Background(), []string{"--resume", "abc"})
-	if err == nil || !strings.Contains(err.Error(), "local proxy is unavailable") {
-		t.Fatalf("sr claude --resume should reach the pooled launcher's daemon check, got %v", err)
-	}
-	if !strings.Contains(errOut.String(), "launching pooled Claude") {
-		t.Fatalf("missing pooled launch notice: %q", errOut.String())
-	}
-}
+// Upstream's TestClaudeFlagsLaunchPooled and
+// TestSRClaudeResumeWithoutProfileRoutesToPooledLauncher are not here: they
+// pin #429's redirect of a bare `sr claude --flag` to the pooled launcher,
+// and this fork launches that through the §15 local-first route instead
+// (TestSRClaudeFlagAndProfileLaunchesGoThroughTheLocalPool).
 
 func TestWithClaudeSessionStatusLine(t *testing.T) {
 	body, err := claudeLaunchSettingsJSON("/tmp/config", map[string]string{"ANTHROPIC_BASE_URL": "http://x"})
@@ -357,7 +329,7 @@ func TestWithClaudeSessionStatusLine(t *testing.T) {
 		t.Fatal(err)
 	}
 	launchID := newSessionLaunchID()
-	withStatus, err := withClaudeSessionStatusLine(body, launchID, "/tmp/store dir")
+	withStatus, err := withClaudeSessionStatusLine(body, launchID, "/tmp/store dir", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -379,7 +351,7 @@ func TestWithClaudeSessionStatusLine(t *testing.T) {
 	}
 
 	t.Setenv(sessionStatusDisableEnv, "0")
-	disabled, err := withClaudeSessionStatusLine(body, launchID, "/tmp/store dir")
+	disabled, err := withClaudeSessionStatusLine(body, launchID, "/tmp/store dir", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -387,7 +359,7 @@ func TestWithClaudeSessionStatusLine(t *testing.T) {
 		t.Fatalf("disabled status line still changed settings: %s", disabled)
 	}
 	t.Setenv(sessionStatusDisableEnv, "")
-	if unchanged, _ := withClaudeSessionStatusLine(body, "", "/tmp/store dir"); !bytes.Equal(unchanged, body) {
+	if unchanged, _ := withClaudeSessionStatusLine(body, "", "/tmp/store dir", nil); !bytes.Equal(unchanged, body) {
 		t.Fatal("an unrecorded launch must not get a status line")
 	}
 }
@@ -415,8 +387,61 @@ func TestUserClaudeStatusLineCommandChainsButNeverRecurses(t *testing.T) {
 	}
 	t.Setenv("CLAUDE_CONFIG_DIR", dir)
 	write(`{"statusLine":{"type":"command","command":"cat >/dev/null; echo user-line"}}`)
-	if got := runUserClaudeStatusLine([]byte(`{}`)); got != "user-line" {
+	if got := runUserClaudeStatusLine([]byte(`{}`), nil); got != "user-line" {
 		t.Fatalf("chained output = %q", got)
+	}
+}
+
+// A launch that chose its --setting-sources gets nothing from sr out of a
+// source it left out (PATCHES 29.9.2), and that covers the user status line
+// sr's hook chains: the hook is told the sources, and runs no status line
+// from the user's settings when "user" is not among them.
+func TestSessionStatusLineChainsOnlyTheLaunchsSettingSources(t *testing.T) {
+	body, err := claudeLaunchSettingsJSON("/tmp/config", map[string]string{"ANTHROPIC_BASE_URL": "http://x"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	launchID := newSessionLaunchID()
+	sources := "project,local"
+	withStatus, err := withClaudeSessionStatusLine(body, launchID, "/tmp/store", &sources)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var settings struct {
+		StatusLine struct {
+			Command string `json:"command"`
+		} `json:"statusLine"`
+	}
+	if err := json.Unmarshal(withStatus, &settings); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasSuffix(settings.StatusLine.Command, " --setting-sources 'project,local'") {
+		t.Fatalf("statusLine command = %q, want the launch's setting sources", settings.StatusLine.Command)
+	}
+	hook, err := parseSessionHookArgs([]string{"--launch", launchID, "--setting-sources", "project,local"}, sessionStatusLineCommand)
+	if err != nil || hook.settingSources == nil || *hook.settingSources != "project,local" {
+		t.Fatalf("hook args = %+v err %v, want the setting sources parsed", hook, err)
+	}
+
+	userDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(userDir, "settings.json"),
+		[]byte(`{"statusLine":{"type":"command","command":"cat >/dev/null; echo user-line"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CLAUDE_CONFIG_DIR", userDir)
+	if got := runUserClaudeStatusLine([]byte(`{}`), &sources); got != "" {
+		t.Fatalf("chained %q from the user settings of a launch that left user out", got)
+	}
+	project := t.TempDir()
+	input := []byte(`{"cwd":` + strconv.Quote(project) + `}`)
+	for _, path := range userClaudeStatusLineSettings(input, &sources) {
+		if !strings.HasPrefix(path, project) {
+			t.Fatalf("settings searched = %q; only the project's sources were chosen", path)
+		}
+	}
+	userToo := "user,project"
+	if got := runUserClaudeStatusLine([]byte(`{}`), &userToo); got != "user-line" {
+		t.Fatalf("chained %q, want the user line when user is a chosen source", got)
 	}
 }
 

@@ -1,9 +1,6 @@
 package proxy
 
 import (
-	"context"
-	"encoding/json"
-	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -66,6 +63,7 @@ func TestCodexOverloadFailoverSwitchesAccountAndSticks(t *testing.T) {
 	pool, seen := codexOverloadPool(t, "oauth-token-0")
 	poolURL, _ := url.Parse(pool.URL)
 	server := codexOverloadServer(t, poolURL, 2, true)
+	fastCapacityGaps(server.CodexOverloadFailover, 5*time.Millisecond)
 	// Arrive as a sticky session already on account 0, the way a live
 	// conversation would.
 	if _, err := server.Sessions.Put("codex", "session-a", "codex-account-0", ""); err != nil {
@@ -82,7 +80,8 @@ func TestCodexOverloadFailoverSwitchesAccountAndSticks(t *testing.T) {
 		t.Fatalf("overloaded stream leaked to the client: %s", body)
 	}
 	// Load shedding usually clears on a quick retry, so the session's own
-	// account gets one more try before the request moves.
+	// account gets one more try before the request moves (upstream's
+	// expectation, restored with the quick retry; PATCHES section 27).
 	if got := seen(); len(got) != 3 || got[0] != "oauth-token-0" || got[1] != "oauth-token-0" || got[2] != "oauth-token-1" {
 		t.Fatalf("pool saw %v, want account 0 twice then account 1", got)
 	}
@@ -107,79 +106,10 @@ func TestCodexOverloadFailoverSwitchesAccountAndSticks(t *testing.T) {
 	}
 }
 
-// Two capacity failures on one account ban only that account for this
-// session. Reassigning the durable sticky record cannot make the next proxy
-// request call the failed account again.
-func TestCodexCapacitySessionBanSkipsRepeatedAccountAtProxyBoundary(t *testing.T) {
-	pool, seen := codexOverloadPool(t, "oauth-token-0")
-	poolURL, _ := url.Parse(pool.URL)
-	server := codexOverloadServer(t, poolURL, 2, true)
-	fastCapacityGaps(server.CodexOverloadFailover, time.Millisecond)
-	if _, err := server.Sessions.Put("codex", "session-ban", "codex-account-0", ""); err != nil {
-		t.Fatal(err)
-	}
-	proxy := httptest.NewServer(server.Handler())
-	defer proxy.Close()
-
-	status, body := codexEgressPost(t, proxy.URL, "session-ban")
-	if status != http.StatusOK || !strings.Contains(body, "served-from-oauth-token-1") {
-		t.Fatalf("first request status=%d body=%s", status, body)
-	}
-	first := seen()
-	if len(first) != 3 || first[0] != "oauth-token-0" || first[1] != "oauth-token-0" || first[2] != "oauth-token-1" {
-		t.Fatalf("first request attempts=%v, want account 0 twice then account 1", first)
-	}
-	if _, err := server.Sessions.Put("codex", "session-ban", "codex-account-0", ""); err != nil {
-		t.Fatal(err)
-	}
-	status, body = codexEgressPost(t, proxy.URL, "session-ban")
-	if status != http.StatusOK || !strings.Contains(body, "served-from-oauth-token-1") {
-		t.Fatalf("banned-session request status=%d body=%s", status, body)
-	}
-	all := seen()
-	if len(all) != len(first)+1 || all[len(all)-1] != "oauth-token-1" {
-		t.Fatalf("banned-session attempts=%v, want one direct account-1 call", all)
-	}
-}
-
-// One HTTP request gets one same-account retry, but both physical failures
-// belong to one capacity episode in the report.
-func TestCodexCapacityHistoryCountsOneBoundaryEpisode(t *testing.T) {
-	pool, _ := codexOverloadPool(t, "oauth-token-0")
-	poolURL, _ := url.Parse(pool.URL)
-	server := codexOverloadServer(t, poolURL, 2, true)
-	server.AdminToken = "capacity-admin"
-	fastCapacityGaps(server.CodexOverloadFailover, time.Millisecond)
-	if _, err := server.Sessions.Put("codex", "session-history", "codex-account-0", ""); err != nil {
-		t.Fatal(err)
-	}
-	proxy := httptest.NewServer(server.Handler())
-	defer proxy.Close()
-	status, _ := codexEgressPost(t, proxy.URL, "session-history")
-	if status != http.StatusOK {
-		t.Fatalf("request status=%d", status)
-	}
-	req, err := http.NewRequest(http.MethodGet, proxy.URL+"/_subrouter/codex-capacity", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	req.Header.Set("Authorization", "Bearer capacity-admin")
-	response, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer response.Body.Close()
-	if response.StatusCode != http.StatusOK {
-		t.Fatalf("capacity status=%d", response.StatusCode)
-	}
-	var report CodexCapacityReport
-	if err := json.NewDecoder(response.Body).Decode(&report); err != nil {
-		t.Fatal(err)
-	}
-	if len(report.Accounts) == 0 || report.Accounts[0].Last24h.Failures != 2 || report.Accounts[0].Last24h.Episodes != 1 {
-		t.Fatalf("capacity report=%+v, want two failures in one episode", report.Accounts)
-	}
-}
+// Upstream's TestCodexCapacitySessionBanSkipsRepeatedAccountAtProxyBoundary
+// (#599) is not here: it pins upstream's per-session account ban, which this
+// fork does not carry (PATCHES §27: capacity eviction is the warm rule's one
+// new exit). The fork's eviction claims are in codex_capacity_marks_test.go.
 
 // Every account overloaded: the pool's own failure is returned after the
 // bounded number of switches, not an endless loop.
@@ -188,12 +118,13 @@ func TestCodexOverloadFailoverBoundedWhenAllAccountsFail(t *testing.T) {
 	poolURL, _ := url.Parse(pool.URL)
 	server := codexOverloadServer(t, poolURL, 6, true)
 	server.CodexOverloadFailover.MaxAccounts = 2
+	fastCapacityGaps(server.CodexOverloadFailover, 5*time.Millisecond)
 	proxy := httptest.NewServer(server.Handler())
 	defer proxy.Close()
 
 	status, body := codexEgressPost(t, proxy.URL, "session-c")
-	if status != http.StatusServiceUnavailable || !strings.Contains(body, "subrouter_capacity_retry") || strings.Contains(body, "server_is_overloaded") {
-		t.Fatalf("status=%d body=%s, want a retryable capacity failure", status, body)
+	if status != http.StatusOK || !strings.Contains(body, "server_is_overloaded") {
+		t.Fatalf("status=%d body=%s, want the pool failure passed through", status, body)
 	}
 	if got := seen(); len(got) != 4 {
 		t.Fatalf("pool saw %d attempts %v, want first account, one same-account retry, plus 2 switches", len(got), got)
@@ -216,6 +147,7 @@ func TestCodexOverloadFailoverFallsThroughToEgress(t *testing.T) {
 	fra := codexEgressTestProxy(t, "fra", &calls)
 	server := codexEgressServer(t, poolURL, []*url.URL{fra}, 2)
 	server.CodexOverloadFailover = &CodexOverloadFailoverConfig{Enabled: true}
+	fastCapacityGaps(server.CodexOverloadFailover, 5*time.Millisecond)
 	proxy := httptest.NewServer(server.Handler())
 	defer proxy.Close()
 
@@ -244,7 +176,7 @@ func TestCodexOverloadFailoverOffByDefault(t *testing.T) {
 	defer proxy.Close()
 
 	status, body := codexEgressPost(t, proxy.URL, "session-e")
-	if status != http.StatusServiceUnavailable || !strings.Contains(body, "subrouter_capacity_retry") || strings.Contains(body, "server_is_overloaded") {
+	if status != http.StatusOK || !strings.Contains(body, "server_is_overloaded") {
 		t.Fatalf("status=%d body=%s", status, body)
 	}
 	got := seen()
@@ -275,105 +207,6 @@ func TestCodexOverloadFailoverLeavesQuotaToUsageLayer(t *testing.T) {
 	}
 }
 
-// The overload layer switches accounts above the usage-limit layer. After it
-// moves the request from A (overloaded) to B, a 401 from B must be charged to
-// B, not A: the usage layer has to start from the account the overload layer
-// actually selected, so it marks B credential-dead, does not replay B, fails
-// over to C, and the response and session land on C.
-func TestCodexOverloadSwitchChargesUsageFailureToSelectedAccount(t *testing.T) {
-	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := store.Put("codex", "session-g", "codex-a", ""); err != nil {
-		t.Fatal(err)
-	}
-	server := Server{
-		Accounts: []accounts.Account{
-			{ID: "codex-a", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "tok-a"},
-			{ID: "codex-b", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "tok-b"},
-			{ID: "codex-c", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "tok-c"},
-		},
-		Sessions:              store,
-		SchedulerRef:          selectacct.NewSchedulerRef(selectacct.NewScheduler(nil)),
-		CodexOverloadFailover: &CodexOverloadFailoverConfig{Enabled: true},
-	}
-	// A is overloaded. Whichever account the overload layer switches to
-	// (call it B) answers 401; any other account completes.
-	var seen []string
-	rejected := ""
-	stub := &stubRoundTripper{responses: func(req *http.Request) *http.Response {
-		token := strings.TrimPrefix(req.Header.Get("Authorization"), "Bearer ")
-		seen = append(seen, token)
-		if token != "tok-a" && rejected == "" {
-			rejected = token
-		}
-		recorder := httptest.NewRecorder()
-		switch token {
-		case "tok-a":
-			codexEgressWriteOverloaded(recorder)
-		case rejected:
-			recorder.Header().Set("Content-Type", "application/json")
-			recorder.WriteHeader(http.StatusUnauthorized)
-			_, _ = io.WriteString(recorder, `{"error":{"code":"token_expired","message":"expired"}}`)
-		default:
-			codexEgressWriteCompleted(recorder, token)
-		}
-		return recorder.Result()
-	}}
-	body := `{"model":"gpt-6-astra","input":[]}`
-	req, err := http.NewRequest(http.MethodPost, "https://chatgpt.example/backend-api/codex/responses", strings.NewReader(body))
-	if err != nil {
-		t.Fatal(err)
-	}
-	req.Header.Set("Authorization", "Bearer tok-a")
-	transport := upstreamLayers{
-		usageLimit:    &usageLimitRetryTransport{method: http.MethodPost, maxAttempts: 3},
-		codexOverload: &codexOverloadFailoverTransport{},
-	}.build(stub, &upstreamAttempt{
-		server:    &server,
-		provider:  accounts.ProviderCodex,
-		agent:     "codex",
-		session:   "session-g",
-		path:      "/responses",
-		poolModel: "gpt-6-astra",
-		account:   accounts.Account{ID: "codex-a", Provider: accounts.ProviderCodex, CredentialVersion: "tok-a"},
-		getBody:   req.GetBody,
-	})
-	response, err := transport.RoundTrip(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	payload, _ := io.ReadAll(response.Body)
-	_ = response.Body.Close()
-
-	accountB := "codex-" + strings.TrimPrefix(rejected, "tok-")
-	accountC, tokenC := "codex-b", "tok-b"
-	if accountB == "codex-b" {
-		accountC, tokenC = "codex-c", "tok-c"
-	}
-	// The default ladder retries A once before switching.
-	if strings.Join(seen, ",") != "tok-a,tok-a,"+rejected+","+tokenC {
-		t.Fatalf("upstream saw %v, want A twice, B (%s) once, then C (%s)", seen, rejected, tokenC)
-	}
-	if response.StatusCode != http.StatusOK || !strings.Contains(string(payload), "served-from-"+tokenC) {
-		t.Fatalf("status=%d body=%s, want completion from account C", response.StatusCode, payload)
-	}
-	if _, marked := server.SchedulerRef.ExhaustedUntilFor(accounts.ProviderCodex, accountB, ""); !marked {
-		t.Fatal("account B answered 401 but was not marked credential-exhausted")
-	}
-	if _, marked := server.SchedulerRef.ExhaustedUntilFor(accounts.ProviderCodex, "codex-a", ""); marked {
-		t.Fatal("account A was marked credential-exhausted for B's 401; A was only overloaded")
-	}
-	routed, ok := routedResponseAccount(response)
-	if !ok || routed.ID != accountC || routed.CredentialVersion != tokenC {
-		t.Fatalf("response attributed to %+v (%t), want %s", routed, ok, accountC)
-	}
-	if assignment, ok := store.Get("codex", "session-g"); !ok || assignment.AccountID != accountC {
-		t.Fatalf("session assignment = %+v (%t), want %s", assignment, ok, accountC)
-	}
-}
-
 func TestCodexOverloadRerouteBudget(t *testing.T) {
 	counts := newCodexOverloadReroutes()
 	for i := 0; i < codexOverloadMaxWebSocketReroutes; i++ {
@@ -388,6 +221,9 @@ func TestCodexOverloadRerouteBudget(t *testing.T) {
 		t.Fatal("another session must have its own budget")
 	}
 }
+
+// --- upstream #373 (e2cdd06, as at c9303d3): capacity-failure detection ---
+// Ported verbatim (PATCHES section 27, the 389/373 port).
 
 // Codex has answered "Selected model is at capacity" as a 400 or 429 JSON
 // body, as an SSE error on a non-2xx status, and as a 2xx JSON error body. All
@@ -405,6 +241,7 @@ func TestCodexCapacityClassifierRecognizesBodiesOnAnyStatus(t *testing.T) {
 		{"429 json server_overloaded type", 429, "application/json", `{"error":{"type":"server_overloaded","message":"busy"}}`, true},
 		{"400 json at-capacity message", 400, "application/json", `{"error":{"message":"Selected model is at capacity. Please try a different model.","code":null}}`, true},
 		{"400 json temporarily overloaded", 400, "application/json; charset=utf-8", `{"error":{"message":"The engine is temporarily overloaded"}}`, true},
+		// Upstream #479: a gateway that flattens the error into plain text.
 		{"400 plain at-capacity message", 400, "text/plain", `Selected model is at capacity. Please try a different model.`, true},
 		{"429 json slow_down", 429, "application/json", `{"error":{"code":"slow_down"}}`, true},
 		{"2xx json error body", 200, "application/json", `{"error":{"code":"server_is_overloaded","message":"busy"}}`, true},
@@ -557,80 +394,6 @@ func TestCodexStreamPeekIsTimeBounded(t *testing.T) {
 	}
 }
 
-// The capacity mark follows the upstream's own retry hint (Retry-After,
-// retry_after_ms, resets_in_seconds), clamped to [30s, 5m] with jitter, and
-// falls back to the configured TTL when there is none.
-func TestCodexOverloadMarkTTLHonorsRetryHints(t *testing.T) {
-	cases := []struct {
-		name     string
-		header   string
-		body     string
-		min, max time.Duration
-	}{
-		{"retry-after header", "200", `{"error":{"code":"server_is_overloaded"}}`, 160 * time.Second, 240 * time.Second},
-		{"retry_after_ms body", "", `{"error":{"code":"server_is_overloaded","retry_after_ms":60000}}`, 48 * time.Second, 72 * time.Second},
-		{"resets_in_seconds body", "", `{"error":{"code":"slow_down","resets_in_seconds":90}}`, 72 * time.Second, 108 * time.Second},
-		{"short hint clamps up", "", `{"error":{"code":"server_is_overloaded","retry_after_ms":2000}}`, 30 * time.Second, 30 * time.Second},
-		{"long hint clamps down", "3600", `{"error":{"code":"server_is_overloaded"}}`, 5 * time.Minute, 5 * time.Minute},
-		{"no hint uses the default", "", `{"error":{"code":"server_is_overloaded"}}`, 240 * time.Second, 360 * time.Second},
-	}
-	for index, test := range cases {
-		t.Run(test.name, func(t *testing.T) {
-			pool := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ") == "oauth-token-0" {
-					w.Header().Set("Content-Type", "application/json")
-					if test.header != "" {
-						w.Header().Set("Retry-After", test.header)
-					}
-					w.WriteHeader(http.StatusServiceUnavailable)
-					_, _ = io.WriteString(w, test.body)
-					return
-				}
-				codexEgressWriteCompleted(w, "ok")
-			}))
-			defer pool.Close()
-			poolURL, _ := url.Parse(pool.URL)
-			server := codexOverloadServer(t, poolURL, 2, true)
-			server.SchedulerRef = selectacct.NewSchedulerRef(server.Scheduler)
-			sessionID := fmt.Sprintf("session-ttl-%d", index)
-			if _, err := server.Sessions.Put("codex", sessionID, "codex-account-0", ""); err != nil {
-				t.Fatal(err)
-			}
-			proxy := httptest.NewServer(server.Handler())
-			defer proxy.Close()
-			started := time.Now()
-			if status, body := codexEgressPost(t, proxy.URL, sessionID); status != http.StatusOK {
-				t.Fatalf("status=%d body=%s", status, body)
-			}
-			until, _, ok := server.SchedulerRef.CapacityMarkFor(accounts.ProviderCodex, "codex-account-0", "gpt-6-astra", "")
-			if !ok {
-				t.Fatal("overloaded account was not marked")
-			}
-			ttl := until.Sub(started)
-			slack := 2 * time.Second
-			if ttl < test.min-slack || ttl > test.max+slack {
-				t.Fatalf("mark ttl = %v, want within [%v, %v]", ttl, test.min, test.max)
-			}
-		})
-	}
-}
-
-func TestCodexRetryHintJSONShapes(t *testing.T) {
-	cases := map[string]time.Duration{
-		`{"type":"response.failed","response":{"error":{"code":"server_is_overloaded","retry_after_ms":1500}}}`: 1500 * time.Millisecond,
-		`{"error":{"retry_after":"12s"}}`:           12 * time.Second,
-		`{"error":{"resets_in_seconds":"45"}}`:      45 * time.Second,
-		`{"type":"error","retry_after":7}`:          7 * time.Second,
-		`{"error":{"code":"server_is_overloaded"}}`: 0,
-		`not json`: 0,
-	}
-	for body, want := range cases {
-		if got := codexRetryHintJSON([]byte(body)); got != want {
-			t.Errorf("codexRetryHintJSON(%s) = %v, want %v", body, got, want)
-		}
-	}
-}
-
 // Switching accounts right away piles onto a pool that is shedding load; the
 // failover waits a short jittered beat between accounts.
 func TestCodexOverloadFailoverBacksOffBetweenAccounts(t *testing.T) {
@@ -693,14 +456,144 @@ func TestCodexEgressReplaysJSONCapacityBody(t *testing.T) {
 	}
 }
 
-func TestCodexRetryableCapacityWebSocketRerouteUsesBudget(t *testing.T) {
-	server := Server{codexOverloadRerouteCounts: newCodexOverloadReroutes()}
-	for i := 0; i < codexOverloadMaxWebSocketReroutes; i++ {
-		if !server.codexRetryableCapacityWebSocketReroute(context.Background(), "codex", "session", false) {
-			t.Fatalf("retryable reroute %d refused inside budget", i+1)
-		}
+// --- upstream #371 (a794582), the prerequisite of #389's same-account replay ---
+
+// The overload layer switches accounts above the usage-limit layer. After it
+// moves the request from A (overloaded) to B, a 401 from B must be charged to
+// B, not A: the usage layer has to start from the account the overload layer
+// actually selected, so it marks B credential-dead, does not replay B, fails
+// over to C, and the response and session land on C.
+//
+// Two stacks. "built" is upstream #405's version of this test: the stack
+// upstreamLayers.build composes, whose layers share the request's attempt
+// state. "standalone" is the fork's: the two layers constructed on their own,
+// with no shared attempt, where only the attempt account the capacity layer
+// puts on the request context (withAttemptAccount) tells the layer below
+// about the move. The capacity layer announces the move both ways, so the
+// usage-limit layer may read either.
+func TestCodexOverloadSwitchChargesUsageFailureToSelectedAccount(t *testing.T) {
+	stacks := []struct {
+		name  string
+		build func(stub http.RoundTripper, server *Server, req *http.Request) http.RoundTripper
+	}{
+		{"built", func(stub http.RoundTripper, server *Server, req *http.Request) http.RoundTripper {
+			return upstreamLayers{
+				usageLimit:    &usageLimitRetryTransport{method: http.MethodPost, maxAttempts: 3},
+				codexOverload: &codexOverloadFailoverTransport{},
+			}.build(stub, &upstreamAttempt{
+				server:    server,
+				provider:  accounts.ProviderCodex,
+				agent:     "codex",
+				session:   "session-g",
+				path:      "/responses",
+				poolModel: "gpt-6-astra",
+				account:   accounts.Account{ID: "codex-a", Provider: accounts.ProviderCodex, CredentialVersion: "tok-a"},
+				getBody:   req.GetBody,
+			})
+		}},
+		{"standalone", func(stub http.RoundTripper, server *Server, _ *http.Request) http.RoundTripper {
+			return codexOverloadFailoverTransport{
+				base: usageLimitRetryTransport{
+					base:              stub,
+					server:            server,
+					provider:          accounts.ProviderCodex,
+					agent:             "codex",
+					session:           "session-g",
+					account:           "codex-a",
+					accountCredential: "tok-a",
+					method:            http.MethodPost,
+					path:              "/responses",
+					maxAttempts:       3,
+					poolModel:         "gpt-6-astra",
+				},
+				server:    server,
+				agent:     "codex",
+				session:   "session-g",
+				account:   "codex-a",
+				poolModel: "gpt-6-astra",
+			}
+		}},
 	}
-	if server.codexRetryableCapacityWebSocketReroute(context.Background(), "codex", "session", false) {
-		t.Fatal("retryable reroute allowed past budget")
+	for _, stack := range stacks {
+		t.Run(stack.name, func(t *testing.T) {
+			store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.Put("codex", "session-g", "codex-a", ""); err != nil {
+				t.Fatal(err)
+			}
+			server := Server{
+				Accounts: []accounts.Account{
+					{ID: "codex-a", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "tok-a"},
+					{ID: "codex-b", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "tok-b"},
+					{ID: "codex-c", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "tok-c"},
+				},
+				Sessions:              store,
+				SchedulerRef:          selectacct.NewSchedulerRef(selectacct.NewScheduler(nil)),
+				CodexOverloadFailover: &CodexOverloadFailoverConfig{Enabled: true},
+			}
+			// A is overloaded. Whichever account the overload layer switches
+			// to (call it B) answers 401; any other account completes.
+			var seen []string
+			rejected := ""
+			stub := &stubRoundTripper{responses: func(req *http.Request) *http.Response {
+				token := strings.TrimPrefix(req.Header.Get("Authorization"), "Bearer ")
+				seen = append(seen, token)
+				if token != "tok-a" && rejected == "" {
+					rejected = token
+				}
+				recorder := httptest.NewRecorder()
+				switch token {
+				case "tok-a":
+					codexEgressWriteOverloaded(recorder)
+				case rejected:
+					recorder.Header().Set("Content-Type", "application/json")
+					recorder.WriteHeader(http.StatusUnauthorized)
+					_, _ = io.WriteString(recorder, `{"error":{"code":"token_expired","message":"expired"}}`)
+				default:
+					codexEgressWriteCompleted(recorder, token)
+				}
+				return recorder.Result()
+			}}
+			body := `{"model":"gpt-6-astra","input":[]}`
+			req, err := http.NewRequest(http.MethodPost, "https://chatgpt.example/backend-api/codex/responses", strings.NewReader(body))
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set("Authorization", "Bearer tok-a")
+			response, err := stack.build(stub, &server, req).RoundTrip(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			payload, _ := io.ReadAll(response.Body)
+			_ = response.Body.Close()
+
+			accountB := "codex-" + strings.TrimPrefix(rejected, "tok-")
+			accountC, tokenC := "codex-b", "tok-b"
+			if accountB == "codex-b" {
+				accountC, tokenC = "codex-c", "tok-c"
+			}
+			// The default ladder retries A once before switching.
+			if strings.Join(seen, ",") != "tok-a,tok-a,"+rejected+","+tokenC {
+				t.Fatalf("upstream saw %v, want A twice, B (%s) once, then C (%s)", seen, rejected, tokenC)
+			}
+			if response.StatusCode != http.StatusOK || !strings.Contains(string(payload), "served-from-"+tokenC) {
+				t.Fatalf("status=%d body=%s, want completion from account C", response.StatusCode, payload)
+			}
+			if _, marked := server.SchedulerRef.ExhaustedUntilFor(accounts.ProviderCodex, accountB, ""); !marked {
+				t.Fatal("account B answered 401 but was not marked credential-exhausted")
+			}
+			if _, marked := server.SchedulerRef.ExhaustedUntilFor(accounts.ProviderCodex, "codex-a", ""); marked {
+				t.Fatal("account A was marked credential-exhausted for B's 401; A was only overloaded")
+			}
+			routed, ok := routedResponseAccount(response)
+			if !ok || routed.ID != accountC || routed.CredentialVersion != tokenC {
+				t.Fatalf("response attributed to %+v (%t), want %s", routed, ok, accountC)
+			}
+			if assignment, ok := store.Get("codex", "session-g"); !ok || assignment.AccountID != accountC {
+				t.Fatalf("session assignment = %+v (%t), want %s", assignment, ok, accountC)
+			}
+		})
 	}
 }

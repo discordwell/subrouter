@@ -48,6 +48,10 @@ func TestAnalyzeAggregatesUsageByUserAccountModelAndTimeline(t *testing.T) {
 
 // The proxy has written "user_hash" rather than "user" since 2026-08-27; by_user must still group by
 // person instead of collapsing every request into "unknown".
+//
+// Ported from upstream #423 (e3b3a91). The Recorder buffers since upstream #394, so the test flushes
+// before it reads. The summaries check also pins the count first, so an empty ListSummaries cannot
+// pass the per-summary loop vacuously.
 func TestAnalyzeGroupsByUserHash(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "transcripts")
 	recorder := NewRecorder(dir)
@@ -73,6 +77,9 @@ func TestAnalyzeGroupsByUserHash(t *testing.T) {
 	summaries, err := ListSummaries(dir)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if len(summaries) != 2 {
+		t.Fatalf("summaries = %+v, want one per session", summaries)
 	}
 	for _, summary := range summaries {
 		if !strings.HasPrefix(summary.User, "user:") {

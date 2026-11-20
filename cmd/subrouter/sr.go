@@ -56,9 +56,34 @@ const srHelp = `sr - Manage Subrouter accounts
 
 Usage:
   sr                    Show usage across all configured providers
+                           Local accounts first, then each configured server
+                           and each peer server this machine's daemon reaches;
+                           set SR_STATUS_SERVERS=0 to stay local-only
+  sr <provider> <verb>  Provider first always works: sr claude add, sr codex add
   sr add                Ask whether to add Codex or Claude
-  sr add codex          Add Codex to the active local or hosted pool
-  sr add claude         Add Claude to the active local or hosted pool
+  sr add codex [--device-auth] [--email <email>]
+                        Add Codex to the active local or hosted pool (same as
+                        sr codex add); the login runs in a throwaway CODEX_HOME
+                        and never changes local Codex auth. --email pins who
+                        the login must sign in as
+                        With a selected server the account is minted there
+  sr codex login|logout Run the real Codex CLI against ~/.codex (your own
+                        personal Codex login, never a pooled account)
+  sr add claude <name>  Add a Claude profile from a 1-year setup token (same as
+                        sr claude add <name>): no refresh token, nothing rotates
+                        With a selected server the token is also copied there
+  sr addr claude [<name>]
+                        Add a Claude profile with the browser OAuth login: a
+                        refresh token, name inferred from the email (same as
+                        sr claude addr / sr claude login). It stays on this
+                        machine; a refresh token held in two places dies
+  sr claude move <name> [<server>]
+                        MOVE a Claude profile to a server: upload, confirm the
+                        server can use it, then remove the local copy
+  sr claude rename <old> <new>
+                        Re-label a local Claude profile
+  sr claude remove <name> --server <server>
+                        Remove a Claude account from a server
   sr add grok           Add a Grok subscription to the local pool
   sr add-key            Add an API key account for Codex
   sr add-key --provider <name>
@@ -74,7 +99,7 @@ Usage:
   sr g [email]          Switch active account, sync OpenCode/pi, and restart Codex.app
   sr gui [email]        Switch active account, sync OpenCode/pi, and restart Codex.app
   sr gui-switch [email] Switch active account, sync OpenCode/pi, and restart Codex.app
-  sr remove <account>   Remove from explicit local state; selected-server removal is not yet supported
+  sr remove <account>   Remove an account from this machine's pool
   sr status [--json]    Show usage across all configured providers (non-interactive)
   sr recover list [--json] [--query TEXT] [--limit N]
                         Find interrupted local Claude sessions and task artifacts
@@ -99,7 +124,16 @@ Usage:
   sr kimi remove <label>
                         Remove one managed Kimi subscription account
   sr pick               Switch to the recommended account, failing if none has quota
-  sr reset [email]      Redeem a rate-limit reset credit (pick best, or --all, or --dry-run)
+  sr claude reset <name|email>
+                        Claim a Claude account's one saved usage-limit reset
+                        now, through the daemon that holds it (same as
+                        sr reset claude <name|email>). It asks first only when
+                        the week has more than 10% left or rolls within a day
+  sr codex reset <name|email>
+                        The same for one Codex account's reset credit (same as
+                        sr reset codex <name|email>)
+  sr reset [email]      Redeem a rate-limit reset credit (pick best, or --all)
+                        The older Codex spelling, verb first, with its smart pick
   sr usage [days]       Refresh and show API-key spend
   sr trace <email>      Show OAuth refresh breadcrumbs for an account
   sr errors [--provider claude|codex] [--since 1h] [--account ID] [--json]
@@ -111,6 +145,9 @@ Usage:
   sr codex enroll-isolated --retiring-state-dir PATH [--device-auth] [--only ACCOUNT]...
                         Enroll the full isolated candidate by default; repeat --only for
                         validation-only accounts (partial candidates cannot activate)
+  sr codex attest-legacy [--state-dir PATH] [--dry-run] [--only ACCOUNT]...
+                        Prove legacy OAuth accounts isolated without a browser:
+                        refresh each once and require the refresh token to rotate
   sr daemon bind-state <absolute-state-dir>
                         Bind loopback CLI relays to an isolated supervised daemon store
   sr daemon unbind-state
@@ -153,28 +190,13 @@ Advanced setup:
   sr doctor             Diagnose login, team, daemon, and credential access
   sr cleanup            Remove the local daemon (--yes to apply, --purge for credentials)
   sr version            Print build version, commit, and build date
-  sr update             Install the latest release (--check, --version vX.Y.Z)
-  sr rollback           Restore the binary replaced by the last update (--to, --list)
 
 Running agents:
   sr codex [args]       Run codex through Subrouter
   sr codex --account [ACCOUNT] [-- args]
                         Pin one Codex account (no failover); omit ACCOUNT for a picker
                         showing each account's health and usage
-  sr codex --persist-capacity [args]
-                        Retry "model at capacity" every 1s, for the longer of 2m and the
-                        daemon's same-account wait (default 4m), even with a fallback;
-                        the daemon must allow it (SUBROUTER_CODEX_OVERLOAD_FAILOVER=1
-                        or SUBROUTER_CODEX_CAPACITY_RETRY_HEADER=1)
-  sr codex --retry-interval 2s --retry-max-wait 4m [args]
-                        Shape the same-account "model at capacity" wait (default: ~9s
-                        gaps for up to 4m, failover off; interval 500ms-60m, max-wait
-                        up to 60m); same daemon opt-in as --persist-capacity
   sr claude             Pick a preferred account, then run pooled with failover
-  sr claude --retry-interval 2s --retry-max-wait 20m [...]
-                        Shape the pooled same-account overload wait (default: 15s gaps
-                        for up to 8m; interval 500ms-60m, max-wait up to 60m);
-                        the daemon must set SUBROUTER_CLAUDE_OVERLOAD_RETRY_HEADER=1
   sr claude proxy [options] [args...]
                         Run pooled using the server's current recommendation
   sr claude proxy --account [profile]
@@ -188,12 +210,6 @@ Running agents:
                         Pin this process with no account failover
   sr kimi proxy [args]  Explicit launcher alias for sr kimi
   sr qwen proxy [args]  Explicit launcher alias for sr qwen
-
-  sr host attach <ssh-host>
-                        Make another machine of yours use this pool (installs sr there)
-  sr host status [<ssh-host>]
-  sr host watch         Live pool health for attached hosts; in a cmux Dock pane it also labels their workspaces
-  sr host detach <ssh-host>
 
   sr server             Legacy form of sr remote
   sr server add <name> --url <url> [--default]
@@ -225,13 +241,14 @@ These account commands also work at top level as subrouter <command> and sr <com
 The subrouter cx <command> form is kept as a compatibility alias.
 `
 
+// srRunner deliberately has no useServingAPI switch. Upstream (977e933, #293)
+// routes add/list/status/remove over HTTP to a separate serving store and
+// starts the local daemon to do it; this fork's daemon and CLI share one
+// ~/.subrouter, and that routing re-created the box-only `sr status` view that
+// PATCHES.md 19 removed. The serving-store topology is not adopted here.
 type srRunner struct {
-	program string
-	store   accounts.CodexStore
-	// useServingAPI is enabled by the real CLI entrypoint. Direct unit runners
-	// leave it false so injected stores remain hermetic and never contact a
-	// developer's live loopback daemon.
-	useServingAPI               bool
+	program                     string
+	store                       accounts.CodexStore
 	in                          io.Reader
 	out                         io.Writer
 	errOut                      io.Writer
@@ -240,9 +257,17 @@ type srRunner struct {
 	kimi                        srKimiUsageStore
 	grok                        srGrokStore
 	withCodexRefreshPublication func(context.Context, string, func(func() error) error) error
-	// overloadRetryHeader is the X-Subrouter-Retry value a pooled Claude
-	// launch sends (sr claude --retry-interval/--retry-max-wait).
-	overloadRetryHeader string
+	// adminReach remembers, for one command, the servers.json entries whose
+	// private URL was out of reach (PATCHES §43.2). run sets it.
+	adminReach *serverAdminReach
+	// credentialUploadPublicOnly sends a credential upload's whole
+	// conversation with the server -- the account-import preflight, the POST
+	// that carries the credential, and a Claude move's usage-status check --
+	// to the entry's public admin path only (serverAdminCall.publicOnly).
+	// pushClaudeProfileTo, moveClaudeProfileTo and serverLoginOne (a Codex
+	// login) set it on their own copies of the runner for an unpinned
+	// plaintext entry (PATCHES §51).
+	credentialUploadPublicOnly bool
 	// sessionLaunchID names this pooled launch in the local session ledger
 	// (see sr_session_ledger.go). Empty when the launch is not recorded.
 	sessionLaunchID string
@@ -342,6 +367,19 @@ type srUsageRow struct {
 	tempCookedReason string
 	authMode         accounts.AuthMode
 	provider         accounts.Provider
+	// claudeProfile is the local Claude profile a row was read from, and
+	// claudeSetupToken whether that profile's credential is a one-year setup
+	// token. They name the command in the row's re-add hint
+	// (claudeUsageRowRepair). A server's row carries neither: its account is a
+	// profile on the server, not here, and serverClaudeProfile names it --
+	// the status's ID, never the email the row displays, which for an OAuth
+	// profile is its oauthAccount address and names no profile at all.
+	// hostedAccount marks a row of hosted cmux storage, whose accounts are
+	// added only through that storage.
+	claudeProfile       string
+	claudeSetupToken    bool
+	serverClaudeProfile string
+	hostedAccount       bool
 }
 
 func cxAlias(args []string) error {
@@ -351,13 +389,12 @@ func cxAlias(args []string) error {
 func srForProgram(program string, args []string) error {
 	store := codexStoreForCommand(args)
 	runner := srRunner{
-		program:       program,
-		store:         store,
-		useServingAPI: true,
-		in:            os.Stdin,
-		out:           os.Stdout,
-		errOut:        os.Stderr,
-		client:        &http.Client{Timeout: 120 * time.Second},
+		program: program,
+		store:   store,
+		in:      os.Stdin,
+		out:     os.Stdout,
+		errOut:  os.Stderr,
+		client:  &http.Client{Timeout: 120 * time.Second},
 	}
 	return runner.run(context.Background(), args)
 }
@@ -372,6 +409,21 @@ func codexStoreForCommand(args []string) accounts.CodexStore {
 	return accounts.DefaultCodexStore()
 }
 
+// helpText is srHelp with the gated commands removed when this machine holds no
+// key. srHelp itself stays whole so the constant keeps describing the build's
+// full capability; what a locked machine may not do is see it.
+func (r srRunner) helpText() string {
+	if remoteUnlocked() {
+		return srHelp
+	}
+	return stripRemoteHelp(srHelp, "sr")
+}
+
+// normalizeProviderAddArgs is upstream's (c0af43c): provider-first `add`
+// folds into the verb-first form, so `sr codex add` and `sr claude add` take
+// the same credential-source routing as `sr add codex|claude`. It runs in
+// runForProgram (before the Codex launcher, which would otherwise run `codex
+// add` as a prompt) and in srRunner.run (which is how `cx` reaches it).
 func normalizeProviderAddArgs(args []string) []string {
 	if len(args) >= 2 && args[1] == "add" && (args[0] == "codex" || args[0] == "claude") {
 		return append([]string{"add", args[0]}, args[2:]...)
@@ -379,16 +431,69 @@ func normalizeProviderAddArgs(args []string) []string {
 	return args
 }
 
-func (r srRunner) run(ctx context.Context, args []string) error {
-	return r.explainHostRouteError(r.runCommand(ctx, args))
+// normalizeAddRefreshArgs folds `sr addr claude …` into `sr claude addr …`.
+// `addr` ("add refresh") is the Claude browser OAuth login: a refresh token,
+// always enrolled on this machine and never uploaded, so unlike `add` it takes
+// no credential-source routing and lives with the other `sr claude` verbs.
+func normalizeAddRefreshArgs(args []string) []string {
+	if len(args) >= 2 && args[0] == "addr" && claudeProviderWords[strings.ToLower(args[1])] {
+		return append([]string{"claude", "addr"}, args[2:]...)
+	}
+	return args
 }
 
-func (r srRunner) runCommand(ctx context.Context, args []string) error {
-	args = normalizeProviderAddArgs(args)
-	// Bare sr prints the status table when a server answers, so `sr --json`
-	// is the machine-readable form of that same view.
+// normalizeProviderResetArgs folds `sr reset <provider> …` into `sr <provider>
+// reset …`, as normalizeProviderAddArgs folds add (PATCHES §22, §46.11).
+// `sr reset` is the older Codex spelling, so it read the provider word as a
+// second account. The fold runs before the credential-source routing: the
+// provider verb finds the daemon that holds the account itself.
+func normalizeProviderResetArgs(args []string) []string {
+	if len(args) < 2 || args[0] != "reset" {
+		return args
+	}
+	switch word := strings.ToLower(args[1]); {
+	case claudeProviderWords[word]:
+		return append([]string{"claude", "reset"}, args[2:]...)
+	case codexProviderWords[word]:
+		return append([]string{"codex", "reset"}, args[2:]...)
+	}
+	return args
+}
+
+func (r srRunner) run(ctx context.Context, args []string) error {
+	if r.adminReach == nil {
+		r.adminReach = &serverAdminReach{}
+	}
+	args = normalizeProviderResetArgs(normalizeAddRefreshArgs(normalizeProviderAddArgs(args)))
+	// Bare sr prints the status table, so `sr --json` is the machine-readable
+	// form of that same view: `sr status --json` (upstream #499).
 	if len(args) == 1 && args[0] == "--json" {
 		args = []string{"status", "--json"}
+	}
+	// One guard for every gated command, placed above both switches -- the
+	// recovery switch below handles login/logout/storage, so a guard inside the
+	// main switch alone would leave those three reachable. `subrouter <cmd>` and
+	// `cx <cmd>` funnel here too (main.go directSRCommands), so this is the only
+	// dispatch gate the CLI needs.
+	if len(args) > 0 && !remoteUnlocked() && isRemoteCommand(args[0]) {
+		return unknownRemoteCommandError(args[0])
+	}
+	// The other one-guard-for-everything (PATCHES §47): a shell whose macOS
+	// login session has ended may run only what srVerbAllowedInEndedSession
+	// names. After the remote gate, so a keyless machine still answers a gated
+	// verb as a typo and names nothing remote.
+	if err := refuseInUnusableLoginSession(r.programOrSubrouter(), args, srVerbAllowedInEndedSession); err != nil {
+		return err
+	}
+	// A spelling the 2026-09 grammar pass retired gets one line naming its
+	// replacement -- before the credential-source routing below, which would
+	// otherwise hand an unrecognised verb to the remote-account switch.
+	if err := r.retiredSpelling(args); err != nil {
+		return err
+	}
+	if len(args) > 0 && args[0] == "addr" {
+		return fmt.Errorf("usage: %s addr claude [<name>] -- addr is the Claude browser OAuth login "+
+			"(a Codex account is '%s codex add')", r.programOrSubrouter(), r.programOrSubrouter())
 	}
 	// Keep recovery commands available when cloud.json is malformed. Login can
 	// replace it after a successful device flow, while help, doctor, and cleanup
@@ -396,7 +501,7 @@ func (r srRunner) runCommand(ctx context.Context, args []string) error {
 	if len(args) > 0 {
 		switch args[0] {
 		case "help", "-h", "--help":
-			fmt.Fprint(r.out, srHelp)
+			fmt.Fprint(r.out, r.helpText())
 			return nil
 		case "login":
 			return r.cloudLogin(ctx, args[1:])
@@ -454,16 +559,24 @@ func (r srRunner) runCommand(ctx context.Context, args []string) error {
 	var source broker.CredentialSource
 	// A named server in the environment is an explicit, one-command target.
 	// Honor it before the persisted credential source so wrappers such as
-	// `SUBROUTER_SERVER=gcp-staging sr add` upload directly to that server
-	// even when this machine normally uses the team vault. explicitServerTarget
-	// owns the SUBROUTER_SERVER / SUBROUTER_CODEX_SERVER precedence so this
-	// check and selectedRemoteServer can never disagree on the target.
-	if target := explicitServerTarget(); target != "" && shouldRouteSRCommand(args[0]) {
-		if isLocalServerName(target) {
+	// `SUBROUTER_CODEX_SERVER=gcp-staging sr add` upload directly to that
+	// server even when this machine normally uses the team vault.
+	// Upstream's explicitServerTarget resolver (SUBROUTER_SERVER first, #380)
+	// is not taken: PATCHES 29.5 keeps SUBROUTER_CODEX_SERVER as the one
+	// spelling, and selectedRemoteServer and the PATCHES 17 gate untouched.
+	if target := strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_SERVER")); target != "" && shouldRouteSRCommand(args[0]) {
+		if strings.EqualFold(target, "local") {
 			source = broker.CredentialSourceLocal
 		} else if handled, err := r.runSelectedRemoteAccountCommand(ctx, args); handled {
 			return err
 		}
+	} else if strings.EqualFold(target, "local") && args[0] == "status" {
+		// status is never routed (it renders this machine and every server),
+		// but an explicit local override must still keep it off team or hosted
+		// storage's own view, as it does bare sr (defaultInteractive) and
+		// argless sr switch -- upstream #397's rule, in this fork's spelling.
+		// A named server is not honoured here: status already shows it.
+		source = broker.CredentialSourceLocal
 	}
 	if source == "" {
 		config, err := cloudModeConfig()
@@ -477,55 +590,13 @@ func (r srRunner) runCommand(ctx context.Context, args []string) error {
 			return err
 		}
 	}
-	if source == broker.CredentialSourceLegacy && shouldRouteSRCommand(args[0]) && !explicitLocalStateAuthority() {
+	// Upstream's `&& !explicitLocalStateAuthority()` (977e933) is not taken
+	// here: it belongs to the skipped serving-store routing, and SUBROUTER_STATE_DIR
+	// is this fork's isolation knob (tests, docker) -- it must not
+	// silently turn a keyed Legacy machine's `sr add` into a local add.
+	if source == broker.CredentialSourceLegacy && shouldRouteSRCommand(args[0]) {
 		if handled, err := r.runSelectedRemoteAccountCommand(ctx, args); handled {
 			return err
-		}
-	}
-	if r.useServingAPI && (source == broker.CredentialSourceLocal || source == broker.CredentialSourceLegacy) && servingAPIAccountCommand(args[0]) && !explicitLocalStateAuthority() {
-		var server srServerConfig
-		var err error
-		routeToServingAPI := true
-		localServingAuthority := source == broker.CredentialSourceLocal
-		var localAuthority localServingStoreAuthority
-		if source == broker.CredentialSourceLocal {
-			server, localAuthority, err = r.readyLocalServingServerWithAuthority(ctx, defaultDaemonStarter())
-			if err != nil {
-				return err
-			}
-			// A stock per-user daemon shares the local store but has no protected
-			// import credential. Keep onboarding off an unrelated loopback process;
-			// an explicitly credentialed local daemon remains authoritative below.
-			if localOnboardingCommand(args) {
-				if serverHasAccountImportCredential(server) || localAuthority.accountImportEnabled {
-					// The daemon owns a protected import path (for example through
-					// a scoped token or tailnet identity). Keep
-					// the mutation on HTTP so authorization succeeds or fails there.
-				} else {
-					routeToServingAPI = false
-				}
-			}
-		} else {
-			var ok bool
-			server, ok, err = r.selectedRemoteServer()
-			if err != nil {
-				return err
-			}
-			if !ok {
-				server, localAuthority, err = r.readyLocalServingServerWithAuthority(ctx, defaultDaemonStarter())
-				if err != nil {
-					return err
-				}
-				localServingAuthority = true
-			}
-		}
-		if localServingAuthority && source == broker.CredentialSourceLegacy && localOnboardingCommand(args) {
-			if !serverHasAccountImportCredential(server) && !localAuthority.accountImportEnabled {
-				routeToServingAPI = false
-			}
-		}
-		if routeToServingAPI {
-			return r.runRemoteAccountCommand(ctx, server, args)
 		}
 	}
 	switch args[0] {
@@ -625,14 +696,17 @@ func (r srRunner) runCommand(ctx context.Context, args []string) error {
 		return r.attachProject(ctx, args[1], projectID)
 	case "server", "servers":
 		return r.server(ctx, args[1:])
-	case "host", "hosts":
-		return r.host(ctx, args[1:])
+	// Upstream's `sr host attach|status|watch|detach` (#437, #440) is not
+	// dispatched: attach installs upstream's release binary (or a
+	// github.com/manaflow-ai build) on the other machine and points it at this
+	// pool -- the release-binary path PATCHES 37.3 refuses for `sr server
+	// install`, and a remote surface outside the PATCHES 17 gate.
 	case "remote", "remotes":
 		return r.remote(ctx, args[1:])
 	case "tenant", "tenants":
 		return r.tenant(ctx, args[1:])
 	case "help", "-h", "--help":
-		fmt.Fprint(r.out, srHelp)
+		fmt.Fprint(r.out, r.helpText())
 		return nil
 	case "daemon":
 		return runDaemonCommand(ctx, args[1:], r.store, r.out, r.errOut)
@@ -658,25 +732,7 @@ func (r srRunner) runCommand(ctx context.Context, args []string) error {
 		if strings.Contains(args[0], "@") {
 			return r.statusOne(ctx, args[0])
 		}
-		return fmt.Errorf("unknown account command %q\n%s", args[0], srHelp)
-	}
-}
-
-func localOnboardingCommand(args []string) bool {
-	if len(args) == 0 {
-		return false
-	}
-	switch args[0] {
-	case "add", "add-key", "add-api-key":
-		return true
-	case "kimi":
-		return isKimiManagementCommand(args[1:])
-	case "qwen":
-		return isQwenManagementCommand(args[1:])
-	case "agy", "antigravity":
-		return isAntigravityManagementCommand(args[1:])
-	default:
-		return false
+		return fmt.Errorf("unknown account command %q\n%s", args[0], r.helpText())
 	}
 }
 
@@ -716,19 +772,6 @@ func isAntigravityManagementCommand(args []string) bool {
 	}
 }
 
-// servingAPIAccountCommand is deliberately narrower than shouldRouteSRCommand.
-// Only account-store operations belong to an isolated serving daemon; usage
-// reports, traces, admin-key management, and project attachment stay local.
-func servingAPIAccountCommand(command string) bool {
-	switch command {
-	case "add", "add-key", "add-api-key", "list", "ls", "status", "reset", "qwen", "kimi", "agy", "antigravity",
-		"remove", "rm":
-		return true
-	default:
-		return strings.Contains(command, "@")
-	}
-}
-
 func (r srRunner) runSelectedRemoteAccountCommand(ctx context.Context, args []string) (bool, error) {
 	server, ok, err := r.selectedRemoteServer()
 	if err != nil || !ok {
@@ -742,7 +785,22 @@ func shouldRouteSRCommand(command string) bool {
 	case "server", "servers", "remote", "remotes", "tenant", "tenants", "codex", "claude", "claude-aws", "claude-direct", "spend", "cost", "gemini", "az", "azure", "oai", "openai", "recover", "help", "-h", "--help":
 		return false
 	// Setup, cleanup and doctor act on this machine, never the remote server.
-	case "setup", "cleanup", "daemon", "doctor", "login", "logout", "team", "account", "accounts", "storage", "host", "hosts":
+	case "setup", "cleanup", "daemon", "doctor", "login", "logout", "team", "account", "accounts", "storage":
+		return false
+	// Upstream's session and error views read this machine's session ledger
+	// and choose their own server. Routed, a Legacy machine handed them to
+	// runRemoteAccountCommand, which has no case for them.
+	case "sessions", "whoami", "errors", "error":
+		return false
+	// addr is the Claude OAuth login, always on this machine; run() folds
+	// `addr claude` into `claude addr` before routing, so this only keeps a
+	// bare `addr` from being sent to a server.
+	case "addr":
+		return false
+	// status renders local AND every configured server. Routing it to the box
+	// replaced that combined view with the box alone, which is the other half of
+	// the bug fixed above -- `sr status` never even reached r.status.
+	case "status":
 		return false
 	default:
 		return true
@@ -828,7 +886,12 @@ func (r srRunner) runRemoteAccountCommand(ctx context.Context, server srServerCo
 	command := args[0]
 	switch command {
 	case "add", "login":
-		if command == "add" && len(args) > 1 && (strings.EqualFold(args[1], "claude") || strings.EqualFold(args[1], "anthropic")) {
+		// Upstream's arms. `sr add claude` under a selected remote is upstream's
+		// addClaudeToServer: a setup token is enrolled here and COPIED to this
+		// server (it cannot race; an unpinned plaintext server gets no copy,
+		// PATCHES §51); `--oauth` stays on this machine, because a
+		// refresh token held in two places dies at the next rotation.
+		if command == "add" && len(args) > 1 && claudeProviderWords[strings.ToLower(args[1])] {
 			return r.addClaudeToServer(ctx, server, args[2:])
 		}
 		if command == "add" && len(args) > 1 && (strings.EqualFold(args[1], "kimi") || strings.EqualFold(args[1], "moonshot")) {
@@ -838,14 +901,18 @@ func (r srRunner) runRemoteAccountCommand(ctx context.Context, server srServerCo
 			return r.unsupportedRemoteCommand(command, server, "self-hosted Grok subscription import is not available yet; use 'sr remote use local' and then 'sr add grok'")
 		}
 		loginArgs := args[1:]
-		if len(loginArgs) > 0 && (strings.EqualFold(loginArgs[0], "codex") || strings.EqualFold(loginArgs[0], "openai") || strings.EqualFold(loginArgs[0], "chatgpt")) {
+		if len(loginArgs) > 0 && codexProviderWords[strings.ToLower(loginArgs[0])] {
 			loginArgs = loginArgs[1:]
 		}
-		deviceAuth, err := parseRemoteAddArgs(command, loginArgs)
+		// --email pins who the server-side login must sign in as. The pin is
+		// checked for shape BEFORE the login and against the signed-in identity
+		// by serverLoginOne, so a browser signed in as someone else cannot enrol
+		// itself on the server.
+		deviceAuth, expectedEmail, err := r.parseCodexAddArgs(command+" codex", loginArgs)
 		if err != nil {
 			return err
 		}
-		return r.serverLoginOne(ctx, server, deviceAuth, "")
+		return r.serverLoginOne(ctx, server, deviceAuth, expectedEmail)
 	case "add-key", "add-api-key":
 		return r.addKeyToServer(ctx, server, args[1:])
 	case "list", "ls":
@@ -891,7 +958,7 @@ func (r srRunner) runRemoteAccountCommand(ctx context.Context, server srServerCo
 		if strings.Contains(command, "@") {
 			return r.statusOneRemote(ctx, server, command)
 		}
-		return fmt.Errorf("unknown account command %q\n%s", command, srHelp)
+		return fmt.Errorf("unknown account command %q\n%s", command, r.helpText())
 	}
 }
 
@@ -931,11 +998,11 @@ func (r srRunner) addProvider(ctx context.Context, args []string) error {
 	}
 	switch provider {
 	case "codex", "openai", "chatgpt":
-		deviceAuth, err := parseRemoteAddArgs("add codex", args[1:])
+		deviceAuth, expectedEmail, err := r.parseCodexAddArgs("add codex", args[1:])
 		if err != nil {
-			return fmt.Errorf("usage: %s add codex [--device-auth]: %w", r.programOrSubrouter(), err)
+			return err
 		}
-		return r.addCodex(ctx, deviceAuth)
+		return r.addCodexPinned(ctx, deviceAuth, expectedEmail)
 	case "claude", "anthropic":
 		return r.claude(ctx, append([]string{"add"}, args[1:]...))
 	case "grok", "xai":
@@ -1008,10 +1075,26 @@ func (r srRunner) promptProvider() (string, error) {
 
 func (r srRunner) add(ctx context.Context) error { return r.addCodex(ctx, false) }
 
+// addCodex is upstream's isolated add (decision 1 of the 2026-09 merge): the
+// login runs in a throwaway CODEX_HOME, the record is stamped
+// isolated-server-login, and ~/.codex/auth.json is never read into the store
+// or written. The fork's old first-account activation (SwitchActive on a fresh
+// machine) is gone with it: auth.json belongs to the human's own Codex login.
 func (r srRunner) addCodex(ctx context.Context, deviceAuth bool) error {
-	auth, _, err := r.isolatedCodexLogin(ctx, deviceAuth)
+	return r.addCodexPinned(ctx, deviceAuth, "")
+}
+
+// addCodexPinned layers the fork's optional identity pin on upstream's
+// isolated add. The pin is checked AFTER the login and BEFORE anything is
+// stored, exactly as serverLoginOne checks it for `sr add <server> codex
+// <email>`: a browser signed in as someone else cannot enrol itself here either.
+func (r srRunner) addCodexPinned(ctx context.Context, deviceAuth bool, expectedEmail string) error {
+	auth, email, err := r.isolatedCodexLogin(ctx, deviceAuth)
 	if err != nil {
 		return err
+	}
+	if expectedEmail != "" && !r.codexLoginMatchesExpected(auth, email, expectedEmail) {
+		return fmt.Errorf("logged in as %s, expected %s; no account was added", email, expectedEmail)
 	}
 	account, existed, err := r.store.ResolveCodexOAuthAccount(auth)
 	if err != nil {
@@ -1034,6 +1117,67 @@ func (r srRunner) addCodex(ctx context.Context, deviceAuth bool) error {
 	}
 	fmt.Fprintln(r.out, "Local Codex auth was left unchanged.")
 	return nil
+}
+
+// codexLoginMatchesExpected mirrors serverLoginOne's pin: the login's email,
+// or the stable owner identity of an already-stored account named by the pin,
+// or the login's Codex OAuth identifier.
+func (r srRunner) codexLoginMatchesExpected(auth accounts.CodexAuthFile, email, expected string) bool {
+	if strings.EqualFold(email, expected) {
+		return true
+	}
+	if stored, found, err := r.store.FindStored(expected); err == nil && found && accounts.SameCodexOAuthIdentity(stored.Auth, auth) {
+		return true
+	}
+	identifier, err := accounts.CodexOAuthIdentifier(auth)
+	return err == nil && strings.EqualFold(identifier, expected)
+}
+
+// parseCodexAddArgs reads `[--device-auth] [--email <email>]` for a Codex add,
+// on this machine or a server. Upstream takes no positional argument; the
+// email pin is this fork's, layered on as a flag (owner decision 1): the
+// address is checked for shape BEFORE any login starts, and against the
+// signed-in identity after it and before anything is stored.
+func (r srRunner) parseCodexAddArgs(command string, args []string) (deviceAuth bool, expectedEmail string, err error) {
+	program := r.programOrSubrouter()
+	usage := fmt.Sprintf("usage: %s %s [--device-auth] [--email <email>]", program, command)
+	setEmail := func(value string) error {
+		if expectedEmail != "" {
+			return fmt.Errorf("%s: --email was given twice", usage)
+		}
+		expectedEmail = strings.TrimSpace(value)
+		if session.NormalizeUserEmail(expectedEmail) == "" {
+			return fmt.Errorf("%q is not an email: --email pins the account by the email it signs in as", value)
+		}
+		return nil
+	}
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		switch {
+		case arg == "--device-auth" || arg == "-device-auth":
+			deviceAuth = true
+		case arg == "--email" || arg == "-email":
+			if i+1 >= len(args) {
+				return false, "", fmt.Errorf("%s: --email needs an address", usage)
+			}
+			i++
+			if err := setEmail(args[i]); err != nil {
+				return false, "", err
+			}
+		case strings.HasPrefix(arg, "--email="):
+			if err := setEmail(strings.TrimPrefix(arg, "--email=")); err != nil {
+				return false, "", err
+			}
+		case strings.HasPrefix(arg, "-"):
+			return false, "", fmt.Errorf("%s: flag provided but not defined: %s", usage, arg)
+		case session.NormalizeUserEmail(arg) != "" && expectedEmail == "":
+			// The positional pin was this fork's old spelling.
+			return false, "", retiredError(program, command+" <email>", fmt.Sprintf("%s %s --email %s", program, command, arg))
+		default:
+			return false, "", fmt.Errorf("%s: unexpected arguments: %s", usage, arg)
+		}
+	}
+	return deviceAuth, expectedEmail, nil
 }
 
 func (r srRunner) addKey(ctx context.Context, args []string) error {
@@ -1129,6 +1273,12 @@ func (r srRunner) importActive(ctx context.Context) error {
 	return nil
 }
 
+// autoImportIfEmpty is upstream's bootstrap: on an empty store, import the
+// active ~/.codex login. It is deliberately NOT called from status, statusOne,
+// pick or defaultInteractive (see status): under the isolated-Codex model that
+// login is the human's own, and the record it makes is one serve refuses. Kept,
+// with upstream's tests, so upstream edits to it merge; do not re-wire it
+// (TestSRViewsNeverImportThePersonalCodexLogin).
 func (r srRunner) autoImportIfEmpty(ctx context.Context) error {
 	all, err := r.store.ListStored()
 	if err != nil || len(all) > 0 {
@@ -1374,58 +1524,80 @@ func (r srRunner) status(ctx context.Context, opts srStatusOptions) error {
 	if err != nil {
 		return err
 	}
-	serverStatus := r.serverStatusFor
-	if opts.json {
-		serverStatus = r.serverStatusJSONFor
-	}
-	source := config.EffectiveCredentialSource()
-	switch source {
+	switch config.EffectiveCredentialSource() {
 	case broker.CredentialSourceTeam:
 		if opts.json {
 			return r.cloudStatusJSON(ctx)
 		}
 		return r.cloudStatus(ctx)
-	case broker.CredentialSourceLegacy:
-		if explicitLocalStateAuthority() {
-			break
-		}
-		if server, ok, err := r.defaultRemoteServer(); err != nil {
-			return err
-		} else if ok {
-			return serverStatus(ctx, server)
-		}
-		if !r.useServingAPI {
-			break
-		}
-		server, err := r.readyLocalServingServer(ctx, defaultDaemonStarter())
-		if err != nil {
-			return err
-		}
-		return serverStatus(ctx, server)
-	case broker.CredentialSourceLocal:
-		if explicitLocalStateAuthority() || !r.useServingAPI {
-			break
-		}
-		server, err := r.readyLocalServingServer(ctx, defaultDaemonStarter())
-		if err != nil {
-			return err
-		}
-		return serverStatus(ctx, server)
 	}
+	// A legacy (server-configured) machine used to RETURN here with the box's
+	// table and nothing else, so `sr` and `sr status` showed the server's
+	// accounts while this machine's were invisible -- on a laptop whose own
+	// Claude profiles were actively serving traffic. The help text has
+	// always promised "Local accounts first, then each configured server", and
+	// the code to do that is the fall-through below: it renders local rows AND
+	// one section per server. Only the early return stood between them, and it
+	// was spelled three separate times (here, status, and the dispatch routing),
+	// which is how it survived.
+	//
+	// The daemon spans both pools, so "which pool is my credential source" has
+	// no bearing on which accounts exist. Replacing one view with the other
+	// answered a question nobody asked. Upstream's serving-API returns for
+	// Legacy/Local (977e933) are the same early return again and are not taken.
 	if opts.json {
-		return r.localStatusJSON(ctx)
+		// `sr status --json` (upstream #499) is this machine's accounts. Upstream
+		// answers it on a Legacy machine with the selected server's table alone
+		// (serverStatusJSONFor, the early return above again), and otherwise
+		// through localStatusJSON, which auto-imports ~/.codex into an empty
+		// store first (see below). Neither is taken here: the rows are the
+		// local table's (fetchLocalStatusRows), nothing is imported, and stdout
+		// stays one JSON document -- no isolation banner and no server
+		// sections, which the schema (one server or none) has no place for.
+		//
+		// fetchLocalStatusRows, not fetchUsageRows: in a shell whose macOS
+		// login session has ended the rows are the daemon's (PATCHES §47),
+		// since fetchUsageRows would read the Keychain and refresh tokens over
+		// TLS from here. The banner and the stale-row notes go to stderr there.
+		rows, view, err := r.fetchLocalStatusRows(ctx)
+		if err != nil {
+			return err
+		}
+		if view.fromDaemon() && r.errOut != nil {
+			printLocalDaemonViewBanner(r.errOut, view)
+			printLocalDaemonViewNotes(r.errOut, view)
+		}
+		return writeSRStatusJSON(r.out, rows, "", time.Now())
 	}
 	if err := printCodexIsolationStatus(r.out, r.store); err != nil {
 		return err
 	}
-	if err := r.autoImportIfEmpty(ctx); err != nil {
-		return err
-	}
-	rows, err := r.fetchUsageRows(ctx)
+	// No autoImportIfEmpty here, in statusOne, pick or defaultInteractive
+	// (upstream calls it in all four). Under the isolated-Codex model
+	// (decision 1) ~/.codex is the human's personal login, never a pool chain:
+	// importing it on an empty store stamped an interactive-import record that
+	// serve refuses, and a status view is not a request to change the pool.
+	// `sr import` stays the explicit way to do it (PATCHES 19).
+	//
+	// printCodexIsolationStatus above stays in a shell that cannot use macOS
+	// login services (PATCHES §47): it reads the Codex store and ~/.codex
+	// files, nothing else. The local rows below are the daemon's there.
+	remote := r.startRemoteAccountSections(ctx)
+	rows, view, err := r.fetchLocalStatusRows(ctx)
 	if err != nil {
 		return err
 	}
+	if view.fromDaemon() {
+		printLocalDaemonViewBanner(r.out, view)
+	} else {
+		printLocalAccountsHeading(r.out, remote)
+	}
 	displayUsageRows(r.out, rows, false)
+	printLocalDaemonViewNotes(r.out, view)
+	serverRows := r.printRemoteAccountSections(remote)
+	// One total across every pool. The count used to come from the box-only
+	// view, so it undercounted on a machine that also holds local accounts.
+	printAccountCountSummary(r.out, append(append([]srUsageRow{}, rows...), serverRows...))
 	printKimiCLIOnlyStatusHint(r.out, rows)
 	return nil
 }
@@ -1461,10 +1633,7 @@ func printKimiCLIOnlyStatusHint(out io.Writer, rows []srUsageRow) {
 }
 
 func (r srRunner) statusOne(ctx context.Context, selector string) error {
-	if err := r.autoImportIfEmpty(ctx); err != nil {
-		return err
-	}
-	all, err := r.fetchUsageRows(ctx)
+	all, view, err := r.fetchLocalStatusRows(ctx)
 	if err != nil {
 		return err
 	}
@@ -1479,14 +1648,15 @@ func (r srRunner) statusOne(ctx context.Context, selector string) error {
 	if len(matches) == 0 {
 		return fmt.Errorf("no account found for %s", selector)
 	}
+	if view.fromDaemon() {
+		fmt.Fprintln(r.out, style(colorEnabled(r.out), ansiDim, fmt.Sprintf("(read from this machine's daemon: %s; `%s status` says more)",
+			view.session.situation(), r.programOrSubrouter())))
+	}
 	displayUsageRows(r.out, matches, false)
 	return nil
 }
 
 func (r srRunner) pick(ctx context.Context, opts srSwitchOptions) error {
-	if err := r.autoImportIfEmpty(ctx); err != nil {
-		return err
-	}
 	rows, err := r.fetchUsageRows(ctx)
 	if err != nil {
 		return err
@@ -1524,51 +1694,41 @@ func (r srRunner) defaultInteractive(ctx context.Context, opts srSwitchOptions) 
 	case broker.CredentialSourceTeam:
 		return r.cloudStatus(ctx)
 	case broker.CredentialSourceHosted:
-		if !explicitLocalServerTarget() {
+		// Hosted cmux storage answers bare `sr` with its usage dashboard, as
+		// team storage does above and as `sr status` already does through
+		// runTeamCredentialCommand (upstream #397). SUBROUTER_CODEX_SERVER=local
+		// keeps it on this machine's accounts. Upstream's explicitLocalServerTarget
+		// also reads SUBROUTER_SERVER, the resolver this fork did not take
+		// (PATCHES 29.5), so the check here is the one run() makes.
+		if !strings.EqualFold(strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_SERVER")), "local") {
 			return r.cloudStatus(ctx)
 		}
-	case broker.CredentialSourceLegacy:
-		if server, ok, err := r.defaultRemoteServer(); err != nil {
-			return err
-		} else if ok {
-			return r.serverStatus(ctx, defaultSRServerStore(r.store), server.Name)
-		}
-		if r.useServingAPI && !explicitLocalStateAuthority() {
-			server, err := r.readyLocalServingServer(ctx, defaultDaemonStarter())
-			if err != nil {
-				return err
-			}
-			return r.serverStatusFor(ctx, server)
-		}
-	case broker.CredentialSourceLocal:
-		if r.useServingAPI && !explicitLocalStateAuthority() {
-			server, err := r.readyLocalServingServer(ctx, defaultDaemonStarter())
-			if err != nil {
-				return err
-			}
-			return r.serverStatusFor(ctx, server)
-		}
 	}
-	if err := r.autoImportIfEmpty(ctx); err != nil {
-		return err
-	}
-	rows, err := r.fetchUsageRows(ctx)
+	// Same fall-through as status: local rows first, then every server. See the
+	// comment there for why the Legacy early return (and upstream's serving-API
+	// returns for Legacy/Local) are not taken, and why nothing is auto-imported.
+	remote := r.startRemoteAccountSections(ctx)
+	rows, view, err := r.fetchLocalStatusRows(ctx)
 	if err != nil {
 		return err
+	}
+	if view.fromDaemon() {
+		// PATCHES §47: the daemon's rows, unnumbered, with no recommendation
+		// and no prompt. recommendOverExhaustedActive says "pick its number
+		// below", and a switch from here would be made blind
+		// (switchingOffLine). `sr switch|g|pick` are refused by the gate.
+		printLocalDaemonViewBanner(r.out, view)
+		displayUsageRows(r.out, rows, false)
+		printLocalDaemonViewNotes(r.out, view)
+		serverRows := r.printRemoteAccountSections(remote)
+		printAccountCountSummary(r.out, append(append([]srUsageRow{}, rows...), serverRows...))
+		fmt.Fprintln(r.out, switchingOffLine(r.programOrSubrouter()))
+		return nil
 	}
 	if len(rows) == 0 {
 		fmt.Fprintln(r.out, "No accounts configured. Run 'subrouter add' to add one.")
+		r.printRemoteAccountSections(remote)
 		return nil
-	}
-	switched, err := r.autoSwitchExhaustedActive(ctx, rows, opts)
-	if err != nil {
-		return err
-	}
-	if switched {
-		rows, err = r.fetchUsageRows(ctx)
-		if err != nil {
-			return err
-		}
 	}
 	allCooked := allOAuthRowsCooked(rows)
 	allBlocked := allOAuthRowsBlockedForNewSession(rows)
@@ -1579,18 +1739,22 @@ func (r srRunner) defaultInteractive(ctx context.Context, opts srSwitchOptions) 
 		fmt.Fprintln(r.out)
 		fmt.Fprintln(r.out, "All of your OAuth accounts are unavailable for new sessions. Usable windows are exhausted, so sr will keep the current active account and will not switch.")
 	}
+	printLocalAccountsHeading(r.out, remote)
 	displayUsageRows(r.out, rows, true)
-	if switched {
-		return nil
-	}
+	serverRows := r.printRemoteAccountSections(remote)
+	printAccountCountSummary(r.out, append(append([]srUsageRow{}, rows...), serverRows...))
 	if allCooked || allBlocked || !hasSwitchableUsageRows(rows) {
 		return nil
 	}
+	r.recommendOverExhaustedActive(rows)
 
 	reader := bufio.NewReader(r.in)
-	answer, err := promptLine(r.out, reader, "Switch to (#): ")
+	answer, cancelled, err := promptSwitchSelection(r.out, reader, r.in, "Switch to (#): ")
 	if err != nil {
 		return err
+	}
+	if cancelled {
+		return nil
 	}
 	answer = strings.TrimSpace(answer)
 	if answer == "" {
@@ -1613,8 +1777,9 @@ func (r srRunner) defaultInteractive(ctx context.Context, opts srSwitchOptions) 
 // parsePickerNumber interprets a "# or name" picker answer. A whole number
 // must name a listed row (1..n) and is returned as a zero-based index; any
 // other number is an error rather than falling through to a name or
-// substring match that could select the wrong account. A non-number returns
-// isNumber=false so the caller can resolve it as a name.
+// substring match that could select the wrong account -- "12" typed against
+// a two-row list used to switch to whichever account's email contained "12".
+// A non-number returns isNumber=false so the caller can resolve it as a name.
 func parsePickerNumber(answer string, n int) (index int, isNumber bool, err error) {
 	number, parseErr := strconv.Atoi(strings.TrimSpace(answer))
 	if parseErr != nil {
@@ -1626,31 +1791,46 @@ func parsePickerNumber(answer string, n int) (index int, isNumber bool, err erro
 	return number - 1, true, nil
 }
 
-func (r srRunner) autoSwitchExhaustedActive(ctx context.Context, rows []srUsageRow, opts srSwitchOptions) (bool, error) {
-	active := activeUsageRow(rows)
+// recommendOverExhaustedActive names a better Codex login when the active one
+// is exhausted, and changes nothing.
+//
+// Upstream's bare `sr` switched automatically here (autoSwitchExhaustedActive).
+// A switch exports the target's refresh-token chain to ~/.codex, OpenCode and
+// pi, and demotes that record (and the one matching ~/.codex) out of serving:
+// under the isolated-Codex model (decision 1) that is allowed only on an
+// explicit request. Viewing the table is not one; typing the row's number at
+// the prompt below, or `sr switch|g <account>`, is.
+func (r srRunner) recommendOverExhaustedActive(rows []srUsageRow) {
+	active := activeCodexUsageRow(rows)
 	if active == nil || active.err != nil || active.authMode != accounts.AuthModeOAuth || !exhaustedForNewSession(active.score) {
-		return false, nil
+		return
 	}
 	target := recommendedUsableOAuthRow(rows)
 	if target == nil || target.email == active.email {
-		return false, nil
+		return
 	}
-	if err := r.switchAccount(ctx, target.email, opts); err != nil {
-		return false, err
-	}
-	fmt.Fprintf(r.out, "Auto-switched to %s because active account %s is exhausted.\n", displayUsageAccountName(*target), displayUsageAccountName(*active))
-	return true, nil
+	program := r.programOrSubrouter()
+	// Display names, not stored selectors, in the prose (upstream #406); the
+	// command keeps target.email, the selector switchAccount resolves.
+	fmt.Fprintf(r.out, "\nActive Codex login %s is exhausted; recommended: %s. Switching exports %s to ~/.codex "+
+		"(and OpenCode/pi) and takes it out of serving: pick its number below, or run `%s switch %s`.\n",
+		displayUsageAccountName(*active), displayUsageAccountName(*target), displayUsageAccountName(*target), program, target.email)
 }
 
-func activeUsageRow(rows []srUsageRow) *srUsageRow {
+// activeCodexUsageRow is the row ~/.codex holds. Only Codex: a Claude profile
+// is marked active too, and its exhaustion says nothing about ~/.codex.
+func activeCodexUsageRow(rows []srUsageRow) *srUsageRow {
 	for i := range rows {
-		if rows[i].active {
+		if rows[i].active && usageProvider(rows[i]) == accounts.ProviderCodex {
 			return &rows[i]
 		}
 	}
 	return nil
 }
 
+// recommendedUsableOAuthRow is Codex-only already: recommendedForNewSession
+// refuses every non-Codex row, so a recommended Claude or Kimi row (one is
+// marked per provider heading) is never named for ~/.codex.
 func recommendedUsableOAuthRow(rows []srUsageRow) *srUsageRow {
 	for i := range rows {
 		if rows[i].gtoRecommended && recommendedForNewSession(rows[i]) && rows[i].authMode == accounts.AuthModeOAuth {
@@ -1940,35 +2120,51 @@ func (r srRunner) fetchUsageRows(ctx context.Context) ([]srUsageRow, error) {
 	for i, profile := range claudeProfiles {
 		i, profile := claudeOffset+i, profile
 		rows[i] = srUsageRow{
-			email:    profile.Name,
-			active:   profile.Name == activeClaude,
-			planType: "unknown",
-			authMode: accounts.AuthModeOAuth,
-			provider: accounts.ProviderClaude,
-			score:    selectacct.Score{AccountID: profile.Name, Headroom: 1, ShortHeadroom: 1},
+			email:         profile.Name,
+			active:        profile.Name == activeClaude,
+			planType:      "unknown",
+			authMode:      accounts.AuthModeOAuth,
+			provider:      accounts.ProviderClaude,
+			score:         selectacct.Score{AccountID: profile.Name, Headroom: 1, ShortHeadroom: 1},
+			claudeProfile: profile.Name,
 		}
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			account, credential, err := r.refreshStatusClaudeCredential(ctx, claudeStore, profile)
+			// The credential comes back with most errors too (an expired setup
+			// token, a refresh the provider refused), so the hint can name the
+			// repair for the kind of login the profile actually holds.
+			rows[i].claudeSetupToken = credential != nil && credential.LongLived()
+			if agentclaude.CredentialCannotReadResets(credential) {
+				// A setup token cannot read the saved reset: "n/a", not "none".
+				rows[i].complimentaryReset = agentclaude.UnreadableResetInfo()
+			}
 			if err != nil {
 				rows[i].err = err
 				rows[i].score = selectacct.Score{AccountID: profile.Name, Headroom: 0, ShortHeadroom: 0}
 				return
 			}
 			rows[i].planType = credential.PlanType()
-			windows, err := fetchClaudeUsageWindows(ctx, r.client, account.Token)
+			windows, reset, err := fetchClaudeUsageWindowsAndReset(ctx, r.client, account.Token)
 			if err != nil {
 				rows[i].err = err
 				rows[i].score = selectacct.Score{AccountID: profile.Name, Headroom: 0, ShortHeadroom: 0}
 				return
+			}
+			if rows[i].complimentaryReset == nil {
+				rows[i].complimentaryReset = reset
 			}
 			rows[i].windows = windows
 			rows[i].score = scoreFromWindows(profile.Name, rows[i].windows)
 		}()
 	}
 	wg.Wait()
-	enrichClaudeRowsWithWebBalances(ctx, rows)
+	fillClaudeResetsFromLocalDaemon(ctx, r, rows[claudeOffset:])
+	// Opt-in only: see claudeWebBalanceEnabled (sr_claude_balance.go).
+	if claudeWebBalanceEnabled() {
+		enrichClaudeRowsWithWebBalances(ctx, rows)
+	}
 	rankUsageRows(rows)
 	return rows, nil
 }
@@ -2489,6 +2685,7 @@ func scoreFromWindows(accountID string, windows []accounts.UsageWindow) selectac
 			LimitWindowSeconds: window.LimitWindowSeconds,
 			ResetAfterSeconds:  window.ResetAfterSeconds,
 			Feature:            window.Feature,
+			SpendCap:           accounts.IsSpendWindow(window),
 		})
 		if hasFableWindow && window.Feature == "" {
 			limitWindows = append(limitWindows, selectacct.LimitWindow{
@@ -2518,6 +2715,9 @@ func cookedFromWindows(windows []accounts.UsageWindow) (bool, string) {
 	}
 	if window.Name == "reached" {
 		return true, "usage limit reached"
+	}
+	if window.Name == accounts.CodexSpendReachedWindowName {
+		return true, "spend cap reached"
 	}
 	if window.ResetAfterSeconds > 0 {
 		return true, fmt.Sprintf("%s fully consumed, resets in %s", windowLabel(window), formatDuration(window.ResetAfterSeconds))
@@ -2712,8 +2912,22 @@ func claudeUsageWindows(usage *agentclaude.UsageResponse) []accounts.UsageWindow
 }
 
 func fetchClaudeUsageWindows(ctx context.Context, client *http.Client, accessToken string) ([]accounts.UsageWindow, error) {
+	windows, _, err := fetchClaudeUsageWindowsAndReset(ctx, client, accessToken)
+	return windows, err
+}
+
+// fetchClaudeUsageWindowsAndReset is fetchClaudeUsageWindows plus the saved
+// usage-limit reset the same usage answer carries (PATCHES §46): nil when it
+// carried none, which the table shows as "?", never as "none".
+func fetchClaudeUsageWindowsAndReset(ctx context.Context, client *http.Client, accessToken string) ([]accounts.UsageWindow, *accounts.ComplimentaryResetInfo, error) {
 	usage, err := agentclaude.FetchUsage(ctx, client, accessToken)
 	windows := claudeUsageWindows(usage)
+	var reset *accounts.ComplimentaryResetInfo
+	if err == nil {
+		if status, statusErr := usage.ResetStatus(); statusErr == nil {
+			reset = agentclaude.ResetInfo(status, time.Now())
+		}
+	}
 	if !usageWindowNamed(windows, agentclaude.FableWindowName) {
 		fableWindows, probeErr := agentclaude.FetchFableUsageWindows(ctx, client, accessToken)
 		if probeErr == nil && len(fableWindows) > 0 {
@@ -2722,15 +2936,15 @@ func fetchClaudeUsageWindows(ctx context.Context, client *http.Client, accessTok
 			}
 		} else if err != nil {
 			if probeErr != nil {
-				return nil, probeErr
+				return nil, nil, probeErr
 			}
-			return nil, err
+			return nil, nil, err
 		}
 	}
 	if err != nil && len(windows) == 0 {
-		return nil, err
+		return nil, nil, err
 	}
-	return windows, nil
+	return agentclaude.WithUnusedFableWindow(windows), reset, nil
 }
 
 func fableProbeHasPrimaryWindows(windows []accounts.UsageWindow) bool {
@@ -2795,7 +3009,36 @@ func (r srRunner) ensureSwitchableForFreshUsage(ctx context.Context, account acc
 	return nil
 }
 
+// rankUsageRows marks the first recommendable row of each heading in rank
+// order (usageRowRankLess) as `rec`, then re-sorts every heading for display
+// (usageRowWeekLess).
 func rankUsageRows(rows []srUsageRow) {
+	sortUsageRowsWithinHeadings(rows, usageRowRankLess)
+	recommended := map[string]bool{}
+	for i := range rows {
+		rows[i].gtoRecommended = false
+		group := usageProviderLabel(rows[i])
+		if !recommended[group] && displayRecommendedForNewSession(rows[i]) {
+			rows[i].gtoRecommended = true
+			recommended[group] = true
+		}
+		rows[i].gtoReason = gtoReason(rows[i])
+	}
+	sortUsageRowsWithinHeadings(rows, usageRowWeekLess)
+}
+
+// usageRowRankLess is the ranking. It decides which row is `rec`, and which
+// of two equal weekly waits the older-server reset fallback redeems.
+func usageRowRankLess(a, b srUsageRow) bool {
+	// No Claude row is ever `rec`, so the Claude order has no visible effect.
+	// It stays so this ranking keeps matching upstream's.
+	if usageProvider(a) == accounts.ProviderClaude {
+		return claudeUsageRowLess(a, b)
+	}
+	return codexUsageRowLess(a, b)
+}
+
+func sortUsageRowsWithinHeadings(rows []srUsageRow, less func(a, b srUsageRow) bool) {
 	sort.SliceStable(rows, func(i, j int) bool {
 		a, b := rows[i], rows[j]
 		ao, bo := usageProviderOrder(a), usageProviderOrder(b)
@@ -2809,21 +3052,45 @@ func rankUsageRows(rows []srUsageRow) {
 		if al, bl := usageProviderLabel(a), usageProviderLabel(b); al != bl {
 			return al < bl
 		}
-		if usageProvider(a) == accounts.ProviderClaude {
-			return claudeUsageRowLess(a, b)
-		}
-		return codexUsageRowLess(a, b)
+		return less(a, b)
 	})
-	recommended := map[string]bool{}
-	for i := range rows {
-		rows[i].gtoRecommended = false
-		group := usageProviderLabel(rows[i])
-		if !recommended[group] && displayRecommendedForNewSession(rows[i]) {
-			rows[i].gtoRecommended = true
-			recommended[group] = true
-		}
-		rows[i].gtoReason = gtoReason(rows[i])
+}
+
+// usageRowWeekLess lists a heading by time left in the week: the longest wait
+// for the 7d column's reset first, so accounts about to roll sit at the
+// bottom. A weekly reading with no reset time counts as 0 left; rows with no
+// weekly reading follow, and rows in error come last.
+func usageRowWeekLess(a, b srUsageRow) bool {
+	// Status tier 6 is the ranking's failure tier: a failed usage read, a
+	// rejected credential or key, a revoked login.
+	inError := func(row srUsageRow) bool { return row.err != nil || usageRowStatusTier(row) == 6 }
+	if ae, be := inError(a), inError(b); ae != be {
+		return be
 	}
+	aw, aok := usageRowWeeklyWindow(a)
+	bw, bok := usageRowWeeklyWindow(b)
+	if aok != bok {
+		return aok
+	}
+	if aok {
+		ar, br := aw.ResetAfterSeconds, bw.ResetAfterSeconds
+		if ar < 0 {
+			ar = 0
+		}
+		if br < 0 {
+			br = 0
+		}
+		if ar != br {
+			return ar > br
+		}
+		if aw.UsedPercent != bw.UsedPercent {
+			return aw.UsedPercent < bw.UsedPercent
+		}
+	}
+	if an, bn := displayUsageAccountName(a), displayUsageAccountName(b); an != bn {
+		return an < bn
+	}
+	return a.email < b.email
 }
 
 func displayRecommendedForNewSession(row srUsageRow) bool {
@@ -2955,10 +3222,12 @@ func claudeCreditCooldownActive(row srUsageRow) bool {
 	return usageProvider(row) == accounts.ProviderClaude && row.creditsExhaustedUntil.After(time.Now())
 }
 
+// claudeWeeklyCapacityRemaining reads the row's account-wide weekly windows.
+// Upstream first trusts Score.WeeklyHeadroom when its WeeklyHeadroomKnown
+// flag is set; this fork's Score has no such flag (WeeklyHeadroom is the
+// spendable share after the Fable reservation, and zero means unmeasured), so
+// the windows the row was scored from decide, as upstream's fallback does.
 func claudeWeeklyCapacityRemaining(row srUsageRow) bool {
-	if row.score.WeeklyHeadroomKnown {
-		return row.score.WeeklyHeadroom > 0
-	}
 	for _, window := range row.windows {
 		if !accountWideWindow(isLongQuotaWindow)(window) {
 			continue
@@ -3056,14 +3325,12 @@ func recommendedForNewSession(row srUsageRow) bool {
 	return row.authMode == accounts.AuthModeOAuth && usableForNewSession(row.score)
 }
 
+// The router's answer, not a second opinion. The private copy this replaces
+// gated the `sr status` usable column and its ordering on a flat 40%, which is
+// why the table could call an account "protected" while the pool was routing
+// to it.
 func usableForNewSession(score selectacct.Score) bool {
 	return score.UsableForNewSession()
-}
-
-// usingExpiringWeeklyQuota marks an account the scheduler admits below the
-// new-session floor because its weekly quota would otherwise go unused.
-func usingExpiringWeeklyQuota(score selectacct.Score) bool {
-	return score.UsableForNewSession() && score.Headroom < selectacct.MinNewSessionHeadroom
 }
 
 func exhaustedForNewSession(score selectacct.Score) bool {
@@ -3085,10 +3352,7 @@ func gtoReason(row srUsageRow) string {
 	}
 	left := fmt.Sprintf("%d%% bottleneck left", int(row.score.Headroom*100+0.5))
 	if !usableForNewSession(row.score) {
-		return fmt.Sprintf("%s, protected below %d%%", left, int(selectacct.MinNewSessionHeadroom*100))
-	}
-	if usingExpiringWeeklyQuota(row.score) {
-		return fmt.Sprintf("%s, weekly quota expiring", left)
+		return left + ", not routable for a new session"
 	}
 	if row.score.ShortResetAfterSeconds > 0 {
 		return fmt.Sprintf("%s, 5h resets in %s", left, formatDuration(row.score.ShortResetAfterSeconds))
@@ -3194,17 +3458,67 @@ func displayUsageRowsGrid(out io.Writer, rows []srUsageRow, numbered, perGroupNu
 		groupRowIndex++
 	}
 	fmt.Fprintln(out)
-	if usageRowsHaveErrors(rows) {
+	if usageRowsHaveErrors(rows) || usageRowsHaveRevokedClaude(rows) {
 		for _, row := range rows {
-			if row.err != nil {
+			switch {
+			case row.err != nil:
 				fmt.Fprintf(out, "  %s %s: %s%s\n",
 					style(colored, ansiBold+ansiWhite, displayUsageAccountName(row)),
 					style(colored, ansiDim, "["+string(usageProvider(row))+"]"),
 					style(colored, ansiRed, row.err.Error()),
 					style(colored, ansiDim, usageRowErrorHint(row)))
+			case revokedClaudeRow(row):
+				// A revoked row is published with no error, so it needs its
+				// own line: the Use cell can only say the verb, and only
+				// this line names the command (PATCHES §36).
+				fmt.Fprintf(out, "  %s %s: %s%s\n",
+					style(colored, ansiBold+ansiWhite, displayUsageAccountName(row)),
+					style(colored, ansiDim, "["+string(usageProvider(row))+"]"),
+					style(colored, ansiRed, revokedLabel(row)+" since "+row.revokedSince.UTC().Format("01-02 15:04Z")),
+					style(colored, ansiDim, " ("+revokedClaudeRepair(row)+")"))
 			}
 		}
 		fmt.Fprintln(out)
+	}
+}
+
+// revokedClaudeRow reports a Claude row whose credential Anthropic revoked.
+func revokedClaudeRow(row srUsageRow) bool {
+	return usageProvider(row) == accounts.ProviderClaude && !row.revokedSince.IsZero()
+}
+
+func usageRowsHaveRevokedClaude(rows []srUsageRow) bool {
+	for _, row := range rows {
+		if revokedClaudeRow(row) {
+			return true
+		}
+	}
+	return false
+}
+
+// revokedClaudeRepair is the repair for a revoked Claude credential, by the
+// row's login (claudeUsageRowRepair, PATCHES §36): an OAuth login is signed in
+// again in place, only a setup token is re-minted. An organization that
+// disallows subscription logins is fixed by neither.
+func revokedClaudeRepair(row srUsageRow) string {
+	if row.revokedKind == "org_oauth_disallowed" {
+		return "the organization disallows subscription logins; use another account"
+	}
+	return claudeUsageRowRepair(row)
+}
+
+// revokedPickReason is the Use cell of a revoked Claude row: the repair's
+// verb (revokedClaudeRepair names the command below the table). Upstream's
+// "re-add" is the setup-token verb, which on an OAuth row is the mistake
+// §36 records.
+func revokedPickReason(row srUsageRow) string {
+	switch {
+	case row.revokedKind == "org_oauth_disallowed":
+		return "use another"
+	case row.claudeSetupToken:
+		return "re-add"
+	default:
+		return "re-auth"
 	}
 }
 
@@ -3284,13 +3598,52 @@ func usageRowErrorHint(row srUsageRow) string {
 	if row.err == nil || !authErrorNeedsReadd(row.err) {
 		return ""
 	}
+	if usageProvider(row) == accounts.ProviderClaude {
+		return " (" + claudeUsageRowRepair(row) + ")"
+	}
 	return " (re-add with: " + providerReaddCommand(usageProvider(row)) + ")"
+}
+
+// claudeUsageRowRepair names the command that revives one Claude row's login,
+// with the row's own profile name (PATCHES §36). Since the 2026-09 grammar
+// (§22) the two Claude logins are repaired differently: a dead OAuth refresh
+// token (invalid_grant, a failed refresh, a 401) is signed in again in place
+// with `sr claude addr <name>`, and only a one-year setup token is re-minted
+// with `sr claude add <name>`. The hint used to say `sr add claude` for every
+// Claude row -- the setup-token verb, with no name, which refuses without one
+// -- and on 2026-09-27 following it minted setup tokens for OAuth accounts.
+//
+// A local row knows its kind from the credential it read. A server's row is
+// judged by its error: only an expired setup token says so, and a setup token
+// never refreshes, so everything else is an OAuth login. A server's account is
+// a profile on that server, so the hint says to run the command there: the
+// same command on this machine would sign in a new local profile and leave the
+// server's copy dead. It names the server's profile ID, never the row's email:
+// the email is the account's address from .claude.json, and `sr claude addr
+// <email>` on the server would sign a NEW profile in under that name and leave
+// the dead one in the pool.
+func claudeUsageRowRepair(row srUsageRow) string {
+	if row.hostedAccount {
+		// Hosted cmux storage: there `sr add claude` is the storage's own add
+		// (cloudAccountAdd), the only way an account reaches it.
+		return "re-add with: sr add claude"
+	}
+	name, where := row.claudeProfile, ""
+	if name == "" {
+		name, where = row.serverClaudeProfile, " on that server"
+	}
+	if name == "" {
+		// A server that sent no ID: say what goes there rather than guess.
+		name = "<name>"
+	}
+	if row.claudeSetupToken || (row.err != nil && strings.Contains(strings.ToLower(row.err.Error()), "setup token expired")) {
+		return "re-add" + where + " with: sr claude add " + name
+	}
+	return "re-auth" + where + " with: sr claude addr " + name
 }
 
 func providerReaddCommand(provider accounts.Provider) string {
 	switch provider {
-	case accounts.ProviderClaude:
-		return "sr add claude"
 	case "gemini":
 		return "sr gemini add"
 	default:
@@ -3572,6 +3925,42 @@ func claudeUsageGridColumns(rows []srUsageRow, numbered bool, termWidth int) []u
 			break
 		}
 	}
+	return insertClaudeResetColumn(rows, columns, termWidth)
+}
+
+// insertClaudeResetColumn places the saved usage-limit reset (PATCHES §46)
+// after the weekly meters and before paid usage and the Detail column --
+// the same title and cell as Codex's -- once every other column has been
+// fitted: on a narrow terminal it gives way first, dated ("1 left 10/22"),
+// then undated ("1 left"), never pushing out Extra usage, Auto-reload or
+// Detail. Upstream folded the "$" (ExtraSpend) cell into Extra (#529) and
+// prints Detail last, so those are the columns it goes before.
+func insertClaudeResetColumn(rows []srUsageRow, columns []usageGridColumn, termWidth int) []usageGridColumn {
+	if !usageGridRowsHaveValue(rows, "Reset") {
+		return columns
+	}
+	at := len(columns)
+	for i, column := range columns {
+		switch column.Key {
+		case "Extra", "ExtraAutoReload", "Detail":
+			if i < at {
+				at = i
+			}
+		}
+	}
+	for _, candidate := range []usageGridColumn{
+		// "1 left 10/22" is the widest cell.
+		{Key: "Reset", Title: "1x reset", Width: usageGridDesiredWidth(rows, "Reset", "1x reset", 12)},
+		{Key: "ResetShort", Title: "1x reset", Width: usageGridDesiredWidth(rows, "ResetShort", "1x reset", 8)},
+	} {
+		next := make([]usageGridColumn, 0, len(columns)+1)
+		next = append(next, columns[:at]...)
+		next = append(next, candidate)
+		next = append(next, columns[at:]...)
+		if termWidth <= 0 || usageGridWidth(next) <= termWidth {
+			return next
+		}
+	}
 	return columns
 }
 
@@ -3642,6 +4031,7 @@ func usageGridValues(row srUsageRow, rowIndex string) map[string]usageGridCell {
 		"5h":              usageGridProviderShortWindowCell(row),
 		"7d":              usageGridProviderLongWindowCell(row),
 		"Reset":           usageGridResetCell(row),
+		"ResetShort":      usageGridResetCellUndated(row),
 		"Credits":         usageGridCreditsCell(row),
 		"Detail":          usageGridClaudeDetailCell(row),
 		"Session":         usageGridWindowCell(row.windows, isClaudeSessionWindow),
@@ -3918,10 +4308,93 @@ func usageGridProviderShortWindowCell(row srUsageRow) usageGridCell {
 }
 
 func usageGridProviderLongWindowCell(row srUsageRow) usageGridCell {
-	return usageGridWindowCell(row.windows, accountWideWindow(isLongQuotaWindow))
+	window, ok := usageRowWeeklyWindow(row)
+	if !ok {
+		return usageGridCell{}
+	}
+	return usageGridWindowStatusCell(window)
+}
+
+// usageRowWeeklyWindow is the window the 7d column prints, and the one
+// usageRowWeekLess orders rows by.
+func usageRowWeeklyWindow(row srUsageRow) (accounts.UsageWindow, bool) {
+	weekly := accountWideWindow(isLongQuotaWindow)
+	for _, window := range row.windows {
+		if weekly(window) {
+			return window, true
+		}
+	}
+	return accounts.UsageWindow{}, false
 }
 
 func usageGridResetCell(row srUsageRow) usageGridCell {
+	if usageProvider(row) == accounts.ProviderClaude {
+		return usageGridClaudeResetCell(row, true)
+	}
+	return usageGridCodexResetCell(row)
+}
+
+// usageGridResetCellUndated is the reset cell without a use-by date, for a
+// table too narrow to carry one.
+func usageGridResetCellUndated(row srUsageRow) usageGridCell {
+	if usageProvider(row) == accounts.ProviderClaude {
+		return usageGridClaudeResetCell(row, false)
+	}
+	return usageGridCodexResetCell(row)
+}
+
+// usageGridClaudeResetCell reads a Claude account's saved usage-limit reset
+// (complimentary_reset with Source "cedar_ember", PATCHES §46): "1 left" (with
+// its use-by date when dated), "1 left !elig" (held, but Anthropic calls the
+// account ineligible), "used", "expired", "none" (no grant), "not elig"
+// (another ineligible_reason), "n/a" (a token that cannot read it), and "?"
+// when nothing was read -- an old daemon, a failed read, Anthropic's own
+// "unavailable", or a usage answer without the block. "?" is never "none".
+func usageGridClaudeResetCell(row srUsageRow, dated bool) usageGridCell {
+	if row.authMode != accounts.AuthModeOAuth {
+		return usageGridCell{}
+	}
+	info := row.complimentaryReset
+	if info == nil || (info.Source != "" && info.Source != agentclaude.ResetProgram) {
+		return usageGridCell{Text: "?", Style: ansiDim}
+	}
+	if info.Status == "unreadable" || info.IneligibleReason == agentclaude.ResetUnreadableReason {
+		return usageGridCell{Text: "n/a", Style: ansiDim}
+	}
+	if !info.Known {
+		return usageGridCell{Text: "?", Style: ansiDim}
+	}
+	eligible := info.Eligible == nil || *info.Eligible
+	if info.Remaining != nil && *info.Remaining > 0 {
+		if !eligible {
+			// Held, but Anthropic will not honour it from here: said in
+			// words, not only by color, so piped output and agents see it.
+			if dated {
+				return usageGridCell{Text: fmt.Sprintf("%d left !elig", *info.Remaining), Style: ansiDim}
+			}
+			return usageGridCell{Text: "not elig", Style: ansiDim}
+		}
+		text := fmt.Sprintf("%d left", *info.Remaining)
+		if dated {
+			if expires, ok := agentclaude.ParseResetTime(info.ExpiresAt); ok {
+				text += " " + expires.Local().Format("1/2")
+			}
+		}
+		return usageGridCell{Text: text, Style: ansiGreen}
+	}
+	if info.Status == "expired" {
+		return usageGridCell{Text: "expired", Style: ansiDim}
+	}
+	if info.Total != nil && *info.Total > 0 {
+		return usageGridCell{Text: "used", Style: ansiYellow}
+	}
+	if !eligible && info.IneligibleReason != "" && info.IneligibleReason != "no_grant" {
+		return usageGridCell{Text: "not elig", Style: ansiDim}
+	}
+	return usageGridCell{Text: "none", Style: ansiDim}
+}
+
+func usageGridCodexResetCell(row srUsageRow) usageGridCell {
 	if usageProvider(row) != accounts.ProviderCodex || row.authMode != accounts.AuthModeOAuth {
 		return usageGridCell{}
 	}
@@ -4273,7 +4746,7 @@ func usageGridError(row srUsageRow) string {
 
 func compactPickReason(row srUsageRow) string {
 	if !row.revokedSince.IsZero() {
-		return "re-add"
+		return revokedPickReason(row)
 	}
 	if claudeCreditCooldownActive(row) {
 		return "credit cooldown, probe in " + formatDuration(int64(time.Until(row.creditsExhaustedUntil).Seconds()))
@@ -4349,10 +4822,7 @@ func compactPickReason(row srUsageRow) string {
 	left := fmt.Sprintf("%d%% left", int(row.score.Headroom*100+0.5))
 	suffix := exhaustedModelSuffix(row.windows)
 	if !usableForNewSession(row.score) {
-		return fmt.Sprintf("%s, protected < %d%%%s", left, int(selectacct.MinNewSessionHeadroom*100), suffix)
-	}
-	if usingExpiringWeeklyQuota(row.score) {
-		return fmt.Sprintf("%s, weekly expiring%s", left, suffix)
+		return fmt.Sprintf("%s, not routable%s", left, suffix)
 	}
 	// Claude's account-wide windows are rendered in the explicit 5h and 7d
 	// columns below. Keep Use compact so those reset values remain readable in

@@ -75,9 +75,10 @@ func (g *workerGeneration) waitError() error {
 }
 
 type supervisor struct {
-	config supervisorConfig
-	router *front.Router
-	fatal  chan error
+	config       supervisorConfig
+	router       *front.Router
+	fatal        chan error
+	claudeSocket *claudeSocket
 
 	upgradeMu   sync.Mutex
 	lifecycleMu sync.RWMutex
@@ -106,21 +107,32 @@ func supervise(args []string) error {
 	if err != nil {
 		return err
 	}
-	router, err := front.NewRouter(front.Backend{ID: initial.id, Network: initial.network, Address: initial.address})
+	s, err := newSupervisor(config, initial)
 	if err != nil {
 		_ = initial.command.Process.Signal(syscall.SIGTERM)
 		return err
 	}
-	s := &supervisor{
-		config:   config,
-		router:   router,
-		fatal:    make(chan error, 1),
-		retireCh: make(chan struct{}),
-		workers:  map[string]*workerGeneration{initial.id: initial},
+	go s.monitorWorker(initial)
+	signals := make(chan os.Signal, 2)
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+	defer signal.Stop(signals)
+	return s.run(signals)
+}
+
+func newSupervisor(config supervisorConfig, initial *workerGeneration) (*supervisor, error) {
+	router, err := front.NewRouter(front.Backend{ID: initial.id, Network: initial.network, Address: initial.address})
+	if err != nil {
+		return nil, err
 	}
 	router.SetSessionKey(session.ExtractRoutingID)
-	go s.monitorWorker(initial)
-	return s.run()
+	return &supervisor{
+		config:       config,
+		router:       router,
+		fatal:        make(chan error, 1),
+		claudeSocket: newClaudeSocket("", os.Getenv),
+		retireCh:     make(chan struct{}),
+		workers:      map[string]*workerGeneration{initial.id: initial},
+	}, nil
 }
 
 func parseSupervisorConfig(args []string) (supervisorConfig, error) {
@@ -194,6 +206,11 @@ func validateWorkerArgs(args []string) error {
 		}
 		if arg == "--local-data-socket" || strings.HasPrefix(arg, "--local-data-socket=") {
 			return fmt.Errorf("worker argument %d sets --local-data-socket; the supervisor owns the stable local data socket", i+1)
+		}
+		// PATCHES section 29: every worker generation would bind the same path,
+		// and the retiring one would unlink it under its successor.
+		if arg == "--unix-socket" || strings.HasPrefix(arg, "--unix-socket=") {
+			return fmt.Errorf("worker argument %d sets --unix-socket; supervised workers do not serve the Claude socket", i+1)
 		}
 	}
 	return nil
@@ -505,7 +522,7 @@ func workerTransport(generation *workerGeneration) *http.Transport {
 	}
 }
 
-func (s *supervisor) run() error {
+func (s *supervisor) run(signals <-chan os.Signal) error {
 	listener, err := openPublicListener(s.config.Addr, s.config.TakeoverListenerPID, s.config.TakeoverListenerFD)
 	if err != nil {
 		s.stopAllWorkers()
@@ -550,12 +567,11 @@ func (s *supervisor) run() error {
 	if localDataListener != nil {
 		go func() { localDataErrCh <- s.router.Serve(localDataListener) }()
 	}
+	s.claudeSocket.start(s.router.Serve, s.config.LocalDataSocket, slog.Default())
+	defer s.claudeSocket.close()
 	go func() { controlErrCh <- controlServer.Serve(controlListener) }()
 
 	slog.Info("subrouter supervisor listening", "addr", s.config.Addr, "control_socket", s.config.ControlSocket, "worker", s.router.Active().ID)
-	sigCh := make(chan os.Signal, 2)
-	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
-	defer signal.Stop(sigCh)
 
 	for {
 		select {
@@ -564,6 +580,7 @@ func (s *supervisor) run() error {
 			if localDataListener != nil {
 				_ = localDataListener.Close()
 			}
+			s.claudeSocket.close()
 			_ = controlServer.Close()
 			s.beginShutdown()
 			<-routerErrCh
@@ -612,6 +629,7 @@ func (s *supervisor) run() error {
 			if localDataListener != nil {
 				_ = localDataListener.Close()
 			}
+			s.claudeSocket.close()
 			<-routerErrCh
 			if localDataListener != nil {
 				<-localDataErrCh
@@ -623,7 +641,7 @@ func (s *supervisor) run() error {
 			_ = controlServer.Close()
 			<-controlErrCh
 			return nil
-		case sig := <-sigCh:
+		case sig := <-signals:
 			if sig == syscall.SIGHUP {
 				go func() {
 					if err := s.upgrade(); err != nil {
@@ -636,6 +654,7 @@ func (s *supervisor) run() error {
 			if localDataListener != nil {
 				_ = localDataListener.Close()
 			}
+			s.claudeSocket.close()
 			_ = controlServer.Close()
 			s.beginShutdown()
 			// Join the accept loop before checking connection counts. Accept and
@@ -644,6 +663,7 @@ func (s *supervisor) run() error {
 			if localDataListener != nil {
 				<-localDataErrCh
 			}
+			s.retireAllWorkers()
 			drainCtx, cancel := context.WithTimeout(context.Background(), s.config.DrainTimeout)
 			if err := s.router.WaitAllIdle(drainCtx); err != nil {
 				slog.Warn("subrouter supervisor drain timed out", "timeout", s.config.DrainTimeout, "error", err)
@@ -852,8 +872,7 @@ func (s *supervisor) controlHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /_subrouter/supervisor-status", func(w http.ResponseWriter, _ *http.Request) {
 		accepting, retiring := s.lifecycleStatus()
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{
+		status := map[string]any{
 			"accepting":     accepting,
 			"retiring":      retiring,
 			"active":        s.router.Active(),
@@ -863,7 +882,12 @@ func (s *supervisor) controlHandler() http.Handler {
 			// A present inhibit marker is how a pin or an in-flight
 			// transaction blocks worker upgrades; surface it for doctor.
 			"upgrade_inhibited": s.upgradeInhibited(),
-		})
+		}
+		if s.claudeSocket != nil {
+			status["claude_socket"] = s.claudeSocket.Status()
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(status)
 	})
 	mux.HandleFunc("POST /_subrouter/upgrade", func(w http.ResponseWriter, _ *http.Request) {
 		if err := s.upgrade(); err != nil {
@@ -974,6 +998,16 @@ func (s *supervisor) terminateAllWorkers() {
 }
 
 func (s *supervisor) stopAllWorkers() {
+	s.signalAllWorkers(syscall.SIGTERM)
+}
+
+func (s *supervisor) retireAllWorkers() {
+	if retireSignal != nil {
+		s.signalAllWorkers(retireSignal)
+	}
+}
+
+func (s *supervisor) signalAllWorkers(sig os.Signal) {
 	s.workersMu.Lock()
 	workers := make([]*workerGeneration, 0, len(s.workers))
 	for _, worker := range s.workers {
@@ -981,7 +1015,7 @@ func (s *supervisor) stopAllWorkers() {
 	}
 	s.workersMu.Unlock()
 	for _, worker := range workers {
-		_ = worker.command.Process.Signal(syscall.SIGTERM)
+		_ = worker.command.Process.Signal(sig)
 	}
 }
 

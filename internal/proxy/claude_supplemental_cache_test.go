@@ -309,62 +309,13 @@ func TestClaudeSupplementalCacheExcludesGlobalAndExtraWindows(t *testing.T) {
 	}
 }
 
-func TestClaudeExhaustedSupplementalSkipsProbesUntilKnownReset(t *testing.T) {
-	transport := &supplementalProbeCounter{includeSupplemental: true, primaryUsed: 30}
-	ref := &AccountRef{}
-	client := &http.Client{Transport: transport}
-	account := probeAccount()
-	if _, _, err := ref.FetchUsageWindowsCached(context.Background(), client, account); err != nil {
-		t.Fatal(err)
-	}
-	if transport.probeCalls != 1 {
-		t.Fatalf("initial synthetic probe count = %d, want 1", transport.probeCalls)
-	}
-	key := claudeSupplementalCacheKey(account)
-	ref.usageWindowsMu.Lock()
-	cached := ref.claudeSupplemental[key]
-	if len(cached.windows) != 1 {
-		ref.usageWindowsMu.Unlock()
-		t.Fatalf("expected one supplementary window, got %+v", cached.windows)
-	}
-	cached.windows[0].UsedPercent = 100
-	cached.windows[0].ResetAt = time.Now().Add(2 * time.Hour)
-	cached.at = time.Now().Add(-claudeSupplementalProbeTTL - time.Minute)
-	ref.claudeSupplemental[key] = cached
-	ref.usageWindowsMu.Unlock()
-
-	// Simulate repeated ordinary status refreshes beyond the original 10m TTL.
-	// None should issue another synthetic Messages request while the model
-	// window is exhausted and its authoritative reset is in the future.
-	for i := 0; i < 4; i++ {
-		expirePrimaryClaudeUsageForTest(t, ref, account)
-		windows, _, err := ref.FetchUsageWindowsCached(context.Background(), client, account)
-		if err != nil {
-			t.Fatal(err)
-		}
-		w, ok := fableUsageWindow(windows)
-		if !ok || w.UsedPercent != 100 {
-			t.Fatalf("refresh %d: expected retained exhaustion until reset; got %+v", i, windows)
-		}
-	}
-	if transport.usageCalls != 5 || transport.probeCalls != 1 {
-		t.Fatalf("usage=%d probes=%d; want fresh primary on each pass and only one supplemental probe",
-			transport.usageCalls, transport.probeCalls)
-	}
-
-	ref.usageWindowsMu.Lock()
-	cached = ref.claudeSupplemental[key]
-	cached.windows[0].ResetAt = time.Now().Add(-time.Second)
-	ref.claudeSupplemental[key] = cached
-	ref.usageWindowsMu.Unlock()
-	expirePrimaryClaudeUsageForTest(t, ref, account)
-	if _, _, err := ref.FetchUsageWindowsCached(context.Background(), client, account); err != nil {
-		t.Fatal(err)
-	}
-	if transport.probeCalls != 2 {
-		t.Fatalf("model bucket reset did not trigger one new verification: probes=%d", transport.probeCalls)
-	}
-}
+// Upstream's TestClaudeExhaustedSupplementalSkipsProbesUntilKnownReset and
+// TestClaudeSupplementalOlderThanPrimaryCadenceIsStale are not here: they pin
+// upstream's reuse of a supplemental model bucket for up to 10 minutes (and
+// until its reset when exhausted), reported as not fresh. This fork reuses it
+// only while younger than usageWindowsTTL, so every read stays fresh and a
+// peer does not drop the row (PATCHES §52; remote_pool.go reads only fresh
+// rows). The cost is one Fable probe per primary refresh, as before the merge.
 
 func TestClaudeHealthySupplementalStillExpiresAfterTTL(t *testing.T) {
 	ref := &AccountRef{}
@@ -381,40 +332,6 @@ func TestClaudeHealthySupplementalStillExpiresAfterTTL(t *testing.T) {
 	ref.usageWindowsMu.Unlock()
 	if _, ok := ref.cachedClaudeSupplemental(account, time.Now()); ok {
 		t.Fatal("healthy model evidence older than TTL must not be treated as fresh")
-	}
-}
-
-func TestClaudeSupplementalOlderThanPrimaryCadenceIsStale(t *testing.T) {
-	transport := &supplementalProbeCounter{includeSupplemental: true, primaryUsed: 30}
-	ref := &AccountRef{}
-	client := &http.Client{Transport: transport}
-	account := probeAccount()
-	if _, _, err := ref.FetchUsageWindowsCached(context.Background(), client, account); err != nil {
-		t.Fatal(err)
-	}
-	if transport.probeCalls != 1 {
-		t.Fatalf("initial synthetic probe count = %d, want 1", transport.probeCalls)
-	}
-	key := claudeSupplementalCacheKey(account)
-	ref.usageWindowsMu.Lock()
-	cached := ref.claudeSupplemental[key]
-	cached.at = time.Now().Add(-usageWindowsTTL - time.Second)
-	ref.claudeSupplemental[key] = cached
-	ref.usageWindowsMu.Unlock()
-
-	// The primary endpoint is refreshed, but the reusable model bucket is older
-	// than the normal primary cadence. Keep its values for display while
-	// withholding a fresh scheduler score until a new model probe observes it.
-	expirePrimaryClaudeUsageForTest(t, ref, account)
-	_, fresh, err := ref.FetchUsageWindowsCached(context.Background(), client, account)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if fresh {
-		t.Fatal("stale supplemental model evidence was reported as a fresh usage score")
-	}
-	if transport.probeCalls != 1 {
-		t.Fatalf("stale supplemental evidence triggered an immediate probe: %d", transport.probeCalls)
 	}
 }
 

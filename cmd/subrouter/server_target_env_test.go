@@ -1,16 +1,7 @@
 package main
 
 import (
-	"bytes"
-	"context"
-	"encoding/json"
-	"net/http"
-	"net/http/httptest"
-	"strings"
-	"sync/atomic"
 	"testing"
-
-	"github.com/manaflow-ai/subrouter/internal/accounts"
 )
 
 func TestExplicitServerTargetPrecedence(t *testing.T) {
@@ -32,35 +23,6 @@ func TestExplicitServerTargetPrecedence(t *testing.T) {
 	}
 }
 
-// SUBROUTER_SERVER must be an explicit one-command target for sr account
-// commands exactly like SUBROUTER_CODEX_SERVER, even when this machine
-// normally uses the team vault. Before, run() only looked at the Codex name
-// while selectedRemoteServer preferred SUBROUTER_SERVER.
-func TestSRCommandHonorsProviderNeutralServerEnvOverTeamVault(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
-	saveReadyCloudConfig(t)
-	var hits atomic.Int32
-	remote := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		hits.Add(1)
-		if req.URL.Path == "/_subrouter/accounts" {
-			_ = json.NewEncoder(w).Encode([]map[string]any{})
-			return
-		}
-		http.NotFound(w, req)
-	}))
-	defer remote.Close()
-	store := accounts.DefaultCodexStore()
-	if err := defaultSRServerStore(store).save(srServerFile{Servers: []srServerConfig{{Name: "neutral", URL: remote.URL, AdminToken: "admin"}}}); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("SUBROUTER_CODEX_SERVER", "")
-	t.Setenv("SUBROUTER_SERVER", "neutral")
-	var out bytes.Buffer
-	runner := srRunner{store: store, out: &out, errOut: &out, client: remote.Client()}
-	if err := runner.run(context.Background(), []string{"list"}); err != nil {
-		t.Fatalf("list: %v (%s)", err, out.String())
-	}
-	if hits.Load() == 0 || !strings.Contains(out.String(), "Server: neutral") {
-		t.Fatalf("list did not target SUBROUTER_SERVER; hits=%d output=%q", hits.Load(), out.String())
-	}
-}
+// Upstream's TestSRCommandHonorsProviderNeutralServerEnvOverTeamVault is not
+// here: it pins run() routing on SUBROUTER_SERVER, which PATCHES §29.5 did
+// not take (run() keeps SUBROUTER_CODEX_SERVER, the §22 spelling).

@@ -10,7 +10,10 @@ import (
 // RecoveryCounters is the rolling one-hour view of capacity and retry recovery
 // activity. It is intentionally a small, in-memory operational signal.
 type RecoveryCounters struct {
-	RetriesHeld          int64 `json:"retries_held"`
+	RetriesHeld int64 `json:"retries_held"`
+	// PersistentRetries counts upstream's persist mode, which this fork does
+	// not run (PATCHES §27): kept on the wire for upstream's readers, never
+	// rendered here.
 	PersistentRetries    int64 `json:"persistent_retries"`
 	Retryable503Handoffs int64 `json:"retryable_503_handoffs"`
 	Exhausted            int64 `json:"exhausted"`
@@ -58,9 +61,13 @@ func (s *recoveryCounterStore) snapshot(now time.Time) map[string]RecoveryCounte
 	defer s.mu.Unlock()
 	minute := now.Unix() / 60
 	s.pruneLocked(minute)
+	// Only Codex is always listed: in this fork only the Codex capacity
+	// stay ladder, egress and Azure handoffs feed these counters. Upstream
+	// also pre-seeds a Claude row for its eight-minute Claude ladder, which
+	// is not ported (PATCHES §27: "a Claude counter would always read 0").
+	// Any provider that records an event still gets its row.
 	out := map[string]RecoveryCounters{
-		string(accounts.ProviderClaude): {},
-		string(accounts.ProviderCodex):  {},
+		string(accounts.ProviderCodex): {},
 	}
 	for bucketMinute, counters := range s.buckets {
 		if bucketMinute < minute-59 {

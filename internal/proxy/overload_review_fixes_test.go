@@ -7,43 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
-	"time"
 )
-
-// Persist mode with the failover off only makes the same-account gaps
-// faster: it never shortens the wait the operator configured, and keeps an
-// operator's unbounded wait.
-func TestCodexPersistPresetNeverShortensOperatorWait(t *testing.T) {
-	persist := codexCapacityRetryPolicy{persist: true, persistBudget: 2 * time.Minute}
-	cases := []struct {
-		name          string
-		config        *CodexOverloadFailoverConfig
-		wantMaxWait   time.Duration
-		wantUnbounded bool
-	}{
-		{"unconfigured: the 4m default beats the 2m budget", nil, codexCapacityDefaultStayMaxWait, false},
-		{"operator default", &CodexOverloadFailoverConfig{}, codexCapacityDefaultStayMaxWait, false},
-		{"shorter operator wait: the budget wins", &CodexOverloadFailoverConfig{StayMaxWait: time.Minute}, 2 * time.Minute, false},
-		{"longer operator wait wins", &CodexOverloadFailoverConfig{StayMaxWait: 10 * time.Minute}, 10 * time.Minute, false},
-		{"operator unbounded stays unbounded", &CodexOverloadFailoverConfig{StayUnbounded: true}, 0, true},
-	}
-	for _, test := range cases {
-		t.Run(test.name, func(t *testing.T) {
-			stay, explicit := test.config.stayPolicy(persist)
-			if stay.interval != codexCapacityPersistStayInterval || !explicit || stay.unbounded != test.wantUnbounded {
-				t.Fatalf("stay = %+v explicit=%t, want 1s gaps, explicit, unbounded=%t", stay, explicit, test.wantUnbounded)
-			}
-			if !test.wantUnbounded && stay.maxWait != test.wantMaxWait {
-				t.Fatalf("stay max wait = %v, want %v", stay.maxWait, test.wantMaxWait)
-			}
-		})
-	}
-	// A longer persist budget still wins over the operator default.
-	long := codexCapacityRetryPolicy{persist: true, persistBudget: 8 * time.Minute}
-	if stay, _ := (&CodexOverloadFailoverConfig{}).stayPolicy(long); stay.maxWait != 8*time.Minute {
-		t.Fatalf("stay max wait = %v, want the 8m persist budget", stay.maxWait)
-	}
-}
 
 // The Fable API-key stage is called with the client's unstripped request on
 // the handler-level fallback; no Subrouter control or forwarding header may

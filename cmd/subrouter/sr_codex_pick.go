@@ -65,44 +65,65 @@ func takeCodexAccountFlag(args []string) (codexAccountOptions, []string, error) 
 // picker lists the accounts Codex will be routed across: the local daemon
 // after a fallback, or the registered remote whose proxy root is baseURL.
 func codexPickerServer(localTarget bool, baseURL string) (srServerConfig, error) {
-	if localTarget {
-		return srServerConfig{Name: "local", URL: localBaseURL()}, nil
+	if server, ok := codexResolvedServer(localTarget, baseURL); ok {
+		return server, nil
 	}
-	file, err := defaultSRServerStore(accounts.DefaultCodexStore()).load()
-	if err == nil {
-		// An exact proxy root identifies the server, including its tenant.
-		// Otherwise accept a unique same-origin entry (a healed address).
-		var sameOrigin []srServerConfig
-		for _, server := range file.Servers {
-			root, rootErr := codexBaseURLForServer(server)
-			if rootErr != nil {
-				continue
-			}
-			if strings.TrimRight(root, "/") == strings.TrimRight(baseURL, "/") {
-				return server, nil
-			}
-			if sameEndpoint(root, baseURL) {
-				sameOrigin = append(sameOrigin, server)
-			}
-		}
-		if len(sameOrigin) == 1 {
-			return sameOrigin[0], nil
-		}
+	if !localTarget && !remoteUnlocked() {
+		// A keyless machine names no remote (PATCHES §17): the picker asks
+		// only the local daemon.
+		return srServerConfig{}, fmt.Errorf("--account picks only from the local daemon on this machine, and this launch goes to %s; set SUBROUTER_CODEX_ACCOUNT_ID to pin an account instead", redactedServerURL(baseURL))
 	}
 	return srServerConfig{}, fmt.Errorf("--account cannot tell which server %s belongs to; set SUBROUTER_CODEX_ACCOUNT_ID to pin an account instead", redactedServerURL(baseURL))
+}
+
+// codexResolvedServer is the server a Codex launch resolved to: the local
+// daemon, or the registered remote whose proxy root is baseURL -- an exact
+// root names the server, tenant included; otherwise a unique same-origin entry
+// (a healed address). ok is false when no registered server matches (an
+// unregistered SUBROUTER_CODEX_BASE_URL).
+//
+// Registered remotes come only through configuredRemoteServers, the §17
+// funnel: upstream #433's picker loaded servers.json itself, so a keyless
+// machine with an entry left in it sent that server's admin token on
+// `SUBROUTER_CODEX_SERVER=<name> sr codex --account`. It reads the same file
+// the launch did, and starts no Tailscale heal of its own.
+func codexResolvedServer(localTarget bool, baseURL string) (srServerConfig, bool) {
+	if localTarget {
+		return srServerConfig{Name: "local", URL: localBaseURL()}, true
+	}
+	servers, err := (srRunner{store: accounts.DefaultCodexStore()}).configuredRemoteServers()
+	if err != nil {
+		return srServerConfig{}, false
+	}
+	var sameOrigin []srServerConfig
+	for _, server := range servers {
+		root, rootErr := codexBaseURLForServer(server)
+		if rootErr != nil {
+			continue
+		}
+		if strings.TrimRight(root, "/") == strings.TrimRight(baseURL, "/") {
+			return server, true
+		}
+		if sameEndpoint(root, baseURL) {
+			sameOrigin = append(sameOrigin, server)
+		}
+	}
+	if len(sameOrigin) == 1 {
+		return sameOrigin[0], true
+	}
+	return srServerConfig{}, false
 }
 
 // resolveCodexLaunchAccount prints to out (stderr in production) so the
 // picker never mixes into Codex's stdout.
 func resolveCodexLaunchAccount(ctx context.Context, server srServerConfig, options codexAccountOptions, in io.Reader, out io.Writer) (string, bool, error) {
 	r := srRunner{
-		program:       programBase(),
-		store:         accounts.DefaultCodexStore(),
-		useServingAPI: true,
-		in:            in,
-		out:           out,
-		errOut:        os.Stderr,
-		client:        &http.Client{Timeout: 30 * time.Second},
+		program: programBase(),
+		store:   accounts.DefaultCodexStore(),
+		in:      in,
+		out:     out,
+		errOut:  os.Stderr,
+		client:  &http.Client{Timeout: 30 * time.Second},
 	}
 	if options.pick && !stdinIsTerminal(in) {
 		return "", false, fmt.Errorf("--account without an account needs an interactive terminal; pass the account, as in '%s codex --account ACCOUNT -- ...'", r.programOrSubrouter())

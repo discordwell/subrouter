@@ -74,10 +74,10 @@ func startCanaryTestHost(t *testing.T) *canaryTestHost {
 	}
 	go host.s.monitorWorker(initial)
 	runDone := make(chan error, 1)
-	go func() { runDone <- host.s.run() }()
+	go func() { runDone <- host.s.run(nil) }()
 	t.Cleanup(func() {
-		// Stop run the way a fatal error does: it closes the listeners,
-		// unregisters its signal handler and signals every worker.
+		// Stop run the way a fatal error does: it closes the listeners and
+		// signals every worker.
 		host.s.fatal <- fmt.Errorf("test finished")
 		select {
 		case <-runDone:

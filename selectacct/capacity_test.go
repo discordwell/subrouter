@@ -8,6 +8,12 @@ import (
 	"github.com/manaflow-ai/subrouter/account"
 )
 
+// Ported from upstream manaflow-ai/subrouter selectacct/capacity_test.go
+// (862a5a5, #382), adapted where the fork's Pick differs (PATCHES section 27):
+// the fork has no PickBest and no placement spread band (Pick is deterministic,
+// PATCHES section 10), so the spread assertions are replaced by their
+// deterministic equivalents. The last two tests are the fork's own.
+
 func capacityTestAccounts(n int) []account.Account {
 	out := make([]account.Account, n)
 	for i := range out {
@@ -41,6 +47,11 @@ func TestCapacityMarkLeavesQuotaViewUnchanged(t *testing.T) {
 	if !marked.UsableForStickySession(account.ProviderCodex, "acct-0") || marked.Exhausted(account.ProviderCodex, "acct-0") {
 		t.Fatal("capacity-marked scheduler changed the quota view")
 	}
+	// The fork's hard gate too: a mark never reads as Evicted, so the warm
+	// rule's eviction branch does not fire on it.
+	if marked.Evicted(account.ProviderCodex, "acct-0") {
+		t.Fatal("capacity mark read as an eviction")
+	}
 }
 
 // Marks are scoped to (model, service tier): the priority tier shedding
@@ -64,6 +75,12 @@ func TestCapacityMarksAreScopedByModelAndTier(t *testing.T) {
 	}
 	if CapacityPoolKey("GPT-6-Astra", "auto") != CapacityPoolKey("gpt-6-astra", "") {
 		t.Fatal("auto and empty tiers must share the default pool key")
+	}
+	// Fork addition: another provider's marks never leak into a Codex read
+	// (ScoreKey is provider-scoped; a Claude profile can share the ID).
+	ref.MarkCapacityUntil(account.ProviderClaude, "acct-0", "gpt-6-astra", "", until)
+	if got := ref.CapacityMarks(account.ProviderCodex, "gpt-6-astra", ""); len(got) != 0 {
+		t.Fatalf("codex default-tier marks = %v after a claude mark, want none", got)
 	}
 }
 
@@ -99,8 +116,14 @@ func TestCapacityMarkCountsFailuresAndClearsOnSuccess(t *testing.T) {
 }
 
 // A capacity-marked account ranks below every unmarked account of the same
-// selection tier, without being excluded: with the whole pool marked,
-// placement still spreads across it instead of herding.
+// selection tier, without being excluded.
+//
+// Adapted: upstream asserts PickBest and 500 spread Picks never reach the
+// marked account, and that with every account marked placement spreads over
+// the whole pool. The fork's Pick is deterministic with no spread band, so
+// one Pick and the Explain winner carry the first claim, and the second
+// becomes its deterministic equivalent: equal marks everywhere rank the pool
+// exactly as no marks do.
 func TestCapacityMarkLowersRankWithoutExcluding(t *testing.T) {
 	candidates := capacityTestAccounts(4)
 	scores := make([]Score, len(candidates))
@@ -110,19 +133,23 @@ func TestCapacityMarkLowersRankWithoutExcluding(t *testing.T) {
 	// The marked account is also the roomiest: rank must still put it last.
 	scores[0].Headroom, scores[0].ShortHeadroom = 1, 1
 	base := NewScheduler(scores)
-	marked := base.WithCapacityMarks(map[string]int{ScoreKey(account.ProviderCodex, "acct-0"): 1})
-	picked, err := marked.PickBest(candidates)
-	if err != nil || picked.ID == "acct-0" {
-		t.Fatalf("PickBest = %v (%v), want an unmarked account", picked.ID, err)
+	if picked, err := base.Pick(candidates); err != nil || picked.ID != "acct-0" {
+		t.Fatalf("fixture drift: unmarked Pick = %v (%v), want the roomiest acct-0", picked.ID, err)
 	}
-	for range 500 {
-		picked, err := marked.Pick(candidates)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if picked.ID == "acct-0" {
-			t.Fatal("placement spread onto a capacity-marked account while unmarked ones were usable")
-		}
+	marked := base.WithCapacityMarks(map[string]int{ScoreKey(account.ProviderCodex, "acct-0"): 1})
+	picked, err := marked.Pick(candidates)
+	if err != nil || picked.ID == "acct-0" {
+		t.Fatalf("Pick = %v (%v), want an unmarked account", picked.ID, err)
+	}
+	explained, err := marked.Explain(candidates)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if explained[0].Account.ID != picked.ID || explained[len(explained)-1].Account.ID != "acct-0" {
+		t.Fatalf("Explain order %v, want Pick's winner first and the marked account last", explainedIDs(explained))
+	}
+	if reason := explained[len(explained)-2].Reason; reason != "not shedding this model's requests; the other is at capacity" {
+		t.Fatalf("reason above the marked account = %q, want the capacity clause", reason)
 	}
 	only, err := marked.Pick(candidates[:1])
 	if err != nil || only.ID != "acct-0" {
@@ -133,22 +160,30 @@ func TestCapacityMarkLowersRankWithoutExcluding(t *testing.T) {
 		all[ScoreKey(account.ProviderCodex, candidate.ID)] = 1
 	}
 	everyMarked := base.WithCapacityMarks(all)
-	seen := map[string]int{}
-	for range 2000 {
-		picked, err := everyMarked.Pick(candidates)
-		if err != nil {
-			t.Fatal(err)
-		}
-		seen[picked.ID]++
+	wantOrder, _ := base.Explain(candidates)
+	gotOrder, _ := everyMarked.Explain(candidates)
+	if fmt.Sprint(explainedIDs(gotOrder)) != fmt.Sprint(explainedIDs(wantOrder)) {
+		t.Fatalf("with every account marked alike the order is %v, want the unmarked order %v",
+			explainedIDs(gotOrder), explainedIDs(wantOrder))
 	}
-	if len(seen) != len(candidates) {
-		t.Fatalf("with every account marked, placement reached %v, want the whole pool", seen)
+}
+
+func explainedIDs(rows []Explanation) []string {
+	out := make([]string, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, row.Account.ID)
 	}
+	return out
 }
 
 // Stampede: a burst of new sessions arrives while the model sheds load on
 // part of the pool. Marked accounts take none of the burst, the rest share
-// it evenly rather than one of them absorbing everything.
+// it rather than one of them absorbing everything.
+//
+// Adapted: upstream's 0.15-0.35 share band comes from its random spread. The
+// fork spreads new sessions deterministically through the session-count
+// discount (spreadAdjusted), which rotates the burst across the unmarked
+// accounts; the band is kept and holds.
 func TestCapacityMarksSpreadStampedeAcrossUnmarkedAccounts(t *testing.T) {
 	candidates := capacityTestAccounts(7)
 	ref := NewSchedulerRef(NewScheduler(nil))
@@ -204,7 +239,8 @@ func TestCapacityStickyEvictionNeedsRepeatedFailures(t *testing.T) {
 	}
 }
 
-// A mark keeps the reason of its latest failure for diagnostics.
+// A mark keeps the reason of its latest failure for diagnostics (upstream
+// #620, as written).
 func TestCapacityMarkKeepsLastReason(t *testing.T) {
 	ref := NewSchedulerRef(NewScheduler(nil))
 	until := time.Now().Add(time.Minute)
@@ -215,5 +251,67 @@ func TestCapacityMarkKeepsLastReason(t *testing.T) {
 	marks := ref.CapacityMarkList()
 	if len(marks) != 1 || marks[0].Reason != "server_is_overloaded" || marks[0].Failures != 2 {
 		t.Fatalf("marks=%+v", marks)
+	}
+}
+
+// Fork: the capacity clause sits where upstream put it, right after the
+// selection tier -- which in the fork places it above the machine-binding and
+// endgame-drain clauses upstream does not have. A shedding account fails the
+// request that lands on it, so neither a machine slot nor an expiring budget
+// is worth sending the request there. Pins the position: moving the clause
+// below either one turns this red.
+func TestCapacityMarkOutranksMachineBindingAndEndgameDrain(t *testing.T) {
+	now := time.Now()
+	// Machine binding: without marks the bound account wins.
+	bound := NewScheduler([]Score{
+		{AccountID: "bound", Provider: account.ProviderCodex, Headroom: 0.5, ShortHeadroom: 1, WeeklyHeadroom: 0.5,
+			WeeklyResetAt: now.Add(5 * 24 * time.Hour), Fresh: true},
+		{AccountID: "free", Provider: account.ProviderCodex, Headroom: 0.5, ShortHeadroom: 1, WeeklyHeadroom: 0.5,
+			WeeklyResetAt: now.Add(5 * 24 * time.Hour), Fresh: true},
+	}).WithMachine("mine", fakeMachines{bindings: map[string][]string{"bound": {"mine"}}})
+	pool := []account.Account{
+		{ID: "free", Provider: account.ProviderCodex, AuthMode: account.AuthModeOAuth},
+		{ID: "bound", Provider: account.ProviderCodex, AuthMode: account.AuthModeOAuth},
+	}
+	if picked, _ := bound.Pick(pool); picked.ID != "bound" {
+		t.Fatalf("fixture drift: unmarked pick %q, want the machine-bound account", picked.ID)
+	}
+	marked := bound.WithCapacityMarks(map[string]int{ScoreKey(account.ProviderCodex, "bound"): 1})
+	if picked, _ := marked.Pick(pool); picked.ID != "free" {
+		t.Fatalf("picked %q, want the unmarked account over the capacity-marked bound one", picked.ID)
+	}
+
+	// Endgame drain: without marks the rolling account wins.
+	rolling := ScoreFromLimitWindowsAt("rolling", 0, codexWindows(50, 12*60*60), now)
+	healthy := ScoreFromLimitWindowsAt("healthy", 0, codexWindows(40, 6*24*60*60), now)
+	drain := NewScheduler([]Score{rolling, healthy})
+	pool = []account.Account{
+		{ID: "healthy", AuthMode: account.AuthModeOAuth},
+		{ID: "rolling", AuthMode: account.AuthModeOAuth},
+	}
+	if picked, _ := drain.Pick(pool); picked.ID != "rolling" {
+		t.Fatalf("fixture drift: unmarked pick %q, want the endgame-draining account", picked.ID)
+	}
+	marked = drain.WithCapacityMarks(map[string]int{ScoreKey(account.ProviderCodex, "rolling"): 1})
+	if picked, _ := marked.Pick(pool); picked.ID != "healthy" {
+		t.Fatalf("picked %q, want the unmarked account over the capacity-marked draining one", picked.ID)
+	}
+}
+
+// Fork: the clause never crosses a selection tier. A capacity-marked account
+// that can take the session still outranks an unmarked one that cannot (an
+// evicted or spent account), because the mark is a tie-break inside a tier,
+// not an exclusion -- the one thing upstream's position guarantees.
+func TestCapacityMarkDoesNotCrossSelectionTier(t *testing.T) {
+	scheduler := NewScheduler([]Score{
+		{AccountID: "marked", Provider: account.ProviderCodex, Headroom: 0.9, ShortHeadroom: 0.9},
+		{AccountID: "spent", Provider: account.ProviderCodex, Headroom: 0, ShortHeadroom: 0},
+	}).WithCapacityMarks(map[string]int{ScoreKey(account.ProviderCodex, "marked"): 3})
+	picked, err := scheduler.Pick([]account.Account{
+		{ID: "spent", Provider: account.ProviderCodex, AuthMode: account.AuthModeOAuth},
+		{ID: "marked", Provider: account.ProviderCodex, AuthMode: account.AuthModeOAuth},
+	})
+	if err != nil || picked.ID != "marked" {
+		t.Fatalf("picked %v (%v), want the marked account over a spent one", picked.ID, err)
 	}
 }

@@ -301,7 +301,7 @@ func (r srRunner) tenantAdminRequest(ctx context.Context, server srServerConfig,
 	}
 	baseURL, err := secureTenantServerURL(ctx, codexProxyRootURL(server.URL), protectedServer)
 	if err != nil {
-		return err
+		return privateOnlyUnreachable(server, path, err)
 	}
 	req, err := http.NewRequestWithContext(ctx, method, baseURL+path, reader)
 	if err != nil {
@@ -315,8 +315,11 @@ func (r srRunner) tenantAdminRequest(ctx context.Context, server srServerConfig,
 	if err != nil {
 		return err
 	}
-	res, err := secured.Do(req)
+	res, trace, err := doTraced(secured, req)
 	if err != nil {
+		if !trace.connected {
+			return privateOnlyUnreachable(server, path, err)
+		}
 		return redactServerRequestError(err, server)
 	}
 	defer res.Body.Close()

@@ -47,7 +47,6 @@ type upstreamAttempt struct {
 	// addressed to, or zero when no layer has named one (the initial account).
 	addressed            accounts.Account
 	capacityRetryStarted time.Time
-	capacityPolicy       *codexCapacityRetryPolicy
 	// reserved is an admission slot a spill already holds on the account it
 	// moved the request to. The next physical attempt on that account uses
 	// it instead of acquiring (and possibly queueing for) another.
@@ -323,8 +322,7 @@ type upstreamLayers struct {
 	azureCodex     *azureCodexFallbackTransport
 	// codexRegional sends each physical attempt out of the region the
 	// request's region state picks. codexOutcome asks the handler to record
-	// what the client got, outside every retry layer including autonomous
-	// agent retry.
+	// what the client got, outside every retry layer.
 	codexRegional bool
 	codexOutcome  bool
 }
@@ -345,8 +343,7 @@ func (l upstreamLayers) build(base http.RoundTripper, a *upstreamAttempt) http.R
 	// model-capability answers belong to the account that produced them, so
 	// they are handled (marked, and failed over) before any layer above can
 	// mistake them for a pool-wide failure. Same-account Anthropic/Kimi
-	// overload retries, the one-shot Claude overload reroute and the Fable
-	// fallback live here for the same reason.
+	// overload retries and the Fable fallback live here for the same reason.
 	if l.usageLimit != nil {
 		layer := *l.usageLimit
 		layer.base, layer.attempt = transport, a
@@ -374,7 +371,6 @@ func (l upstreamLayers) build(base http.RoundTripper, a *upstreamAttempt) http.R
 		layer.server = a.server
 		layer.agent, layer.session, layer.userEmail = a.agent, a.session, a.userEmail
 		layer.account, layer.poolModel = a.account.ID, a.poolModel
-		a.capacityPolicy = &layer.policy
 		transport = layer
 	}
 	// Regional egress only after every tried account failed the same way: a

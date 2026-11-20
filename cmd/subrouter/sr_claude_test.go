@@ -517,6 +517,7 @@ func triggerClaudeAccountReload(t *testing.T, ref *proxy.AccountRef) {
 	handler := proxy.Server{AccountRef: ref, MaxBodyBytes: 1 << 20}.Handler()
 	request := httptest.NewRequest(http.MethodGet, "/_subrouter/accounts", nil)
 	request.RemoteAddr = "127.0.0.1:12345"
+	// Loopback trust needs a loopback Host (PATCHES §29), as the sr CLI sends.
 	request.Host = "127.0.0.1:31415"
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
@@ -552,6 +553,76 @@ func TestClaudeEnvPrintsActiveProfile(t *testing.T) {
 	}
 	if !strings.Contains(got, "/claude/work") {
 		t.Fatalf("env output missing profile path: %q", got)
+	}
+}
+
+// `sr claude env <name>` prints THAT profile's directory. It used to ignore the
+// name and print the active profile's: on 2026-08-28 it answered main's
+// directory for both seven-alpha and ten-alpha, and a re-auth pointed there
+// overwrote main (PATCHES §36).
+func TestClaudeEnvHonoursTheName(t *testing.T) {
+	store := claude.Store{Dir: t.TempDir()}
+	for _, name := range []string{"main", "seven-alpha", "ten-alpha"} {
+		if _, err := store.CreateProfile(name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.SetActiveProfile("main"); err != nil {
+		t.Fatal(err)
+	}
+	envFor := func(args ...string) (string, error) {
+		var out bytes.Buffer
+		runner := claudeRunner{store: store, in: strings.NewReader(""), out: &out, errOut: &out}
+		err := runner.run(context.Background(), append([]string{"env"}, args...))
+		return strings.TrimSpace(out.String()), err
+	}
+	want := func(name string) string {
+		return "export CLAUDE_CONFIG_DIR=" + store.ClaudeConfigDir(name)
+	}
+	// Calibration: the three directories differ, so an answer naming the wrong
+	// profile cannot pass for the right one.
+	if want("main") == want("seven-alpha") || want("seven-alpha") == want("ten-alpha") {
+		t.Fatalf("fixture profiles share a directory; the test proves nothing")
+	}
+
+	for _, name := range []string{"seven-alpha", "ten-alpha", "main"} {
+		if got, err := envFor(name); err != nil || got != want(name) {
+			t.Fatalf("sr claude env %s = %q, %v; want %q", name, got, err, want(name))
+		}
+	}
+	// The name resolves as `sr claude addr` resolves it: exact, else the one
+	// profile that differs only in case.
+	if got, err := envFor("SEVEN-Alpha"); err != nil || got != want("seven-alpha") {
+		t.Fatalf("sr claude env SEVEN-Alpha = %q, %v; want %q", got, err, want("seven-alpha"))
+	}
+	// Not by fragment, as `run` and `switch` match: the output decides where a
+	// sign-in writes, and `sr claude env seven` for a new account "seven" must
+	// not hand over seven-alpha's directory for the login to overwrite. It
+	// fails, and says which profile the fragment would have meant.
+	if got, err := envFor("seven"); err == nil || strings.Contains(got, "export") || !strings.Contains(err.Error(), `"seven-alpha"`) {
+		t.Fatalf("sr claude env seven = %q, %v; want an error naming seven-alpha and no export line", got, err)
+	}
+	// No name is still the active profile, for eval "$(sr claude env)" in a
+	// shell rc.
+	if got, err := envFor(); err != nil || got != want("main") {
+		t.Fatalf("sr claude env = %q, %v; want %q", got, err, want("main"))
+	}
+	// Naming a profile reads it; it does not switch to it.
+	if active := store.ActiveProfile(); active != "main" {
+		t.Fatalf("active = %q after naming other profiles, want main", active)
+	}
+	// An unknown or ambiguous name, a second name and an option all fail and
+	// print no export line, so an eval of the output exports nothing. So does
+	// an empty name -- `sr claude env "$acct"` with $acct unset -- which must
+	// not fall back to the active profile the way no name at all does.
+	if _, _, err := store.MatchProfile("alpha"); err == nil {
+		t.Fatalf("calibration: alpha must match more than one profile, or the ambiguous case proves nothing")
+	}
+	for _, args := range [][]string{{"nine-alpha"}, {"alpha"}, {""}, {" "}, {"seven-alpha", "ten-alpha"}, {"--json"}} {
+		got, err := envFor(args...)
+		if err == nil || strings.Contains(got, "export") {
+			t.Fatalf("sr claude env %q = %q, %v; want an error and no export line", args, got, err)
+		}
 	}
 }
 
@@ -1135,7 +1206,7 @@ func TestClaudeEnvRejectsProtectedPlaintextManagedServer(t *testing.T) {
 	}
 	var out bytes.Buffer
 	runner := claudeRunner{store: store, out: &out, errOut: &out}
-	err := runner.env()
+	err := runner.env("")
 	if err == nil || !strings.Contains(err.Error(), "sr claude run work") {
 		t.Fatalf("env error = %v", err)
 	}
@@ -1146,9 +1217,14 @@ func TestClaudeEnvRejectsProtectedPlaintextManagedServer(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(configDir, "settings.json"), []byte(legacy), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	err = runner.env()
+	err = runner.env("")
 	if err == nil || !strings.Contains(err.Error(), "sr claude push work") || !strings.Contains(err.Error(), "sr claude run work") {
 		t.Fatalf("legacy env error = %v", err)
+	}
+	// Named, the same refusal: the name picks the profile, not the checks.
+	err = runner.env("work")
+	if err == nil || !strings.Contains(err.Error(), "sr claude push work") || !strings.Contains(err.Error(), "sr claude run work") {
+		t.Fatalf("named legacy env error = %v", err)
 	}
 }
 
@@ -1262,6 +1338,7 @@ func TestSRClaudeProxyUsesSelectedRemoteWithoutLocalProfile(t *testing.T) {
 			t.Setenv("CLAUDE_CODE_AUTH_TOKEN", "personal-auth-must-not-leak")
 			t.Setenv("CLAUDE_CODE_BASE_URL", "https://personal-route.invalid")
 			t.Setenv("ANTHROPIC_API_KEY", "personal-anthropic-key-must-not-leak")
+			pinClaudeProxyToSelectedServer(t)
 
 			runner := srRunner{program: "sr", store: store, in: strings.NewReader(""), out: io.Discard, errOut: io.Discard}
 			if err := runner.claude(context.Background(), []string{"proxy", "--resume", "session-a", "--model", "opus"}); err != nil {
@@ -1338,6 +1415,19 @@ func TestSRClaudeProxyUsesSelectedRemoteWithoutLocalProfile(t *testing.T) {
 			}
 		})
 	}
+}
+
+// pinClaudeProxyToSelectedServer makes `sr claude proxy` take the selected
+// server, for tests about remote launch mechanics. Upstream sent every
+// profileless launch to the selected remote; this fork routes it local-first
+// (resolveClaudeProxyRoute), with SUBROUTER_DISABLE_FALLBACK as the documented
+// pin to the configured server, and a remote exists only on a machine holding
+// the key (PATCHES 17). Call it after the test has set HOME, if it does.
+func pinClaudeProxyToSelectedServer(t *testing.T) {
+	t.Helper()
+	unlockRemoteGateForTest(t)
+	t.Setenv("SUBROUTER_DISABLE_FALLBACK", "1")
+	t.Setenv("SUBROUTER_CLOUD_CONFIG", filepath.Join(t.TempDir(), "missing-cloud.json"))
 }
 
 func TestResolveClaudeProxyAccountSelectorFailsClosed(t *testing.T) {
@@ -1447,6 +1537,7 @@ printf '%s\n' "$CLAUDE_CONFIG_DIR" > "$RECORD_DIR/$marker.config"
 	}
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("RECORD_DIR", recordDir)
+	pinClaudeProxyToSelectedServer(t)
 
 	type launch struct{ selector, marker string }
 	launches := []launch{{selector: "account-one", marker: "one"}, {selector: "account-two", marker: "two"}}
@@ -1549,6 +1640,7 @@ func TestSRClaudeProxyPinnedAccountValidationFailsBeforeLaunch(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	pinClaudeProxyToSelectedServer(t)
 	runner := srRunner{program: "sr", store: store, in: strings.NewReader(""), out: io.Discard, errOut: io.Discard}
 	err := runner.claude(t.Context(), []string{"proxy", "--account", "missing", "-p", "hello"})
 	if err == nil || !strings.Contains(err.Error(), "was not found") {
@@ -1815,6 +1907,7 @@ func TestSRClaudeProxyRejectsPreviouslyStoredRemoteHTTPTenant(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	pinClaudeProxyToSelectedServer(t)
 	runner := srRunner{program: "sr", store: store, in: strings.NewReader(""), out: io.Discard, errOut: io.Discard}
 	err := runner.claude(context.Background(), []string{"proxy", "--print", "hello"})
 	if err == nil || !strings.Contains(err.Error(), "must use HTTPS") {
@@ -1903,7 +1996,59 @@ func TestSRClaudeProxyUsesHealthySelectedLocalRoute(t *testing.T) {
 	}
 }
 
-func TestSRClaudeBareLaunchesInteractivePooledPreference(t *testing.T) {
+// On the fork's default local route `sr claude proxy` talks through a relay
+// that strips every client X-Subrouter-Session and sets only its own, so the
+// caller's SUBROUTER_SESSION_KEY (upstream #511) must be the relay's, or it
+// never reaches the daemon and each `claude -p` turn is its own session.
+func TestSRClaudeProxyLocalRelayCarriesTheCallersSessionKey(t *testing.T) {
+	home := t.TempDir()
+	store := accounts.CodexStore{Dir: filepath.Join(home, "state", "codex", "accounts")}
+	initializeLocalDataTestStore(t, store)
+	local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/_subrouter/health" || request.URL.Path == proxy.StoreHandshakePath {
+			writeLocalStoreAuthorityHealth(t, w, request, store, "enabled")
+			return
+		}
+		http.NotFound(w, request)
+	}))
+	defer local.Close()
+	attachPrivateLocalTestListener(t, local)
+	t.Setenv("HOME", home)
+	t.Setenv("SUBROUTER_CLOUD_CONFIG", filepath.Join(home, "missing-cloud.json"))
+	t.Setenv("SUBROUTER_LOCAL_BASE_URL", local.URL+"/v1")
+	t.Setenv(claudeProxySessionKeyEnv, "optchat-c0eb90ed-turn")
+
+	binDir := filepath.Join(home, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(binDir, "claude"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	var relaySessions []string
+	previous := startClaudeLocalRelay
+	startClaudeLocalRelay = func(targetRoot, route, agent, sessionID, proxyToken, forcedAccountID, preferredAccountID string, bindingStore accounts.CodexStore) (*nativeProxyRelay, error) {
+		relaySessions = append(relaySessions, sessionID)
+		return previous(targetRoot, route, agent, sessionID, proxyToken, forcedAccountID, preferredAccountID, bindingStore)
+	}
+	t.Cleanup(func() { startClaudeLocalRelay = previous })
+
+	runner := srRunner{program: "sr", store: store, in: strings.NewReader(""), out: io.Discard, errOut: io.Discard}
+	if err := runner.claude(context.Background(), []string{"proxy", "-p", "hello"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(relaySessions) != 1 || relaySessions[0] != "optchat-c0eb90ed-turn" {
+		t.Fatalf("local relay session ids = %q, want the caller's SUBROUTER_SESSION_KEY", relaySessions)
+	}
+}
+
+// Upstream also ran this picker, unpinned, for a bare `sr claude` and launched
+// on the selected remote. This fork keeps bare `sr claude` as the PATCHES 15
+// local-first launch (TestSRClaudeFlagAndProfileLaunchesGoThroughTheLocalPool),
+// so the picker is reached only through `sr claude proxy --account`.
+func TestSRClaudeProxyAccountPickerPinsTheChosenAccount(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
@@ -1927,19 +2072,20 @@ func TestSRClaudeBareLaunchesInteractivePooledPreference(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	pinClaudeProxyToSelectedServer(t)
 	var out bytes.Buffer
 	runner := srRunner{
 		store:  store,
-		in:     strings.NewReader("1\n"),
+		in:     strings.NewReader("2\n"),
 		out:    &out,
 		errOut: &out,
 		client: http.DefaultClient,
 	}
-	if err := runner.claude(context.Background(), nil); err != nil {
+	if err := runner.claude(context.Background(), []string{"proxy", "--account"}); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(out.String(), "POOLED Claude process") || !strings.Contains(out.String(), "failover remains enabled") {
-		t.Fatalf("bare command did not explain pooled preference semantics: %q", out.String())
+	if !strings.Contains(out.String(), "PINNED process") || !strings.Contains(out.String(), "No account failover") {
+		t.Fatalf("interactive pin did not explain no-failover semantics: %q", out.String())
 	}
 	settingsBody, err := os.ReadFile(settingsCopyPath)
 	if err != nil {
@@ -1947,24 +2093,6 @@ func TestSRClaudeBareLaunchesInteractivePooledPreference(t *testing.T) {
 	}
 	var overlay struct {
 		Env map[string]string `json:"env"`
-	}
-	if err := json.Unmarshal(settingsBody, &overlay); err != nil {
-		t.Fatal(err)
-	}
-	if got := overlay.Env["ANTHROPIC_CUSTOM_HEADERS"]; got != "X-Subrouter-Agent: claude\nX-Subrouter-Preferred-Account-ID: claude-one" {
-		t.Fatalf("bare pooled headers = %q", got)
-	}
-	out.Reset()
-	runner.in = strings.NewReader("2\n")
-	if err := runner.claude(context.Background(), []string{"proxy", "--account"}); err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(out.String(), "PINNED process") || !strings.Contains(out.String(), "No account failover") {
-		t.Fatalf("interactive pin did not explain no-failover semantics: %q", out.String())
-	}
-	settingsBody, err = os.ReadFile(settingsCopyPath)
-	if err != nil {
-		t.Fatal(err)
 	}
 	if err := json.Unmarshal(settingsBody, &overlay); err != nil {
 		t.Fatal(err)
@@ -1974,66 +2102,62 @@ func TestSRClaudeBareLaunchesInteractivePooledPreference(t *testing.T) {
 	}
 }
 
-func TestSRClaudeBareLaunchDoesNotRevalidateSoftPickerChoice(t *testing.T) {
+// Upstream sends `sr claude proxy` to the selected remote whenever one is
+// selected. Here a selected remote is spill capacity: while this machine's pool
+// has room the launch stays local, and the box is never asked.
+func TestResolveClaudeProxyRouteKeepsTheSelectedServerAsSpill(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
-	accountRequests := 0
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		if req.URL.Path != "/_subrouter/accounts" {
+	boxRequests := 0
+	box := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		boxRequests++
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer box.Close()
+	store := accounts.CodexStore{Dir: filepath.Join(home, "state", "codex", "accounts")}
+	if err := defaultSRServerStore(store).save(srServerFile{Default: "home", Servers: []srServerConfig{{Name: "home", URL: box.URL}}}); err != nil {
+		t.Fatal(err)
+	}
+	unlockRemoteGateForTest(t)
+	t.Setenv("SUBROUTER_DISABLE_FALLBACK", "")
+	t.Setenv("SUBROUTER_CLOUD_CONFIG", filepath.Join(home, "missing-cloud.json"))
+	// This machine's daemon reports one Claude account with room for a new
+	// session.
+	local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if !strings.HasSuffix(req.URL.Path, "/usage-status") {
 			http.NotFound(w, req)
 			return
 		}
-		accountRequests++
-		if accountRequests == 1 {
-			_ = json.NewEncoder(w).Encode([]remoteServerAccount{
-				{ID: "removed-after-pick", Label: "Initially available", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth},
-				{ID: "remaining", Label: "Remaining", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth},
-			})
-			return
-		}
-		// A second validation observes the account's removal and would abort the
-		// pooled launch. Soft preference must instead reach the server, whose
-		// scheduler can select the remaining account.
-		_ = json.NewEncoder(w).Encode([]remoteServerAccount{
-			{ID: "remaining", Label: "Remaining", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth},
-		})
+		_ = json.NewEncoder(w).Encode([]map[string]any{{
+			"id": "work", "provider": "claude", "auth_valid": true,
+			"normalized": map[string]any{
+				"headroom": 0.9, "short_headroom": 0.9,
+				"seconds_to_short_reset": 3600, "short_window_seconds": 18000,
+			},
+		}})
 	}))
-	defer server.Close()
-	store := accounts.CodexStore{Dir: filepath.Join(home, "state", "codex", "accounts")}
-	if err := defaultSRServerStore(store).save(srServerFile{Default: "team", Servers: []srServerConfig{{Name: "team", URL: server.URL}}}); err != nil {
-		t.Fatal(err)
-	}
-	binDir := filepath.Join(home, "bin")
-	if err := os.MkdirAll(binDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	settingsCopyPath := filepath.Join(home, "settings.json")
-	if err := os.WriteFile(filepath.Join(binDir, "claude"), []byte("#!/bin/sh\ncp \"$2\" "+shellQuote(settingsCopyPath)+"\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
-	runner := srRunner{
-		store: store, in: strings.NewReader("2\n"), out: io.Discard, errOut: io.Discard,
-		client: http.DefaultClient,
-	}
-	if err := runner.claude(context.Background(), nil); err != nil {
-		t.Fatal(err)
-	}
-	if accountRequests != 1 {
-		t.Fatalf("account inventory requests = %d, want one picker snapshot and no soft revalidation", accountRequests)
-	}
-	settingsBody, err := os.ReadFile(settingsCopyPath)
+	defer local.Close()
+	t.Setenv("SUBROUTER_LOCAL_BASE_URL", local.URL)
+
+	runner := srRunner{program: "sr", store: store, in: strings.NewReader(""), out: io.Discard, errOut: io.Discard}
+	route, err := runner.resolveClaudeProxyRoute(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	var overlay struct {
-		Env map[string]string `json:"env"`
+	if route.remote {
+		t.Fatalf("route = remote %q while this machine had capacity: the box became the default launch target", route.server.Name)
 	}
-	if err := json.Unmarshal(settingsBody, &overlay); err != nil {
+	if boxRequests != 0 {
+		t.Fatalf("the box was contacted %d time(s) for a launch that stays local", boxRequests)
+	}
+
+	t.Setenv("SUBROUTER_DISABLE_FALLBACK", "1")
+	route, err = runner.resolveClaudeProxyRoute(context.Background())
+	if err != nil {
 		t.Fatal(err)
 	}
-	if got := overlay.Env["ANTHROPIC_CUSTOM_HEADERS"]; got != "X-Subrouter-Agent: claude\nX-Subrouter-Preferred-Account-ID: removed-after-pick" {
-		t.Fatalf("soft picker headers = %q", got)
+	if !route.remote || route.server.Name != "home" {
+		t.Fatalf("SUBROUTER_DISABLE_FALLBACK route = %+v, want the pinned server", route)
 	}
 }
 
@@ -2168,6 +2292,7 @@ func TestClaudeProxyExpectedScopeFailsBeforeLaunch(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	pinClaudeProxyToSelectedServer(t)
 	runner := srRunner{program: "sr", store: store, in: strings.NewReader(""), out: io.Discard, errOut: io.Discard}
 	err := runner.claude(t.Context(), []string{
 		"proxy", "--sr-expect-scope", opaqueClaudeProxyScope("tenant:different"), "--", "-p", "hello",
@@ -2197,6 +2322,7 @@ func TestClaudeProxyExpectedScopeRejectsSameKeyURLReplacementBeforeLaunch(t *tes
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	pinClaudeProxyToSelectedServer(t)
 	runner := srRunner{program: "sr", store: store, in: strings.NewReader(""), out: io.Discard, errOut: io.Discard}
 	err := runner.claude(t.Context(), []string{
 		"proxy", "--sr-expect-scope", opaqueClaudeProxyScope(claudeProxyScope(oldServer, true)), "--", "-p", "hello",
@@ -2356,6 +2482,70 @@ func TestPrepareClaudeLoginFastPathSeedsFreshDir(t *testing.T) {
 	}
 }
 
+// Re-running add against an already-seeded profile must not touch either file:
+// same bytes, same mtimes, no backups. The seeding otherwise races whatever
+// Claude Code is doing with its own config dir.
+func TestPrepareClaudeLoginFastPathRerunTouchesNothing(t *testing.T) {
+	dir := t.TempDir()
+	if err := prepareClaudeLoginFastPath(dir); err != nil {
+		t.Fatalf("prepareClaudeLoginFastPath: %v", err)
+	}
+	past := time.Now().Add(-time.Hour).Truncate(time.Second)
+	paths := []string{
+		filepath.Join(dir, ".claude.json"),
+		filepath.Join(dir, "settings.json"),
+	}
+	for _, path := range paths {
+		// Both files were freshly seeded, so no backups may exist.
+		if _, err := os.Stat(path + ".bak"); !os.IsNotExist(err) {
+			t.Fatalf("fresh seed created %s.bak: %v", path, err)
+		}
+		if err := os.Chtimes(path, past, past); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := prepareClaudeLoginFastPath(dir); err != nil {
+		t.Fatalf("prepareClaudeLoginFastPath rerun: %v", err)
+	}
+	for _, path := range paths {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !info.ModTime().Equal(past) {
+			t.Fatalf("rerun rewrote %s (mtime %v, want %v)", path, info.ModTime(), past)
+		}
+		if _, err := os.Stat(path + ".bak"); !os.IsNotExist(err) {
+			t.Fatalf("rerun created %s.bak: %v", path, err)
+		}
+	}
+}
+
+// When seeding does modify a lived-in file, the prior bytes — in the user's
+// own formatting, which the canonical re-marshal loses — land in a .bak next
+// to it.
+func TestPrepareClaudeLoginFastPathBacksUpModifiedState(t *testing.T) {
+	dir := t.TempDir()
+	seed := "{\"theme\":   \"light\"}\n"
+	if err := os.WriteFile(filepath.Join(dir, ".claude.json"), []byte(seed), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := prepareClaudeLoginFastPath(dir); err != nil {
+		t.Fatalf("prepareClaudeLoginFastPath: %v", err)
+	}
+	backup, err := os.ReadFile(filepath.Join(dir, ".claude.json.bak"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(backup) != seed {
+		t.Fatalf(".claude.json.bak does not hold the original bytes:\n%s", backup)
+	}
+	// settings.json did not exist beforehand, so it gets no backup.
+	if _, err := os.Stat(filepath.Join(dir, "settings.json.bak")); !os.IsNotExist(err) {
+		t.Fatalf("fresh settings.json write created a backup: %v", err)
+	}
+}
+
 func TestPrepareClaudeLoginFastPathPreservesExistingChoices(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, ".claude.json"), []byte(`{"theme":"light"}`+"\n"), 0o600); err != nil {
@@ -2374,6 +2564,316 @@ func TestPrepareClaudeLoginFastPathPreservesExistingChoices(t *testing.T) {
 	settings, _ := os.ReadFile(filepath.Join(dir, "settings.json"))
 	if !strings.Contains(string(settings), `"forceLoginMethod":"console"`) {
 		t.Fatalf("existing login method overwritten:\n%s", settings)
+	}
+}
+
+// installFakeClaudeCLI puts a stub `claude` on PATH. claude.DetectCLI is just
+// exec.LookPath("claude"), so this is enough to drive claudeRunner.add with no
+// real Claude install. The stub appends every invocation and the
+// CLAUDE_CONFIG_DIR it ran against to a log, which is what the isolation
+// assertions read. supportsAuthLogin models an older Claude that only offers
+// the interactive TUI.
+func installFakeClaudeCLI(t *testing.T, home, email string, supportsAuthLogin bool) string {
+	t.Helper()
+	binDir := filepath.Join(home, "bin")
+	if err := os.MkdirAll(binDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	logPath := filepath.Join(home, "claude-invocations.log")
+	supports := "no"
+	if supportsAuthLogin {
+		supports = "yes"
+	}
+	script := "#!/bin/sh\n" +
+		"LOG='" + logPath + "'\n" +
+		"SUPPORTS='" + supports + "'\n" +
+		"if [ \"$1\" = auth ] && [ \"$2\" = login ]; then\n" +
+		"  if [ \"$SUPPORTS\" != yes ]; then exit 1; fi\n" +
+		"  if [ \"$3\" = --help ]; then exit 0; fi\n" +
+		"  printf 'login %s\\n' \"$CLAUDE_CONFIG_DIR\" >> \"$LOG\"\n" +
+		"  mkdir -p \"$CLAUDE_CONFIG_DIR\"\n" +
+		"  printf '{\"claudeAiOauth\":{\"accessToken\":\"tok\"}}' > \"$CLAUDE_CONFIG_DIR/.credentials.json\"\n" +
+		"  exit 0\n" +
+		"fi\n" +
+		"if [ \"$1\" = auth ] && [ \"$2\" = status ]; then\n" +
+		"  printf 'status %s\\n' \"$CLAUDE_CONFIG_DIR\" >> \"$LOG\"\n" +
+		"  printf '{\"loggedIn\":true,\"email\":\"" + email + "\",\"subscriptionType\":\"max\"}'\n" +
+		"  exit 0\n" +
+		"fi\n" +
+		"printf 'tui %s\\n' \"$CLAUDE_CONFIG_DIR\" >> \"$LOG\"\n" +
+		"exit 0\n"
+	if err := os.WriteFile(filepath.Join(binDir, "claude"), []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	return logPath
+}
+
+func readInvocations(t *testing.T, logPath string) string {
+	t.Helper()
+	body, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read invocation log: %v", err)
+	}
+	return string(body)
+}
+
+// The bare `claude` TUI refuses to start without a controlling terminal: it
+// degrades into `claude --print` and dies on the empty prompt, which meant
+// `sr add claude` only ever worked when a human typed it into a terminal.
+// Driving the login through `claude auth login` makes it work from a script,
+// an agent, or a non-interactive SSH session.
+func TestClaudeAddCompletesWithoutATerminal(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	logPath := installFakeClaudeCLI(t, home, "fifteen@example.com", true)
+
+	store := claude.Store{Dir: filepath.Join(home, ".subrouter", "codex")}
+	var out bytes.Buffer
+	// A strings.Reader is not a terminal. That is the whole point of the test.
+	runner := claudeRunner{store: store, in: strings.NewReader(""), out: &out, errOut: &out}
+
+	if err := runner.addOAuth(context.Background(), "fifteen"); err != nil {
+		t.Fatalf("add without a terminal: %v\noutput:\n%s", err, out.String())
+	}
+	if _, ok := store.FindProfile("fifteen"); !ok {
+		t.Fatal("profile was not registered")
+	}
+	invocations := readInvocations(t, logPath)
+	if !strings.Contains(invocations, "login ") {
+		t.Fatalf("auth login never ran; invocations:\n%s", invocations)
+	}
+	if strings.Contains(invocations, "tui ") {
+		t.Fatalf("fell back to the TUI path instead of auth login; invocations:\n%s", invocations)
+	}
+}
+
+// The login must run against the profile's own config directory. If it ran
+// against the machine's live ~/.claude it would overwrite whichever account is
+// signed in there, which is how the Codex side of this command used to revoke
+// an account on every add.
+func TestClaudeAddLeavesTheLiveClaudeConfigAlone(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	logPath := installFakeClaudeCLI(t, home, "fifteen@example.com", true)
+
+	liveDir := filepath.Join(home, ".claude")
+	if err := os.MkdirAll(liveDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	liveCredential := filepath.Join(liveDir, ".credentials.json")
+	want := []byte(`{"claudeAiOauth":{"accessToken":"live-session"}}`)
+	if err := os.WriteFile(liveCredential, want, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Stat(liveCredential)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	store := claude.Store{Dir: filepath.Join(home, ".subrouter", "codex")}
+	var out bytes.Buffer
+	runner := claudeRunner{store: store, in: strings.NewReader(""), out: &out, errOut: &out}
+	if err := runner.addOAuth(context.Background(), "fifteen"); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+
+	for _, line := range strings.Split(strings.TrimSpace(readInvocations(t, logPath)), "\n") {
+		invocation, configDir, ok := strings.Cut(line, " ")
+		if !ok {
+			t.Fatalf("unparsable invocation %q", line)
+		}
+		if !strings.HasPrefix(configDir, store.Dir) {
+			t.Fatalf("claude %s ran against %q, outside the store at %q", invocation, configDir, store.Dir)
+		}
+	}
+	got, err := os.ReadFile(liveCredential)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(want) {
+		t.Fatalf("live credential was rewritten: %s", got)
+	}
+	// Byte equality alone would also pass if the file were rewritten with the
+	// same contents; the mtime is what separates untouched from clobbered.
+	after, err := os.Stat(liveCredential)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !after.ModTime().Equal(before.ModTime()) {
+		t.Fatalf("live credential was rewritten: mtime %s -> %s", before.ModTime(), after.ModTime())
+	}
+}
+
+// Older Claude builds have no `auth login` subcommand, and must keep the
+// interactive TUI path rather than failing outright.
+func TestClaudeSupportsAuthLoginDetectsMissingSubcommand(t *testing.T) {
+	home := t.TempDir()
+
+	installFakeClaudeCLI(t, home, "x@example.com", false)
+	claudePath, ok := claude.DetectCLI()
+	if !ok {
+		t.Fatal("fake claude is not on PATH")
+	}
+	if claudeSupportsAuthLogin(context.Background(), claudePath) {
+		t.Fatal("probe reported auth login support for a CLI that lacks it")
+	}
+
+	installFakeClaudeCLI(t, home, "x@example.com", true)
+	if !claudeSupportsAuthLogin(context.Background(), claudePath) {
+		t.Fatal("probe missed a CLI that has auth login")
+	}
+}
+
+// Claude wraps the authorization URL in OSC-8 hyperlink escapes and emits it
+// twice back to back, once as the link target and once as the visible text. A
+// terminal renders that as one link, but anything capturing the output to a
+// file - a script, or an agent driving the login - sees an unusable smear.
+func TestClaudeLoginURLEchoRepeatsACleanURL(t *testing.T) {
+	const url = "https://claude.com/cai/oauth/authorize?code=true&client_id=abc&state=xyz"
+	raw := "If the browser didn't open, visit: \x1b]8;;" + url + "\x07" + url + "\x1b]8;;\x07\n"
+
+	var out bytes.Buffer
+	echo := &claudeLoginURLEcho{out: &out}
+	// Split inside the URL to prove the match survives a chunk boundary.
+	split := strings.Index(raw, url) + 20
+	if _, err := echo.Write([]byte(raw[:split])); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := echo.Write([]byte(raw[split:])); err != nil {
+		t.Fatal(err)
+	}
+
+	got := out.String()
+	if !strings.Contains(got, "Login URL: "+url+"\n") {
+		t.Fatalf("clean URL line missing:\n%q", got)
+	}
+	if strings.Contains(got, url+url) && !strings.Contains(got, "\x07"+url) {
+		t.Fatalf("clean URL ran into the duplicated copy:\n%q", got)
+	}
+	if n := strings.Count(got, "Login URL:"); n != 1 {
+		t.Fatalf("printed the URL line %d times, want exactly 1:\n%q", n, got)
+	}
+	if !strings.Contains(got, raw[:30]) {
+		t.Fatalf("original output was not forwarded verbatim:\n%q", got)
+	}
+}
+
+func TestResolveAddTargetReauthsInsteadOfErroring(t *testing.T) {
+	store := claude.Store{Dir: t.TempDir()}
+	created, err := store.CreateProfile("seven-alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// An expired or revoked refresh token has no other first-party repair path,
+	// so `sr claude add <existing>` must sign in again rather than refuse.
+	name, got, reauth, err := resolveAddTarget(store, "seven-alpha")
+	if err != nil {
+		t.Fatalf("re-adding an existing profile errored: %v", err)
+	}
+	if name != "seven-alpha" {
+		t.Fatalf("re-auth resolved profile %q, want seven-alpha", name)
+	}
+	if !reauth {
+		t.Fatal("existing profile must report reauth=true: the caller keys discard() " +
+			"off it, and discarding would DELETE a recoverable account when a login fails")
+	}
+	if got != created {
+		t.Fatalf("re-auth path = %q, want the existing profile's %q", got, created)
+	}
+
+	_, fresh, reauth, err := resolveAddTarget(store, "eight-alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reauth {
+		t.Fatal("a brand-new profile must not report reauth")
+	}
+	if fresh == created {
+		t.Fatalf("two different labels resolved to the SAME dir %q", fresh)
+	}
+}
+
+func TestResolveAddTargetHandlesOpaqueProfileDir(t *testing.T) {
+	// Real profiles are stored under an opaque _p<epoch> directory as often as
+	// under their own label, so the path can never be derived from the name.
+	store := claude.Store{Dir: t.TempDir()}
+	if err := store.RegisterProfile("seven-alpha", "_p1787439512239"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RegisterProfile("main", "_p1787439913450"); err != nil {
+		t.Fatal(err)
+	}
+
+	_, got, reauth, err := resolveAddTarget(store, "seven-alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reauth {
+		t.Fatal("registered profile must resolve as a re-auth")
+	}
+	if !strings.HasSuffix(got, "_p1787439512239") {
+		t.Fatalf("resolved %q, want the registry's opaque dir _p1787439512239", got)
+	}
+	_, other, _, err := resolveAddTarget(store, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == other {
+		t.Fatalf("seven-alpha and main both resolved to %q -- re-auth would "+
+			"overwrite whichever account is actually serving", got)
+	}
+}
+
+// A name that differs only in case re-auths the existing profile under its own
+// spelling. Upstream's addOAuth matched case-insensitively; a box matches Claude
+// names the same way, so a case twin here would overwrite its sibling there.
+func TestResolveAddTargetReauthsCaseVariantUnderItsOwnName(t *testing.T) {
+	store := claude.Store{Dir: t.TempDir()}
+	created, err := store.CreateProfile("main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	name, got, reauth, err := resolveAddTarget(store, "Main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reauth || name != "main" || got != created {
+		t.Fatalf("resolveAddTarget(Main) = %q, %q, reauth=%v; want the existing main at %q", name, got, reauth, created)
+	}
+	if len(store.ListProfiles()) != 1 {
+		t.Fatalf("a case variant created a twin profile: %+v", store.ListProfiles())
+	}
+}
+
+// A successful add used to upload the credential to the configured server every
+// time, which left one refresh-token chain in two places: the two daemons race
+// to refresh it and the loser dies permanently. That is how seven-alpha and
+// ten-alpha were lost. An OAuth add never uploads now (the 2026-09 grammar
+// pass): the credential reaches a server only by `sr claude move`.
+func TestClaudeOAuthAddNeverUploads(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	installFakeClaudeCLI(t, home, "fifteen@example.com", true)
+	store := claude.Store{Dir: filepath.Join(home, ".subrouter", "codex")}
+	var out bytes.Buffer
+	var pushed []string
+	r := claudeRunner{
+		store: store, in: strings.NewReader(""), out: &out, errOut: &out,
+		pushAfterAdd: func(_ context.Context, name string) error {
+			pushed = append(pushed, name)
+			return nil
+		},
+	}
+	for _, args := range [][]string{{"addr", "fifteen"}, {"login", "fifteen"}, {"add", "fifteen", "--oauth"}} {
+		if err := r.run(context.Background(), args); err != nil {
+			t.Fatalf("%v: %v\n%s", args, err, out.String())
+		}
+	}
+	if len(pushed) != 0 {
+		t.Fatalf("an OAuth add uploaded to the server: %v -- this creates the "+
+			"credential-refresh race that permanently kills one copy", pushed)
 	}
 }
 
@@ -2491,5 +2991,35 @@ func TestProxyClaudeLaunchSettingsSendsTheCallersSessionKey(t *testing.T) {
 		if got := headers(t); strings.Contains(got, "X-Subrouter-Session") {
 			t.Fatalf("invalid key %q was sent: %q", bad, got)
 		}
+	}
+}
+
+// An account draining its last day takes new sessions on the daemon's verdict
+// while its 5h burn projection alone would refuse it: 10% of the 5h window left
+// an hour before its reset, after spending 90% in four hours. `sr claude` must
+// count that as this machine's capacity, as the daemon's router does, and not
+// spill the launch to a server.
+func TestLocalClaudeCapacityFollowsTheDaemonsVerdict(t *testing.T) {
+	local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if !strings.HasSuffix(req.URL.Path, "/usage-status") {
+			http.NotFound(w, req)
+			return
+		}
+		_ = json.NewEncoder(w).Encode([]map[string]any{{
+			"id": "main", "provider": "claude", "auth_valid": true,
+			"normalized": map[string]any{
+				"headroom": 0.10, "short_headroom": 0.10,
+				"seconds_to_short_reset": 3600, "short_window_seconds": 18000,
+				"usable":      false,
+				"new_session": map[string]any{"eligible": true, "reason": "burndown", "burndown": true},
+			},
+		}})
+	}))
+	defer local.Close()
+
+	runner := srRunner{program: "sr", in: strings.NewReader(""), out: io.Discard, errOut: io.Discard}
+	has, known := runner.localClaudeCapacity(local.URL)(context.Background())
+	if !has || !known {
+		t.Fatalf("capacity = (%v, %v), want (true, true): the daemon routes new sessions to main", has, known)
 	}
 }

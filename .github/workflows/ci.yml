@@ -22,13 +22,21 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # Fork (discordwell/clawedswap): upstream's CLA step, deploy-scripts job
+  # (deploy/macos deploy, guard, verify, canary, upgrade-host and autoupdate
+  # suites, the bake gate end to end, shellcheck), shadow rehearsal,
+  # exact-head client artifact and macOS LaunchAgent job are left out. They
+  # test what this fork does not run: the CLA, upstream's deploy/macos
+  # pipeline and autoupdater, the supervisor, and upstream's coordinator.
+  # The owner keeps the macOS suite local (ops/PATCHES.md §23, §45.1).
+  #
   # "Build, vet, test" is the long-standing required check. It is now a
   # small gate over jobs that run in parallel, so wall time is the slowest
   # of them rather than their sum.
   test:
     name: Build, vet, test
     runs-on: ubuntu-latest
-    needs: [changes, unit, cross-compile, shadow-rehearsal, deploy-scripts]
+    needs: [changes, unit, cross-compile, public-check]
     # Run when a gated job fails (so the required check fails too), but not
     # when the whole run is cancelled because a newer push superseded it:
     # that run's result is moot and would only post a red check on the old
@@ -42,10 +50,13 @@ jobs:
         env:
           CHANGES: ${{ needs.changes.result }}
           CODE: ${{ needs.changes.outputs.code }}
+          PUBLIC: ${{ needs.public-check.result }}
           RESULTS: ${{ join(needs.*.result, ' ') }}
         run: |
           echo "classifier: ${CHANGES}, code changed: ${CODE}; gated job results: ${RESULTS}"
           [ "${CHANGES}" = "success" ] || exit 1
+          # The public check runs on every change, so it is never skipped.
+          [ "${PUBLIC}" = "success" ] || exit 1
           for result in ${RESULTS}; do
             if [ "${result}" = "skipped" ] && [ "${CODE}" = "false" ]; then
               continue
@@ -86,74 +97,31 @@ jobs:
       - name: Test
         run: CGO_ENABLED=0 go test ./...
 
-      - name: Test CLA workflow policy
-        # tests/ had no CI wiring, so a change that made the CLA required check
-        # fail on every ordinary pull request reached main unnoticed.
-        run: |
-          shopt -s nullglob
-          for suite in tests/*.sh; do
-            echo "== ${suite}"
-            bash "${suite}"
-          done
+      - name: Test the ops tools
+        # ops/ is its own module, so the step above never runs it. Neither
+        # suite depends on the other, so a red one does not skip this.
+        if: ${{ !cancelled() }}
+        run: cd ops && go test -count=1 ./...
 
-  deploy-scripts:
-    name: Deploy scripts
-    needs: changes
-    if: ${{ needs.changes.outputs.code == 'true' }}
+  # The classifier skips the unit job when a change touches only Markdown,
+  # planning/ or cloudflare/, and the docs are where most private pointers
+  # sit. So this job has no classifier condition and runs on every pull
+  # request, merge group and push.
+  public-check:
+    name: Public check
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
-
-      - name: Test macOS deploy guard and installer scripts
-        # Both suites drive the scripts against fake launchctl, a fake
-        # supervisor control socket, and file:// health probes, so they run on
-        # Linux. They previously had no CI wiring at all.
-        run: |
-          bash deploy/macos/tests/guard-rollback-test.sh
-          bash deploy/macos/tests/deploy-install-test.sh
-          bash deploy/macos/tests/canary-rollout-test.sh
-          bash deploy/macos/tests/upgrade-host-rollouts-test.sh
-          bash deploy/macos/tests/verify-healthy-count-test.sh
-          bash deploy/macos/tests/verify-reroute-invariant-test.sh
-          bash deploy/macos/tests/cli-autoupdate-test.sh
 
       - name: Set up Go
         uses: actions/setup-go@v6
         with:
-          go-version-file: go.mod
+          go-version-file: ops/go.mod
+          cache: false
 
-      - name: Bake gate end to end with real binaries
-        # Builds a good and a deliberately broken worker, runs them under the
-        # real `subrouter supervise` with live loopback traffic, and drives the
-        # real deploy, autoupdate and guard scripts through a rollback and a
-        # promotion. Skipped by plain `go test ./...` because it takes minutes.
-        env:
-          SUBROUTER_BAKE_E2E: "1"
-        run: go test ./deploy/macos/tests/bakee2e -count=1 -v -timeout 15m
-
-      - name: Shellcheck deploy scripts
-        # Error severity only: the warning-level findings are deliberate
-        # patterns (e.g. `check "..." $?` after a test) in existing scripts.
-        # shellcheck is preinstalled on the ubuntu runner image.
-        run: |
-          shopt -s globstar nullglob
-          shellcheck --version
-          shellcheck -S error deploy/**/*.sh
-
-  shadow-rehearsal:
-    name: Shadow rehearsal
-    needs: changes
-    if: ${{ needs.changes.outputs.code == 'true' }}
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v6
-
-      - name: Test optional shadow rehearsal
-        # The full shadow suite runs on Linux. The hosted macOS image does
-        # not permit loopback listeners from child fixtures.
-        run: python3 deploy/tests/run-shadow-rehearsal-test.py
+      - name: Check tracked files for tailnet addresses and private pointers
+        run: cd ops && go test -count=1 ./publiccheck
 
   # CI tests only linux/amd64, but releases cross-compile for every platform
   # below. A platform-specific symbol (syscall.SIGUSR1 does not exist on
@@ -231,49 +199,6 @@ jobs:
             ~/go/pkg/mod
           key: ${{ steps.cache.outputs.cache-primary-key }}
 
-  # Keep a runnable Linux client for the exact pull-request head. The regular
-  # cross-compile job intentionally writes to /dev/null, while the release
-  # workflow only publishes artifacts after a protected-main tag. This small
-  # candidate artifact lets the coordinator install a statusline fix only
-  # after the full PR gate passes, without building on Big Red.
-  client-artifact:
-    name: Linux client artifact (exact head)
-    needs: changes
-    if: ${{ github.event_name == 'pull_request' && needs.changes.outputs.code == 'true' }}
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check out exact pull-request head
-        uses: actions/checkout@v6
-        with:
-          ref: ${{ github.event.pull_request.head.sha }}
-          fetch-depth: 1
-
-      - name: Set up Go
-        uses: actions/setup-go@v6
-        with:
-          go-version-file: go.mod
-          cache: false
-
-      - name: Build Linux amd64 client
-        env:
-          SOURCE_SHA: ${{ github.event.pull_request.head.sha }}
-        run: |
-          set -euo pipefail
-          output="${RUNNER_TEMP}/subrouter-linux-amd64"
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -buildvcs=true -o "${output}" ./cmd/subrouter
-          printf '%s\n' "${SOURCE_SHA}" > "${RUNNER_TEMP}/subrouter-linux-amd64.source-sha"
-          sha256sum "${output}" > "${RUNNER_TEMP}/subrouter-linux-amd64.sha256"
-
-      - name: Upload exact-head Linux client
-        uses: actions/upload-artifact@v5
-        with:
-          name: subrouter-linux-amd64-${{ github.event.pull_request.head.sha }}
-          path: |
-            ${{ runner.temp }}/subrouter-linux-amd64
-            ${{ runner.temp }}/subrouter-linux-amd64.source-sha
-            ${{ runner.temp }}/subrouter-linux-amd64.sha256
-          if-no-files-found: error
-
   docker-smoke:
     name: Docker local and team profiles
     # Not gated by "Build, vet, test", so nothing in the queue waits on it.
@@ -295,10 +220,6 @@ jobs:
   # LICENSE, planning/, and cloudflare/, which cloudflare-do.yml tests) skips
   # the Go, script, and Docker jobs. "Build, vet, test" still reports, so the
   # required check passes instead of waiting for a run that never starts.
-  #
-  # macos, matrix: the macOS job takes 5-7 minutes, three times the next
-  # slowest job, so it set the wait for every pull request even when nothing
-  # macOS-specific changed. It runs on pull requests touching the paths below.
   changes:
     name: Detect changed paths
     runs-on: ubuntu-latest
@@ -307,8 +228,6 @@ jobs:
       pull-requests: read
     outputs:
       code: ${{ steps.filter.outputs.code }}
-      macos: ${{ steps.filter.outputs.macos }}
-      matrix: ${{ steps.filter.outputs.matrix }}
     steps:
       - name: Classify changed files
         id: filter
@@ -320,7 +239,7 @@ jobs:
           MERGE_GROUP_HEAD: ${{ github.event.merge_group.head_sha }}
         run: |
           run_everything() {
-            printf 'code=true\nmacos=true\nmatrix=true\n' >> "${GITHUB_OUTPUT}"
+            echo "code=true" >> "${GITHUB_OUTPUT}"
             exit 0
           }
           case "${EVENT}" in
@@ -355,51 +274,3 @@ jobs:
           else
             echo "code=false" >> "${GITHUB_OUTPUT}"
           fi
-          pattern='^(deploy/macos/|cmd/subrouter/|cmd/subrouter-cutover-canary/|internal/cutovercanary/|go\.(mod|sum)$|\.github/workflows/ci\.yml$)|_darwin(_test)?\.go$'
-          if printf '%s\n' "${files}" | grep -qE "${pattern}"; then
-            echo "macos=true" >> "${GITHUB_OUTPUT}"
-          else
-            echo "macos=false" >> "${GITHUB_OUTPUT}"
-          fi
-          # The transaction matrix is 5 of the job's 6.5 minutes, and it only
-          # drives the shell and Python scripts under deploy/macos/ against a
-          # fake launchctl. It builds no Go, so Go changes that still need the
-          # canary tests above do not need it.
-          if printf '%s\n' "${files}" | grep -qE '^(deploy/macos/|\.github/workflows/ci\.yml$)'; then
-            echo "matrix=true" >> "${GITHUB_OUTPUT}"
-          else
-            echo "matrix=false" >> "${GITHUB_OUTPUT}"
-          fi
-
-  macos-launchagent-transaction:
-    name: macOS LaunchAgent transaction
-    # Not gated by "Build, vet, test", so nothing in the queue waits on it.
-    # It already ran on the pull request and runs again on the push to main.
-    runs-on: macos-latest
-    needs: changes
-    if: ${{ github.event_name != 'merge_group' && needs.changes.outputs.macos == 'true' }}
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v6
-
-      - name: Set up Go
-        uses: actions/setup-go@v6
-        with:
-          go-version-file: go.mod
-
-      - name: Test functional canary runner and helper
-        run: |
-          python3 deploy/macos/tests/run-functional-canary-test.py
-          go test ./internal/cutovercanary ./cmd/subrouter-cutover-canary -count=1
-          go test ./cmd/subrouter \
-            -run 'TestLaunchAgentFunctionalCanary|TestPeerProbeSubcommand|TestLegResultHasExactRunnerKeys|TestMacOSAutoUpdaterDefers|TestParseSupervisorConfigRequiresAbsoluteUpgradeInhibitFile|TestUpgradeInhibitMarkerBlocksGenerationChange|TestSlotRetirementDrainsPinnedStreamBeforeSupervisorExit' \
-            -count=1
-
-      - name: Test rollback and signal transaction matrix
-        if: ${{ needs.changes.outputs.matrix == 'true' }}
-        run: deploy/macos/tests/launchagent-transaction-test.sh
-
-      - name: Test launchd log rotation
-        # Uses BSD stat and plutil, so it runs here rather than in the Linux
-        # deploy-scripts job.
-        run: bash deploy/macos/tests/log-rotate-test.sh

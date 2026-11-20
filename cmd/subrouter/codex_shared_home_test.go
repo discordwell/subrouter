@@ -41,28 +41,24 @@ func TestCodexSharedDaemonEligibility(t *testing.T) {
 		{"attached profile", []string{"-pmuse-high"}, false},
 		{"attached model", []string{"-mgpt-5"}, false},
 	} {
-		if got := codexSharedDaemonEligible(tc.args, false, "", "", false, ""); got != tc.ok {
+		if got := codexSharedDaemonEligible(tc.args, false, "", ""); got != tc.ok {
 			t.Errorf("%s: eligible=%v, want %v", tc.name, got, tc.ok)
 		}
 	}
-	if codexSharedDaemonEligible(nil, true, "", "", false, "") {
+	if codexSharedDaemonEligible(nil, true, "", "") {
 		t.Error("the built-in local relay needs a per-launch credential")
 	}
-	if codexSharedDaemonEligible(nil, false, "a@b.co", "", false, "") ||
-		codexSharedDaemonEligible(nil, false, "", "team-codex-1", false, "") {
+	if codexSharedDaemonEligible(nil, false, "a@b.co", "") ||
+		codexSharedDaemonEligible(nil, false, "", "team-codex-1") {
 		t.Error("user and account pins are per-launch headers")
 	}
-	if codexSharedDaemonEligible(nil, false, "", "", true, "") ||
-		codexSharedDaemonEligible(nil, false, "", "", false, "persist") {
-		t.Error("capacity retry settings are per-launch")
-	}
 	t.Setenv("SUBROUTER_CODEX_BASE_URL", "http://x/v1")
-	if codexSharedDaemonEligible(nil, false, "", "", false, "") {
+	if codexSharedDaemonEligible(nil, false, "", "") {
 		t.Error("an explicit base URL has no stable shared home")
 	}
 	t.Setenv("SUBROUTER_CODEX_BASE_URL", "")
 	t.Setenv(codexSharedDaemonDisable, "0")
-	if codexSharedDaemonEligible(nil, false, "", "", false, "") {
+	if codexSharedDaemonEligible(nil, false, "", "") {
 		t.Error("SUBROUTER_CODEX_SHARED_DAEMON=0 must opt out")
 	}
 }
@@ -150,9 +146,13 @@ url = "https://example.com/mcp"
 	provider := getTomlPath(got, []string{"model_providers", "subrouter"}).(map[string]any)
 	if got["model_provider"] != "subrouter" || provider["base_url"] != "http://127.0.0.1:31415/v1" ||
 		provider["experimental_bearer_token"] != "subrouter" || provider["supports_websockets"] != true ||
-		provider["stream_idle_timeout_ms"] != int64(autonomousAgentClientTimeoutMS) ||
-		provider["http_headers"].(map[string]any)["X-Subrouter-Retry-Policy"] != "autonomous" {
+		provider["http_headers"].(map[string]any)["X-Subrouter-Agent"] != "codex" {
 		t.Fatalf("provider not routed through Subrouter: %v", got)
+	}
+	// Upstream's autonomous retry (#505) is not ported, so the shared home
+	// neither asks for it nor raises Codex's stream idle timeout for it.
+	if _, ok := provider["stream_idle_timeout_ms"]; ok || provider["http_headers"].(map[string]any)["X-Subrouter-Retry-Policy"] != nil {
+		t.Fatalf("provider carries upstream's autonomous retry settings: %v", provider)
 	}
 	for path, want := range map[string]any{
 		"model":            "gpt-6",
@@ -479,11 +479,13 @@ func TestCodexBareLaunchUsesSharedHomeWithRecoveryOverrides(t *testing.T) {
 	if !strings.Contains(string(config), `base_url = "`+upstream.URL+`/v1"`) {
 		t.Fatalf("shared config lacks the resolved server:\n%s", config)
 	}
-	if !strings.Contains(string(config), `X-Subrouter-Retry-Policy = "autonomous"`) ||
-		!strings.Contains(string(config), "stream_idle_timeout_ms = 2147483647") ||
+	// Upstream's autonomous retry (#505) is not ported: the shared home asks
+	// for none and leaves Codex's own retry and idle-timeout settings alone.
+	if strings.Contains(string(config), "X-Subrouter-Retry-Policy") ||
+		strings.Contains(string(config), "stream_idle_timeout_ms") ||
 		strings.Contains(string(config), "request_max_retries") ||
 		strings.Contains(string(config), "stream_max_retries") {
-		t.Fatalf("shared config lacks autonomous retry settings:\n%s", config)
+		t.Fatalf("shared config carries retry settings the daemon does not honor:\n%s", config)
 	}
 
 	if err := codex([]string{"--no-goal-resume", "fix"}); err != nil {
@@ -494,8 +496,8 @@ func TestCodexBareLaunchUsesSharedHomeWithRecoveryOverrides(t *testing.T) {
 		t.Fatalf("shared opt-out launch = %q", got)
 	}
 	config, _ = os.ReadFile(filepath.Join(shared, "config.toml"))
-	if !strings.Contains(string(config), `X-Subrouter-Retry-Policy = "autonomous"`) {
-		t.Fatalf("shared launch lost autonomous retry settings:\n%s", config)
+	if !strings.Contains(string(config), `X-Subrouter-Agent = "codex"`) {
+		t.Fatalf("shared launch lost its routing headers:\n%s", config)
 	}
 
 	if err := codex([]string{"-m", "gpt-5", "fix"}); err != nil {

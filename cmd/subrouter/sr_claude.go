@@ -28,39 +28,63 @@ import (
 	"github.com/manaflow-ai/subrouter/internal/broker"
 	"github.com/manaflow-ai/subrouter/internal/proxy"
 	"github.com/manaflow-ai/subrouter/internal/tenant"
+	"github.com/manaflow-ai/subrouter/selectacct"
 )
 
-const srClaudeHelp = `sr claude - Manage local profiles and launch server-pooled Claude
+const srClaudeHelp = `sr claude - Manage local profiles and launch pooled Claude
 
 Usage:
-  sr claude                     Interactively launch pooled Claude (chosen account is a preference)
-  sr add claude <name>          Add local profile from a 1-year Claude setup token
-                                (runs 'claude setup-token' and captures its printed token)
+  sr claude                     Show profiles and switch interactively
+  sr claude add <name>          Add a profile from a 1-year Claude setup token (same as 'sr add claude <name>')
+                                (runs 'claude setup-token' and captures its printed token; no refresh token)
+                                With a selected server the token is also copied there: it cannot race
     --token TOKEN|-             Use an already minted setup token (or read it from stdin)
-    --oauth                     Use the classic browser OAuth login instead (same as 'sr claude login')
-  sr claude login [name]        Add local profile with the classic browser OAuth login (refresh token, infers email)
+    --oauth                     Use the browser OAuth login instead (same as 'sr claude addr')
+  sr claude addr [name]         Add a profile with the browser OAuth login: a refresh token, name inferred
+                                from the email (same as 'sr addr claude'). It stays on this machine;
+                                a refresh token held in two places dies at the next rotation
+  sr claude login [name]        Same as 'sr claude addr'
   sr claude list                List local managed profiles with auth status and setup-token expiry
   sr claude switch [name]       Switch active local profile
-  sr claude remove <name>       Remove a profile
-  sr claude env                 Print CLAUDE_CONFIG_DIR for local/HTTPS profiles
-  sr claude push [name]         Upload a profile to the default Subrouter server pool
+  sr claude remove <name>       Remove a local profile
+  sr claude remove <name> --server <server>
+                                Remove the account from that server instead
+  sr claude rename <old> <new>  Re-label a local profile
+                                (each configured server is checked for a clash; a server cannot rename)
+  sr claude move <name> [<server>]
+                                MOVE a profile to a server (default: the default server): upload, confirm
+                                the server can use it, then remove the local copy
+  sr claude env [name]          Print CLAUDE_CONFIG_DIR for a local/HTTPS profile (default: the active one)
+  sr claude push [name] [--copy] Upload a profile to the default server pool: a setup token is copied,
+                                a refresh-token profile is MOVED (--copy is refused for it)
   sr claude pick                Switch to the profile with the most quota left
+  sr claude reset <name|email>
+                                Claim an account's one saved usage-limit reset now, through the
+                                daemon that holds it. The exact profile name or account email;
+                                one account per call, no --all. It asks first only when the
+                                week has more than 10% left or rolls within a day
+  sr claude reset <name|email> --server <server>
+                                The same against that server's daemon
   sr claude proxy [options] [args...]
-                                Launch Claude profilelessly through the selected server pool
-    sr claude proxy --resume ID Resume a direct or pooled session through the server pool;
+                                Launch Claude profilelessly through this machine's pool
+                                (the configured server is spill capacity, as for 'sr claude')
+    sr claude proxy --resume ID Resume a direct or pooled session through the pool;
                                 prefers the account that last served ID (from sr sessions)
     --account [ACCOUNT]         Pin to one profile with no account failover; omit ACCOUNT for a picker
     --sr-expect-scope SCOPE --  Atomically bind launch to an opaque proxy scope (must be last option)
                                 Wrapper options must precede Claude args; args at/after -- are literal
   sr claude proxy-scope         Print the opaque selected proxy session scope
   sr claude run [name] [...]    Launch one authenticated local managed profile safely
-  sr claude --flag [...]        Launch Claude with the active profile; with no active
-                                profile this is 'sr claude proxy --flag [...]'
+  sr claude --unix-socket[=PATH] [...]
+                                Opt-in: launch through this machine's daemon over its Claude socket
+                                (default ~/.subrouter/claude.sock) in first-party mode; falls back to
+                                TCP with a warning when the socket does not answer. Must come first
+  sr claude --flag [...]        Launch Claude with the active profile
   sr claude <name> [...]        Shorthand for 'sr claude run <name>'
   sr claude help                Show this help
 
-Pooled launches show the serving account, its 5h/weekly limits, and any
-account switch in Claude's status line (your own statusLine command still
+'sr claude proxy' launches show the serving account, its 5h/weekly limits, and
+any account switch in Claude's status line (your own statusLine command still
 runs first). Set SUBROUTER_CLAUDE_STATUSLINE=0 to turn it off. 'sr sessions'
 lists every recorded session and the accounts that served it.
 `
@@ -80,9 +104,23 @@ type claudeRunner struct {
 	// one is configured. nil when the claude runner is built without server
 	// support (tests). pushAfterAdd is the same upload but no-ops silently
 	// when no default server is configured.
-	pushToServer func(ctx context.Context, name string) error
+	//
+	// pushToServer is `sr claude push`: a setup token is copied, a
+	// refresh-token profile is moved (copyOnly asks for the copy, which is
+	// refused for a refresh token). pushAfterAdd runs after a setup-token add
+	// only -- an OAuth add never uploads.
+	pushToServer func(ctx context.Context, name string, copyOnly bool) error
 	pushAfterAdd func(ctx context.Context, name string) error
 	pick         func(ctx context.Context) error
+	// reset is `sr claude reset` (PATCHES §46): it finds the daemon holding
+	// the account and claims through it. nil without server support.
+	reset func(ctx context.Context, args []string) error
+	// moveToServer, renameProfile and removeFromServer are this fork's
+	// provider-first verbs (`sr claude move|rename|remove --server`). nil when
+	// the runner is built without server support.
+	moveToServer     func(ctx context.Context, name, server string) error
+	renameProfile    func(ctx context.Context, oldName, newName string) error
+	removeFromServer func(ctx context.Context, name, server string) error
 	// ephemeral is used by hosted account onboarding. OAuth runs in a
 	// temporary store, the credential is uploaded, and no local profile or
 	// trajectory directory survives the command.
@@ -94,11 +132,11 @@ type claudeRunner struct {
 	// boundary, including errors returned after mutate has committed.
 	mutateProfileInventoryForTest func(context.Context, func() (bool, error)) error
 	// verifyToken proves a pasted setup token against Anthropic before it is
-	// stored. nil selects claude.VerifyAccessToken with the runner's client.
+	// stored. nil leaves the proof to tokenIdentity's probe.
 	verifyToken func(ctx context.Context, token string) error
 	// tokenIdentity reports which Claude organization a token bills against.
-	// nil selects claude.VerifyAccessTokenIdentity with the runner's client,
-	// unless verifyToken is stubbed, in which case no identity is probed.
+	// nil selects verifyClaudeSetupToken with the runner's client, unless
+	// verifyToken is stubbed, in which case no identity is probed.
 	tokenIdentity func(ctx context.Context, token string) (claude.TokenIdentity, error)
 	// now is the clock used to stamp a setup token's expiry. nil selects
 	// time.Now.
@@ -107,64 +145,331 @@ type claudeRunner struct {
 
 const claudeProfileReconcileTimeout = 10 * time.Second
 
+// verifyClaudeSetupToken proves a setup token against Anthropic before it is
+// stored, and reports the organization it bills (upstream #574): one probe
+// does both. A variable only so a test driving the whole CLI can stand in for
+// Anthropic; claudeRunner.verifyToken and tokenIdentity are the per-runner
+// seams.
+var verifyClaudeSetupToken = claude.VerifyAccessTokenIdentity
+
 func (r srRunner) claude(ctx context.Context, args []string) error {
-	// --retry-interval/--retry-max-wait shape the daemon's same-account
-	// overload wait for pooled launches (X-Subrouter-Retry).
-	args, retryHeader, err := takeOverloadRetryFlags(args)
-	if err != nil {
-		return err
-	}
-	r.overloadRetryHeader = retryHeader
+	// Upstream's --retry-interval/--retry-max-wait (#389) send an
+	// X-Subrouter-Retry header the daemon here does not honor: the Claude
+	// 8-minute ladder and the header are not ported (PATCHES §27, §58).
 	if len(args) > 0 && args[0] == "proxy-scope" {
-		return r.printClaudeProxyScope()
+		return r.printClaudeProxyScope(ctx)
 	}
-	if claudeFlagsLaunchPooled(args, claude.DefaultStore().ActiveProfile()) {
-		// `sr claude --resume ID` and other bare Claude flags used to fail with
-		// "no active profile set" when no local profile is active. With no
-		// profile to launch, the pooled launcher is the only sensible target.
-		fmt.Fprintf(r.errOut, "%s: no active local Claude profile; launching pooled Claude (same as '%s claude proxy ...')\n",
-			r.programOrSubrouter(), r.programOrSubrouter())
-		args = append([]string{"proxy"}, args...)
-	}
-	if claudeLaunchesAgent(args) {
-		if len(args) == 0 {
-			selector, scope, _, err := r.pickClaudeProxyAccount(ctx, false, "")
-			if err != nil {
-				return err
-			}
-			return r.proxyClaudeSelectedRemote(ctx, nil, claudeProxyLaunchOptions{
-				expectedScope:      scope,
-				preferredAccountID: selector,
-			})
-		}
-		options, launchArgs, err := parseClaudeProxyLaunchArgs(args[1:])
+	// Opt-in first-party mode over the daemon's Unix socket (PATCHES section
+	// 29, sr_claude_socket.go). Only a LEADING flag counts; without it nothing
+	// below changes.
+	if socket, rest, ok, err := takeClaudeUnixSocketFlag(args); ok {
 		if err != nil {
 			return err
 		}
-		if options.pickPinnedAccount {
-			selector, scope, chosen, pickErr := r.pickClaudeProxyAccount(ctx, true, claudeResumeSessionID(launchArgs))
-			if pickErr != nil {
-				return pickErr
-			}
-			if !chosen {
-				return nil
-			}
-			options.accountSelector = selector
-			options.expectedScope = scope
+		return r.claudeViaUnixSocket(ctx, rest, socket)
+	}
+	// Launching Claude needs a live daemon; account management does not. Start
+	// the daemon only for the launching forms so `sr claude list` stays quiet.
+	if claudeLaunchesAgent(args) {
+		if len(args) > 0 && args[0] == "proxy" {
+			return r.claudeProxyLaunch(ctx, args[1:])
 		}
-		return r.proxyClaudeSelectedRemote(ctx, launchArgs, options)
+		config, err := cloudModeConfig()
+		if err != nil {
+			return fmt.Errorf("load cmux.com login: %w", err)
+		}
+		source := config.EffectiveCredentialSource()
+		if source == broker.CredentialSourceTeam && !config.Ready() {
+			return fmt.Errorf("team credential storage requires login and a selected team; run '%s login'", programBase())
+		}
+		if source == broker.CredentialSourceHosted {
+			server, ok, err := r.selectedRemoteServer()
+			if err != nil {
+				return err
+			}
+			if !ok || server.Name != "cmux" || server.TenantKey == "" {
+				return fmt.Errorf("hosted cmux remote is unavailable; run '%s login'", programBase())
+			}
+			root, err := serverProxyRootURL(server)
+			if err != nil {
+				return err
+			}
+			return r.proxyClaudeTo(ctx, args, root, server.TenantKey)
+		}
+		if source == broker.CredentialSourceTeam {
+			// Team credentials are leased from cmux.com and must be sent from
+			// this machine, so they are pinned to the local daemon and never
+			// follow the configured server the way local storage does.
+			if !ensureLocalHealthy(
+				ctx,
+				fallbackHTTPClient(),
+				localBaseURL(),
+				defaultDaemonStarter(),
+				r.errOut,
+			) {
+				return fmt.Errorf("local proxy is unavailable; run '%s doctor'", programBase())
+			}
+			localProxyToken := cloudClientProxyToken(config, localBaseURL())
+			return r.proxyClaude(ctx, args, localProxyToken)
+		}
+		if source == broker.CredentialSourceLocal {
+			baseURL, proxyToken, err := r.claudeLaunchTarget(ctx, config)
+			if err != nil {
+				return err
+			}
+			return r.proxyClaudeTo(ctx, args, baseURL, proxyToken)
+		}
+		ensureLocalHealthy(ctx, fallbackHTTPClient(), localBaseURL(), defaultDaemonStarter(), r.errOut)
 	}
-	cr := claudeRunner{
-		store:        claude.DefaultStore(),
-		in:           r.in,
-		out:          r.out,
-		errOut:       r.errOut,
-		client:       r.client,
-		pushToServer: r.pushClaudeProfileToServer,
-		pushAfterAdd: r.pushClaudeProfileAfterAdd,
-		pick:         r.pickClaudeProfile,
+	return r.newClaudeRunner(claude.DefaultStore()).run(ctx, args)
+}
+
+// newClaudeRunner is the profile manager with every server hook wired. The
+// hooks reach a server only through resolveServer / defaultRemoteServer, both
+// behind the PATCHES 17 gate.
+func (r srRunner) newClaudeRunner(store claude.Store) claudeRunner {
+	return claudeRunner{
+		store:            store,
+		in:               r.in,
+		out:              r.out,
+		errOut:           r.errOut,
+		client:           r.client,
+		pushToServer:     r.pushClaudeProfileToServer,
+		pushAfterAdd:     r.pushClaudeProfileAfterAdd,
+		pick:             r.pickClaudeProfile,
+		reset:            r.claudeReset,
+		moveToServer:     r.moveClaudeProfile,
+		renameProfile:    r.renameClaudeProfile,
+		removeFromServer: r.deleteRemoteAccount,
 	}
-	return cr.run(ctx, args)
+}
+
+// claudeProxyLaunch is upstream's profileless `sr claude proxy` launcher
+// (f39439a, 730ade8, 72e235d) with one change: WHERE it launches. Upstream sends
+// every such launch to the selected remote whenever one is selected, which makes
+// the box the default target. Here the route is decided once, by
+// resolveClaudeProxyRoute, under the PATCHES 15 rule -- this machine's pool
+// first, the server as spill -- and the picker and the launch share that one
+// decision so they cannot disagree about which pool they are talking to.
+func (r srRunner) claudeProxyLaunch(ctx context.Context, args []string) error {
+	options, launchArgs, err := parseClaudeProxyLaunchArgs(args)
+	if err != nil {
+		return err
+	}
+	// Resolving the route can ask the server; a bad --settings value fails
+	// before that (upstream #503; proxyClaudeSelectedRemote checks again).
+	if err := validateClaudeCLISettings(launchArgs); err != nil {
+		return err
+	}
+	route, err := r.resolveClaudeProxyRoute(ctx)
+	if err != nil {
+		return err
+	}
+	options.route = &route
+	if options.pickPinnedAccount {
+		selector, scope, chosen, pickErr := r.pickClaudeProxyAccount(ctx, route, true, claudeResumeSessionID(launchArgs))
+		if pickErr != nil {
+			return pickErr
+		}
+		if !chosen {
+			return nil
+		}
+		options.accountSelector = selector
+		options.expectedScope = scope
+	}
+	return r.proxyClaudeSelectedRemote(ctx, launchArgs, options)
+}
+
+// claudeProxyPlaceholderToken satisfies Claude Code's requirement that
+// ANTHROPIC_AUTH_TOKEN be set, for targets that enforce no token of their own
+// and substitute pooled credentials themselves. It is the same placeholder
+// `sr claude push` writes into a profile's settings.json.
+const claudeProxyPlaceholderToken = "subrouter"
+
+// localCapacityProbe reports whether this machine's own pool can still start a
+// Claude session. The second result is false when that could not be determined,
+// which is deliberately distinct from "no capacity": an unreadable local pool
+// must not be mistaken for an exhausted one.
+type localCapacityProbe func(ctx context.Context) (hasCapacity bool, known bool)
+
+// claudeLaunchTarget resolves the configured server, then defers to
+// claudeLaunchTargetTo.
+func (r srRunner) claudeLaunchTarget(
+	ctx context.Context,
+	config broker.Config,
+) (string, string, error) {
+	server, ok, err := r.defaultRemoteServer()
+	if err != nil {
+		return "", "", err
+	}
+	local := localBaseURL()
+	return claudeLaunchTargetTo(
+		ctx,
+		fallbackHTTPClient(),
+		server,
+		ok,
+		local,
+		defaultDaemonStarter(),
+		config,
+		r.localClaudeCapacity(local),
+		r.errOut,
+	)
+}
+
+// localClaudeCapacity asks this machine's daemon whether any of its own Claude
+// accounts still takes a new session, by the daemon's published verdict where
+// it has one (PATCHES §31) and the new-session floor on its normalized score
+// where it does not.
+//
+// It reads the scheduler's normalized view rather than deriving a score from
+// raw windows: window names are provider vocabulary, and scoring Claude rows
+// through them reports healthy accounts as empty — measured against this pool,
+// an account with 80% of its week left scored 0.00. A daemon too old to publish
+// the normalized view yields unknown, not exhausted, so the launch stays local
+// until the daemon is upgraded.
+func (r srRunner) localClaudeCapacity(local string) localCapacityProbe {
+	return func(ctx context.Context) (bool, bool) {
+		// No admin token: addServerAdminAuth sends no header, and the daemon
+		// short-circuits authorization for loopback callers.
+		statuses, ok, err := r.fetchServerUsageStatuses(ctx, srServerConfig{Name: "local", URL: local})
+		if err != nil || !ok {
+			return false, false
+		}
+		judged := false
+		for _, status := range statuses {
+			if status.Provider != accounts.ProviderClaude || status.Error != "" {
+				continue
+			}
+			if status.Normalized == nil {
+				// Old daemon, or an account the scheduler has no score for.
+				continue
+			}
+			judged = true
+			if verdict := status.Normalized.NewSession; verdict != nil {
+				// The daemon's own routing verdict: it sees the burndown drain,
+				// the owner's reserve and live session counts, none of which a
+				// score rebuilt from the published headroom carries.
+				if verdict.Eligible {
+					return true, true
+				}
+				continue
+			}
+			if (selectacct.Score{
+				Headroom:               status.Normalized.Headroom,
+				ShortHeadroom:          status.Normalized.ShortHeadroom,
+				ShortResetAfterSeconds: status.Normalized.SecondsToShortReset,
+				ShortWindowSeconds:     status.Normalized.ShortWindowSeconds,
+			}).UsableForNewSession() {
+				return true, true
+			}
+		}
+		// "No usable account" is only meaningful if something was judged.
+		return false, judged
+	}
+}
+
+// claudeLaunchTargetTo picks where a local-storage `sr claude` launch sends
+// traffic, and which token it must present there. Whether it leaves this
+// machine at all is claudeLaunchSpills's decision.
+//
+// The token follows the target rather than the configuration: cloudClientProxyToken
+// already refuses to hand this machine's proxy token to a non-loopback address,
+// so a remote target presents its tenant key, or the placeholder when the server
+// enforces no token at all.
+func claudeLaunchTargetTo(
+	ctx context.Context,
+	client *http.Client,
+	server srServerConfig,
+	hasServer bool,
+	local string,
+	start daemonStarter,
+	config broker.Config,
+	localCapacity localCapacityProbe,
+	warn io.Writer,
+) (string, string, error) {
+	if !claudeLaunchSpills(ctx, client, server, hasServer, local, localCapacity, warn) {
+		if !ensureLocalHealthy(ctx, client, local, start, warn) {
+			return "", "", fmt.Errorf("local proxy is unavailable; run '%s doctor'", programBase())
+		}
+		return local, cloudClientProxyToken(config, local), nil
+	}
+	remoteToken := strings.TrimSpace(server.TenantKey)
+	if remoteToken == "" {
+		remoteToken = claudeProxyPlaceholderToken
+	}
+	// serverProxyRootURL applies upstream's tenant transport policy (HTTPS,
+	// loopback, or a verified tailnet node) and may pin the URL to an address.
+	remote, err := serverProxyRootURL(server)
+	if err != nil {
+		return "", "", err
+	}
+	return remote, remoteToken, nil
+}
+
+// claudeLaunchSpills reports whether a Claude launch leaves this machine's pool
+// for the configured server. It is the one PATCHES 15 decision, shared by
+// `sr claude` (claudeLaunchTargetTo) and upstream's profileless
+// `sr claude proxy` (resolveClaudeProxyRoute), so the two launchers cannot
+// disagree about which pool a session starts on.
+//
+// This machine's own accounts are preferred, and the configured server is spill
+// capacity: the launch moves there only once no local account is routable for
+// a new session, by the router's own predicate rather than a copy of it. Two
+// cases deliberately stay local rather than spend the server's pool on a guess — a
+// local pool that cannot be read at all, and a server that fails its health
+// probe. Staying put and letting the local daemon report exhaustion is a better
+// failure than silently draining the server's quota.
+//
+// SUBROUTER_DISABLE_FALLBACK keeps its documented meaning of pinning the
+// configured server, which here means skipping the local-first preference.
+//
+// The remote is named through redactedServerURL: a tenant entry's proxy root
+// carries its tenant key in the path (upstream redacts the same warning in
+// withLocalFallbackTo).
+func claudeLaunchSpills(
+	ctx context.Context,
+	client *http.Client,
+	server srServerConfig,
+	hasServer bool,
+	local string,
+	localCapacity localCapacityProbe,
+	warn io.Writer,
+) bool {
+	if !hasServer || sameEndpoint(server.URL, local) {
+		return false
+	}
+	if fallbackDisabled() {
+		return true
+	}
+	hasCapacity, known := localCapacity(ctx)
+	if !known {
+		warnf(warn, "subrouter: could not read this machine's pool; keeping the launch local\n")
+		return false
+	}
+	if hasCapacity {
+		return false
+	}
+	// A root the transport policy refuses (a tenant key over plaintext to a host
+	// that is not a verified tailnet node) is not spill capacity: stay local
+	// rather than probe it, which would send the key in the clear.
+	remote, err := serverProxyRootURL(server)
+	if err != nil {
+		warnf(warn, "subrouter: local accounts are below the new-session floor but server %s cannot be used (%v); keeping the launch local\n", server.Name, err)
+		return false
+	}
+	if !serverHealthy(ctx, client, remote) {
+		warnf(warn, "subrouter: local accounts are below the new-session floor and %s is unreachable; keeping the launch local\n", redactedServerURL(remote))
+		return false
+	}
+	warnf(warn, "subrouter: local accounts are below the new-session floor; routing through %s\n", redactedServerURL(remote))
+	return true
+}
+
+func warnf(warn io.Writer, format string, args ...any) {
+	if warn == nil {
+		return
+	}
+	fmt.Fprintf(warn, format, args...)
 }
 
 type claudeProxyLaunchOptions struct {
@@ -172,6 +477,50 @@ type claudeProxyLaunchOptions struct {
 	accountSelector    string
 	preferredAccountID string
 	pickPinnedAccount  bool
+	// route is the pool claudeProxyLaunch already chose, so a picker and its
+	// launch share one decision. nil resolves it at launch.
+	route *claudeProxyRoute
+}
+
+// claudeProxyRoute is where a profileless `sr claude proxy` launch goes: this
+// machine's daemon (remote=false), or one server.
+type claudeProxyRoute struct {
+	server srServerConfig
+	remote bool
+}
+
+// resolveClaudeProxyRoute decides the pool for a profileless launch.
+//
+// Upstream answers "the selected remote, whenever one is selected", which makes
+// the box the default launch target and bypasses PATCHES 16 (the client would
+// point at the box instead of 127.0.0.1). Here the selected remote is spill
+// capacity exactly as it is for `sr claude`: claudeLaunchSpills decides.
+// Hosted storage has no local pool, so its hosted remote IS the pool; team
+// credentials are leased to this machine and sent from it, so team storage
+// stays local (the same split srRunner.claude makes).
+//
+// selectedRemoteServer carries the PATCHES 17 gate, so a keyless machine
+// always resolves local here and never probes a box.
+func (r srRunner) resolveClaudeProxyRoute(ctx context.Context) (claudeProxyRoute, error) {
+	server, ok, err := r.selectedRemoteServer()
+	if err != nil || !ok {
+		return claudeProxyRoute{}, err
+	}
+	config, err := cloudModeConfig()
+	if err != nil {
+		return claudeProxyRoute{}, fmt.Errorf("load cmux.com login: %w", err)
+	}
+	switch config.EffectiveCredentialSource() {
+	case broker.CredentialSourceHosted:
+		return claudeProxyRoute{server: server, remote: true}, nil
+	case broker.CredentialSourceTeam:
+		return claudeProxyRoute{}, nil
+	}
+	local := localBaseURL()
+	if claudeLaunchSpills(ctx, fallbackHTTPClient(), server, true, local, r.localClaudeCapacity(local), r.errOut) {
+		return claudeProxyRoute{server: server, remote: true}, nil
+	}
+	return claudeProxyRoute{}, nil
 }
 
 func claudeProxyScope(server srServerConfig, remote bool) string {
@@ -273,11 +622,15 @@ func parseClaudeProxyLaunchArgs(args []string) (options claudeProxyLaunchOptions
 	return options, nil, nil
 }
 
-func (r srRunner) pickClaudeProxyAccount(ctx context.Context, pinned bool, resumeSessionID string) (selector, expectedScope string, chosen bool, err error) {
-	server, remote, err := r.selectedRemoteServer()
-	if err != nil {
-		return "", "", false, err
-	}
+// pickClaudeProxyAccount lists the route's Claude accounts, with the health and
+// usage table plain `sr` prints, and asks for one (upstream #429/#432). Only the
+// pinned form (`sr claude proxy --account` with no ACCOUNT) reaches it: upstream
+// also ran the unpinned form for a bare `sr claude`, which this fork keeps as the
+// PATCHES 15 launch (see srRunner.claude), so the pinned=false branch is
+// upstream's, kept for merge parity. A resumed session's last account is the
+// default while its prompt cache may still be warm.
+func (r srRunner) pickClaudeProxyAccount(ctx context.Context, route claudeProxyRoute, pinned bool, resumeSessionID string) (selector, expectedScope string, chosen bool, err error) {
+	server, remote := route.server, route.remote
 	if !remote {
 		if !ensureLocalHealthy(ctx, fallbackHTTPClient(), localBaseURL(), defaultDaemonStarter(), r.errOut) {
 			return "", "", false, fmt.Errorf("local proxy is unavailable; run '%s doctor'", r.programOrSubrouter())
@@ -380,12 +733,17 @@ func (r srRunner) accountPickerUsage(ctx context.Context, server srServerConfig)
 	return statuses, fmt.Sprintf("Live server usage is not available yet; showing usage from %s ago.", age.Round(time.Second))
 }
 
-func (r srRunner) printClaudeProxyScope() error {
-	server, remote, err := r.selectedRemoteServer()
+// printClaudeProxyScope prints the scope a `sr claude proxy` launch would bind
+// to right now. The route is local-first (resolveClaudeProxyRoute), so it can
+// change between this call and a launch bound with --sr-expect-scope; that
+// launch then refuses with "scope changed" before sending anything, which is the
+// flag's contract.
+func (r srRunner) printClaudeProxyScope(ctx context.Context) error {
+	route, err := r.resolveClaudeProxyRoute(ctx)
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(r.out, "scope=%s\n", opaqueClaudeProxyScope(claudeProxyScope(server, remote)))
+	fmt.Fprintf(r.out, "scope=%s\n", opaqueClaudeProxyScope(claudeProxyScope(route.server, route.remote)))
 	return nil
 }
 
@@ -393,16 +751,27 @@ func (r srRunner) printClaudeProxyScope() error {
 // local Claude profile. Pooled launches leave account selection to the server;
 // pinned launches resolve one current server-side Claude profile and carry its
 // routing ID only in the authoritative private settings for that child.
+//
+// The pool is options.route, or resolveClaudeProxyRoute's local-first answer
+// when the caller did not decide it -- never simply the selected remote.
 func (r srRunner) proxyClaudeSelectedRemote(ctx context.Context, args []string, options claudeProxyLaunchOptions) error {
-	// Reject a bad --settings value before any server request or session
-	// ledger record, so a failed launch leaves nothing behind.
+	// Reject a bad --settings value before the route is resolved (which can ask
+	// the server) or the launch is recorded in the session ledger, so a failed
+	// launch leaves nothing behind (upstream #503).
 	if err := validateClaudeCLISettings(args); err != nil {
 		return err
 	}
-	server, ok, err := r.selectedRemoteServer()
-	if err != nil {
-		return err
+	route := claudeProxyRoute{}
+	if options.route != nil {
+		route = *options.route
+	} else {
+		resolved, err := r.resolveClaudeProxyRoute(ctx)
+		if err != nil {
+			return err
+		}
+		route = resolved
 	}
+	server, ok := route.server, route.remote
 	scope := claudeProxyScope(server, ok)
 	actualScope := opaqueClaudeProxyScope(scope)
 	if options.expectedScope != "" && options.expectedScope != actualScope {
@@ -453,20 +822,6 @@ func (r srRunner) proxyClaudeSelectedRemote(ctx context.Context, args []string, 
 	preferredAccountID = r.resumePreferredClaudeAccount(ctx, server, args, accountID, preferredAccountID)
 	r = r.beginClaudeSessionLaunch(server.Name, args, accountID, preferredAccountID)
 	return r.proxyClaudeArgsToServer(ctx, args, server, proxyToken, scope, accountID, preferredAccountID)
-}
-
-// claudeFlagsLaunchPooled reports whether `sr claude <flags...>` should run
-// the pooled launcher: it starts with a Claude flag (not help) and there is
-// no active local profile for the legacy profile launch to use.
-func claudeFlagsLaunchPooled(args []string, activeProfile string) bool {
-	if len(args) == 0 || !strings.HasPrefix(args[0], "-") || strings.TrimSpace(activeProfile) != "" {
-		return false
-	}
-	switch args[0] {
-	case "-h", "--help", "--retry-interval", "--retry-max-wait":
-		return false
-	}
-	return true
 }
 
 // resumePreferredClaudeAccount returns the account to prefer for a pooled
@@ -734,8 +1089,13 @@ func (r srRunner) proxyClaudeArgsTo(
 		if upstreamToken == "" {
 			upstreamToken = "subrouter"
 		}
-		relay, relayErr := startLocalServingProxyRelay(
-			codexProxyRootURL(baseURL), "v1", "claude", "", upstreamToken,
+		// The relay strips every X-Subrouter-Session the client sends and
+		// sets only its own, so the caller's SUBROUTER_SESSION_KEY (upstream
+		// #511, which Claude sends in ANTHROPIC_CUSTOM_HEADERS) has to be the
+		// relay's: on this default local route the key never reached the
+		// daemon, and each `claude -p` process got its own sticky session.
+		relay, relayErr := startClaudeLocalRelay(
+			codexProxyRootURL(baseURL), "v1", "claude", claudeProxySessionKey(), upstreamToken,
 			accountID, preferredAccountID, r.store,
 		)
 		if relayErr != nil {
@@ -744,12 +1104,14 @@ func (r srRunner) proxyClaudeArgsTo(
 		defer relay.Close()
 		// The durable local token and authoritative account choice stay in the
 		// relay. Claude receives only its short-lived process capability.
-		defer shareClaudeProxyProjectTrust(configDir, r.store.StoreDir())
 		return r.runProxyClaude(ctx, args, relay.URL(), relay.Credential(), configDir, "", "")
 	}
-	defer shareClaudeProxyProjectTrust(configDir, r.store.StoreDir())
 	return r.runProxyClaude(ctx, args, baseURL, proxyToken, configDir, accountID, preferredAccountID)
 }
+
+// startClaudeLocalRelay starts the relay a local pooled Claude launch talks
+// through. A variable so a test can see what the relay is asked to stamp.
+var startClaudeLocalRelay = startLocalServingProxyRelay
 
 func (r srRunner) proxyClaudeArgsToServer(
 	ctx context.Context,
@@ -770,7 +1132,6 @@ func (r srRunner) proxyClaudeArgsToServer(
 	if err := prepareClaudeProxySharedState(configDir, r.store.StoreDir()); err != nil {
 		return fmt.Errorf("prepare shared Claude proxy history: %w", err)
 	}
-	defer shareClaudeProxyProjectTrust(configDir, r.store.StoreDir())
 	return r.runProxyClaudeForServerAccount(ctx, args, server, proxyToken, configDir, accountID, preferredAccountID)
 }
 
@@ -779,28 +1140,8 @@ func claudeProxyConfigDir(storeDir, scope, accountID string) string {
 	if accountID != "" {
 		identity += "\x00account:" + accountID
 	}
-	// A proxy directory links to one shared Claude config directory, so
-	// callers with different CLAUDE_CONFIG_DIR values get separate proxy
-	// directories. The default ~/.claude keeps its original hash.
-	if shared := claudeProxySharedConfigDir(storeDir); shared != "" {
-		identity += "\x00shared:" + shared
-	}
 	scopeHash := sha256.Sum256([]byte(identity))
 	return filepath.Join(storeDir, "claude-proxy", fmt.Sprintf("%x", scopeHash[:12]))
-}
-
-// claudeProxySharedConfigDir returns the caller's Claude config directory
-// when it is not the default ~/.claude, for the real default store only.
-func claudeProxySharedConfigDir(storeDir string) string {
-	store := claude.DefaultStore()
-	if filepath.Clean(storeDir) != filepath.Clean(store.Dir) {
-		return ""
-	}
-	shared := strings.TrimSpace(store.SharedStateDir)
-	if shared == "" || filepath.Clean(shared) == filepath.Clean(claude.DefaultClaudeConfigDir()) {
-		return ""
-	}
-	return filepath.Clean(shared)
 }
 
 func prepareClaudeProxySharedState(configDir, storeDir string) error {
@@ -809,28 +1150,22 @@ func prepareClaudeProxySharedState(configDir, storeDir string) error {
 		// Hermetic/test stores must never attach to the user's real Claude home.
 		return nil
 	}
-	if err := defaultStore.ShareUserConfigDir(configDir); err != nil {
-		return err
-	}
 	if err := defaultStore.PrepareSharedStateDir(configDir); err != nil {
 		return err
 	}
-	shareClaudeProxyProjectTrust(configDir, storeDir)
-	return nil
-}
-
-// shareClaudeProxyProjectTrust carries folder trust between the user's Claude
-// and a proxy config directory (see claude_proxy_trust.go). It runs before a
-// launch and again after it, so trust accepted inside a proxy session is
-// asked only once overall. Like prepareClaudeProxySharedState it only
-// touches the user's real Claude config for the real default store.
-func shareClaudeProxyProjectTrust(configDir, storeDir string) {
-	if filepath.Clean(storeDir) != filepath.Clean(claude.DefaultStore().Dir) {
-		return
+	// Skills, agents, commands, CLAUDE.md and key bindings (upstream #441). A
+	// launch never depends on them, so a failure is logged, not returned.
+	if err := defaultStore.ShareUserConfigDir(configDir); err != nil {
+		slog.Warn("share Claude user config with proxy config", "error", err)
 	}
-	if err := syncClaudeProjectTrust(claudeUserConfigPath(), configDir); err != nil {
+	// Folder trust the user granted in their own Claude (upstream #430, one
+	// way: claude_proxy_trust.go). This reads the user's .claude.json and
+	// writes only the proxy home's; like the rest it runs only for the real
+	// default store.
+	if err := syncClaudeProjectTrustToProxy(claudeUserConfigPath(), configDir); err != nil {
 		slog.Warn("share Claude folder trust with proxy config", "error", err)
 	}
+	return nil
 }
 
 func (r srRunner) runProxyClaudeForServer(ctx context.Context, args []string, server srServerConfig, proxyToken, configDir string) error {
@@ -900,25 +1235,44 @@ func (r srRunner) launchProxyClaude(ctx context.Context, args []string, baseURL,
 			_, _ = newSessionLedger(r.store.StoreDir()).finishLaunch(r.sessionLaunchID, err)
 		}
 	}()
-	settingsBody, err := proxyClaudeLaunchSettingsWithRetry(baseURL, proxyToken, configDir, r.overloadRetryHeader, accountID, preferredAccountID)
+	settingsBody, err := proxyClaudeLaunchSettings(baseURL, proxyToken, configDir, accountID, preferredAccountID)
 	if err != nil {
 		return err
 	}
+	// managedClaudeLaunchArgs drops the caller's --settings; their content
+	// rides in the private file instead (upstream #502).
 	settingsBody, err = withClaudeCLISettings(settingsBody, args)
 	if err != nil {
 		return err
 	}
-	settingsBody, err = withClaudeUserSettings(settingsBody, claudeProxyUserSettingsPath(r.store.StoreDir()), claudeProxyOwnSettingsPath(configDir))
-	if err != nil {
-		return err
-	}
-	if store := claude.DefaultStore(); filepath.Clean(r.store.StoreDir()) == filepath.Clean(store.Dir) {
-		settingsBody, err = withClaudeProxyMemoryDirectory(settingsBody, store.SharedStateDir)
+	if !claudeArgsChooseSettingSources(args) {
+		// The profile or proxy directory hides ~/.claude/settings.json from the
+		// child; carry it in the one private settings file (upstream #435).
+		settingsBody, err = withClaudeUserSettings(settingsBody,
+			claudeProxyUserSettingsPath(r.store.StoreDir(), configDir), claudeOwnSettingsPath(configDir))
 		if err != nil {
 			return err
 		}
 	}
-	settingsBody, err = withClaudeSessionStatusLine(settingsBody, r.sessionLaunchID, r.store.StoreDir())
+	memoryRoot := claudeLaunchMemoryRoot(r.store.StoreDir(), configDir)
+	if memoryRoot != "" {
+		// A launch never depends on the grant: without it, auto-memory writes
+		// through the projects link ask first, as they did before.
+		if granted, grantErr := withClaudeProxyMemoryDirectory(settingsBody, memoryRoot); grantErr != nil {
+			slog.Warn("grant Claude shared project memory to launch", "error", grantErr)
+			memoryRoot = ""
+		} else {
+			settingsBody = granted
+		}
+	}
+	// The hook chains the user's own status line; a launch that chose its
+	// setting sources hands them on, so it never runs one from a source the
+	// caller left out (PATCHES 29.9.2).
+	var chainSources *string
+	if sources, chosen := claudeArgsSettingSources(args); chosen {
+		chainSources = &sources
+	}
+	settingsBody, err = withClaudeSessionStatusLine(settingsBody, r.sessionLaunchID, r.store.StoreDir(), chainSources)
 	if err != nil {
 		return err
 	}
@@ -944,14 +1298,14 @@ func (r srRunner) launchProxyClaude(ctx context.Context, args []string, baseURL,
 	// The authoritative private settings file carries every routing value. Keep the
 	// child environment credential-free so tenant URLs and keys cannot be read
 	// through process inspection or inherited by subprocesses.
-	childEnv := claudeSettingsChildEnvironment(os.Environ(), baseURL, configDir)
-	if defaultStore := claude.DefaultStore(); filepath.Clean(r.store.StoreDir()) == filepath.Clean(defaultStore.Dir) && strings.TrimSpace(defaultStore.SharedStateDir) != "" {
-		// Claude resolves auto-memory before it applies settings.env. Set the
-		// shared root in the child environment so its per-project memory path
-		// never begins at the proxy symlink.
-		childEnv = upsertEnv(childEnv, "CLAUDE_CODE_REMOTE_MEMORY_DIR", defaultStore.SharedStateDir)
+	cmd.Env = proxyClaudeEnvironmentForLaunch(os.Environ(), baseURL, configDir, settingsBody)
+	if memoryRoot != "" {
+		// Claude resolves auto-memory before it applies settings.env, so the
+		// shared root goes in the child environment too and the per-project
+		// memory path never begins at the config directory's projects link
+		// (upstream #485).
+		cmd.Env = upsertEnv(cmd.Env, "CLAUDE_CODE_REMOTE_MEMORY_DIR", memoryRoot)
 	}
-	cmd.Env = childEnv
 	claudeStarted = true
 	runErr := cmd.Run()
 	if r.sessionLaunchID != "" {
@@ -962,10 +1316,31 @@ func (r srRunner) launchProxyClaude(ctx context.Context, args []string, baseURL,
 	return runErr
 }
 
+// claudeLaunchMemoryRoot is the shared Claude home whose projects/ a launch's
+// config directory links to (prepareSharedState), for the real default store
+// only, and "" when the child reads that home itself (no profile selected, or
+// the home is the config directory): Claude Code then resolves its memory
+// root there with no link to follow (upstream #484/#485, adapted).
+func claudeLaunchMemoryRoot(storeDir, configDir string) string {
+	if strings.TrimSpace(configDir) == "" {
+		return ""
+	}
+	store := claude.DefaultStore()
+	if filepath.Clean(storeDir) != filepath.Clean(store.Dir) || strings.TrimSpace(store.SharedStateDir) == "" {
+		return ""
+	}
+	if sameClaudePath(store.SharedStateDir, configDir) {
+		return ""
+	}
+	return store.SharedStateDir
+}
+
 // withClaudeSessionStatusLine adds sr's status line hook to a pooled launch's
 // private settings so the session shows its serving account and limits.
-func withClaudeSessionStatusLine(settingsBody []byte, launchID, storeDir string) ([]byte, error) {
-	statusLine := claudeStatusLineSetting(launchID, storeDir)
+// settingSources is the launch's --setting-sources value, nil when it chose
+// none (claudeStatusLineSetting).
+func withClaudeSessionStatusLine(settingsBody []byte, launchID, storeDir string, settingSources *string) ([]byte, error) {
+	statusLine := claudeStatusLineSetting(launchID, storeDir, settingSources)
 	if statusLine == nil {
 		return settingsBody, nil
 	}
@@ -979,6 +1354,91 @@ func withClaudeSessionStatusLine(settingsBody []byte, launchID, storeDir string)
 		return nil, fmt.Errorf("encode Claude status line settings: %w", err)
 	}
 	return body, nil
+}
+
+// proxyClaudeEnvironment is the child environment launchProxyClaude starts
+// Claude Code with: credential-free (claudeSettingsChildEnvironment; the
+// routing values travel in the private --settings file), and asking for the
+// 1-hour prompt cache unless the environment or the user settings.json that
+// child will read already records a TTL decision (PATCHES §21).
+//
+// The key goes in the environment, not in the private --settings file. Claude
+// Code applies every settings file's env over its environment, so a TTL the
+// user put in any settings file still wins; the --settings file outranks the
+// user's settings.json, so a value there would override their decision.
+func proxyClaudeEnvironment(environ []string, baseURL, configDir string) []string {
+	return proxyClaudeEnvironmentForLaunch(environ, baseURL, configDir, nil)
+}
+
+// proxyClaudeEnvironmentForLaunch is proxyClaudeEnvironment that also reads
+// the private --settings document the child is launched with. Since that file
+// carries the user's ~/.claude/settings.json (withClaudeUserSettings), a TTL
+// decision recorded there is the user's too: an env key there already beats
+// the injected one, but a top-level promptCacheTtl does not (Claude Code's env
+// beats the setting), so an injection would override it. A document that is
+// not a JSON object records nothing.
+func proxyClaudeEnvironmentForLaunch(environ []string, baseURL, configDir string, launchSettings []byte) []string {
+	env := claudeSettingsChildEnvironment(environ, baseURL, configDir)
+	var overlay map[string]any
+	if len(launchSettings) > 0 && json.Unmarshal(launchSettings, &overlay) == nil {
+		overlayEnv, _ := overlay["env"].(map[string]any)
+		if claudeCacheTTLDecided(overlay, overlayEnv) {
+			return env
+		}
+	}
+	return withClaudeCacheTTL(env, claudeLaunchSettings(env))
+}
+
+// claudeLaunchSettings is the user settings.json a Claude Code child launched
+// with env will read: $CLAUDE_CONFIG_DIR from that env, else ~/.claude
+// (homeClaudeConfigDir). Not defaultClaudeConfigDir: CLAUDE_CONFIG_DIR is a
+// routing key, so claudeSettingsChildEnvironment strips an inherited one when
+// no profile is selected, and the child then reads the home default even where
+// this process's CLAUDE_CONFIG_DIR names another directory. The home is this
+// process's; the child inherits it unchanged. A missing or unparsable file is
+// an empty document; Claude Code cannot read a TTL decision out of a file
+// nobody can parse either.
+func claudeLaunchSettings(env []string) map[string]any {
+	dir := ""
+	for _, kv := range env {
+		if name, value, ok := strings.Cut(kv, "="); ok && name == "CLAUDE_CONFIG_DIR" {
+			dir = strings.TrimSpace(value)
+		}
+	}
+	if dir == "" {
+		resolved, err := homeClaudeConfigDir()
+		if err != nil {
+			return nil
+		}
+		dir = resolved
+	}
+	file, err := readClaudeConfigFile(filepath.Join(dir, "settings.json"))
+	if err != nil {
+		return nil
+	}
+	return file.value
+}
+
+// withClaudeCacheTTL appends CLAUDE_CODE_PROMPT_CACHE_TTL=1h to a Claude Code
+// child environment unless the user already decided: either env key present
+// (any value, including empty), or settings (the settings.json the child will
+// read) recording one. It checks presence rather than calling upsertEnv, which
+// would overwrite an inherited value. The key is deliberately not in
+// claudeRoutingEnvKeys, so claudeDirect keeps a user's own value.
+func withClaudeCacheTTL(env []string, settings map[string]any) []string {
+	for _, kv := range env {
+		name, _, _ := strings.Cut(kv, "=")
+		if name == claudePromptCacheTTLEnv || name == claudeForcePromptCaching5mEnv {
+			return env
+		}
+	}
+	settingsEnv, _ := settings["env"].(map[string]any)
+	if claudeCacheTTLDecided(settings, settingsEnv) {
+		return env
+	}
+	// The full slice expression forces a copy, so the caller's backing array
+	// is never written through.
+	return append(env[:len(env):len(env)], claudePromptCacheTTLEnv+"="+claudeRoutedPromptCacheTTL)
 }
 
 func proxyClaudeInvocation(
@@ -1031,6 +1491,9 @@ func claudeSettingsChildEnvironment(environ []string, baseURL, configDir string)
 	env := envWithout(environ, claudeRoutingEnvKeys)
 	env = directPlainHTTPEnvironment(env, baseURL)
 	if baseURL != "" {
+		// Routed: Claude Code sees a non-Anthropic base URL and would turn tool
+		// search off. A direct profile launch (no base URL) talks to Anthropic
+		// itself, where Claude Code decides on its own.
 		env = withClaudeToolSearch(env)
 	}
 	if configDir != "" {
@@ -1040,20 +1503,38 @@ func claudeSettingsChildEnvironment(environ []string, baseURL, configDir string)
 	return env
 }
 
-// claudeToolSearchEnv opts Claude Code back into tool search. Claude turns it
-// off whenever ANTHROPIC_BASE_URL points at a non-Anthropic host, because most
-// proxies drop tool_reference blocks; that hides every deferred tool, including
-// MCP and desktop app tools. Subrouter forwards the request body and client
-// Anthropic-Beta values unchanged, so "true" is safe on its routes.
-const claudeToolSearchEnv = "ENABLE_TOOL_SEARCH"
-
-// withClaudeToolSearch sets ENABLE_TOOL_SEARCH=true unless the user already
-// chose a value.
+// withClaudeToolSearch appends ENABLE_TOOL_SEARCH=true to a routed Claude Code
+// child environment unless the key is already there with any value, even
+// empty (the rule withClaudeCacheTTL uses; claudeToolSearchEnv says why the
+// key exists). The key goes in the environment, not in the private --settings
+// file: Claude Code applies every settings file's env over its environment, so
+// a value in the user's or the profile's settings.json still wins, while one
+// in the --settings file would outrank theirs. Like the TTL it is not in
+// claudeRoutingEnvKeys, so claudeDirect keeps a user's own value.
 func withClaudeToolSearch(env []string) []string {
-	if envValue(env, claudeToolSearchEnv) != "" {
-		return env
+	for _, kv := range env {
+		if name, _, _ := strings.Cut(kv, "="); name == claudeToolSearchEnv {
+			return env
+		}
 	}
-	return upsertEnv(env, claudeToolSearchEnv, "true")
+	// The full slice expression forces a copy, so the caller's backing array
+	// is never written through.
+	return append(env[:len(env):len(env)], claudeToolSearchEnv+"="+claudeRoutedToolSearch)
+}
+
+// claudeHelpText is srClaudeHelp as this machine may see it. It was printed
+// unfiltered, so `sr claude help` on a keyless machine still described pushing
+// to "the default Subrouter server pool" -- a remote surface PATCHES 17 hides
+// everywhere else.
+func claudeHelpText() string {
+	if remoteUnlocked() {
+		return srClaudeHelp
+	}
+	return stripRemoteHelp(srClaudeHelp, "sr")
+}
+
+func unknownClaudeCommandError(command string) error {
+	return fmt.Errorf("unknown command: sr claude %s\n%s", command, claudeHelpText())
 }
 
 func (r claudeRunner) run(ctx context.Context, args []string) error {
@@ -1062,6 +1543,8 @@ func (r claudeRunner) run(ctx context.Context, args []string) error {
 	}
 	switch args[0] {
 	case "add":
+		// Upstream #305: `add` mints a one-year setup token; `--oauth` is the
+		// browser OAuth login, the same as `addr`.
 		options, err := parseClaudeAddArgs(args[1:])
 		if err != nil {
 			return err
@@ -1070,15 +1553,17 @@ func (r claudeRunner) run(ctx context.Context, args []string) error {
 			return r.addOAuth(ctx, options.name)
 		}
 		return r.addSetupToken(ctx, options)
-	case "login":
-		// The pre-setup-token flow, kept verbatim: browser OAuth writes a
-		// refreshable credential and the profile name defaults to the email.
+	case "addr", "login":
+		// `addr` ("add refresh") is the browser OAuth login with a refresh
+		// token, the name inferred from the email when omitted. `login` is
+		// upstream's spelling of the same thing.
 		options, err := parseClaudeAddArgs(args[1:])
 		if err != nil {
 			return err
 		}
-		if options.token != "" || options.tokenFromStdin {
-			return fmt.Errorf("sr claude login does not take --token; use 'sr add claude --token'")
+		if options.token != "" || options.tokenFromStdin || options.setupToken {
+			return fmt.Errorf("sr claude %s is the browser OAuth login and takes no setup token; "+
+				"a setup token is 'sr claude add <name>'", args[0])
 		}
 		return r.addOAuth(ctx, options.name)
 	case "list", "ls", "status":
@@ -1089,24 +1574,110 @@ func (r claudeRunner) run(ctx context.Context, args []string) error {
 		}
 		return r.switchProfile(args[1])
 	case "remove", "rm":
-		if len(args) < 2 {
-			return fmt.Errorf("usage: sr claude remove <name>")
+		rest, server, hasServer, err := takeClaudeServerFlag(args[1:])
+		if err != nil {
+			return err
 		}
-		return r.remove(ctx, args[1])
+		if len(rest) != 1 {
+			return errors.New(claudeRemoveUsage())
+		}
+		if hasServer {
+			// resolveServer answers `unknown flag: --server` on a keyless
+			// machine, so nothing remote is reached or named there.
+			if r.removeFromServer == nil {
+				return fmt.Errorf("unknown flag: --server")
+			}
+			return r.removeFromServer(ctx, rest[0], server)
+		}
+		return r.remove(ctx, rest[0])
+	case "rename":
+		if len(args) != 3 || strings.HasPrefix(args[1], "-") || strings.HasPrefix(args[2], "-") {
+			return fmt.Errorf("usage: sr claude rename <old> <new>")
+		}
+		if r.renameProfile == nil {
+			return fmt.Errorf("rename is not available")
+		}
+		return r.renameProfile(ctx, args[1], args[2])
+	case "move":
+		// A move only ever reaches a server, so a keyless machine refuses it
+		// exactly as it refuses a typo (PATCHES 17).
+		if !remoteUnlocked() {
+			return unknownClaudeCommandError(args[0])
+		}
+		if r.moveToServer == nil {
+			return fmt.Errorf("server move is not available")
+		}
+		var positional []string
+		for _, arg := range args[1:] {
+			switch {
+			case arg == "--copy":
+				return fmt.Errorf("sr claude move never keeps a local copy; 'sr claude push <name> --copy' " +
+					"copies a setup token, and a refresh-token profile cannot be copied")
+			case strings.HasPrefix(arg, "-"):
+				return fmt.Errorf("unknown option %q\nusage: sr claude move <name> [<server>]", arg)
+			default:
+				positional = append(positional, arg)
+			}
+		}
+		if len(positional) < 1 || len(positional) > 2 {
+			return fmt.Errorf("usage: sr claude move <name> [<server>]")
+		}
+		server := ""
+		if len(positional) == 2 {
+			server = positional[1]
+		}
+		return r.moveToServer(ctx, positional[0], server)
 	case "env":
-		return r.env()
+		if len(args) > 2 {
+			return errors.New(claudeEnvUsage)
+		}
+		selector := ""
+		if len(args) == 2 {
+			if strings.HasPrefix(args[1], "-") {
+				return fmt.Errorf("unknown option %q\n%s", args[1], claudeEnvUsage)
+			}
+			// An empty name is an unset shell variable, not "the active
+			// profile": `sr claude env "$acct"` must not export the account
+			// serving you when $acct is empty.
+			if strings.TrimSpace(args[1]) == "" {
+				return fmt.Errorf("profile name is empty\n%s", claudeEnvUsage)
+			}
+			selector = args[1]
+		}
+		return r.env(selector)
 	case "pick":
 		if r.pick == nil {
 			return fmt.Errorf("pick is not available")
 		}
 		return r.pick(ctx)
+	case "reset":
+		if r.reset == nil {
+			return fmt.Errorf("reset is not available")
+		}
+		return r.reset(ctx, args[1:])
 	case "push", "upload":
+		// Push only ever reaches a server, so a keyless machine refuses it as an
+		// unknown subcommand and names nothing remote (PATCHES 17). It answered
+		// "no default Subrouter server is configured".
+		if !remoteUnlocked() {
+			return unknownClaudeCommandError(args[0])
+		}
 		if r.pushToServer == nil {
 			return fmt.Errorf("server push is not available")
 		}
 		name := ""
-		if len(args) > 1 {
-			name = args[1]
+		copyOnly := false
+		for _, arg := range args[1:] {
+			switch {
+			case arg == "--copy":
+				copyOnly = true
+			case strings.HasPrefix(arg, "-"):
+				return fmt.Errorf("unknown option %q\nusage: sr claude push [name] [--copy]", arg)
+			case name != "":
+				return fmt.Errorf("usage: sr claude push [name] [--copy]")
+			default:
+				name = arg
+			}
 		}
 		if name == "" {
 			name = r.store.ActiveProfile()
@@ -1114,7 +1685,7 @@ func (r claudeRunner) run(ctx context.Context, args []string) error {
 		if name == "" {
 			return fmt.Errorf("usage: sr claude push <name>")
 		}
-		return r.pushToServer(ctx, name)
+		return r.pushToServer(ctx, name, copyOnly)
 	case "run":
 		name := ""
 		extra := []string{}
@@ -1128,7 +1699,7 @@ func (r claudeRunner) run(ctx context.Context, args []string) error {
 		}
 		return r.runClaude(ctx, name, extra)
 	case "help", "-h", "--help":
-		fmt.Fprint(r.out, srClaudeHelp)
+		fmt.Fprint(r.out, claudeHelpText())
 		return nil
 	default:
 		if strings.HasPrefix(args[0], "-") {
@@ -1137,20 +1708,111 @@ func (r claudeRunner) run(ctx context.Context, args []string) error {
 		if _, ok := r.store.FindProfile(args[0]); ok {
 			return r.runClaude(ctx, args[0], args[1:])
 		}
-		return fmt.Errorf("unknown command: sr claude %s\n%s", args[0], srClaudeHelp)
+		return unknownClaudeCommandError(args[0])
 	}
+}
+
+// claudeRemoveUsage names --server only where the flag exists: on a keyless
+// machine the remote does not exist, and a usage line that names it would teach
+// that it does (PATCHES 17).
+func claudeRemoveUsage() string {
+	if remoteUnlocked() {
+		return "usage: sr claude remove <name> [--server <server>]"
+	}
+	return "usage: sr claude remove <name>"
+}
+
+// takeClaudeServerFlag reads `--server <server>` / `--server=<server>` out of a
+// `sr claude remove` tail. A bare `--server` is an error rather than a name.
+// Keyless, every spelling of the flag -- bare, empty or valued -- is the same
+// unknown flag, so no answer ever describes what it would have taken.
+func takeClaudeServerFlag(args []string) (rest []string, server string, hasServer bool, err error) {
+	for i := 0; i < len(args); i++ {
+		switch arg := args[i]; {
+		case (arg == "--server" || strings.HasPrefix(arg, "--server=")) && !remoteUnlocked():
+			return nil, "", false, errors.New("unknown flag: --server")
+		case arg == "--server":
+			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "-") {
+				return nil, "", false, fmt.Errorf("--server needs a server name")
+			}
+			server, hasServer = args[i+1], true
+			i++
+		case strings.HasPrefix(arg, "--server="):
+			server, hasServer = strings.TrimPrefix(arg, "--server="), true
+			if strings.TrimSpace(server) == "" {
+				return nil, "", false, fmt.Errorf("--server needs a server name")
+			}
+		case strings.HasPrefix(arg, "-"):
+			return nil, "", false, fmt.Errorf("unknown option %q\n%s", arg, claudeRemoveUsage())
+		default:
+			rest = append(rest, arg)
+		}
+	}
+	return rest, server, hasServer, nil
+}
+
+// existingClaudeProfile finds the profile an add or login re-authenticates:
+// the exact name, else the one profile whose name differs only in case. A
+// server matches Claude names case-insensitively (its own account-import does),
+// so `Main` re-auths `main` rather than minting a case twin that would share
+// its credential there.
+func existingClaudeProfile(store claude.Store, name string) (string, bool) {
+	if profile, ok := store.FindProfile(name); ok {
+		return profile.Name, true
+	}
+	for _, profile := range store.ListProfiles() {
+		if strings.EqualFold(profile.Name, name) {
+			return profile.Name, true
+		}
+	}
+	return "", false
+}
+
+// resolveAddTarget decides where `sr claude addr <name>` should sign in.
+//
+// `sr claude addr <existing>` is a RE-AUTH, not an error. A refresh token that
+// has expired or been revoked can only be repaired by signing in again, and
+// CreateProfile refusing outright left no first-party way to do it: the
+// documented workaround was to read an opaque _p<epoch> path out of the
+// daemon's usage-status API and hand it to `claude auth login` through
+// CLAUDE_CONFIG_DIR. That is not a workflow, and `sr claude env` could not even
+// produce the path -- it ignored the name it was given and returned the ACTIVE
+// profile's directory, so following it re-authed whichever account was serving
+// you (it honours the name since PATCHES §36).
+//
+// profileName is the existing profile's own spelling on a re-auth. The returned
+// reauth flag matters beyond bookkeeping: the caller must not delete a
+// pre-existing profile when a login fails.
+func resolveAddTarget(store claude.Store, name string) (profileName, instancePath string, reauth bool, err error) {
+	if existing, ok := existingClaudeProfile(store, name); ok {
+		// InstancePath resolves through the registry, so it is correct for
+		// profiles whose directory is the label AND for those with an opaque
+		// _p<epoch> dir.
+		return existing, store.InstancePath(existing), true, nil
+	}
+	instancePath, err = store.CreateProfile(name)
+	if err != nil {
+		return "", "", false, err
+	}
+	return name, instancePath, false, nil
 }
 
 type claudeAddOptions struct {
 	name           string
 	token          string
 	tokenFromStdin bool
-	oauth          bool
+	// oauth selects the browser OAuth login (`--oauth`/`--login`, or the
+	// `addr`/`login` verbs). Upstream #305 made the one-year setup token the
+	// default for `add` (owner decision, 2026-09 merge).
+	oauth bool
+	// setupToken records an explicit --setup-token, so `addr`/`login` can
+	// refuse it instead of silently running the OAuth login.
+	setupToken bool
 }
 
 // parseClaudeAddArgs accepts `[name] [--token TOKEN|-] [--oauth|--setup-token]`
-// in any order. A bare `-` after --token reads the token from stdin so scripts
-// never place it on a command line.
+// in any order (upstream). A bare `-` after --token reads the token from stdin
+// so scripts never place it on a command line.
 func parseClaudeAddArgs(args []string) (claudeAddOptions, error) {
 	var options claudeAddOptions
 	for i := 0; i < len(args); i++ {
@@ -1160,6 +1822,15 @@ func parseClaudeAddArgs(args []string) (claudeAddOptions, error) {
 			options.oauth = true
 		case arg == "--setup-token":
 			options.oauth = false
+			options.setupToken = true
+		case arg == "--push":
+			// Retired with the house grammar (2026-09). A keyless machine has no
+			// such option at all (PATCHES 17), so it is refused there as any
+			// unknown option is, naming nothing remote.
+			if !remoteUnlocked() {
+				return options, fmt.Errorf("unknown option %q\n%s", arg, claudeHelpText())
+			}
+			return options, errors.New(retiredClaudePushPointer)
 		case arg == "--token":
 			if i+1 >= len(args) {
 				return options, fmt.Errorf("usage: sr add claude <name> --token <token|->")
@@ -1173,7 +1844,7 @@ func parseClaudeAddArgs(args []string) (claudeAddOptions, error) {
 				return options, err
 			}
 		case strings.HasPrefix(arg, "-"):
-			return options, fmt.Errorf("unknown option %q\n%s", arg, srClaudeHelp)
+			return options, fmt.Errorf("unknown option %q\n%s", arg, claudeHelpText())
 		default:
 			if options.name != "" {
 				return options, fmt.Errorf("usage: sr add claude <name> [--token <token|->] [--oauth]")
@@ -1202,18 +1873,25 @@ func (o *claudeAddOptions) setToken(value string) error {
 	return nil
 }
 
-// addSetupToken is the default `sr add claude`: obtain a one-year Claude setup
-// token (by running `claude setup-token`, or from --token), prove it against
-// Anthropic, and store it as a refresh-less credential with its expiry
-// recorded. Nothing here depends on Claude Code writing a credential file, so
-// the profile directory is written by Subrouter alone.
+// addSetupToken is `sr add claude <name>` (upstream #305's default): obtain a
+// one-year Claude setup token (by running `claude setup-token`, or from
+// --token), prove it against Anthropic, and store it as a refresh-less
+// credential with its expiry recorded. Nothing here depends on Claude Code
+// writing a credential file, so the profile directory is written by Subrouter
+// alone.
 func (r claudeRunner) addSetupToken(ctx context.Context, options claudeAddOptions) error {
 	name := strings.TrimSpace(options.name)
 	if name == "" {
-		return fmt.Errorf("a profile name is required: use 'sr add claude <email-or-name>'")
+		return fmt.Errorf("a profile name is required: use 'sr add claude <email-or-name>' " +
+			"(or 'sr claude addr' for a browser login named after its email)")
 	}
 	if err := claude.ValidateProfileNameAllowEmail(name); err != nil {
 		return err
+	}
+	// An existing profile is re-keyed in place under the spelling it already
+	// has, rather than gaining a case twin (see existingClaudeProfile).
+	if existing, ok := existingClaudeProfile(r.store, name); ok {
+		name = existing
 	}
 	token := options.token
 	switch {
@@ -1237,13 +1915,15 @@ func (r claudeRunner) addSetupToken(ctx context.Context, options claudeAddOption
 	if r.now != nil {
 		issuedAt = r.now()
 	}
-	// One probe both proves the token and identifies the account it bills.
-	// A stubbed verifyToken keeps tests off the network, so identity is then
-	// probed only through an explicit tokenIdentity.
+	// One probe both proves the token and identifies the account it bills
+	// (upstream #574), through verifyClaudeSetupToken, the seam a test driving
+	// the whole CLI replaces. A stubbed verifyToken keeps tests off the
+	// network, so identity is then probed only through an explicit
+	// tokenIdentity.
 	identify := r.tokenIdentity
 	if identify == nil && r.verifyToken == nil {
 		identify = func(ctx context.Context, token string) (claude.TokenIdentity, error) {
-			return claude.VerifyAccessTokenIdentity(ctx, r.client, token)
+			return verifyClaudeSetupToken(ctx, r.client, token)
 		}
 	}
 	var identity claude.TokenIdentity
@@ -1302,6 +1982,9 @@ func (r claudeRunner) addSetupToken(ctx context.Context, options claudeAddOption
 
 	fmt.Fprintf(r.out, "\nAdded Claude profile %q from a setup token.\n", name)
 	fmt.Fprintf(r.out, "Expires %s. Re-run 'sr add claude %s' before then; setup tokens do not renew.\n", formatSetupTokenExpiry(expiresAt, issuedAt), name)
+	// Upstream's automatic copy to the selected server. A setup token has no
+	// refresh token, so the copies cannot race -- which is the whole reason
+	// this copy is kept while an OAuth add never uploads (addOAuth).
 	if r.pushAfterAdd != nil {
 		if err := r.pushAfterAdd(ctx, name); err != nil {
 			fmt.Fprintf(r.errOut, "warning: server upload failed (profile stays local-only): %v\n", err)
@@ -1441,8 +2124,16 @@ func formatSetupTokenExpiry(expiresAt, now time.Time) string {
 	}
 }
 
-// addOAuth is the classic browser OAuth login. Claude Code writes a refreshable
-// credential into the profile directory and Subrouter adopts it.
+// addOAuth is the browser OAuth login -- `sr claude addr`, `sr claude login`,
+// `sr add claude --oauth`. Claude Code writes a refreshable credential into the
+// profile directory and Subrouter adopts it.
+//
+// It NEVER uploads. Upstream copied the new profile to the default server
+// afterwards, which leaves one refresh-token chain in two places: Anthropic
+// rotates the refresh token on every refresh, the second refresher holds a
+// rotated-away token, and that copy is dead for good (seven-alpha and
+// ten-alpha were lost exactly this way). The credential reaches a server only
+// by `sr claude move`, which removes the local copy once the server can use it.
 func (r claudeRunner) addOAuth(ctx context.Context, name string) error {
 	claudePath, ok := claude.DetectCLI()
 	if !ok {
@@ -1457,33 +2148,28 @@ func (r claudeRunner) addOAuth(ctx context.Context, name string) error {
 		if err := claude.ValidateProfileNameAllowEmail(name); err != nil {
 			return err
 		}
+		// Creating the profile is published like every other inventory change
+		// (upstream 7dbc4b1), so a running worker never serves a registry it
+		// has not reloaded. A re-auth commits nothing here; its credential is
+		// published once the login lands (publishProfileCompletion below).
 		profileName := name
-		if _, ok := r.store.FindProfile(profileName); !ok {
-			for _, profile := range r.store.ListProfiles() {
-				if strings.EqualFold(profile.Name, name) {
-					profileName = profile.Name
-					break
-				}
+		reauth := false
+		created, createErr := r.mutateProfileInventory(ctx, func() (bool, error) {
+			var resolveErr error
+			profileName, instancePath, reauth, resolveErr = resolveAddTarget(r.store, name)
+			return resolveErr == nil && !reauth, resolveErr
+		})
+		if createErr != nil {
+			if created {
+				rollbackErr := r.rollbackProfileInventory(ctx, name)
+				return errors.Join(createErr, wrapClaudeReconcileError("remove Claude profile committed before publication teardown failed", rollbackErr))
 			}
+			return createErr
 		}
-		if _, ok := r.store.FindProfile(profileName); ok {
-			// Re-login into the existing profile in place: the OAuth flow
-			// overwrites its credential without churning the registry.
-			instancePath = r.store.InstancePath(profileName)
-		} else {
-			created, createErr := r.mutateProfileInventory(ctx, func() (bool, error) {
-				var createErr error
-				instancePath, createErr = r.store.CreateProfile(name)
-				return createErr == nil, createErr
-			})
-			if createErr != nil {
-				if created {
-					rollbackErr := r.rollbackProfileInventory(ctx, name)
-					return errors.Join(createErr, wrapClaudeReconcileError("remove Claude profile committed before publication teardown failed", rollbackErr))
-				}
-				return createErr
-			}
-			createdProfile = true
+		name = profileName
+		createdProfile = !reauth
+		if reauth {
+			fmt.Fprintf(r.out, "Profile %q already exists -- re-authenticating it in place.\n", name)
 		}
 	} else {
 		instancePath, tempDir, err = r.store.CreateTempInstance()
@@ -1496,40 +2182,56 @@ func (r claudeRunner) addOAuth(ctx context.Context, name string) error {
 		fmt.Fprintf(r.errOut, "Warning: could not pre-seed the login fast path: %s\n", err)
 	}
 
-	fmt.Fprintln(r.out, "Starting Claude Code...")
-	fmt.Fprintln(r.out, "Complete the OAuth login in your browser; Claude closes automatically once the login lands.")
-	fmt.Fprintln(r.out)
-
-	// Passing "/login" as the initial prompt triggers the login flow; with
-	// forceLoginMethod seeded, Claude opens the browser directly.
-	cmd := exec.CommandContext(ctx, claudePath, "/login")
-	cmd.Dir = claudeConfigDir
-	cmd.Stdin = r.in
-	cmd.Stdout = r.out
-	cmd.Stderr = r.errOut
-	cmd.Env = claude.EnvForConfigDir(claudeConfigDir)
-	exitErr, autoClosed := r.runClaudeUntilCredential(ctx, cmd, claudeConfigDir)
-	if exitErr != nil && !autoClosed {
+	// discard undoes a failed login and returns loginErr (joined with any
+	// rollback failure). A failed browser login must NEVER delete a profile
+	// that already existed. The credential lives in the OS keychain rather than
+	// this directory, so the account is very often still recoverable -- and
+	// removing it here would turn a mistyped login into data loss. Only a
+	// profile this command created is rolled back, and that rollback is
+	// published so no worker keeps a credential-less profile.
+	discard := func(loginErr error) error {
 		if createdProfile {
 			if rollbackErr := r.rollbackProfileInventory(ctx, name); rollbackErr != nil {
-				return errors.Join(fmt.Errorf("Claude login did not complete: %w", exitErr), fmt.Errorf("remove incomplete Claude profile: %w", rollbackErr))
+				return errors.Join(loginErr, fmt.Errorf("remove incomplete Claude profile: %w", rollbackErr))
 			}
 		} else if name == "" {
 			_ = r.store.CleanupInstance(tempDir)
 		}
-		return fmt.Errorf("Claude login did not complete: %w", exitErr)
+		return loginErr
+	}
+
+	// The bare `claude` TUI needs a controlling terminal. Without one it
+	// silently degrades into `--print` mode and dies on the empty prompt, so
+	// `sr add claude` only ever worked when a human typed it into a terminal.
+	// `claude auth login` is the same OAuth flow without the TUI, which makes
+	// the command usable from a script, an agent, or a non-interactive SSH
+	// session. Older Claude builds lack the subcommand and keep the TUI path.
+	if claudeSupportsAuthLogin(ctx, claudePath) {
+		if err := r.runClaudeAuthLogin(ctx, claudePath, claudeConfigDir); err != nil {
+			return discard(fmt.Errorf("Claude login did not complete: %w", err))
+		}
+	} else {
+		fmt.Fprintln(r.out, "Starting Claude Code...")
+		fmt.Fprintln(r.out, "Complete the OAuth login in your browser; Claude closes automatically once the login lands.")
+		fmt.Fprintln(r.out)
+
+		// Passing "/login" as the initial prompt triggers the login flow; with
+		// forceLoginMethod seeded, Claude opens the browser directly.
+		cmd := exec.CommandContext(ctx, claudePath, "/login")
+		cmd.Dir = claudeConfigDir
+		cmd.Stdin = r.in
+		cmd.Stdout = r.out
+		cmd.Stderr = r.errOut
+		cmd.Env = claude.EnvForConfigDir(claudeConfigDir)
+		exitErr, autoClosed := r.runClaudeUntilCredential(ctx, cmd, claudeConfigDir)
+		if exitErr != nil && !autoClosed {
+			return discard(fmt.Errorf("Claude login did not complete: %w", exitErr))
+		}
 	}
 
 	status, err := claude.AuthStatusForPath(ctx, claudePath, claudeConfigDir)
 	if err != nil || status == nil || !status.LoggedIn {
-		if createdProfile {
-			if rollbackErr := r.rollbackProfileInventory(ctx, name); rollbackErr != nil {
-				return errors.Join(errors.New("login was not completed"), fmt.Errorf("remove incomplete Claude profile: %w", rollbackErr))
-			}
-		} else if name == "" {
-			_ = r.store.CleanupInstance(tempDir)
-		}
-		return fmt.Errorf("login was not completed")
+		return discard(errors.New("login was not completed"))
 	}
 	if r.afterAuthVerified != nil {
 		r.afterAuthVerified()
@@ -1632,11 +2334,10 @@ func (r claudeRunner) addOAuth(ctx context.Context, name string) error {
 	}
 
 	fmt.Fprintf(r.out, "\nAdded Claude profile %q.%s%s\n", profileName, email, plan)
-	if r.pushAfterAdd != nil {
-		if err := r.pushAfterAdd(ctx, profileName); err != nil {
-			fmt.Fprintf(r.errOut, "warning: server upload failed (profile stays local-only): %v\n", err)
-			fmt.Fprintf(r.errOut, "Retry with: sr claude push %s\n", profileName)
-		}
+	// The hint names the server, so a keyless machine does not print it
+	// (PATCHES 17).
+	if r.moveToServer != nil && remoteUnlocked() {
+		fmt.Fprintf(r.out, "Kept on this machine only (it holds a refresh token). To move it to a server: sr claude move %s\n", profileName)
 	}
 	fmt.Fprintf(r.out, "\n  sr claude switch %s\n", profileName)
 	fmt.Fprintf(r.out, "  sr claude run %s\n", profileName)
@@ -1653,41 +2354,25 @@ func prepareClaudeLoginFastPath(configDir string) error {
 	if err := os.MkdirAll(configDir, 0o700); err != nil {
 		return err
 	}
-	statePath := filepath.Join(configDir, ".claude.json")
-	state := map[string]any{}
-	if body, err := os.ReadFile(statePath); err == nil {
-		if err := json.Unmarshal(body, &state); err != nil {
-			return fmt.Errorf("parse %s: %w", statePath, err)
-		}
-	}
-	if onboarded, _ := state["hasCompletedOnboarding"].(bool); !onboarded {
-		state["hasCompletedOnboarding"] = true
-		out, err := json.MarshalIndent(state, "", "  ")
-		if err != nil {
-			return err
-		}
-		out = append(out, '\n')
-		if err := os.WriteFile(statePath, out, 0o600); err != nil {
-			return err
-		}
-	}
-	settingsPath := filepath.Join(configDir, "settings.json")
-	settings := map[string]any{}
-	if body, err := os.ReadFile(settingsPath); err == nil {
-		if err := json.Unmarshal(body, &settings); err != nil {
-			return fmt.Errorf("parse %s: %w", settingsPath, err)
-		}
-	}
-	if _, ok := settings["forceLoginMethod"]; ok {
-		return nil
-	}
-	settings["forceLoginMethod"] = "claudeai"
-	out, err := json.MarshalIndent(settings, "", "  ")
+	state, err := readClaudeConfigFile(filepath.Join(configDir, ".claude.json"))
 	if err != nil {
 		return err
 	}
-	out = append(out, '\n')
-	return os.WriteFile(settingsPath, out, 0o600)
+	if onboarded, _ := state.value["hasCompletedOnboarding"].(bool); !onboarded {
+		state.value["hasCompletedOnboarding"] = true
+		if err := state.write(); err != nil {
+			return err
+		}
+	}
+	settings, err := readClaudeConfigFile(filepath.Join(configDir, "settings.json"))
+	if err != nil {
+		return err
+	}
+	if _, ok := settings.value["forceLoginMethod"]; ok {
+		return nil
+	}
+	settings.value["forceLoginMethod"] = "claudeai"
+	return settings.write()
 }
 
 func (r claudeRunner) list(ctx context.Context, numbered bool) error {
@@ -1898,21 +2583,48 @@ func (r claudeRunner) profileInventoryReferencesDir(dir string) bool {
 	return false
 }
 
-func (r claudeRunner) env() error {
-	active := r.store.ActiveProfile()
-	if active == "" {
+const claudeEnvUsage = "usage: sr claude env [name]"
+
+// env prints the CLAUDE_CONFIG_DIR export for the named profile, or for the
+// active profile when no name is given. It used to take no argument and ignore
+// any it was handed, so `sr claude env seven-alpha` printed the ACTIVE
+// profile's directory (main's, on 2026-08-28, for seven-alpha and ten-alpha
+// alike), and a re-auth pointed there overwrote the account serving you
+// (PATCHES §36).
+//
+// The name resolves as `sr claude addr <name>` resolves it (existingClaudeProfile:
+// the exact name, else the one that differs only in case), not by the fragment
+// matching of `run` and `switch`. The output decides where a sign-in writes, so
+// a name that is not a profile must not land on one that merely contains it:
+// `sr claude env seven` for a new account "seven" would export seven-alpha's
+// directory and the login would overwrite it. Anything else is an error that
+// prints nothing, so `eval "$(sr claude env typo)"` exports nothing. Naming a
+// profile does not make it the active one.
+func (r claudeRunner) env(selector string) error {
+	name := r.store.ActiveProfile()
+	if selector != "" {
+		found, ok := existingClaudeProfile(r.store, strings.TrimSpace(selector))
+		if !ok {
+			if profile, fragment, _ := r.store.MatchProfile(selector); fragment {
+				return fmt.Errorf("profile %q not found (did you mean %q? env takes a profile's full name)", selector, profile.Name)
+			}
+			return fmt.Errorf("profile %q not found", selector)
+		}
+		name = found
+	}
+	if name == "" {
 		return nil
 	}
-	configDir := r.store.ClaudeConfigDir(active)
+	configDir := r.store.ClaudeConfigDir(name)
 	launchMode, err := managedClaudeProfileLaunchMode(configDir)
 	if err != nil {
 		return err
 	}
 	if launchMode == managedClaudeLaunchNeedsMigration {
-		return fmt.Errorf("profile %q is a legacy plaintext remote profile; repair it with 'sr claude push %s', then launch it with 'sr claude run %s [claude args...]'", active, active, active)
+		return fmt.Errorf("profile %q is a legacy plaintext remote profile; repair it with 'sr claude push %s', then launch it with 'sr claude run %s [claude args...]'", name, name, name)
 	}
 	if launchMode == managedClaudeLaunchWrapped {
-		return fmt.Errorf("profile %q uses a protected plaintext server; launch it with 'sr claude run %s [claude args...]' so Subrouter can verify the server for each run", active, active)
+		return fmt.Errorf("profile %q uses a protected plaintext server; launch it with 'sr claude run %s [claude args...]' so Subrouter can verify the server for each run", name, name)
 	}
 	fmt.Fprintf(r.out, "export CLAUDE_CONFIG_DIR=%s\n", configDir)
 	return nil
@@ -1923,6 +2635,80 @@ func (r claudeRunner) env() error {
 // the Claude process is closed automatically so the user does not have to exit
 // by hand. Returns the process exit error and whether we initiated the close
 // (in which case a non-nil exit error is expected and not a failure).
+// claudeSupportsAuthLogin reports whether the installed Claude CLI exposes the
+// non-TUI `claude auth login` command. The probe is a --help run, so it needs
+// no terminal of its own and cannot start a login.
+func claudeSupportsAuthLogin(ctx context.Context, claudePath string) bool {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	return exec.CommandContext(ctx, claudePath, "auth", "login", "--help").Run() == nil
+}
+
+// runClaudeAuthLogin drives the OAuth login for one profile's config directory.
+// Claude prints an authorization URL and opens a browser, then waits on stdin
+// for the code the callback page hands back; it binds no local listener, so
+// unlike `codex login` the flow cannot self-complete and stdin has to stay
+// connected to whoever is driving the login.
+func (r claudeRunner) runClaudeAuthLogin(ctx context.Context, claudePath, claudeConfigDir string) error {
+	fmt.Fprintln(r.out, "Opening Claude OAuth login...")
+	fmt.Fprintln(r.out, "Authorize in the browser, then paste the code back here.")
+	fmt.Fprintln(r.out)
+
+	echo := &claudeLoginURLEcho{out: r.out}
+	cmd := exec.CommandContext(ctx, claudePath, "auth", "login", "--claudeai")
+	cmd.Stdin = r.in
+	cmd.Stdout = echo
+	cmd.Stderr = r.errOut
+	// EnvForConfigDir (upstream) also strips inherited Claude routing selectors
+	// and SUBROUTER_* variables, so an exported ANTHROPIC_BASE_URL or a stale
+	// CLAUDE_CODE_OAUTH_TOKEN cannot redirect or shadow the login.
+	cmd.Dir = claudeConfigDir
+	cmd.Env = claude.EnvForConfigDir(claudeConfigDir)
+	return cmd.Run()
+}
+
+// claudeLoginURLPattern matches the authorization URL Claude prints. The URL is
+// terminated by the OSC-8 hyperlink escape around it (ESC or BEL), and both
+// bytes are excluded so the match stops at the end of the first URL rather than
+// running into the copy Claude emits as the link text.
+var claudeLoginURLPattern = regexp.MustCompile(`https://[^\s\x1b\x07\\]*oauth/authorize\?[^\s\x1b\x07\\]+`)
+
+// claudeLoginURLEcho forwards Claude's login output untouched and, the first
+// time an authorization URL goes by, repeats it on a clean line of its own.
+// Claude wraps that URL in OSC-8 hyperlink escapes and emits it twice, back to
+// back, which a terminal renders as one link but which is unreadable once the
+// output is captured to a file — which is exactly what a script or an agent
+// driving this command does.
+type claudeLoginURLEcho struct {
+	out     io.Writer
+	buf     []byte
+	printed bool
+}
+
+func (w *claudeLoginURLEcho) Write(p []byte) (int, error) {
+	n, err := w.out.Write(p)
+	if w.printed {
+		return n, err
+	}
+	// A single write can split the URL, so match against the accumulated
+	// stream rather than this chunk alone.
+	w.buf = append(w.buf, p...)
+	if match := claudeLoginURLPattern.Find(w.buf); match != nil {
+		url := string(match)
+		if i := strings.Index(url[len("https://"):], "https://"); i >= 0 {
+			url = url[:len("https://")+i]
+		}
+		w.printed = true
+		w.buf = nil
+		fmt.Fprintf(w.out, "\nLogin URL: %s\n\n", url)
+		return n, err
+	}
+	if len(w.buf) > 1<<15 {
+		w.buf = w.buf[len(w.buf)-(1<<14):]
+	}
+	return n, err
+}
+
 func (r claudeRunner) runClaudeUntilCredential(ctx context.Context, cmd *exec.Cmd, claudeConfigDir string) (error, bool) {
 	if err := cmd.Start(); err != nil {
 		return err, false
@@ -2041,16 +2827,47 @@ func (r claudeRunner) runClaude(ctx context.Context, name string, extra []string
 	}
 	launchArgs := extra
 	var launchSettingsBody []byte
+	// The profile directory hides ~/.claude/settings.json from this child as it
+	// does from a proxied one (withClaudeUserSettings, upstream #435). r.store
+	// is the real default store only in production; test stores carry no
+	// shared Claude home, or a temporary one.
+	userSettings := ""
+	if !claudeArgsChooseSettingSources(extra) {
+		userSettings = claudeUserSettingsPathFor(r.store.SharedStateDir, configDir)
+	}
+	directSettings := false
 	if secureBaseURL != "" {
 		settingsOverride, settingsErr := managedClaudeLaunchSettings(secureBaseURL, configDir)
 		if settingsErr != nil {
 			return settingsErr
 		}
+		// managedClaudeLaunchArgs drops the caller's --settings below; their
+		// content rides in the override instead, under its routing values
+		// (upstream #502).
+		settingsOverride, settingsErr = withClaudeCLISettings(settingsOverride, extra)
+		if settingsErr != nil {
+			return settingsErr
+		}
+		settingsOverride, settingsErr = withClaudeUserSettings(settingsOverride, userSettings, claudeOwnSettingsPath(configDir))
+		if settingsErr != nil {
+			return settingsErr
+		}
 		launchSettingsBody = settingsOverride
-	}
-	launchSettingsBody, err = withManagedClaudeUserSettings(launchSettingsBody, claudeProxyUserSettingsPath(r.store.Dir), extra)
-	if err != nil {
-		return err
+	} else if userSettings != "" && !claudeArgsCarrySettings(extra) {
+		// A direct profile has no transport overlay to protect, so the caller's
+		// own --settings or --managed-settings passes through untouched and a
+		// caller who passed one gets no second file from sr. Otherwise the user's
+		// settings ride in a file of their own, with every routing key and
+		// credential source already removed, so the profile's own settings.json
+		// still decides where this launch goes.
+		settingsOverride, settingsErr := withClaudeUserSettings([]byte(`{}`), userSettings, claudeOwnSettingsPath(configDir))
+		if settingsErr != nil {
+			return settingsErr
+		}
+		if string(settingsOverride) != "{}" {
+			launchSettingsBody = settingsOverride
+			directSettings = true
+		}
 	}
 	cmd := exec.CommandContext(ctx, claudePath)
 	if len(launchSettingsBody) > 0 {
@@ -2059,9 +2876,13 @@ func (r claudeRunner) runClaude(ctx context.Context, name string, extra []string
 			return settingsErr
 		}
 		defer cleanupSettings()
-		launchArgs, err = managedClaudeLaunchArgs(extra, settingsArg)
-		if err != nil {
-			return err
+		if directSettings {
+			launchArgs = append([]string{"--settings", settingsArg}, extra...)
+		} else {
+			launchArgs, err = managedClaudeLaunchArgs(extra, settingsArg)
+			if err != nil {
+				return err
+			}
 		}
 	}
 	cmd.Args = append([]string{claudePath}, launchArgs...)
@@ -2070,35 +2891,6 @@ func (r claudeRunner) runClaude(ctx context.Context, name string, extra []string
 	cmd.Stderr = r.errOut
 	cmd.Env = claudeSettingsChildEnvironment(claude.EnvForConfigDir(configDir), secureBaseURL, configDir)
 	return cmd.Run()
-}
-
-// withManagedClaudeUserSettings gives a managed profile launch the same user
-// settings overlay as a pooled launch. CLAUDE_CONFIG_DIR points at the profile,
-// which hides ~/.claude/settings.json (env such as subagent limits, hooks,
-// permissions). Claude already reads the profile's own settings.json, so only
-// the user's file is merged; routing values in the launch body still win. A
-// profile without routing gets an overlay only when user settings exist;
-// without an overlay the caller's --settings reach Claude unchanged. With
-// one, the caller's --settings ride inside it, above the user's file.
-func withManagedClaudeUserSettings(launchSettingsBody []byte, userSettingsPath string, args []string) ([]byte, error) {
-	hasUserSettings := false
-	if strings.TrimSpace(userSettingsPath) != "" {
-		_, hasUserSettings = readClaudeSettingsObject(userSettingsPath)
-	}
-	if len(launchSettingsBody) == 0 {
-		if !hasUserSettings {
-			return launchSettingsBody, nil
-		}
-		launchSettingsBody = []byte("{}")
-	}
-	launchSettingsBody, err := withClaudeCLISettings(launchSettingsBody, args)
-	if err != nil {
-		return nil, err
-	}
-	if !hasUserSettings {
-		return launchSettingsBody, nil
-	}
-	return withClaudeUserSettings(launchSettingsBody, userSettingsPath, "")
 }
 
 func managedClaudeLaunchArgs(args []string, settingsPath string) ([]string, error) {
@@ -2129,6 +2921,21 @@ func managedClaudeLaunchArgs(args []string, settingsPath string) ([]string, erro
 		}
 	}
 	return append([]string{"--settings", settingsPath}, clean...), nil
+}
+
+// claudeArgsCarrySettings reports whether the caller passed its own
+// --settings or --managed-settings before the option terminator.
+func claudeArgsCarrySettings(args []string) bool {
+	for _, arg := range args {
+		if arg == "--" {
+			return false
+		}
+		if arg == "--settings" || arg == "--managed-settings" ||
+			strings.HasPrefix(arg, "--settings=") || strings.HasPrefix(arg, "--managed-settings=") {
+			return true
+		}
+	}
+	return false
 }
 
 func isolatedClaudeSettingSourcesArgs(args []string) ([]string, error) {
@@ -2331,15 +3138,6 @@ func claudeProxySessionKey() string {
 }
 
 func proxyClaudeLaunchSettings(baseURL, proxyToken, configDir string, accountIDs ...string) ([]byte, error) {
-	return proxyClaudeLaunchSettingsWithRetry(baseURL, proxyToken, configDir, "", accountIDs...)
-}
-
-// proxyClaudeLaunchSettingsWithRetry is proxyClaudeLaunchSettings that also
-// sends an X-Subrouter-Retry header when retryHeader is set.
-func proxyClaudeLaunchSettingsWithRetry(baseURL, proxyToken, configDir, retryHeader string, accountIDs ...string) ([]byte, error) {
-	if strings.ContainsAny(retryHeader, "\r\n") {
-		return nil, fmt.Errorf("encode Claude proxy launch settings: invalid retry header")
-	}
 	accountID := ""
 	preferredAccountID := ""
 	if len(accountIDs) > 2 {
@@ -2372,9 +3170,6 @@ func proxyClaudeLaunchSettingsWithRetry(baseURL, proxyToken, configDir, retryHea
 		customHeaders += "\nX-Subrouter-Account-ID: " + accountID
 	} else if preferredAccountID != "" {
 		customHeaders += "\nX-Subrouter-Preferred-Account-ID: " + preferredAccountID
-	}
-	if retryHeader != "" {
-		customHeaders += "\n" + proxy.OverloadRetryHeader + ": " + retryHeader
 	}
 	if key := claudeProxySessionKey(); key != "" {
 		customHeaders += "\nX-Subrouter-Session: " + key
@@ -2621,7 +3416,9 @@ func bedrockModelID(name string) string {
 	switch lower {
 	case "", "fable", "fable-5", "fable5", "claude-fable-5":
 		return "us.anthropic.claude-fable-5"
-	case "opus", "claude-opus-4-8", "opus-4-8":
+	case "opus", "claude-opus-5-5", "opus-5-5":
+		return "us.anthropic.claude-opus-5-5"
+	case "claude-opus-4-8", "opus-4-8":
 		return "us.anthropic.claude-opus-4-8"
 	case "sonnet", "claude-sonnet-5", "sonnet-5":
 		return "us.anthropic.claude-sonnet-5"

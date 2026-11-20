@@ -212,7 +212,8 @@ var jsonServiceTierFieldPattern = regexp.MustCompile(`"service_tier"\s*:\s*"([A-
 // ExtractServiceTier returns the request body's top-level service_tier
 // ("priority", "flex", ...) or "" when absent. It scans the decoded body
 // rather than parsing it: the field is a short bare token, and requests can
-// be megabytes of conversation.
+// be megabytes of conversation. The tier names the Codex capacity pool a
+// "model at capacity" failure is marked in (selectacct/capacity.go; fork §27).
 func ExtractServiceTier(r *http.Request, maxBodyBytes int64) string {
 	return inspectRequestBody(r, maxBodyBytes).serviceTier
 }
@@ -284,6 +285,7 @@ func StripSubrouterHeaders(headers http.Header) {
 	headers.Del("X-Subrouter-Account-ID")
 	headers.Del("X-Subrouter-Account")
 	headers.Del("X-Subrouter-Preferred-Account-ID")
+	headers.Del("X-Subrouter-Target-Account")
 	headers.Del("X-Subrouter-Model")
 	headers.Del("X-Model")
 	headers.Del("X-Subrouter-Azure")

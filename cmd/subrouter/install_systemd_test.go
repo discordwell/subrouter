@@ -87,6 +87,27 @@ func TestSystemdSocketUsesConfiguredAddress(t *testing.T) {
 	}
 }
 
+// The box binds its tailnet address, which does not exist when sockets.target
+// starts at boot. Without FreeBind the bind fails with EADDRNOTAVAIL, the
+// socket and the service that Requires= it both fail, and systemd never
+// retries: a rebooted box stays down. Ordering the socket After=tailscaled is
+// an ordering cycle with the socket's default dependencies, so it must not be
+// the fix. PATCHES section 37.
+func TestSystemdSocketBindsTheTailnetAddressBeforeItExists(t *testing.T) {
+	socketUnit, err := systemdSocket(systemdConfig{ServiceName: defaultSystemdServiceName, Addr: "100.64.0.1:31415"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	section := socketUnit[strings.Index(socketUnit, "[Socket]"):]
+	section = section[:strings.Index(section, "[Install]")]
+	if !strings.Contains(section, "\nFreeBind=true\n") {
+		t.Fatalf("socket unit binds without FreeBind, so it fails at boot before tailscale0 has its address:\n%s", socketUnit)
+	}
+	if strings.Contains(socketUnit, "tailscaled") {
+		t.Fatalf("socket unit orders itself on tailscaled, a cycle with sockets.target:\n%s", socketUnit)
+	}
+}
+
 func TestSystemdDefaultsEscapesExtraArgs(t *testing.T) {
 	config := systemdConfig{
 		Addr:               "0.0.0.0:31415",

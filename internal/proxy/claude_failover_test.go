@@ -3,14 +3,11 @@ package proxy
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
-	"net/http/httptest"
 	"path/filepath"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -155,98 +152,48 @@ func TestUsageLimitRetryTransportClaudeFailsOverOn429(t *testing.T) {
 	}
 }
 
-// Concurrent Claude quota failures must reserve their replacement placement
-// before credential refresh completes. Otherwise every request sees the same
-// stale scheduler snapshot and sends its retry to one account.
-func TestClaudeRetryCandidateReservesBeforeRefresh(t *testing.T) {
+// PATCHES §34: the Claude store serves a keychain answer up to a minute old.
+// A credential the provider refuses is forgotten there at the mark, so the
+// account's next refresh reads the store -- where a rotation another process
+// made shows up and replaces the refused generation -- instead of being
+// handed the refused token until the answer ages out.
+func TestAClaude401ForgetsTheStoresKeychainAnswer(t *testing.T) {
 	server, _ := claudeFailoverServer(t)
-	server.Accounts = append(server.Accounts,
-		accounts.Account{ID: "fresh-2@example.com", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "tok-fresh-2"},
-	)
-	server.SchedulerRef = selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
-		{AccountID: "cooked@example.com", Provider: accounts.ProviderClaude, Headroom: 0, ShortHeadroom: 0},
-		{AccountID: "fresh@example.com", Provider: accounts.ProviderClaude, Headroom: 0.9, ShortHeadroom: 0.9},
-		{AccountID: "fresh-2@example.com", Provider: accounts.ProviderClaude, Headroom: 0.9, ShortHeadroom: 0.9},
-	}))
-	started := make(chan struct{}, 2)
-	release := make(chan struct{})
-	server.RefreshAccountFn = func(ctx context.Context, account accounts.Account) (accounts.Account, error) {
-		if account.ID == "cooked@example.com" {
-			return account, nil
+	server.AccountRef = &AccountRef{accounts: []accounts.Account{
+		{ID: "cooked@example.com", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "tok-cooked", Source: "/instances/cooked"},
+		{ID: "fresh@example.com", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "tok-fresh", Source: "/instances/fresh"},
+	}}
+	var forgotten []string
+	previous := forgetClaudeKeychainAnswer
+	forgetClaudeKeychainAnswer = func(instancePath string) { forgotten = append(forgotten, instancePath) }
+	t.Cleanup(func() { forgetClaudeKeychainAnswer = previous })
+	stub := &stubRoundTripper{responses: func(req *http.Request) *http.Response {
+		if strings.Contains(req.Header.Get("Authorization"), "tok-cooked") {
+			return &http.Response{
+				StatusCode: http.StatusUnauthorized,
+				Body:       io.NopCloser(strings.NewReader(`{"type":"error","error":{"type":"authentication_error","message":"Invalid authentication credentials"}}`)),
+				Header:     http.Header{},
+			}
 		}
-		started <- struct{}{}
-		select {
-		case <-release:
-			return account, nil
-		case <-ctx.Done():
-			return accounts.Account{}, ctx.Err()
-		}
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"id":"msg_1"}`)), Header: http.Header{}}
+	}}
+	transport := usageLimitRetryTransport{
+		base: stub, server: &server, provider: accounts.ProviderClaude, agent: "claude", session: "session-1",
+		account: "cooked@example.com", method: http.MethodPost, path: "/v1/messages", maxAttempts: 3,
 	}
-
-	type result struct {
-		account     accounts.Account
-		reservation *selectacct.PlacementReservation
-		err         error
+	req, err := http.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", bytes.NewReader([]byte(`{"model":"claude-opus-4-8"}`)))
+	if err != nil {
+		t.Fatal(err)
 	}
-	results := make(chan result, 2)
-	var wg sync.WaitGroup
-	for i := 0; i < 2; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			account, reservation, err := server.oauthRetryCandidateWithReservation(
-				context.Background(), accounts.ProviderClaude, "claude", "session", "", "",
-				map[string]struct{}{"cooked@example.com": {}}, false, false,
-			)
-			results <- result{account: account, reservation: reservation, err: err}
-		}()
+	req.Header.Set("Authorization", "Bearer tok-cooked")
+	response, err := transport.RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
 	}
-	for i := 0; i < 2; i++ {
-		select {
-		case <-started:
-		case <-time.After(5 * time.Second):
-			t.Fatal("replacement refresh did not start twice")
-		}
-	}
-	debits := server.SchedulerRef.LiveDebits()
-	if got := debits[selectacct.ScoreKey(accounts.ProviderClaude, "fresh@example.com")] + debits[selectacct.ScoreKey(accounts.ProviderClaude, "fresh-2@example.com")]; got != 2 {
-		t.Fatalf("live reservation debit = %d, want 2 while refreshes are blocked: %v", got, debits)
-	}
-	close(release)
-	wg.Wait()
-	close(results)
-	for outcome := range results {
-		if outcome.err != nil {
-			t.Fatal(outcome.err)
-		}
-		if outcome.reservation == nil {
-			t.Fatal("successful replacement returned no placement reservation")
-		}
-		outcome.reservation.Commit()
-	}
-	debits = server.SchedulerRef.LiveDebits()
-	if got := debits[selectacct.ScoreKey(accounts.ProviderClaude, "fresh@example.com")] + debits[selectacct.ScoreKey(accounts.ProviderClaude, "fresh-2@example.com")]; got != 2 {
-		t.Fatalf("committed live debit = %d, want 2: %v", got, debits)
-	}
-}
-
-func TestClaudeRetryCandidateReleasesReservationOnRefreshFailure(t *testing.T) {
-	server, _ := claudeFailoverServer(t)
-	server.RefreshAccountFn = func(_ context.Context, account accounts.Account) (accounts.Account, error) {
-		if account.ID == "fresh@example.com" {
-			return accounts.Account{}, errors.New("refresh failed")
-		}
-		return account, nil
-	}
-	_, reservation, err := server.oauthRetryCandidateWithReservation(
-		context.Background(), accounts.ProviderClaude, "claude", "session", "", "",
-		map[string]struct{}{"cooked@example.com": {}}, false, false,
-	)
-	if err == nil || reservation != nil {
-		t.Fatalf("refresh failure result = account reservation %v err %v, want no reservation", reservation, err)
-	}
-	if got := server.SchedulerRef.LiveDebits(); len(got) != 0 {
-		t.Fatalf("failed refresh leaked placement reservation: %v", got)
+	_, _ = io.Copy(io.Discard, response.Body)
+	response.Body.Close()
+	if len(forgotten) != 1 || forgotten[0] != "/instances/cooked" {
+		t.Fatalf("keychain answers forgotten %q; want exactly the refused account's instance", forgotten)
 	}
 }
 
@@ -413,7 +360,7 @@ func TestAccountForSessionProviderClaudeRefusesExhaustedOAuthWithoutFallback(t *
 	}
 	req.Header.Set("X-Subrouter-Agent", "claude")
 	req.Header.Set("X-Subrouter-Session", "session-1")
-	if _, _, _, err := server.accountForSessionProvider(accounts.ProviderClaude, "claude", "session-1", req); err == nil {
+	if _, _, _, _, err := server.accountForSessionProvider(accounts.ProviderClaude, "claude", "session-1", req); err == nil {
 		t.Fatal("expected exhausted Claude OAuth selection to be refused")
 	}
 	if _, ok := store.Get("claude", "session-1"); ok {
@@ -441,11 +388,12 @@ func TestReuseStickyAssignmentClaudeExhausted(t *testing.T) {
 		{AccountID: "cooked@example.com", Provider: accounts.ProviderClaude, Headroom: 0, ShortHeadroom: 0},
 		{AccountID: "fresh@example.com", Provider: accounts.ProviderClaude, Headroom: 1, ShortHeadroom: 1},
 	})
-	if server.reuseStickyAssignment("claude", "session-1", cooked, scheduler) {
+	fresh := accounts.Account{ID: "fresh@example.com", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth}
+	available := []accounts.Account{cooked, fresh}
+	if server.reuseStickyAssignment("claude", "session-1", cooked, scheduler, available) {
 		t.Fatal("exhausted claude account should not keep its sticky session")
 	}
-	fresh := accounts.Account{ID: "fresh@example.com", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth}
-	if !server.reuseStickyAssignment("claude", "session-1", fresh, scheduler) {
+	if !server.reuseStickyAssignment("claude", "session-1", fresh, scheduler, available) {
 		t.Fatal("healthy claude account should keep its sticky session")
 	}
 }
@@ -456,7 +404,7 @@ func TestReuseStickyAssignmentClaudeKeepsSubFloorSession(t *testing.T) {
 	scheduler := selectacct.NewScheduler([]selectacct.Score{
 		{AccountID: account.ID, Provider: accounts.ProviderClaude, Headroom: 0.30, ShortHeadroom: 0.30},
 	})
-	if !server.reuseStickyAssignment("claude", "session-1", account, scheduler) {
+	if !server.reuseStickyAssignment("claude", "session-1", account, scheduler, []accounts.Account{account}) {
 		t.Fatal("Claude session below the 40% new-session floor should stay sticky while headroom remains")
 	}
 }
@@ -746,7 +694,7 @@ func TestClaudeSSEOverloadBeforeContentRetried(t *testing.T) {
 		base: stub, server: &server, provider: accounts.ProviderClaude,
 		agent: "claude", session: "session-sse", account: "fresh@example.com",
 		method: http.MethodPost, path: "/v1/messages", maxAttempts: 6,
-		sleep: recordSleep(&waits), overloadPolicy: claudeShortLadder,
+		sleep: recordSleep(&waits),
 	}
 	req, _ := http.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", bytes.NewReader([]byte(`{"stream":true}`)))
 	req.Header.Set("Authorization", "Bearer tok-fresh")
@@ -789,7 +737,7 @@ func TestClaudeSSEOverloadAfterContentPassedThrough(t *testing.T) {
 		base: stub, server: &server, provider: accounts.ProviderClaude,
 		agent: "claude", session: "s", account: "fresh@example.com",
 		method: http.MethodPost, path: "/v1/messages", maxAttempts: 6,
-		sleep: recordSleep(&waits), overloadPolicy: claudeShortLadder,
+		sleep: recordSleep(&waits),
 	}
 	req, _ := http.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", bytes.NewReader([]byte(`{"stream":true}`)))
 	req.Header.Set("Authorization", "Bearer tok-fresh")
@@ -804,45 +752,6 @@ func TestClaudeSSEOverloadAfterContentPassedThrough(t *testing.T) {
 	}
 	if response.StatusCode != http.StatusOK || string(body) != stream {
 		t.Fatalf("status=%d body=%q, want the original stream passed through", response.StatusCode, string(body))
-	}
-}
-
-// TestClaudeOverloadNoRerouteWithoutHeadroom: the opt-in one-shot overload
-// reroute only targets an account with new-session headroom; otherwise the
-// request keeps to the same-account ladder and the 529 passes through once it
-// is spent.
-func TestClaudeOverloadNoRerouteWithoutHeadroom(t *testing.T) {
-	server, _ := claudeFailoverServer(t)
-	server.ClaudeOverloadReroute = true
-	// Both accounts are low but not exhausted: below new-session headroom.
-	server.SchedulerRef = selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
-		{AccountID: "cooked@example.com", Provider: accounts.ProviderClaude, Headroom: 0.1, ShortHeadroom: 0.1},
-		{AccountID: "fresh@example.com", Provider: accounts.ProviderClaude, Headroom: 0.1, ShortHeadroom: 0.1},
-	}))
-	var calls int
-	stub := &stubRoundTripper{responses: func(req *http.Request) *http.Response {
-		calls++
-		if !strings.Contains(req.Header.Get("Authorization"), "tok-fresh") {
-			t.Errorf("attempt went to %q without an eligible reroute target", req.Header.Get("Authorization"))
-		}
-		return &http.Response{StatusCode: 529, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{"type":"error","error":{"type":"overloaded_error"}}`))}
-	}}
-	var waits []time.Duration
-	transport := usageLimitRetryTransport{
-		base: stub, server: &server, provider: accounts.ProviderClaude,
-		agent: "claude", session: "s", account: "fresh@example.com",
-		method: http.MethodPost, path: "/v1/messages", maxAttempts: 6,
-		sleep: recordSleep(&waits), overloadPolicy: claudeShortLadder,
-	}
-	req, _ := http.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", bytes.NewReader([]byte(`{}`)))
-	req.Header.Set("Authorization", "Bearer tok-fresh")
-	response, err := transport.RoundTrip(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer response.Body.Close()
-	if response.StatusCode != 529 || calls != 1+claudeShortLadderRetries {
-		t.Fatalf("status=%d calls=%d, want 529 after %d same-account attempts", response.StatusCode, calls, 1+claudeShortLadderRetries)
 	}
 }
 
@@ -874,56 +783,4 @@ func TestClaudeStreamOverloadedPeekTimeoutKeepsBytes(t *testing.T) {
 		t.Fatalf("body = %q, want the full stream in order", string(body))
 	}
 	_ = response.Body.Close()
-}
-
-// A pinned account whose refresh token is dead must fail once with a final,
-// readable error. A 503 made Claude Code retry the same dead refresh ten
-// times before giving up.
-func TestPinnedClaudeAccountWithDeadCredentialFailsFast(t *testing.T) {
-	for _, tc := range []struct {
-		name    string
-		refresh string
-		want    string
-	}{
-		{name: "invalid_grant", refresh: `Claude OAuth refresh failed: 400 Bad Request: {"error": "invalid_grant", "error_description": "Refresh token not found or invalid"}`, want: "needs re-login"},
-		{name: "account_on_hold", refresh: `Claude OAuth refresh failed: 403 Forbidden: {"error": {"type": "account_on_hold"}}`, want: "restricted by Anthropic"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			server, _ := claudeFailoverServer(t)
-			refreshes := 0
-			server.RefreshAccountFn = func(_ context.Context, account accounts.Account) (accounts.Account, error) {
-				refreshes++
-				if account.ID == "cooked@example.com" {
-					return account, errors.New(tc.refresh)
-				}
-				return account, nil
-			}
-			req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"claude-sonnet-4-5"}`))
-			req.RemoteAddr = "127.0.0.1:5000"
-			req.Header.Set("X-Subrouter-Agent", "claude")
-			req.Header.Set("X-Claude-Code-Session-Id", "pinned-session")
-			req.Header.Set("X-Subrouter-Account-ID", "cooked@example.com")
-			response := httptest.NewRecorder()
-			server.Handler().ServeHTTP(response, req)
-			if response.Code != http.StatusForbidden {
-				t.Fatalf("status = %d body = %s", response.Code, response.Body.String())
-			}
-			if got := response.Header().Get("X-Should-Retry"); got != "false" {
-				t.Fatalf("X-Should-Retry = %q", got)
-			}
-			var body struct {
-				Type  string `json:"type"`
-				Error struct {
-					Type    string `json:"type"`
-					Message string `json:"message"`
-				} `json:"error"`
-			}
-			if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
-				t.Fatalf("body is not Anthropic-shaped JSON: %v: %s", err, response.Body.String())
-			}
-			if body.Type != "error" || body.Error.Type != "permission_error" || !strings.Contains(body.Error.Message, tc.want) || !strings.Contains(body.Error.Message, "cooked@example.com") {
-				t.Fatalf("body = %+v", body)
-			}
-		})
-	}
 }

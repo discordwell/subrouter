@@ -31,12 +31,28 @@ type systemdConfig struct {
 	SRSwitchInterval   string
 	AdminToken         string
 	AccountImportToken string
-	ExtraArgs          string
-	Start              bool
-	DryRun             bool
-	InstallAliases     bool
-	ForceShims         bool
-	ReplaceLegacy      bool
+	// ProxyToken gates /v1/* -- the credential that actually spends the pooled
+	// subscriptions. It became a field because this installer used to REWRITE
+	// that file wholesale, deleting every key it did not know about: re-running
+	// install-systemd dropped SUBROUTER_PROXY_TOKEN, and the daemon then refused
+	// to start on a non-loopback bind -- correct, but presenting as "the upgrade
+	// broke it". Since PATCHES section 37 unknown keys are carried over
+	// (keepSystemdEnvironment), but a key the render writes is always this
+	// field's value, and a non-empty one replaces SUBROUTER_PROXY_TOKEN_FILE.
+	ProxyToken string
+	ExtraArgs  string
+	// ExtraArgsExplicit distinguishes `--extra-args ""` from omitting the flag.
+	// Without it the two are identical and the preservation path restores the
+	// previous value, so there is NO WAY to clear extra args: an operator removing
+	// a public listener is told it happened while the listener keeps running.
+	// Failing silently in the direction of "still exposed" is the one direction
+	// this must not fail.
+	ExtraArgsExplicit bool
+	Start             bool
+	DryRun            bool
+	InstallAliases    bool
+	ForceShims        bool
+	ReplaceLegacy     bool
 }
 
 func installSystemd(args []string) error {
@@ -54,8 +70,10 @@ func installSystemdWithInput(args []string, input io.Reader) error {
 	return installSystemdWithConfig(config, commandRunner{})
 }
 
-// parseInstallSystemdArgs parses install-systemd flags and backfills values the
-// operator did not pass from the existing EnvironmentFile.
+// parseInstallSystemdArgs parses install-systemd flags and backfills every value
+// the operator did not pass from the existing EnvironmentFile. It is split from
+// installSystemdWithInput so a test can prove what a reinstall would write
+// without being root or touching the host's /etc.
 func parseInstallSystemdArgs(args []string, input io.Reader) (systemdConfig, error) {
 	config := systemdConfig{}
 	flags := flag.NewFlagSet("install-systemd", flag.ContinueOnError)
@@ -73,6 +91,8 @@ func parseInstallSystemdArgs(args []string, input io.Reader) (systemdConfig, err
 	adminTokenStdin := flags.Bool("admin-token-stdin", false, "read the admin token from standard input without exposing it in process arguments")
 	flags.StringVar(&config.AccountImportToken, "account-import-token", "", "token limited to protected account import; preserves existing SUBROUTER_ACCOUNT_IMPORT_TOKEN by default")
 	accountImportTokenStdin := flags.Bool("account-import-token-stdin", false, "read the account import token from standard input without exposing it in process arguments")
+	flags.StringVar(&config.ProxyToken, "proxy-token", "", "token required to spend the pool via /v1/*; preserves existing SUBROUTER_PROXY_TOKEN by default")
+	proxyTokenStdin := flags.Bool("proxy-token-stdin", false, "read the proxy token from standard input without exposing it in process arguments")
 	flags.StringVar(&config.ExtraArgs, "extra-args", "", "extra arguments appended to subrouter serve")
 	flags.BoolVar(&config.Start, "start", true, "enable and restart the systemd service")
 	flags.BoolVar(&config.DryRun, "dry-run", false, "print the systemd unit without writing files")
@@ -88,11 +108,17 @@ func parseInstallSystemdArgs(args []string, input io.Reader) (systemdConfig, err
 	if *accountImportTokenStdin && strings.TrimSpace(config.AccountImportToken) != "" {
 		return config, errors.New("--account-import-token and --account-import-token-stdin cannot be used together")
 	}
+	if *proxyTokenStdin && strings.TrimSpace(config.ProxyToken) != "" {
+		return config, errors.New("--proxy-token and --proxy-token-stdin cannot be used together")
+	}
 	requestedTokens := 0
 	if *adminTokenStdin {
 		requestedTokens++
 	}
 	if *accountImportTokenStdin {
+		requestedTokens++
+	}
+	if *proxyTokenStdin {
 		requestedTokens++
 	}
 	if requestedTokens > 0 {
@@ -107,10 +133,21 @@ func parseInstallSystemdArgs(args []string, input io.Reader) (systemdConfig, err
 		}
 		if *accountImportTokenStdin {
 			config.AccountImportToken = tokens[index]
+			index++
+		}
+		// Appended LAST so a caller piping the existing two lines keeps working
+		// unchanged; inserting it earlier would silently reassign their tokens to
+		// the wrong fields.
+		if *proxyTokenStdin {
+			config.ProxyToken = tokens[index]
 		}
 	}
+	// flag.Visit reports only flags actually present on the command line, which
+	// is the sole way to tell an explicit value -- including an explicit empty
+	// one, or one equal to the flag's default -- from an absent one.
 	explicit := map[string]bool{}
 	flags.Visit(func(f *flag.Flag) { explicit[f.Name] = true })
+	config.ExtraArgsExplicit = explicit["extra-args"]
 	applyExistingSystemdDefaults(&config, systemdDefaultPath(config))
 	applyExistingSystemdServeDefaults(&config, systemdDefaultPath(config), explicit)
 	return config, nil
@@ -178,8 +215,16 @@ func installSystemdWithConfig(config systemdConfig, runner commandRunner) error 
 		fmt.Print(socketUnit)
 		return nil
 	}
-	if os.Geteuid() != 0 {
+	if systemdInstallerEUID() != 0 {
 		return errors.New("install-systemd must run as root; use sudo")
+	}
+	// Read the EnvironmentFile being replaced before anything is installed, as
+	// install-daemon reads its plist: a file this cannot read stops the install
+	// with the binary, the aliases and the legacy services untouched, rather
+	// than after them.
+	previousDefaults, err := readSystemdEnvironmentFile(config)
+	if err != nil {
+		return err
 	}
 
 	if config.ReplaceLegacy {
@@ -230,7 +275,7 @@ func installSystemdWithConfig(config systemdConfig, runner commandRunner) error 
 	if strings.TrimSpace(config.TranscriptsDir) != "" {
 		chownPaths = append(chownPaths, config.TranscriptsDir)
 	}
-	if err := applySystemdUnits(config, defaults, unit, socketUnit, chownPaths, runner); err != nil {
+	if err := applySystemdUnits(config, defaults, previousDefaults, unit, socketUnit, chownPaths, runner); err != nil {
 		return err
 	}
 
@@ -246,19 +291,53 @@ func installSystemdWithConfig(config systemdConfig, runner commandRunner) error 
 	return nil
 }
 
-// applySystemdUnits writes the EnvironmentFile and unit files, hands the state
-// directories to the service user, and (with Start) enables and restarts the
-// units.
-func applySystemdUnits(config systemdConfig, defaults, unit, socketUnit string, chownPaths []string, runner taskRunner) error {
+// systemdInstallerEUID is os.Geteuid. Tests replace it to reach the steps
+// after the root check without being root; production never changes it.
+var systemdInstallerEUID = os.Geteuid
+
+// readSystemdEnvironmentFile returns the EnvironmentFile this install replaces,
+// or "" when there is none. The render only writes the keys it has flags for,
+// so everything else is carried over from this (keepSystemdEnvironment). A
+// file that is there but cannot be read fails the install rather than being
+// overwritten without its hand-added keys.
+func readSystemdEnvironmentFile(config systemdConfig) (string, error) {
+	path := systemdDefaultPath(config)
+	body, err := os.ReadFile(path)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return "", fmt.Errorf("read %s: %w; rewriting it would drop every key install-systemd does not write", path, err)
+	}
+	return string(body), nil
+}
+
+// applySystemdUnits writes the EnvironmentFile, the rendered defaults plus what
+// keepSystemdEnvironment carries over from previousDefaults, and the unit
+// files, hands the state directories to the service user, and (with Start)
+// enables and restarts the units. It takes a taskRunner so a test can record
+// the systemctl sequence.
+func applySystemdUnits(config systemdConfig, defaults, previousDefaults, unit, socketUnit string, chownPaths []string, runner taskRunner) error {
+	defaultPath := systemdDefaultPath(config)
+	defaults, kept := keepSystemdEnvironment(defaults, previousDefaults)
 	defaultMode := systemdDefaultsMode(config)
-	if err := writeFileAtomic(systemdDefaultPath(config), []byte(defaults), defaultMode); err != nil {
+	for _, line := range kept {
+		if strings.HasSuffix(systemdEnvironmentKey(line), "_TOKEN") {
+			defaultMode = 0o600
+		}
+	}
+	defaultMode = noWiderThanExisting(defaultMode, defaultPath)
+	if err := writeFileAtomic(defaultPath, []byte(defaults), defaultMode); err != nil {
 		return err
 	}
 	if err := writeFileAtomic(systemdUnitPath(config), []byte(unit), 0o644); err != nil {
 		return err
 	}
-	// An active socket keeps its old ListenStream until the socket unit itself
-	// restarts, so remember whether this install changes it.
+	// systemd owns the listener (ListenStream) and hands it to the service, so
+	// an ACTIVE socket keeps its old address until the socket unit itself
+	// restarts; restarting only the service reuses the old fd. A reinstall that
+	// moved the bind -- a changed tailnet IP, a new port -- reported success and
+	// kept listening on the old address. Remember whether this install changes
+	// the socket unit so only then is the listener dropped and rebound; an
+	// unrelated reinstall keeps it, and with it the connection queue that makes
+	// a service restart invisible to clients.
 	previousSocket, readErr := os.ReadFile(systemdSocketPath(config))
 	socketChanged := readErr != nil || string(previousSocket) != socketUnit
 	if err := writeFileAtomic(systemdSocketPath(config), []byte(socketUnit), 0o644); err != nil {
@@ -275,8 +354,8 @@ func applySystemdUnits(config systemdConfig, defaults, unit, socketUnit string, 
 			return err
 		}
 		if socketChanged {
-			// Stop the service first so it releases the old listener, then
-			// rebind the socket on the new address.
+			// Stop the service first so it releases the inherited listener,
+			// then rebind the socket on the new address.
 			if err := runner.Run("systemctl", "stop", config.ServiceName); err != nil {
 				return err
 			}
@@ -325,7 +404,12 @@ func writeFileAtomic(path string, body []byte, mode os.FileMode) error {
 }
 
 func systemdDefaultsMode(config systemdConfig) os.FileMode {
-	if config.AdminToken != "" || config.AccountImportToken != "" {
+	// The proxy token counts. It is the credential that SPENDS the pooled
+	// subscriptions, so a file carrying it must not be world-readable -- and
+	// before it was listed here, that only held because bootstrap happens to set
+	// an admin token too. Secrecy resting on an unrelated field being populated
+	// is secrecy that lapses the first time someone configures one without it.
+	if config.AdminToken != "" || config.AccountImportToken != "" || config.ProxyToken != "" {
 		return 0o600
 	}
 	return 0o644
@@ -370,6 +454,7 @@ func validateSystemdConfig(config systemdConfig) error {
 		"sr-switch-interval":   config.SRSwitchInterval,
 		"admin-token":          config.AdminToken,
 		"account-import-token": config.AccountImportToken,
+		"proxy-token":          config.ProxyToken,
 		"extra-args":           config.ExtraArgs,
 	} {
 		if strings.ContainsAny(value, "\r\n\x00") {
@@ -398,7 +483,7 @@ func ensureSystemUser(config systemdConfig, runner commandRunner) error {
 // --transcript-gcs-uri in extra args yields a config that serve rejects at
 // startup, which crash-loops the service behind socket activation.
 func applyExistingSystemdDefaults(config *systemdConfig, defaultPath string) {
-	if config.ExtraArgs == "" {
+	if config.ExtraArgs == "" && !config.ExtraArgsExplicit {
 		config.ExtraArgs = readDefaultValue(defaultPath, "SUBROUTER_EXTRA_ARGS")
 		if config.ExtraArgs == "" && config.ReplaceLegacy {
 			config.ExtraArgs = readLegacySystemdExtraArgs()
@@ -413,14 +498,24 @@ func applyExistingSystemdDefaults(config *systemdConfig, defaultPath string) {
 	if config.AccountImportToken == "" {
 		config.AccountImportToken = readDefaultValue(defaultPath, "SUBROUTER_ACCOUNT_IMPORT_TOKEN")
 	}
+	if config.ProxyToken == "" {
+		config.ProxyToken = readDefaultValue(defaultPath, "SUBROUTER_PROXY_TOKEN")
+	}
 }
 
 // applyExistingSystemdServeDefaults backfills the listen address, sr switch
 // interval and session store from an existing EnvironmentFile unless the
-// operator passed the flag. These flags have non-empty defaults, so the value
-// alone cannot tell "not passed" from "passed the default"; without this a
-// reinstall or credential rotation silently rebinds 0.0.0.0:31415 and
-// re-enables a disabled sweep.
+// operator passed the flag. applyExistingSystemdDefaults cannot do these: its
+// fields default to "", so "empty" means "not passed", while these flags have
+// NON-empty defaults (0.0.0.0:31415, 10m, /var/lib/subrouter/sessions.json)
+// and the value alone cannot tell "not passed" from "passed the default".
+//
+// Without this, any rerun that omitted --addr -- a credential rotation, a
+// binary upgrade, `sr server install` -- rewrote SUBROUTER_ADDR to 0.0.0.0:31415.
+// A box deliberately bound to its tailnet IP silently became a listener on every
+// interface, and a disabled sweep (interval 0) silently came back at 10m.
+// The box's bootstrap script always passes --addr, so the fleet box is not
+// exposed today; every hand-run install-systemd was.
 func applyExistingSystemdServeDefaults(config *systemdConfig, defaultPath string, explicit map[string]bool) {
 	if !explicit["addr"] {
 		if value := readDefaultValue(defaultPath, "SUBROUTER_ADDR"); value != "" {
@@ -467,6 +562,64 @@ func readDefaultValue(path, keyName string) string {
 		return parseSystemdEnvironmentValue(strings.TrimSpace(value))
 	}
 	return ""
+}
+
+// keepSystemdEnvironment appends to a rendered EnvironmentFile every line of
+// the previous file that sets a key the render does not, and returns the
+// merged file with the lines it kept.
+//
+// install-systemd rewrites the file wholesale, and until this it deleted every
+// key it has no flag for: a hand-set CODEX_HOME, SUBROUTER_RESERVED_ACCOUNTS,
+// SUBROUTER_IDENTITY_ACCOUNT, a *_TOKEN_FILE. The flags it does have are
+// already backfilled from the file (applyExistingSystemdDefaults); this is the
+// rest. PATCHES section 37.
+//
+// Kept lines go in as the file spelled them, comments included, after the
+// rendered keys; blank lines are dropped. A token the render writes non-empty
+// also claims its _FILE twin, because serve refuses the two together: a new
+// --proxy-token replaces a hand-set SUBROUTER_PROXY_TOKEN_FILE, as the
+// wholesale rewrite always did, while an empty one leaves the file to supply it.
+func keepSystemdEnvironment(rendered, previous string) (string, []string) {
+	owned := map[string]bool{}
+	for _, line := range strings.Split(rendered, "\n") {
+		key := systemdEnvironmentKey(line)
+		if key == "" {
+			continue
+		}
+		owned[key] = true
+		if _, value, _ := strings.Cut(line, "="); strings.HasSuffix(key, "_TOKEN") &&
+			strings.TrimSpace(parseSystemdEnvironmentValue(strings.TrimSpace(value))) != "" {
+			owned[key+"_FILE"] = true
+		}
+	}
+	var kept []string
+	for _, line := range strings.Split(previous, "\n") {
+		if strings.TrimSpace(line) == "" || owned[systemdEnvironmentKey(line)] {
+			continue
+		}
+		kept = append(kept, line)
+	}
+	if len(kept) == 0 {
+		return rendered, nil
+	}
+	if !strings.HasSuffix(rendered, "\n") {
+		rendered += "\n"
+	}
+	return rendered + strings.Join(kept, "\n") + "\n", kept
+}
+
+// systemdEnvironmentKey is the key a line assigns, read as readDefaultValue
+// reads it, or "" for a comment, a blank line or a line with no assignment.
+func systemdEnvironmentKey(line string) string {
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" || strings.HasPrefix(trimmed, "#") || strings.HasPrefix(trimmed, ";") {
+		return ""
+	}
+	key, _, ok := strings.Cut(trimmed, "=")
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(key)
 }
 
 // EnvironmentFile double-quoted values use shell-like escaping only for a
@@ -526,9 +679,9 @@ func migrateLegacySystemdState(config systemdConfig, runner commandRunner) {
 	_ = storepath.MigrateCodexDir(filepath.Join(config.Home, "codex"), filepath.Join(config.Home, ".codex-accounts"))
 }
 
-// systemdEtcDir is the root of the system configuration tree. Tests point it
-// at a temporary directory so installer and lifecycle behavior can be exercised
-// without touching the host's /etc.
+// systemdEtcDir is the root of the system configuration tree. Tests point it at
+// a temporary directory so installer and lifecycle behavior can be exercised
+// without reading or writing the host's /etc. Production never changes it.
 var systemdEtcDir = "/etc"
 
 func systemdDefaultPath(config systemdConfig) string {
@@ -556,11 +709,13 @@ SUBROUTER_TRANSCRIPT_ARGS=%s
 SUBROUTER_SR_SWITCH_INTERVAL=%s
 SUBROUTER_ADMIN_TOKEN=%s
 SUBROUTER_ACCOUNT_IMPORT_TOKEN=%s
+SUBROUTER_PROXY_TOKEN=%s
 SUBROUTER_EXTRA_ARGS=%s
 `, config.Addr, config.Home, config.SessionsPath, config.TranscriptsDir,
 		quoteSystemdEnvironmentValue(transcriptArgs), config.SRSwitchInterval,
 		quoteSystemdEnvironmentValue(config.AdminToken),
 		quoteSystemdEnvironmentValue(config.AccountImportToken),
+		quoteSystemdEnvironmentValue(config.ProxyToken),
 		quoteSystemdEnvironmentValue(config.ExtraArgs))
 }
 
@@ -634,11 +789,28 @@ ReadWritePaths={{.Home}} /var/log/subrouter
 WantedBy=multi-user.target
 `))
 
+// systemdSocketTemplate sets FreeBind because the box binds its tailnet
+// address, and at boot that address does not exist yet. Socket units start
+// with sockets.target, early in boot and long before tailscaled has brought up
+// tailscale0, so a plain bind of 100.x.y.z fails with EADDRNOTAVAIL: the
+// socket unit fails, the service (Requires= the socket) fails with it, and a
+// rebooted box stays down until someone restarts both by hand. systemd does
+// not retry a failed socket. FreeBind (IP_FREEBIND) lets the bind succeed
+// before the address exists; packets are delivered once tailscale0 carries
+// it. For a wildcard or loopback bind it changes nothing. PATCHES section 37.
+//
+// Not After=tailscaled.service: a socket unit's default dependencies order it
+// Before=sockets.target, which basic.target and so tailscaled.service come
+// after. The ordering is a cycle, and systemd breaks a cycle by dropping a
+// job, possibly the socket. That fix needs DefaultDependencies=no as well, and
+// even then tailscaled having started does not mean tailscale0 has its
+// address yet; FreeBind does not depend on when it arrives.
 var systemdSocketTemplate = template.Must(template.New("systemd-socket").Parse(`[Unit]
 Description=Subrouter AI agent router socket
 
 [Socket]
 ListenStream={{.Addr}}
+FreeBind=true
 NoDelay=true
 Service={{.ServiceName}}
 

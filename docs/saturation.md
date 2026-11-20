@@ -25,31 +25,8 @@ For a new conversation:
 2. Prefer usable subscription OAuth before API-key fallback.
 3. Protect OAuth accounts below 40% bottleneck or 5h headroom.
 4. Pick the healthy account with highest expiry pressure.
-5. When several accounts share the leading pressure band, spread new sessions
-   across that band. Weight each account by surplus headroom above the 40%
-   threshold and damp the weight by its assigned-session count.
-6. Fall back to highest bottleneck headroom.
-7. Break deterministic ties by fewer active sessions and account identity.
-
-This spreading applies when a session is first placed, not to every request.
-The session remains sticky to the selected account down to 5% headroom so its
-provider-side prompt cache is retained. A request is replayed against another
-account only after an account-specific quota, credential, or model-
-compatibility failure. Provider overload (Claude 529/5xx, Codex "model at
-capacity") is not account-specific and should be rare and brief, so by default
-the request waits it out on the same account (Claude up to 8m, Codex up to 4m,
-or 10s when an egress or Azure fallback is configured; see
-`SUBROUTER_CLAUDE_OVERLOAD_MAX_WAIT` and
-`SUBROUTER_CODEX_CAPACITY_RETRY_MAX_WAIT`) instead of moving the session and
-losing its prompt cache. To move a conversation, start or fork a new session;
-switching on overload is an operator opt-in
-(`SUBROUTER_CLAUDE_OVERLOAD_REROUTE=1`, `SUBROUTER_CODEX_OVERLOAD_FAILOVER=1`),
-and even then a Codex conversation past about 32k input tokens
-(`SUBROUTER_CODEX_OVERLOAD_FAILOVER_MAX_INPUT`) stays and waits. One client request has a shared
-six-attempt ceiling across account failover and same-account transport repair,
-even when the configured pool is larger; the overload ladders carry their own
-request-wide bounds. No account is attempted twice within the failover walk
-itself.
+5. Fall back to highest bottleneck headroom.
+6. Break ties by fewer active sessions.
 
 ## Why this saturates better
 
@@ -69,4 +46,8 @@ Subrouter fetches Codex OAuth account usage on startup by default. Use `--fetch-
 Accounts whose usage fetch fails are scored at zero headroom so stale tokens do
 not win new sessions. `sr status` labels the deterministic best account as
 `rec` and the locally selected CLI account as `active`; neither label means the
-proxy routes all sessions through that one account.
+proxy routes all sessions through that one account. Within each provider
+heading, `sr status` and the bare `sr` picker list accounts by the time until
+the window in the `7d` column resets, longest first. Accounts without a weekly
+reading come next, and accounts in error come last. So the `rec` account is not
+always the top row.

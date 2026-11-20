@@ -20,7 +20,7 @@ func cmuxCalls(fake *hostFakeHost, verb string) [][]string {
 
 func TestHostWatchLabelsMatchingCmuxWorkspaces(t *testing.T) {
 	runner, fake, out, _ := setupHostTest(t, "http://127.0.0.1:31415")
-	if err := runner.run(context.Background(), []string{"host", "attach", "devbox"}); err != nil {
+	if err := runner.host(context.Background(), []string{"attach", "devbox"}); err != nil {
 		t.Fatalf("attach: %v\n%s", err, out)
 	}
 	old := hostInCmux
@@ -32,7 +32,7 @@ func TestHostWatchLabelsMatchingCmuxWorkspaces(t *testing.T) {
 		{"id":"ws-other","remote":{"destination":"beryl7"}}]}`
 
 	out.Reset()
-	if err := runner.run(context.Background(), []string{"host", "watch", "--once"}); err != nil {
+	if err := runner.host(context.Background(), []string{"watch", "--once"}); err != nil {
 		t.Fatalf("watch: %v\n%s", err, out)
 	}
 	set := cmuxCalls(fake, "set-status")

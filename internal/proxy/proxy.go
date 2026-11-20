@@ -15,14 +15,13 @@ import (
 	"io"
 	"log"
 	"log/slog"
-	"math"
-	"math/rand/v2"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -34,6 +33,7 @@ import (
 
 	"github.com/gorilla/websocket"
 	accountpkg "github.com/manaflow-ai/subrouter/account"
+	"github.com/manaflow-ai/subrouter/internal/accesstoken"
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	agentantigravity "github.com/manaflow-ai/subrouter/internal/agents/antigravity"
 	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
@@ -112,6 +112,17 @@ type Server struct {
 	// AntigravityUpstream fronts Google's cloudcode-pa endpoint, which the
 	// Antigravity CLI reaches when CLOUD_CODE_URL points at this proxy.
 	AntigravityUpstream *url.URL
+	// ClaudeSocketStatus reports serve's opt-in Claude Code Unix socket
+	// (SUBROUTER_CLAUDE_SOCKET, PATCHES section 29) as `claude_socket` in
+	// health. nil when the socket is not configured, and health is unchanged.
+	// The socket fails soft -- TCP serves on -- so health is the only place a
+	// dead one shows, and a client in socket mode hangs silently without it.
+	ClaudeSocketStatus func() string
+	// ClaudeSocketGuard is the Claude socket's guard (claude_socket_guard.go),
+	// reported as claude_socket_guard in the private listener's health. nil
+	// when the socket is not configured. The socket puts it in front of the
+	// private listener's whole handler when it starts serving.
+	ClaudeSocketGuard *ClaudeSocketGuard
 	// LegacyStoreAttestation keeps v1/direct loopback clients compatible. A
 	// supervisor with a private v2 data socket disables this public proof path.
 	LegacyStoreAttestation bool
@@ -121,13 +132,19 @@ type Server struct {
 	Scheduler              selectacct.Scheduler
 	SchedulerRef           *selectacct.SchedulerRef
 	// admission is the controller-wide physical-attempt gate. It is a pointer
-	// so value copies of Server made by Handler and middleware share one queue.
+	// so value copies of Server made by Handler and middleware share one queue,
+	// and normalized() takes it from AccountRef.sharedAdmission so the two
+	// listeners' handlers (each built from its own copy) share it too.
 	admission     *admissionControl
 	UsageScoreTTL time.Duration
 	// ReadyCheck gates supervisor readiness on asynchronous startup state that
 	// must be coherent before this worker may receive traffic.
 	ReadyCheck    func() error
 	ScoreAccounts func(context.Context, []accounts.Account) ([]selectacct.Score, int)
+	// startBackgroundScoreRefresh, when set, starts the refresh a request
+	// hands off (refreshUsageScoresForRequest) in place of `go run()`. Test
+	// seam, so a test can run it to completion or hold it; nil in production.
+	startBackgroundScoreRefresh func(run func())
 	// RefreshAccountFn, when set, replaces the default OAuth refresh path. Test
 	// seam for simulating dead/expired refresh tokens; nil in production.
 	RefreshAccountFn func(context.Context, accounts.Account) (accounts.Account, error)
@@ -145,8 +162,19 @@ type Server struct {
 	// ForwardSessionHeaders preserves the selected session identity across an
 	// explicitly configured Subrouter-to-Subrouter delegation hop.
 	ForwardSessionHeaders bool
-	sessionLeases         *sessionLeaseStore
-	cutoverChallenges     *cutoverChallengeRegistry
+	// RemotePool is a peer Subrouter to fall through to when this daemon's own
+	// pool cannot serve. Nil disables it entirely. See remote_pool.go.
+	RemotePool *RemotePool
+	// RemotePeers is every configured peer, in configuration order (PATCHES
+	// §31, D0); when set it supersedes RemotePool. Read both only through
+	// s.peers() (remote_pool_peers.go).
+	RemotePeers       []*RemotePool
+	sessionLeases     *sessionLeaseStore
+	cutoverChallenges *cutoverChallengeRegistry
+	// quotaResetGate serializes automatic rate-limit-reset redemptions across
+	// every handler in this daemon. Server is copied per request, so the gate
+	// has to be a pointer; normalized() fills it.
+	quotaResetGate *quotaResetGate
 	// StreamDrops counts dropped response streams by which side ended them,
 	// so the expected client-hangup case is countable without a log line each.
 	StreamDrops *StreamDropStats
@@ -157,11 +185,35 @@ type Server struct {
 	// file; /_subrouter/health then reports it as "release".
 	ReleaseStatePath string
 	Lifecycle        *Lifecycle
-	AdminToken       string
-	// PublicURL is the public origin this server is reached at, if any. Its
-	// host is accepted as a Host header on loopback admin requests alongside
-	// the loopback names.
-	PublicURL string
+	// Hold holds a proxied request through a transient upstream failure and
+	// retries it, instead of answering the failure at once (hold.go, PATCHES
+	// §58). Nil is off: the handler answers every failure immediately, as it
+	// did before. serve sets it (NewHoldPolicy).
+	Hold *HoldPolicy
+	// OutageSpill serves a turn whose local upstream could not be reached
+	// (a lookup, dial or TLS handshake that failed) from a peer, for that
+	// turn only, at most at its rate (outage_spill.go, PATCHES §59). Nil is
+	// off: the failure is answered or held as before. serve sets it
+	// (NewOutageSpillPolicy).
+	OutageSpill *OutageSpillPolicy
+	// PeerDownGrace is how long a peer must answer nothing, on any
+	// connection, while this machine is online, before its breaker finds it
+	// down and ends every hold on it (remotePoolBreaker.failure, PATCHES
+	// §67). Zero turns off only that rule: an opening gateway attribution and
+	// §54 blame on the peer finds it down. serve sets it
+	// (DefaultPeerDownGrace).
+	PeerDownGrace time.Duration
+	AdminToken    string
+	// AllowUnauthenticatedAdmin is no longer consulted by authorizeAdmin.
+	// Owner decision 8 (2026-09 upstream merge, round 2) took upstream's
+	// tokenless fallback: with no AdminToken and no AccountImportToken
+	// configured, any caller of the PRIVATE handler is admin, opt-in or not.
+	// The field stays only so existing callers compile: serve still accepts
+	// --allow-unauthenticated-admin (unit files that pass it must start) and
+	// copies it here, but serve no longer has an admin-token bind refusal and
+	// nothing reads this field. The public listener grants admin to nobody
+	// (publicSurface).
+	AllowUnauthenticatedAdmin bool
 	// ShadowHealthKey is an ephemeral, per-process attestation key used only by
 	// the optional shadow rehearsal. Nil keeps the normal health response.
 	ShadowHealthKey []byte
@@ -169,6 +221,29 @@ type Server struct {
 	// It is intentionally distinct from AdminToken, which can read operational
 	// state and transcripts.
 	AccountImportToken string
+	// PublicURL is the public origin this server is reached at (serve's
+	// --public-url), if any. Its host is accepted as a Host header on a
+	// loopback admin request alongside the loopback names, for a reverse proxy
+	// on the same machine that serves that name. See loopbackAdminHostAllowed.
+	PublicURL string
+	// MachinePolicy caps how many distinct machines may share one account and
+	// keeps one machine on an account at a time. Nil or off means no policy,
+	// which is the fail-open direction.
+	MachinePolicy *MachinePolicy
+	// AutoRedeemRateLimitReset lets Codex quota failover spend a complimentary
+	// rate-limit-reset credit when EVERY account in the pool is cooked, rather
+	// than passing the upstream quota error back and interrupting the turn.
+	// Off by default: the credits are finite and do not regenerate, so the
+	// daemon only spends one where a human opted in. See
+	// codex_quota_reset_failover.go for the bounds that apply once it is on.
+	AutoRedeemRateLimitReset bool
+	// AccountReserves holds back a fraction of an account's WEEKLY budget from
+	// the pool, keyed by bare account ID. Meant for the one account a person
+	// can log into directly: when the pool drains everything, that sliver is
+	// what is left to diagnose the pool with. Empty means everything is fully
+	// poolable, which is the previous behaviour. The holdout is lifted in the
+	// last day before the account's weekly roll (PATCHES §60).
+	AccountReserves map[string]float64
 	// TailnetAuth authenticates callers with the tailnet itself instead of a
 	// token, for self-hosted servers whose port is already restricted to a
 	// tailnet by ACL. Identity comes from this machine's tailscaled, so it is
@@ -179,6 +254,40 @@ type Server struct {
 	// LocalProxyToken protects provider proxy routes in cloud mode. Health and
 	// readiness stay unauthenticated so supervisors can probe the daemon.
 	LocalProxyToken string
+	// AccessTokens is the store of NAMED access tokens (PATCHES §43): one
+	// secret per caller, each membership or admin, with an expiry and a
+	// revoked flag, re-read when the file changes. Nil, or no file, means
+	// none. Additive only: see access_tokens.go. A pointer, because Server is
+	// copied per request and into PublicHandler and they share one cache.
+	AccessTokens *accesstoken.Checker
+	// PublicAdmin mounts the admin routes on the PUBLIC listener too, behind
+	// named admin-role access tokens and nothing else (PATCHES §43.1): never
+	// the static admin token, never the import token, never loopback, a
+	// store handshake or a tailnet identity. serve sets it from
+	// --public-admin / SUBROUTER_PUBLIC_ADMIN=1, off by default. Off, the
+	// public listener is exactly what it was: no admin route mounted, admin
+	// to nobody. It changes nothing on the private listener. See
+	// public_admin.go.
+	PublicAdmin bool
+	// AllowLoopbackProxyWithoutToken exempts LOOPBACK callers from
+	// LocalProxyToken, mirroring how authorizeAdmin treats loopback on the
+	// admin surface. Off by default; remote callers are never exempt.
+	//
+	// It exists for clients that physically cannot present the token. The
+	// ChatGPT/Codex desktop app is the case in hand: it honours exactly one
+	// override, CODEX_API_BASE_URL, and has no way to set a header or a bearer,
+	// so every /backend-api request it makes is a 401 no matter how the pool is
+	// configured. The alternative was clearing LocalProxyToken outright, which
+	// startup validation rightly refuses (a local-storage config with no secret
+	// is a skipped key ceremony, not a choice) -- and which crash-looped this
+	// daemon when tried. This is the narrower door: same outcome for a loopback
+	// client, no change at all for anything off-box.
+	AllowLoopbackProxyWithoutToken bool
+
+	// PublicRateLimit controls the limiter on the PUBLIC listener only. Empty
+	// means observe: log what would have been refused, refuse nothing. See
+	// internal/proxy/ratelimit.go for why the default is not enforce.
+	PublicRateLimit RateLimitMode
 	MaxBodyBytes    int64
 	Transcripts     *transcript.Recorder
 	// CacheFlight collapses identical concurrent requests to read-heavy
@@ -199,6 +308,18 @@ type Server struct {
 	// touch this key.
 	ClaudeFableAPIKey string
 
+	// IdentityAccountID names the account that answers control-plane requests
+	// (see controlPlanePath). Empty means "pick deterministically", which is
+	// still stable -- this only chooses WHICH account is the stable one.
+	IdentityAccountID string
+	// IdentityPinRequired: Claude control-plane calls are answered by
+	// IdentityAccountID or refused, never by a fallback account. serve sets it
+	// when the Claude socket is configured (control_plane.go).
+	IdentityPinRequired bool
+	// IdentityOnly (SUBROUTER_IDENTITY_ONLY) keeps the IdentityAccountID
+	// account out of inference, failover, the auto-switch and paid probes
+	// (control_plane.go). Off by default.
+	IdentityOnly bool
 	// ClaudeFableCacheTTLUpgradeOff disables the Bedrock-path rewrite of bare
 	// ephemeral cache_control blocks to the 1-hour TTL (see
 	// upgradeEphemeralCacheTTL). Default off = upgrade enabled.
@@ -224,37 +345,25 @@ type Server struct {
 	// egress, by proxy index.
 	codexEgressWebSocketDialers []*websocket.Dialer
 	codexCapacityEvents         *codexCapacityEventLog
-	// codexCapacity keeps per-account capacity history for the live failover
-	// policy and its diagnostics report.
-	codexCapacity         *codexCapacityStats
-	codexSessionBans      *codexSessionBans
+	// Upstream's capacity history and per-session bans (#599, #622), its
+	// shedding tracker and persist mode (#382, #486), its autonomous retry
+	// (#505) and its Claude 8-minute overload ladder (#389) are not part of
+	// this fork: PATCHES §27 keeps upstream 862a5a5's capacity marks "as
+	// written", the 2m mark TTL and the 32k size cap, with capacity eviction
+	// as the warm rule's one new exit (§20), and §58's hold is built on the
+	// short Claude overload retries.
 	CodexOverloadFailover *CodexOverloadFailoverConfig
-	// ClaudeOverloadReroute opts in to moving a Claude request to another
-	// account once after sustained overload
-	// (SUBROUTER_CLAUDE_OVERLOAD_REROUTE=1). Off by default: prompt caches
-	// are per account, so the request stays on its account and backs off.
-	ClaudeOverloadReroute bool
-	// ClaudeOverloadRetry shapes that same-account backoff; nil uses the
-	// defaults (1s, 2s, 4s, 8s, then every 15s for up to 8m).
-	ClaudeOverloadRetry *ClaudeOverloadRetryConfig
 	// overloadHeld counts requests currently waiting out an overload on
 	// their own account, per provider.
 	overloadHeld     *overloadHeldGauge
 	recoveryCounters *recoveryCounterStore
 	// codexCapacityCounters counts what the Codex capacity retry did
 	// (same-account retries, switches, exhaustion, marks) for traffic.
-	codexCapacityCounters *codexCapacityCounterStore
-	retryStatuses         *retryStatusRegistry
-	// softMoveState remembers recent capacity-driven session moves. It is
-	// initialized with the request handler so copies of Server share the same
-	// bounded in-process state.
-	softMoveState              *softMoveState
+	codexCapacityCounters      *codexCapacityCounterStore
 	codexOverloadRerouteCounts *codexOverloadReroutes
-	// codexWebSocketTurnRetryDelay overrides the autonomous websocket turn
-	// backoff; a test seam, nil in production.
+	// codexWebSocketTurnRetryDelay overrides the websocket region retry's
+	// backoff (upstream #666); a test seam, nil in production.
 	codexWebSocketTurnRetryDelay func(attempt int) time.Duration
-	codexPersistLoops            *codexPersistLoops
-	codexShedding                *codexSheddingTracker
 	// azureCodexRejects remembers request fields an Azure deployment refused.
 	azureCodexRejects *azureCodexFieldMemory
 	// claudeWebBalances holds CLI-pushed Claude prepaid balances for the
@@ -278,64 +387,107 @@ type Server struct {
 	// MultiTenant router has validated its tenant key. Global remote imports
 	// require a configured admin token instead.
 	tenantAccountImportAuthorized bool
-}
-
-// softMoveCooldown is long enough to absorb the observed sub-minute capacity
-// ping-pong while remaining short relative to a normal turn. Hard quota and
-// credential failures bypass it entirely.
-const softMoveCooldown = time.Minute
-
-type softMoveState struct {
-	mu   sync.Mutex
-	last map[string]time.Time
-}
-
-// newSoftMoveState creates the bounded in-process state shared by handlers.
-func newSoftMoveState() *softMoveState {
-	return &softMoveState{last: make(map[string]time.Time)}
-}
-
-// recentlyMoved reports whether a session moved within the soft cooldown.
-func (s *softMoveState) recentlyMoved(key string, now time.Time) (time.Duration, bool) {
-	if s == nil || key == "" {
-		return 0, false
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	last, ok := s.last[key]
-	if !ok {
-		return 0, false
-	}
-	age := now.Sub(last)
-	if age < 0 || age >= softMoveCooldown {
-		delete(s.last, key)
-		return age, false
-	}
-	return age, true
-}
-
-// note records a successful capacity-driven move and expires stale entries.
-func (s *softMoveState) note(key string, now time.Time) {
-	if s == nil || key == "" {
-		return
-	}
-	s.mu.Lock()
-	for existing, last := range s.last {
-		if now.Before(last) || now.Sub(last) >= softMoveCooldown {
-			delete(s.last, existing)
-		}
-	}
-	s.last[key] = now
-	s.mu.Unlock()
+	// tenantControlAuthorized is likewise set only on a tenant-scoped server:
+	// the MultiTenant router routes only tenantControlPaths here, and reaching
+	// any of them already proved possession of the tenant key, so the scoped
+	// admin reads need no further token. This is authentication DELEGATED
+	// upstream — distinct from authorizeAdmin's tokenless fallback, which is a
+	// deployment with no authentication at all.
+	tenantControlAuthorized bool
+	// publicSurface is set only on the copy PublicHandler builds for the
+	// internet-facing listener, and authorizeAdmin refuses every request on it.
+	//
+	// PublicHandler blanks AdminToken so the admin secret is never a valid
+	// credential on the public wire. Under upstream's tokenless fallback (owner
+	// decision 8), a blank AdminToken reads as "no admin token configured" and
+	// grants admin to any caller when no AccountImportToken is set either -- so
+	// the blanking that protects the secret would, on its own, open the admin
+	// gate to the internet. The admin routes are also not mounted there unless
+	// serve runs with --public-admin (PATCHES §43.1), and then only for named
+	// admin-role tokens (publicAdminGranted); this makes "no admin on the
+	// public listener" a property of the gate as well, so a route later
+	// promoted to public cannot inherit an open door.
+	publicSurface bool
+	// rootHealth answers a root health probe (rootHealthProbeRequest) in
+	// proxyHandler; nil means handleHealth. PublicHandler sets it on its
+	// credential-stripped copy to the configured server's health handler
+	// (serverRoute.describesDaemon), so a probe there reports what
+	// /_subrouter/health does on that listener, not auth "open".
+	rootHealth http.Handler
 }
 
 type ActiveSessions struct {
 	mu     sync.Mutex
 	counts map[string]int
+	// lastSeen is the wall clock of each session's most recent turn. It is
+	// deliberately in-memory: session.Assignment already carries UpdatedAt, but
+	// that field is only written by Sessions.Put, and refreshing it per request
+	// would add a second flock plus a full sessions.json re-read to every
+	// proxied request -- the same cost that already makes WithLiveSessionCounts
+	// degrade as that never-pruned store grows.
+	lastSeen map[string]time.Time
+	// startedAt bounds what an unseen session can be: see sessionIdle.
+	startedAt time.Time
+	// forcedRerank marks sessions whose NEXT turn is a forced switch the
+	// current connection could not act on (markForcedRerank).
+	forcedRerank map[string]time.Time
+}
+
+// forcedRerankTTL bounds how long a forced re-rank waits for the session's
+// next turn. It is the reconnect Codex makes on a 1013, seconds away; a
+// session that never comes back must not carry the mark into a later turn
+// that has nothing to do with it.
+const forcedRerankTTL = 5 * time.Minute
+
+// markForcedRerank records that the session was FORCED off its account where
+// the one ranking could not run: mid-socket, the Codex websocket quota
+// failover can only close the connection (1013) so the client reconnects. The
+// reconnect is a new request, and takeForcedRerank makes it rank across every
+// pool as a forced switch (P8) rather than ride the alternate's fresh pin as a
+// warm session.
+func (a *ActiveSessions) markForcedRerank(agentType, sessionID string) {
+	if a == nil || sessionID == "" {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.forcedRerank == nil {
+		a.forcedRerank = map[string]time.Time{}
+	}
+	now := time.Now()
+	for key, at := range a.forcedRerank {
+		if now.Sub(at) > forcedRerankTTL {
+			delete(a.forcedRerank, key)
+		}
+	}
+	a.forcedRerank[session.ScopedSessionKey(agentType, sessionID)] = now
+}
+
+// takeForcedRerank reports and clears a live markForcedRerank.
+func (a *ActiveSessions) takeForcedRerank(agentType, sessionID string) bool {
+	if a == nil || sessionID == "" {
+		return false
+	}
+	key := session.ScopedSessionKey(agentType, sessionID)
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	at, ok := a.forcedRerank[key]
+	delete(a.forcedRerank, key)
+	return ok && time.Since(at) <= forcedRerankTTL
 }
 
 func NewActiveSessions() *ActiveSessions {
-	return &ActiveSessions{counts: map[string]int{}}
+	return &ActiveSessions{counts: map[string]int{}, lastSeen: map[string]time.Time{}, startedAt: time.Now()}
+}
+
+// Uptime is how long this tracker has been observing turns. A session it has
+// never seen had no turn in that time, which is the only thing a restarted
+// daemon can say about it.
+func (a *ActiveSessions) Uptime() (time.Duration, bool) {
+	if a == nil || a.startedAt.IsZero() {
+		return 0, false
+	}
+	return time.Since(a.startedAt), true
 }
 
 func (a *ActiveSessions) Begin(agentType, sessionID string) func() {
@@ -345,16 +497,67 @@ func (a *ActiveSessions) Begin(agentType, sessionID string) func() {
 	key := session.ScopedSessionKey(agentType, sessionID)
 	a.mu.Lock()
 	a.counts[key]++
+	if a.lastSeen == nil {
+		a.lastSeen = map[string]time.Time{}
+	}
+	a.lastSeen[key] = time.Now()
+	a.sweepLastSeenLocked()
 	a.mu.Unlock()
 	return func() {
 		a.mu.Lock()
 		defer a.mu.Unlock()
+		// Stamp on release too: a long streaming turn should count as idle from
+		// when it finished, not from when it started.
+		a.lastSeen[key] = time.Now()
 		if a.counts[key] <= 1 {
 			delete(a.counts, key)
 			return
 		}
 		a.counts[key]--
 	}
+}
+
+const (
+	// lastSeenSweepThreshold bounds the lastSeen map. Unlike counts, which is
+	// deleted on release, lastSeen must outlive the request -- so without a
+	// sweep it would grow for the life of the daemon, one entry per session
+	// ever routed.
+	lastSeenSweepThreshold = 1024
+	// lastSeenRetention is far longer than any migration decision window, so
+	// sweeping can never turn a known-idle session back into an unknown (and
+	// therefore warm, un-migratable) one while the decision still matters.
+	lastSeenRetention = 24 * time.Hour
+)
+
+func (a *ActiveSessions) sweepLastSeenLocked() {
+	if len(a.lastSeen) <= lastSeenSweepThreshold {
+		return
+	}
+	cutoff := time.Now().Add(-lastSeenRetention)
+	for key, seen := range a.lastSeen {
+		if seen.Before(cutoff) && a.counts[key] == 0 {
+			delete(a.lastSeen, key)
+		}
+	}
+}
+
+// IdleSince reports how long a session has gone without a turn. The false
+// return means "no turn observed by this process" -- which callers must treat
+// as warm, not cold: the daemon may simply have restarted while the upstream
+// cache stayed live, and mistaking that for idleness would throw away a warm
+// prefix. It self-corrects on the session's next request.
+func (a *ActiveSessions) IdleSince(agentType, sessionID string) (time.Duration, bool) {
+	if a == nil || sessionID == "" {
+		return 0, false
+	}
+	key := session.ScopedSessionKey(agentType, sessionID)
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	seen, ok := a.lastSeen[key]
+	if !ok {
+		return 0, false
+	}
+	return time.Since(seen), true
 }
 
 func (a *ActiveSessions) Active(agentType, sessionID string) bool {
@@ -367,16 +570,77 @@ func (a *ActiveSessions) Active(agentType, sessionID string) bool {
 	return a.counts[key] > 0
 }
 
+// ActiveKeys snapshots the scoped session keys with in-flight work.
+func (a *ActiveSessions) ActiveKeys() map[string]bool {
+	if a == nil {
+		return nil
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	keys := make(map[string]bool, len(a.counts))
+	for key, count := range a.counts {
+		if count > 0 {
+			keys[key] = true
+		}
+	}
+	return keys
+}
+
+// activeSessionCountsByAccount counts sessions with in-flight work per
+// account — the live-concurrency signal the scheduler's fewest-sessions
+// tie-break and the Claude endgame taper run on. The session store's
+// CountByAccount is NOT usable for this: sticky assignments are never
+// pruned, so its counts grow monotonically (a day-old store already exceeds
+// the endgame session cap on every active account) and the taper would
+// never admit a draining account. Falls back to the all-time counts when no
+// ActiveSessions tracker is wired — over-counting keeps endgame drain off,
+// which is the conservative direction.
+func (s Server) activeSessionCountsByAccount() map[string]int {
+	if s.Sessions == nil {
+		return nil
+	}
+	if s.ActiveSessions == nil {
+		return s.Sessions.CountByAccount()
+	}
+	active := s.ActiveSessions.ActiveKeys()
+	counts := make(map[string]int)
+	for _, assignment := range s.Sessions.All() {
+		if active[session.ScopedSessionKey(assignment.AgentType, assignment.SessionID)] {
+			counts[assignment.AccountID]++
+		}
+	}
+	return counts
+}
+
 type Lifecycle struct {
 	startedAt time.Time
 	gateMu    sync.Mutex
 	draining  atomic.Bool
 	quiesced  atomic.Bool
-	active    atomic.Int64
+	// stopping is set once, by Stop, and never cleared. Written under gateMu
+	// like quiesced, so every websocket turn either started before it (and is
+	// counted) or is refused after it.
+	stopping atomic.Bool
+	active   atomic.Int64
+	// shuttingDown is set once, by BeginShutdown at SIGTERM, and never
+	// cleared: the drain socket keeps answering until the process exits, and a
+	// resume there must not undo the drain of a process that is leaving.
+	shuttingDown atomic.Bool
+	// websocketTurns counts websocket turns in flight: a response.create
+	// forwarded upstream whose finishing event the client has not yet been
+	// sent. active cannot answer that question for a websocket, because the
+	// handler that counts it runs for the socket's whole life, and a Codex
+	// socket stays open, idle, between turns.
+	websocketTurns atomic.Int64
+	// background counts StartBackground work still running; backgroundIdle
+	// is closed when it drops to zero. Both under gateMu.
+	background     int
+	backgroundIdle chan struct{}
+	retired        chan struct{}
 }
 
 func NewLifecycle() *Lifecycle {
-	return &Lifecycle{startedAt: time.Now().UTC()}
+	return &Lifecycle{startedAt: time.Now().UTC(), retired: make(chan struct{})}
 }
 
 func (l *Lifecycle) BeginProxyRequest() func() {
@@ -404,7 +668,71 @@ func (l *Lifecycle) TryBeginProxyRequest() (func(), bool) {
 
 func (l *Lifecycle) Drain() {
 	if l != nil {
+		// Under gateMu so that, once Drain returns, StartBackground can no
+		// longer start anything WaitBackground would miss.
+		l.gateMu.Lock()
 		l.draining.Store(true)
+		l.gateMu.Unlock()
+	}
+}
+
+// StartBackground runs fn on its own goroutine as work graceful shutdown waits
+// for (WaitBackground), unless the process is draining: then it starts nothing
+// and reports false. http.Server.Shutdown waits only for handlers, so work a
+// handler hands off outlives it untracked -- the stale-score sweep (PATCHES
+// section 44) refreshes OAuth tokens, and a process that exits between the
+// provider's rotation and the save keeps a spent refresh token. A nil
+// Lifecycle runs fn untracked.
+func (l *Lifecycle) StartBackground(fn func()) bool {
+	if l == nil {
+		go fn()
+		return true
+	}
+	l.gateMu.Lock()
+	if l.draining.Load() {
+		l.gateMu.Unlock()
+		return false
+	}
+	if l.background == 0 {
+		l.backgroundIdle = make(chan struct{})
+	}
+	l.background++
+	l.gateMu.Unlock()
+	go func() {
+		defer l.endBackground()
+		fn()
+	}()
+	return true
+}
+
+func (l *Lifecycle) endBackground() {
+	l.gateMu.Lock()
+	defer l.gateMu.Unlock()
+	l.background--
+	if l.background == 0 {
+		close(l.backgroundIdle)
+		l.backgroundIdle = nil
+	}
+}
+
+// WaitBackground waits until no StartBackground work is running or ctx ends,
+// and reports whether it saw the work finish.
+func (l *Lifecycle) WaitBackground(ctx context.Context) bool {
+	if l == nil {
+		return true
+	}
+	for {
+		l.gateMu.Lock()
+		idle := l.backgroundIdle
+		l.gateMu.Unlock()
+		if idle == nil {
+			return true
+		}
+		select {
+		case <-idle:
+		case <-ctx.Done():
+			return false
+		}
 	}
 }
 
@@ -418,14 +746,160 @@ func (l *Lifecycle) Quiesce() {
 	l.gateMu.Unlock()
 }
 
-func (l *Lifecycle) Resume() {
+// Why a resume was refused.
+var (
+	// ErrResumeQuiesced: ResumeDrain never lifts a quiesce, which is set from
+	// loopback only and so is undone from loopback only (Resume).
+	ErrResumeQuiesced = errors.New("subrouter is quiesced, and a quiesce is only resumed from loopback")
+	// ErrResumeShuttingDown: no resume undoes the drain BeginShutdown made. The
+	// process is leaving; the drain socket answers until it exits, and a resume
+	// there would make drain-status call it ready and let StartBackground admit
+	// work the exit may not wait for (PATCHES section 38.1).
+	ErrResumeShuttingDown = errors.New("subrouter is shutting down; a resume would not keep it serving")
+)
+
+// Resume undoes a Drain and a Quiesce: loopback's resume. It refuses, with
+// ErrResumeShuttingDown, once BeginShutdown has run.
+func (l *Lifecycle) Resume() error {
+	if l == nil {
+		return nil
+	}
+	l.gateMu.Lock()
+	defer l.gateMu.Unlock()
+	if l.shuttingDown.Load() {
+		return ErrResumeShuttingDown
+	}
+	l.quiesced.Store(false)
+	l.draining.Store(false)
+	return nil
+}
+
+// ResumeDrain undoes a Drain but never a Quiesce: while the process is
+// quiesced it changes nothing and returns ErrResumeQuiesced. It is the resume
+// a caller gets from off the machine (handleResume) and over the drain socket,
+// because quiesce is loopback-only and so is its undo. Like Resume it refuses
+// once BeginShutdown has run (ErrResumeShuttingDown). The check and the
+// resume are one step under gateMu, and BeginShutdown sets its drain and its
+// mark under the same lock, so no resume lands between the two.
+func (l *Lifecycle) ResumeDrain() error {
+	if l == nil {
+		return nil
+	}
+	l.gateMu.Lock()
+	defer l.gateMu.Unlock()
+	if l.shuttingDown.Load() {
+		return ErrResumeShuttingDown
+	}
+	if l.quiesced.Load() {
+		return ErrResumeQuiesced
+	}
+	l.draining.Store(false)
+	return nil
+}
+
+// Stop is Drain for a process that is exiting: serve calls it on SIGTERM once
+// its listeners have drained, just before it waits for the websocket turns in
+// flight. On top of Drain it refuses every websocket turn not already in
+// flight (TryBeginWebSocketTurn), so the relay closes the socket 1012 and the
+// client replays the turn on the next process. That is what bounds the wait by
+// the turns in flight when it began: a busy Codex socket would otherwise start
+// turn after turn on a process waiting to exit. Resume does not undo it.
+func (l *Lifecycle) Stop() {
 	if l == nil {
 		return
 	}
 	l.gateMu.Lock()
-	l.quiesced.Store(false)
-	l.draining.Store(false)
+	l.draining.Store(true)
+	l.stopping.Store(true)
 	l.gateMu.Unlock()
+}
+
+// BeginShutdown is the Drain serve makes on SIGTERM. It also marks the
+// process as leaving for good, which drain-status reports as shutting_down
+// and which no resume undoes (Resume, ResumeDrain): the drain socket, unlike
+// the listeners, answers until the process exits, so a deploy can watch the
+// old process drain (PATCHES section 38.1). The drain and the mark are set in
+// one step under gateMu. Set apart, a resume that took the gate between them
+// cleared the drain of a process already marked as leaving.
+func (l *Lifecycle) BeginShutdown() {
+	if l == nil {
+		return
+	}
+	l.gateMu.Lock()
+	l.draining.Store(true)
+	l.shuttingDown.Store(true)
+	l.gateMu.Unlock()
+}
+
+func (l *Lifecycle) ShuttingDown() bool {
+	return l != nil && l.shuttingDown.Load()
+}
+
+// Left open, an idle Codex websocket pins this generation until Codex closes
+// it, which can be hours.
+func (l *Lifecycle) Retire() {
+	if l == nil {
+		return
+	}
+	l.gateMu.Lock()
+	defer l.gateMu.Unlock()
+	select {
+	case <-l.retired:
+	default:
+		close(l.retired)
+	}
+}
+
+func (l *Lifecycle) Retired() <-chan struct{} {
+	if l == nil {
+		return nil
+	}
+	return l.retired
+}
+
+// TryBeginWebSocketTurn admits one websocket turn against Stop, as
+// TryBeginProxyRequest admits a request against Quiesce.
+func (l *Lifecycle) TryBeginWebSocketTurn() (func(), bool) {
+	if l == nil {
+		return func() {}, true
+	}
+	l.gateMu.Lock()
+	defer l.gateMu.Unlock()
+	if l.stopping.Load() {
+		return func() {}, false
+	}
+	l.websocketTurns.Add(1)
+	var once sync.Once
+	return func() {
+		once.Do(func() { l.websocketTurns.Add(-1) })
+	}, true
+}
+
+func (l *Lifecycle) ActiveWebSocketTurns() int64 {
+	if l == nil {
+		return 0
+	}
+	return l.websocketTurns.Load()
+}
+
+// lifecycleWaitPoll is how often WaitForWebSocketTurns rechecks the count.
+const lifecycleWaitPoll = 50 * time.Millisecond
+
+// WaitForWebSocketTurns blocks until no websocket turn is in flight, or ctx
+// ends. After Stop the count can only fall, so a zero read is final. It exists
+// for the part of a shutdown http.Server.Shutdown cannot see: a websocket is a
+// hijacked connection, which Shutdown neither waits for nor closes.
+func (l *Lifecycle) WaitForWebSocketTurns(ctx context.Context) error {
+	ticker := time.NewTicker(lifecycleWaitPoll)
+	defer ticker.Stop()
+	for l.ActiveWebSocketTurns() > 0 {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
+	return nil
 }
 
 func (l *Lifecycle) Draining() bool {
@@ -450,14 +924,21 @@ func (l *Lifecycle) Status() map[string]any {
 			"quiesced":                 false,
 			"accepting_proxy_requests": true,
 			"active_proxy_requests":    int64(0),
+			"active_websocket_turns":   int64(0),
+			"shutting_down":            false,
 		}
 	}
 	return map[string]any{
 		"draining":                 l.Draining(),
 		"quiesced":                 l.Quiesced(),
 		"accepting_proxy_requests": !l.Quiesced(),
-		"active_proxy_requests":    l.ActiveProxyRequests(),
-		"started_at":               l.startedAt.Format(time.RFC3339),
+		// Includes every open websocket, idle ones too, so on a daemon with
+		// Codex clients it does not reach 0. active_websocket_turns is the part
+		// of it a shutdown waits for.
+		"active_proxy_requests":  l.ActiveProxyRequests(),
+		"active_websocket_turns": l.ActiveWebSocketTurns(),
+		"shutting_down":          l.ShuttingDown(),
+		"started_at":             l.startedAt.Format(time.RFC3339),
 	}
 }
 
@@ -488,10 +969,14 @@ type AccountRef struct {
 	usageStatusCache     []AccountUsageStatus
 	usageStatusAt        time.Time
 	lastGoodUsage        map[string]usageStatusSnapshot
-	// usageStatusSweep is the in-flight live sweep concurrent callers join;
-	// usageStatusEpoch advances on invalidation so a sweep that started
-	// before it is not cached.
+	// usageStatusSweep is non-nil while a live sweep is running; its done is
+	// closed when it lands. Readers with a snapshot serve it rather than queue
+	// behind the sweep; readers with none wait on it instead of starting a
+	// second (UsageStatusesAvailable).
 	usageStatusSweep *usageStatusSweep
+	// usageStatusEpoch counts invalidations. A sweep that started before an
+	// invalidation must not publish over it: its rows may predate the change
+	// that invalidated them.
 	usageStatusEpoch uint64
 
 	usageWindowsMu       sync.Mutex
@@ -515,6 +1000,22 @@ type AccountRef struct {
 	credFailMu sync.Mutex
 	credFail   map[string]credFailure
 
+	// Claude saved-reset claims (PATCHES §46): one claim at a time per
+	// account (claudeResetClaimLocks, guarded by claudeResetMu), and the
+	// request_id of a claim that got no definite answer.
+	claudeResetMu         sync.Mutex
+	claudeResetClaimLocks map[string]chan struct{}
+	claudeResetPending    map[string]pendingClaudeResetClaim
+	// claudeResetClaimSentAt is when each account's last claim POST went
+	// out: no block read before it is gone by again (§46.7 review).
+	claudeResetClaimSentAt map[string]time.Time
+	// claudeResetStatuses are saved resets read with Claude Code's own query
+	// (the claim path, and the sweep's fallback read), by account id.
+	// claudeResetFallbackEvery > 0 turns the fallback read on: the daemon
+	// sets it, tests that want it set it (EnableClaudeResetFallback).
+	claudeResetStatuses      map[string]claudeResetStatusEntry
+	claudeResetFallbackEvery time.Duration
+
 	// resetAdvice holds the reset-credit spender's latest unexecuted
 	// decisions (warn mode) by account ID, for /_subrouter/usage-status.
 	resetAdviceMu sync.Mutex
@@ -527,6 +1028,29 @@ type AccountRef struct {
 	// claudeHealthTracker keeps the Claude credential death ledger and
 	// liveness probe schedule (claude_credential_health.go).
 	claudeHealthTracker atomic.Pointer[claudeCredentialHealth]
+	// claudeIdentityOnly is the identity-only pin (SetClaudeIdentityOnly):
+	// that account is sent no paid Messages probe.
+	claudeIdentityOnly atomic.Pointer[string]
+	// admission is the admission gate shared by every Server copy over this
+	// ref (see sharedAdmission): the private and the public listener each
+	// build their handler from their own copy of Server, and one account's
+	// concurrency limit and 429 pause must hold across both.
+	admission atomic.Pointer[admissionControl]
+}
+
+// sharedAdmission returns the ref's admission gate, creating it on first use.
+// Handler and PublicHandler normalize separate Server copies; a gate created
+// per copy doubled every account's limit and hid one listener's 429 pause from
+// the other (the fork's public listener carries peer-forwarded turns).
+func (r *AccountRef) sharedAdmission() *admissionControl {
+	if r == nil {
+		return newAdmissionControl()
+	}
+	if control := r.admission.Load(); control != nil {
+		return control
+	}
+	r.admission.CompareAndSwap(nil, newAdmissionControl())
+	return r.admission.Load()
 }
 
 func (r *AccountRef) qwenRoot() string {
@@ -596,23 +1120,6 @@ func (r *AccountRef) antigravityStore() (*agentantigravity.Store, bool) {
 	return nil, false
 }
 
-func (r *AccountRef) hasOAuthUsageSource(provider accounts.Provider) bool {
-	if provider == "" || provider == accounts.ProviderCodex || provider == accounts.ProviderClaude {
-		return true
-	}
-	if r == nil {
-		return false
-	}
-	for _, source := range r.oauthSources {
-		if source.Provider() != provider {
-			continue
-		}
-		_, ok := source.(OAuthUsageSource)
-		return ok
-	}
-	return false
-}
-
 // OAuthAccountSource is one provider's OAuth credential store. Claude and
 // Codex predate it and keep their bespoke wiring; every OAuth provider added
 // since (Kimi, Antigravity, Grok) plugs in here instead of growing another
@@ -668,6 +1175,23 @@ func irreparableClaudeRefreshFailure(err error) bool {
 
 type usageWindowsEntry struct {
 	windows []accounts.UsageWindow
+	// reset is a Claude account's saved usage-limit reset as the same read
+	// reported it (PATCHES §46), nil when that read did not carry the block.
+	reset *accounts.ComplimentaryResetInfo
+	// resetStatus is the same block decoded whole (next_grant_id included):
+	// what a claim picks its grant from when this read is fresh enough
+	// (PATCHES §46.7).
+	resetStatus *agentclaude.ResetStatus
+	// resetLogin marks the token that read resetStatus
+	// (claudeResetLoginMark): a claim goes by the block only for the same
+	// login.
+	resetLogin string
+	// resetAt is when the read that carried resetStatus started. It is kept
+	// apart from at, because at moves without a new reset block: upstream's
+	// passive quota-header evidence (claude_response_evidence.go, #544)
+	// advances at on every Claude reply, and an explicit status refresh ages
+	// it. The age of a reset block is the age of the read that carried it.
+	resetAt time.Time
 	at      time.Time
 	// orderAt is the request start of the newest accepted response. It is
 	// separate from at because partial headers may retain an older bucket age.
@@ -677,6 +1201,20 @@ type usageWindowsEntry struct {
 	// Account IDs survive re-login, so ID-only quota data cannot cross a
 	// credential rotation.
 	credentialKey string
+}
+
+// measuredAt is when the reading behind e started, the instant a score built
+// from it may supersede exhaustion marks at (PATCHES §29.3b). A live fetch
+// stamps at with its start. Passive reply headers (claude_response_evidence.go,
+// upstream #544) stamp at with their arrival, for the cache TTL, but Anthropic
+// measured them when it admitted the request, which orderAt (that request's
+// start) bounds from above: a 429 marked while the request was in flight is
+// newer than its headers and must outlive them.
+func (e usageWindowsEntry) measuredAt() time.Time {
+	if !e.orderAt.IsZero() && e.orderAt.Before(e.at) {
+		return e.orderAt
+	}
+	return e.at
 }
 
 // A temporary upstream usage throttle has a short-lived, account-scoped
@@ -863,21 +1401,63 @@ func (r *AccountRef) credentialSnapshot(provider accounts.Provider, id string) a
 // windows as a confident exhaustion signal: stale cooked data was overwriting
 // healthy accounts' scores and routing traffic to dead accounts.
 func (r *AccountRef) FetchUsageWindowsCached(ctx context.Context, client *http.Client, account accounts.Account) ([]accounts.UsageWindow, bool, error) {
-	windows, fresh, _, _, err := r.FetchUsageWindowsCachedWithObservation(ctx, client, account)
+	windows, fresh, _, _, err := r.fetchUsageWindowsCachedReason(ctx, client, account)
 	return windows, fresh, err
 }
 
 // FetchUsageWindowsCachedWithObservation is FetchUsageWindowsCached plus the
-// provider observation time represented by the returned windows. The time is
-// captured with the same cache/flight result, so a concurrent refresh cannot
-// pair old windows with an unrelated timestamp.
+// provider observation time represented by the returned windows, and whether
+// an account-scoped usage-endpoint throttle (a provider Retry-After) is
+// active. The time is captured with the same cache/flight result, so a
+// concurrent refresh cannot pair old windows with an unrelated timestamp. It is
+// the same instant as fetchUsageWindowsCachedReason's measuredAt: when the
+// read that produced the windows started.
 func (r *AccountRef) FetchUsageWindowsCachedWithObservation(ctx context.Context, client *http.Client, account accounts.Account) ([]accounts.UsageWindow, bool, time.Time, bool, error) {
+	read := r.readUsageWindowsCached(ctx, client, account)
+	return read.windows, read.fresh, read.measuredAt, read.throttled, read.err
+}
+
+// fetchUsageWindowsCachedReason is FetchUsageWindowsCached with the reason a
+// last-good result was served made visible: servedOver is the error the live
+// fetch returned when the windows are last-good, and nil when they are fresh
+// or a cache hit. The usage sweep needs it -- a cut hidden behind last-good
+// windows is still a cut, and must be published as one (sweep_cut), or the
+// row is byte-for-byte a restarted peer's stale seed on the wire.
+//
+// measuredAt is when the returned windows were read upstream: the instant the
+// fetch that produced them STARTED, so a cache hit reports its entry's age,
+// not now. Scores built from these windows carry it (Score.MeasuredAt), and a
+// 429 exhaustion mark set after it is newer than they are (PATCHES.md §29): a
+// "fresh" cache hit up to usageWindowsTTL old is fresh enough to rank on, and
+// far too old to prove a rejection that happened since is over.
+func (r *AccountRef) fetchUsageWindowsCachedReason(ctx context.Context, client *http.Client, account accounts.Account) (windows []accounts.UsageWindow, fresh bool, measuredAt time.Time, servedOver error, err error) {
+	read := r.readUsageWindowsCached(ctx, client, account)
+	return read.windows, read.fresh, read.measuredAt, read.servedOver, read.err
+}
+
+// usageWindowsRead is one read of an account's usage windows through the
+// cache: what fetchUsageWindowsCachedReason and
+// FetchUsageWindowsCachedWithObservation each report a part of.
+type usageWindowsRead struct {
+	windows []accounts.UsageWindow
+	fresh   bool
+	// measuredAt is when the read behind windows started (PATCHES §29).
+	measuredAt time.Time
+	// throttled is an active account-scoped usage-endpoint throttle.
+	throttled bool
+	// servedOver is the live fetch's error when windows are last-good.
+	servedOver error
+	err        error
+}
+
+func (r *AccountRef) readUsageWindowsCached(ctx context.Context, client *http.Client, account accounts.Account) usageWindowsRead {
 	if r == nil {
+		measuredAt := time.Now()
 		windows, err := fetchAccountUsageWindowsLive(ctx, client, account)
 		if err != nil {
-			return windows, false, time.Time{}, false, err
+			return usageWindowsRead{windows: windows, err: err}
 		}
-		return windows, true, time.Now().UTC(), false, nil
+		return usageWindowsRead{windows: windows, fresh: true, measuredAt: measuredAt}
 	}
 	key := account.ID + "\x00" + string(account.Provider)
 	credentialKey := usageWindowsCredentialKey(account)
@@ -897,19 +1477,21 @@ func (r *AccountRef) FetchUsageWindowsCachedWithObservation(ctx context.Context,
 				supplementalFresh = true
 			}
 		}
-		return windows, supplementalFresh, entry.at, false, nil
+		return usageWindowsRead{windows: windows, fresh: supplementalFresh, measuredAt: entry.measuredAt()}
 	}
 	// A quota-status poll should never turn one upstream 429 into a storm of
 	// identical follow-up 429s. No waiting: serve last-good or return the
 	// already-known failure. Actual model requests use their normal route.
 	if throttled && now.Before(failure.retryAt) {
 		if entryMatchesCredential && now.Sub(entry.at) < usageWindowsLastGoodTTL {
-			return append([]accounts.UsageWindow(nil), entry.windows...), false, entry.at, true, nil
+			return usageWindowsRead{windows: append([]accounts.UsageWindow(nil), entry.windows...),
+				measuredAt: entry.measuredAt(), throttled: true, servedOver: failure.err}
 		}
 		if len(failure.windows) > 0 {
-			return append([]accounts.UsageWindow(nil), failure.windows...), false, failure.fetchedAt, true, nil
+			return usageWindowsRead{windows: append([]accounts.UsageWindow(nil), failure.windows...),
+				measuredAt: failure.fetchedAt, throttled: true, servedOver: failure.err}
 		}
-		return nil, false, time.Time{}, true, failure.err
+		return usageWindowsRead{throttled: true, err: failure.err}
 	}
 	windows, supplementalFresh, fetchedAt, err := r.fetchUsageWindowsShared(ctx, client, account, key)
 	if err == nil {
@@ -917,33 +1499,40 @@ func (r *AccountRef) FetchUsageWindowsCachedWithObservation(ctx context.Context,
 		failure, throttled = r.usageWindowsFailures[failureKey]
 		throttleActive := throttled && now.Before(failure.retryAt)
 		r.usageWindowsMu.Unlock()
-		return windows, supplementalFresh, fetchedAt, throttleActive, nil
+		read := usageWindowsRead{windows: windows, fresh: supplementalFresh, measuredAt: fetchedAt, throttled: throttleActive}
+		if throttleActive && !supplementalFresh {
+			// Reset metadata the provider attached to a throttled reply,
+			// served as stale evidence: the read behind it still failed.
+			read.servedOver = failure.err
+		}
+		return read
 	}
+	throttleActive := throttled && now.Before(failure.retryAt)
 	if !authLikeUsageError(err.Error()) && entryMatchesCredential && now.Sub(entry.at) < usageWindowsLastGoodTTL {
-		return append([]accounts.UsageWindow(nil), entry.windows...), false, entry.at, throttled && now.Before(failure.retryAt), nil
+		return usageWindowsRead{windows: append([]accounts.UsageWindow(nil), entry.windows...),
+			measuredAt: entry.measuredAt(), throttled: throttleActive, servedOver: err}
 	}
-	return nil, false, time.Time{}, throttled && now.Before(failure.retryAt), err
+	return usageWindowsRead{throttled: throttleActive, err: err}
 }
 
 // usageWindowsFlight is one in-flight upstream usage fetch shared by every
 // concurrent reader of the same account credential.
 type usageWindowsFlight struct {
-	done              chan struct{}
+	done chan struct{}
+	// started is when the fetch began: the measuredAt of everything it
+	// returns (PATCHES §29: a 429 mark set while the fetch was in flight is
+	// newer than its reading, so the reading must not clear it).
+	started           time.Time
 	epoch             uint64
 	windows           []accounts.UsageWindow
 	fetchedAt         time.Time
 	supplementalFresh bool
-	err               error
+	// resetStatus is the saved reset the same Claude usage answer carried
+	// (PATCHES §46), nil when it carried none.
+	resetStatus *agentclaude.ResetStatus
+	err         error
 }
 
-// fetchUsageWindowsShared coalesces concurrent live fetches of one account's
-// usage into a single upstream call (the score sweep and the status sweep
-// overlap on every account), and records a success in the usage-window cache.
-//
-// The shared fetch runs on a context detached from whichever caller started
-// it, bounded by usageStatusFetchTimeout, so that caller disconnecting does
-// not fail every other waiter. Each caller still stops waiting when its own
-// context ends.
 // usageWindowsFailureKey identifies the upstream telemetry throttle by the
 // logical account, rather than by its short-lived OAuth credential. Provider
 // Retry-After applies to the subscription/account, so a normal token refresh
@@ -963,6 +1552,15 @@ func usageWindowsCredentialKey(account accounts.Account) string {
 	return hex.EncodeToString(fingerprint[:])
 }
 
+// fetchUsageWindowsShared coalesces concurrent live fetches of one account's
+// usage into a single upstream call (the score sweep and the status sweep
+// overlap on every account), and records a success in the usage-window cache.
+//
+// The shared fetch runs on a context detached from whichever caller started
+// it, bounded by usageStatusFetchTimeout, so that caller disconnecting does
+// not fail every other waiter (PATCHES §18: a caller's cancellation never
+// poisons shared state). Each caller still stops waiting when its own context
+// ends. It reads usage only: no token is refreshed here.
 func (r *AccountRef) fetchUsageWindowsShared(ctx context.Context, client *http.Client, account accounts.Account, cacheKey string) ([]accounts.UsageWindow, bool, time.Time, error) {
 	credentialKey := usageWindowsCredentialKey(account)
 	r.usageWindowsMu.Lock()
@@ -983,7 +1581,7 @@ func (r *AccountRef) fetchUsageWindowsShared(ctx context.Context, client *http.C
 			}
 			return nil, false, time.Time{}, failure.err
 		}
-		flight = &usageWindowsFlight{done: make(chan struct{}), epoch: epoch}
+		flight = &usageWindowsFlight{done: make(chan struct{}), epoch: epoch, started: time.Now()}
 		if r.usageWindowsFlights == nil {
 			r.usageWindowsFlights = map[string]*usageWindowsFlight{}
 		}
@@ -997,7 +1595,7 @@ func (r *AccountRef) fetchUsageWindowsShared(ctx context.Context, client *http.C
 			defer cancel()
 			defer func() {
 				if recovered := recover(); recovered != nil {
-					flight.windows, flight.err = nil, fmt.Errorf("usage fetch panicked: %v", recovered)
+					flight.windows, flight.resetStatus, flight.err = nil, nil, fmt.Errorf("usage fetch panicked: %v", recovered)
 				}
 				var persistedFailure *usageWindowsFailure
 				var clearPersistedFailure bool
@@ -1011,22 +1609,31 @@ func (r *AccountRef) fetchUsageWindowsShared(ctx context.Context, client *http.C
 				}
 				latest := r.usageWindowsLatest[cacheKey] == flightKey
 				if flight.err == nil {
-					flight.fetchedAt = time.Now().UTC()
+					// The reading is as old as the fetch's start, not its
+					// end (PATCHES §29).
+					flight.fetchedAt = flight.started
 					if flight.epoch == r.usageWindowsEpoch && latest {
 						if r.usageWindows == nil {
 							r.usageWindows = map[string]usageWindowsEntry{}
 						}
-						r.usageWindows[cacheKey] = usageWindowsEntry{
+						entry := usageWindowsEntry{
 							windows: append([]accounts.UsageWindow(nil), flight.windows...), at: flight.fetchedAt,
 							supplementalFresh: flight.supplementalFresh, credentialKey: credentialKey,
 						}
+						if flight.resetStatus != nil {
+							entry.reset = agentclaude.ResetInfo(flight.resetStatus, flight.started)
+							entry.resetStatus = flight.resetStatus
+							entry.resetLogin = claudeResetLoginMark(account.Token)
+							entry.resetAt = flight.started
+						}
+						r.usageWindows[cacheKey] = entry
 						delete(r.usageWindowsFailures, failureKey)
 						clearPersistedFailure = true
 					}
 				} else if usageWindowsIsThrottle(flight.err) && flight.epoch == r.usageWindowsEpoch && latest {
 					var throttle *agentclaude.UsageThrottleError
 					if errors.As(flight.err, &throttle) && len(throttle.Windows) > 0 {
-						flight.fetchedAt = time.Now().UTC()
+						flight.fetchedAt = flight.started
 					}
 					if r.usageWindowsFailures == nil {
 						r.usageWindowsFailures = map[string]usageWindowsFailure{}
@@ -1053,7 +1660,7 @@ func (r *AccountRef) fetchUsageWindowsShared(ctx context.Context, client *http.C
 				}
 				close(flight.done)
 			}()
-			flight.windows, flight.supplementalFresh, flight.err = r.fetchAccountUsageWindowsLiveWithFreshness(fetchCtx, client, account)
+			flight.windows, flight.resetStatus, flight.supplementalFresh, flight.err = r.fetchAccountUsageLive(fetchCtx, client, account)
 		}()
 	}
 	r.usageWindowsMu.Unlock()
@@ -1080,13 +1687,25 @@ func (r *AccountRef) fetchUsageWindowsShared(ctx context.Context, client *http.C
 // newer OAuth provider such as Kimi fell through to the legacy Codex endpoint,
 // which could incorrectly zero a healthy account's routing score on reload.
 func (r *AccountRef) fetchAccountUsageWindowsLive(ctx context.Context, client *http.Client, account accounts.Account) ([]accounts.UsageWindow, error) {
-	windows, _, err := r.fetchAccountUsageWindowsLiveWithFreshness(ctx, client, account)
+	windows, _, _, err := r.fetchAccountUsageLive(ctx, client, account)
 	return windows, err
 }
 
+// fetchAccountUsageWindowsLiveWithFreshness is fetchAccountUsageWindowsLive
+// plus whether the windows are fresh as a whole (see fetchAccountUsageLive).
 func (r *AccountRef) fetchAccountUsageWindowsLiveWithFreshness(ctx context.Context, client *http.Client, account accounts.Account) ([]accounts.UsageWindow, bool, error) {
+	windows, _, fresh, err := r.fetchAccountUsageLive(ctx, client, account)
+	return windows, fresh, err
+}
+
+// fetchAccountUsageLive is fetchAccountUsageWindowsLive plus the saved reset
+// a Claude usage read carries (PATCHES §46), decoded, and whether the windows
+// are fresh as a whole. The reset rides on the same request as the windows;
+// no provider makes a second one for it.
+func (r *AccountRef) fetchAccountUsageLive(ctx context.Context, client *http.Client, account accounts.Account) ([]accounts.UsageWindow, *agentclaude.ResetStatus, bool, error) {
 	if account.Provider == accounts.ProviderClaude && account.AuthMode == accounts.AuthModeOAuth {
-		return r.fetchClaudeUsageWindowsReusingSupplementalWithFreshness(ctx, client, account)
+		windows, reset, err := r.fetchClaudeOAuthUsageLive(ctx, client, account)
+		return windows, reset, true, err
 	}
 	if account.AuthMode == accounts.AuthModeOAuth {
 		for _, source := range r.oauthSources {
@@ -1095,14 +1714,202 @@ func (r *AccountRef) fetchAccountUsageWindowsLiveWithFreshness(ctx context.Conte
 			}
 			usageSource, ok := source.(OAuthUsageSource)
 			if !ok {
-				return nil, true, fmt.Errorf("%w for provider %q", errOAuthUsageUnavailable, account.Provider)
+				return nil, nil, true, fmt.Errorf("%w for provider %q", errOAuthUsageUnavailable, account.Provider)
 			}
 			_, windows, err := usageSource.FetchUsage(ctx, client, account)
-			return windows, true, err
+			return windows, nil, true, err
 		}
 	}
+	if account.Provider == accounts.ProviderClaude {
+		windows, reset, err := fetchClaudeUsageLive(ctx, client, account)
+		return windows, reset, true, err
+	}
+	if account.AuthMode == accounts.AuthModeOAuth && (account.Provider == "" || account.Provider == accounts.ProviderCodex) {
+		details, _, err := r.fetchCodexUsageDetails(ctx, client, account)
+		return details.Windows, nil, true, err
+	}
 	windows, err := fetchAccountUsageWindowsLive(ctx, client, account)
-	return windows, true, err
+	return windows, nil, true, err
+}
+
+// fetchClaudeOAuthUsageLive reads one Claude OAuth account's windows and the
+// saved reset its usage answer carries (PATCHES §46). It is upstream's
+// fetchClaudeUsageWindowsReusingSupplementalWithFreshness (#535, #541, #625)
+// with two fork rules:
+//
+//   - The saved reset is decoded from the same usage answer, so no second
+//     request is made for it.
+//   - Cached model-specific (supplemental) windows stand in for the Fable
+//     probe only while they are younger than usageWindowsTTL, so every read
+//     this returns is fresh. Upstream also reuses them up to
+//     claudeSupplementalProbeTTL old and reports such a read as not fresh;
+//     here a non-fresh score is dropped by a peer (remote_pool.go, PATCHES
+//     §31, §52), which would take an idle box account out of the laptop's
+//     ranking most of the time. Under traffic the passive reply headers keep
+//     the supplemental cache younger than that, so the probe is still saved.
+//
+// The null-means-unused Fable window (agentclaude.WithUnusedFableWindow) is
+// appended, as fetchClaudeUsageLive does, after the probe has had its chance.
+func (r *AccountRef) fetchClaudeOAuthUsageLive(ctx context.Context, client *http.Client, account accounts.Account) ([]accounts.UsageWindow, *agentclaude.ResetStatus, error) {
+	var usage *agentclaude.UsageResponse
+	var err error
+	if r.claudeUsageScopeDeniedFor(ctx, account) {
+		// This credential cannot read the usage endpoint. Asking again only
+		// earns a 429 that would mark a healthy account throttled, so go
+		// straight to the Messages probe, whose headers are its usage source.
+		err = &agentclaude.UsageScopeError{Status: "403 Forbidden"}
+	} else {
+		usage, err = agentclaude.FetchUsage(ctx, client, account.Token)
+		var scope *agentclaude.UsageScopeError
+		if errors.As(err, &scope) {
+			r.rememberClaudeUsageScopeDenied(account)
+		}
+	}
+	windows := claudeUsageWindows(usage)
+	var throttle *agentclaude.UsageThrottleError
+	if errors.As(err, &throttle) {
+		// The provider's usage endpoint supplied an explicit retry deadline.
+		// Do not immediately issue the synthetic Messages probe as a fallback;
+		// that would double traffic while the account is already throttled.
+		// Keep any unified reset headers from that same response for status.
+		return append([]accounts.UsageWindow(nil), throttle.Windows...), nil, err
+	}
+	var reset *agentclaude.ResetStatus
+	if err == nil && usage != nil {
+		// A malformed block is not read, never "none": reset stays nil.
+		if status, statusErr := usage.ResetStatus(); statusErr == nil {
+			reset = status
+		}
+	}
+	if usageWindowNamed(windows, agentclaude.FableWindowName) {
+		// The ordinary endpoint's model bucket is newer than our probe cache.
+		// Save it so a later ordinary response that omits the bucket does not
+		// resurrect older supplemental evidence.
+		r.rememberClaudeSupplemental(account, windows)
+		return windows, reset, nil
+	}
+
+	// A successful primary fetch can use prior supplementary evidence without
+	// another model request, while that evidence is young enough to rank on
+	// (see the doc comment). On primary errors, leave the normal recovery
+	// probe intact so its primary windows may recover a usable status.
+	if err == nil && len(windows) > 0 {
+		if supplemental, observedAt, ok := r.cachedClaudeSupplementalWithObservation(account, time.Now()); ok &&
+			(len(supplemental) == 0 || time.Since(observedAt) < usageWindowsTTL) {
+			windows = mergeUsageWindows(windows, supplemental)
+			// Passive replies can supply only one model family's bucket. Keep
+			// that evidence, but still probe the missing Fable/OAuth-app bucket;
+			// otherwise a fresh Opus-only observation makes Fable look unsupported
+			// and suppresses the only probe that can discover its quota.
+			if len(supplemental) == 0 || usageWindowNamed(windows, agentclaude.FableWindowName) {
+				return agentclaude.WithUnusedFableWindow(windows), reset, nil
+			}
+		}
+	}
+
+	fableWindows, probeErr := r.claudeFableProbe(ctx, client, account)
+	if probeErr == nil {
+		if err == nil {
+			r.rememberClaudeSupplemental(account, fableWindows)
+		}
+		if err == nil {
+			// The usage endpoint is authoritative for account-wide 5h/7d. A
+			// probe rejection can carry exhausted 5h/7d headers for a healthy
+			// account, so only its model-scoped buckets may be merged.
+			windows = mergeUsageWindows(windows, supplementalClaudeWindows(fableWindows))
+		} else if fableProbeHasPrimaryWindows(fableWindows) {
+			windows = mergeUsageWindows(windows, fableWindows)
+		}
+	} else if err != nil {
+		return nil, nil, probeErr
+	}
+	if err != nil && len(windows) == 0 {
+		var scope *agentclaude.UsageScopeError
+		if errors.As(err, &scope) {
+			// The token works for inference; only its usage reading is
+			// missing this time. That is not a bad credential.
+			return nil, nil, errClaudeUsageProbeEmpty
+		}
+		return nil, nil, err
+	}
+	return agentclaude.WithUnusedFableWindow(windows), reset, nil
+}
+
+// fetchCodexUsageDetails is both sweeps' read of a Codex OAuth account's
+// usage. When OpenAI refuses it with token_expired, which it does days before
+// the JWT exp after a ChatGPT plan change, it renews that account's stored
+// chain and reads once more with the new token. The bool reports whether this
+// call renewed the chain.
+func (r *AccountRef) fetchCodexUsageDetails(ctx context.Context, client *http.Client, account accounts.Account) (accounts.CodexUsageDetails, bool, error) {
+	details, err := accounts.FetchCodexUsageDetails(ctx, client, account)
+	if !accounts.CodexAccessTokenRejectedAsExpired(err) {
+		return details, false, err
+	}
+	stored, ok, findErr := r.store.FindStored(account.ID)
+	if findErr != nil || !ok {
+		return details, false, err
+	}
+	refreshCtx := accounts.WithCodexRefreshReason(ctx, "usage.token-expired")
+	refreshed, didRefresh, refreshErr := r.store.RefreshStoredIfRejected(refreshCtx, r.client, stored, account.Token)
+	r.noteCredResult(account, refreshErr)
+	if refreshErr != nil {
+		return accounts.CodexUsageDetails{}, false, refreshErr
+	}
+	next, ok := refreshed.Account(refreshed.SourcePath(r.store))
+	if !ok {
+		return details, false, err
+	}
+	r.replace(next)
+	details, err = accounts.FetchCodexUsageDetails(ctx, client, next)
+	return details, didRefresh, err
+}
+
+// cachedUsageReset is the saved reset the cached usage read of account
+// carried, while that read is no older than a fresh window read may be
+// (usageWindowsTTL). The entry itself can stay fresh far longer than the read
+// that carried the reset: upstream's passive quota-header evidence
+// (claude_response_evidence.go, #544) renews it on every Claude reply, so an
+// account in use is never read live again. An older reset is not served as
+// current; the caller falls back to Claude Code's own reset read
+// (usageReadReset).
+func (r *AccountRef) cachedUsageReset(account accounts.Account) *accounts.ComplimentaryResetInfo {
+	if r == nil {
+		return nil
+	}
+	key := account.ID + "\x00" + string(account.Provider)
+	r.usageWindowsMu.Lock()
+	defer r.usageWindowsMu.Unlock()
+	entry, ok := r.usageWindows[key]
+	if !ok || entry.reset == nil || time.Since(entry.resetAt) >= usageWindowsTTL {
+		return nil
+	}
+	return cloneResetInfo(entry.reset)
+}
+
+// forgetUsageWindows drops account's cached usage read, so the next read of
+// it is live.
+func (r *AccountRef) forgetUsageWindows(account accounts.Account) {
+	if r == nil {
+		return
+	}
+	key := account.ID + "\x00" + string(account.Provider)
+	r.usageWindowsMu.Lock()
+	delete(r.usageWindows, key)
+	// A fetch already in flight started before whatever made this read stale
+	// (a claimed reset): the next read must not join it, and it must not
+	// publish over that read. Advancing the epoch gives the next read a
+	// flight of its own and keeps the old flight's answer out of the cache.
+	r.usageWindowsEpoch++
+	r.usageWindowsMu.Unlock()
+}
+
+func cloneResetInfo(info *accounts.ComplimentaryResetInfo) *accounts.ComplimentaryResetInfo {
+	if info == nil {
+		return nil
+	}
+	out := *info
+	out.Clears = append([]string(nil), info.Clears...)
+	return &out
 }
 
 // ResolvedAccount returns a refreshed, token-bearing OAuth account for the
@@ -1161,6 +1968,14 @@ type AccountStatus struct {
 
 type AccountUsageStatus struct {
 	AccountStatus
+	// SweepCut marks a row the sweep's own clock ran out on before it was
+	// measured this pass. Published explicitly and preserved through the
+	// last-good backfill below, because the backfill otherwise rewrites a
+	// cut row into one that looks merely stale -- the same shape as a
+	// just-restarted peer -- and a reader can no longer tell "not looked at"
+	// from "looked at, nothing fresh". Rows with it set are unmeasured, not
+	// dead and not empty.
+	SweepCut          bool       `json:"sweep_cut,omitempty"`
 	Active            bool       `json:"active,omitempty"`
 	KeyFingerprint    string     `json:"key_fingerprint,omitempty"`
 	AssignedSessions  int        `json:"assigned_sessions,omitempty"`
@@ -1181,6 +1996,7 @@ type AccountUsageStatus struct {
 	AccountIdentity    string                           `json:"account_identity,omitempty"`
 	QuotaUsageKnown    bool                             `json:"quota_usage_known,omitempty"`
 	Windows            []accounts.UsageWindow           `json:"windows,omitempty"`
+	Normalized         *NormalizedUsage                 `json:"normalized,omitempty"`
 	Credits            *accounts.CreditsInfo            `json:"credits,omitempty"`
 	ComplimentaryReset *accounts.ComplimentaryResetInfo `json:"complimentary_reset,omitempty"`
 	ExtraUsage         *accounts.ExtraUsageInfo         `json:"extra_usage,omitempty"`
@@ -1215,9 +2031,186 @@ type AccountUsageStatus struct {
 	UsageFresh            bool      `json:"-"`
 	AccountWideUsageFresh bool      `json:"-"`
 	UsageFetchedAt        time.Time `json:"usage_fetched_at,omitzero"`
+	// UsageMeasuredAt is when a UsageFresh row's windows were read upstream
+	// (fetchUsageWindowsCachedReason's measuredAt). The 30 s sweep cache
+	// republishes the row on every usage-status read, so the score built from
+	// it must say how old its reading is (Score.MeasuredAt, PATCHES.md §29).
+	UsageMeasuredAt time.Time `json:"-"`
 	// CapacityMarks is a Codex account's live capacity marks, one per
 	// (model, tier) pool; omitted when it has none.
 	CapacityMarks []AccountCapacityMark `json:"capacity_marks,omitempty"`
+}
+
+// NormalizedUsage is the provider-independent view of an account's capacity, as
+// the scheduler computes it for routing.
+//
+// `Windows` above is raw provider vocabulary: claude reports 5h/7d, codex
+// reports primary/<model>/primary/reached, and nothing guarantees a future
+// provider reuses either. A consumer that reads windows directly must therefore
+// hardcode that mapping, and the failure mode when it is wrong is silent --
+// looking up "7d" on a codex account yields no window, which reads as no data,
+// which renders as exhausted. Untouched accounts get reported as spent.
+//
+// These fields let a consumer answer "how much is left, and when does it roll"
+// without knowing any provider's vocabulary.
+type NormalizedUsage struct {
+	// Headroom is the bottleneck fraction remaining across all binding
+	// windows, 0..1 (not a percentage).
+	Headroom float64 `json:"headroom"`
+	// ShortHeadroom is the short-window (session) fraction remaining, 0..1.
+	ShortHeadroom       float64 `json:"short_headroom"`
+	SecondsToShortReset int64   `json:"seconds_to_short_reset,omitempty"`
+	// ShortWindowSeconds is the LENGTH of the short window, not how much is
+	// left. Published because eligibility is a burn RATE, and a consumer
+	// holding only the level and the reset cannot compute one -- 20% left
+	// means opposite things four hours and four minutes before a refill. A
+	// peer that omits it reads as unknown timing, which admits the account on
+	// the exhaustion floor rather than inventing a threshold.
+	ShortWindowSeconds int64 `json:"short_window_seconds,omitempty"`
+	// WeeklyHeadroom is the spendable weekly fraction for this traffic class:
+	// the measured week less this daemon's live debit and, with the Fable
+	// reservation on (SUBROUTER_FABLE_RESERVATION=1, PATCHES §57; off by
+	// default since 2026-10-15), less that reservation for a non-fable pool.
+	// Zero on codex scores, where weekly pacing does not apply.
+	//
+	// 🔴 It is NOT "how much of the week is left", and reading it that way has
+	// produced a wrong answer twice, both with the reservation on: an account
+	// 3% spent published 0.50 here (both meters full, reservation at full
+	// strength), and a 25%-remaining account publishes 0.125. The raw
+	// bottleneck is `headroom`; this is what a non-fable request may actually
+	// draw. With the reservation on the two differ by a reservation that
+	// decays to zero across the last 24h before the roll, so they also
+	// converge over time, which makes the discrepancy look like drift rather
+	// than definition.
+	WeeklyHeadroom       float64 `json:"weekly_headroom,omitempty"`
+	SecondsToWeeklyReset int64   `json:"seconds_to_weekly_reset,omitempty"`
+	// SecondsToHeldResetExpiry is how long the account's unclaimed saved reset
+	// (cedar_ember) has left, published while this daemon ranks the account
+	// on it (Score.HoldsReset, PATCHES §56): a peer ranks it at
+	// selectacct.ResetHoldPreferenceRatio until then. Counted from now like
+	// the weekly roll, so the two daemons' clocks need not agree. Absent is no
+	// hold -- none held, none read, the switch off here, or a daemon from
+	// before §56 -- and the peer ranks the account at 1x. Its early burndown is
+	// not derived from this: that arrives in new_session. Top level only: the
+	// hold is the account's, and a peer reads a pool entry with its account's
+	// (inheritPeerAccountFacts).
+	SecondsToHeldResetExpiry *float64 `json:"seconds_to_held_reset_expiry,omitempty"`
+	// Pools answers "can this account serve THIS traffic class" per quota pool
+	// (claudefable, plus claudeopus / claudesonnet only when Anthropic reports
+	// those buckets -- a model with no limit of its own gets no pool, PATCHES
+	// §24), keyed as selectacct.ModelKey normalizes the upstream window's
+	// Feature.
+	//
+	// Published because the scheduler already computes every one of these --
+	// ScoreFromLimitWindows builds a per-pool Score for each model-specific
+	// window and routing picks among them via ForModel -- and collapsing them
+	// into one scalar on the way out left consumers unable to answer the
+	// question routing answers internally. "Is this account usable" has a
+	// different answer for opus than for fable whenever the two meters diverge,
+	// which on this pool is most of the time: accounts often sit at
+	// 100% weekly with a completely full 5h window.
+	//
+	// Entries never carry their own Pools; the nesting is exactly one deep.
+	Pools map[string]*NormalizedUsage `json:"pools,omitempty"`
+	// FableWeekSpent is the used fraction, 0..1, of the account's own Fable
+	// weekly meter (Score.FableSpent, PATCHES §65): a peer ranks an Opus or
+	// Sonnet turn on it with selectacct's FableSpentFactor. A measurement,
+	// published whatever this daemon's SUBROUTER_FABLE_SPENT_PREFERENCE says;
+	// the reader's switch decides. Absent is 0 -- untouched, unknown, or a
+	// daemon from before §65 -- and ranks at 1x. Top level only: the meter is
+	// the account's, and a peer reads a pool entry with its account's
+	// (inheritPeerAccountFacts).
+	FableWeekSpent float64 `json:"fable_week_spent,omitempty"`
+	// Fresh distinguishes a score computed from a current usage fetch from one
+	// carried forward as a seed after a failed fetch. A stale reading is still
+	// the scheduler's working belief, but it is not evidence.
+	Fresh bool `json:"fresh"`
+	// Usable is the ROUTER'S OWN verdict on whether it would start a new
+	// session here. Published so no consumer has to reconstruct it.
+	//
+	// Every tool that reconstructed it eventually disagreed with the router:
+	// cmd/subrouter and internal/proxy each kept a `>= 0.40` copy, srdash and
+	// claudemode kept a third in Python, and the dashboard printed "0/6 above
+	// floor" for a pool the daemon was routing to happily. Eligibility is a
+	// burn rate over a window whose length the consumer may not even receive,
+	// so reconstructing it is guesswork with extra steps.
+	Usable bool `json:"usable"`
+	// NewSession is this daemon's own verdict on a PEER placing a new session
+	// on this account now (selectacct.NewSessionVerdict, PATCHES §31). Computed
+	// by the selection scheduler -- live session counts, reserves, live debits
+	// -- because those are exactly what a peer cannot see. A pointer so an old
+	// daemon's absence reads as "no verdict", never as "ineligible".
+	NewSession *selectacct.NewSessionVerdict `json:"new_session,omitempty"`
+}
+
+// withNormalizedUsage attaches the scheduler's normalized score to each status.
+// normalizedFromScore is the ONE conversion from a scheduler score to published
+// usage. Base scores and per-pool scores go through it identically, so a pool
+// entry can never come to mean something subtly different from the top level --
+// which is the drift this daemon has already been bitten by four separate times
+// (eligibility reimplemented in four places, each eventually disagreeing with
+// the router).
+func normalizedFromScore(score selectacct.Score, now time.Time) NormalizedUsage {
+	normalized := NormalizedUsage{
+		Usable:              score.UsableForNewSession(),
+		Headroom:            score.Headroom,
+		ShortHeadroom:       score.ShortHeadroom,
+		SecondsToShortReset: score.ShortResetAfterSeconds,
+		ShortWindowSeconds:  score.ShortWindowSeconds,
+		WeeklyHeadroom:      score.WeeklyHeadroom,
+		Fresh:               score.Fresh,
+		FableWeekSpent:      score.FableSpent,
+	}
+	if !score.WeeklyResetAt.IsZero() {
+		if remaining := score.WeeklyResetAt.Sub(now); remaining > 0 {
+			normalized.SecondsToWeeklyReset = int64(remaining.Seconds())
+		}
+	}
+	if score.HoldsReset(now) {
+		seconds := score.ResetHeldUntil.Sub(now).Seconds()
+		normalized.SecondsToHeldResetExpiry = &seconds
+	}
+	return normalized
+}
+
+// The input slice may be owned by AccountRef, so the result is a copy.
+func (s Server) withNormalizedUsage(statuses []AccountUsageStatus) []AccountUsageStatus {
+	scheduler := s.scheduler()
+	now := time.Now()
+	out := append([]AccountUsageStatus(nil), statuses...)
+	for i := range out {
+		// LookupScore, not ScoreFor: the latter substitutes a fully-healthy
+		// default for an unknown account, which as published output would
+		// assert capacity nobody measured. Omitted means unknown.
+		score, ok := scheduler.LookupScore(out[i].Provider, out[i].ID)
+		if !ok {
+			continue
+		}
+		normalized := normalizedFromScore(score, now)
+		// One level of nesting only. A pool's own ModelScores is empty by
+		// construction (scoreFromLimitWindows builds each from a single filtered
+		// window set), but building them through the same helper means a future
+		// change there cannot quietly produce an unbounded structure here.
+		for key, modelScore := range score.ModelScores {
+			// A pool is a slice of its account's usage reading, not a reading
+			// of its own, and the scheduler stamps Fresh on the account score
+			// only. Published as the sub-score's own false, every measured
+			// pool read stale, and a peer dropped the row (PATCHES §52).
+			modelScore.Fresh = score.Fresh
+			// The reset hold is deliberately NOT copied the same way: it is
+			// set on the account score only and published once, at the top
+			// level, where a peer's inheritPeerAccountFacts reads it for every
+			// pool (PATCHES §56).
+			pool := normalizedFromScore(modelScore, now)
+			pool.Pools = nil
+			if normalized.Pools == nil {
+				normalized.Pools = make(map[string]*NormalizedUsage, len(score.ModelScores))
+			}
+			normalized.Pools[key] = &pool
+		}
+		out[i].Normalized = &normalized
+	}
+	return out
 }
 
 // withWeeklyCooked fills each status's WeeklyCooked verdict from its windows,
@@ -1392,11 +2385,36 @@ func OpenAccountRefWithSources(ctx context.Context, store accounts.CodexStore, c
 }
 
 func loadAccountRefAccounts(store accounts.CodexStore, claudeStore agentclaude.Store, sources []OAuthAccountSource) ([]accounts.Account, error) {
+	return loadAccountRefAccountsKeeping(store, claudeStore, sources, nil)
+}
+
+// loadAccountRefAccountsKeeping is loadAccountRefAccounts for a reload: a
+// Claude profile whose credential read reached no verdict keeps its entry
+// from previous rather than dropping out of the pool, where it would read as
+// removed and send every session pinned to it to a fresh pick
+// (agentclaude.ErrCredentialUnchecked, ListAccountsKeeping).
+//
+// The keeper is passed even when previous is empty -- the daemon's first
+// listing, from OpenAccountRefWithSources at startup -- because a nil keeper
+// is ListAccounts, which drops the profile. A deploy restart under load is
+// exactly when a first read gets no answer, and the sessions the restart
+// restores with pins to that profile then moved for good (probed: startup
+// pool [b], the warm session's next turn committed to b). With a keeper, the
+// profile is listed without a credential until a read answers.
+func loadAccountRefAccountsKeeping(store accounts.CodexStore, claudeStore agentclaude.Store, sources []OAuthAccountSource, previous []accounts.Account) ([]accounts.Account, error) {
 	loaded, err := store.List()
 	if err != nil {
 		return nil, err
 	}
-	claudeAccounts, err := claudeStore.ListAccounts(context.Background())
+	keep := func(id string) (accounts.Account, bool) {
+		for _, account := range previous {
+			if account.Provider == accounts.ProviderClaude && account.ID == id {
+				return account, true
+			}
+		}
+		return accounts.Account{}, false
+	}
+	claudeAccounts, err := claudeStore.ListAccountsKeeping(context.Background(), keep)
 	if err != nil {
 		return nil, err
 	}
@@ -1459,7 +2477,8 @@ func (r *AccountRef) ReloadSnapshot() ([]accounts.Account, uint64, error) {
 	}
 	var loaded []accounts.Account
 	if !rollbackActive {
-		loaded, err = loadAccountRefAccounts(r.store, r.claudeStore, r.oauthSources)
+		previous, _ := r.Snapshot()
+		loaded, err = loadAccountRefAccountsKeeping(r.store, r.claudeStore, r.oauthSources, previous)
 		if err != nil {
 			return nil, 0, err
 		}
@@ -1485,19 +2504,68 @@ func (r *AccountRef) ReloadSnapshot() ([]accounts.Account, uint64, error) {
 // claudeRefreshCandidate skips a previously rejected credential, but accepts
 // a newer in-memory version of the same profile even if the in-flight request
 // still carries the older account snapshot.
-func (r *AccountRef) claudeRefreshCandidate(account accounts.Account) (accounts.Account, error) {
+// claudeRefreshCandidate is the account a Claude refresh may go on with, or
+// the cached terminal verdict that stops it before any provider request
+// (upstream #537: a dead grant is never presented again).
+//
+// The verdict is keyed by credential identity. The identity this daemon holds
+// in memory changes only on a reload, a usage-status sweep or a restart, but
+// the profile's store changes whenever another process rotates or re-logs it
+// (PATCHES §34.2, §34.5: Claude Code rotating its own item, an in-place `sr
+// claude addr`, an overlapping worker), and before #537 the next refresh read
+// the store and picked that up. So when every identity in memory is dead, the
+// store is read too (storedClaudeCredential, no provider request): a different
+// identity there that is not itself dead goes on to the refresh, which reads
+// the store again under its lock; the same dead identity keeps the verdict.
+func (r *AccountRef) claudeRefreshCandidate(ctx context.Context, account accounts.Account) (accounts.Account, error) {
 	reason, knownDead := r.terminalCredFailure(account)
 	if !knownDead {
 		return account, nil
 	}
 	current := r.credentialSnapshot(account.Provider, account.ID)
 	if current.Token != "" && current.CredentialIdentity() != account.CredentialIdentity() {
-		if reason, dead := r.terminalCredFailure(current); dead {
-			return current, errors.New(reason)
+		currentReason, dead := r.terminalCredFailure(current)
+		if !dead {
+			return current, nil
 		}
-		return current, nil
+		account, reason = current, currentReason
+	}
+	if stored, ok := r.storedClaudeCredential(ctx, account); ok {
+		if _, dead := r.terminalCredFailure(stored); !dead {
+			return stored, nil
+		}
 	}
 	return account, errors.New(reason)
+}
+
+// storedClaudeCredential is the credential a Claude profile's store holds now,
+// as account with that credential, when its identity differs from account's.
+// ok is false when the store holds the same identity, cannot be read, or
+// account is no Claude OAuth profile. It sends nothing to the provider:
+// ProfileCredential serves a fresh keychain answer and otherwise reads the
+// store.
+func (r *AccountRef) storedClaudeCredential(ctx context.Context, account accounts.Account) (accounts.Account, bool) {
+	if r == nil || account.Provider != accounts.ProviderClaude || account.AuthMode != accounts.AuthModeOAuth {
+		return accounts.Account{}, false
+	}
+	profile, ok := r.claudeStore.FindProfile(account.ID)
+	if !ok {
+		return accounts.Account{}, false
+	}
+	credential, err := r.claudeStore.ProfileCredential(ctx, profile)
+	if err != nil || credential == nil || credential.AccessToken == "" {
+		return accounts.Account{}, false
+	}
+	stored := account
+	stored.Token = credential.AccessToken
+	stored.CredentialVersion = accountpkg.OAuthCredentialVersion(credential.AccessToken, credential.RefreshToken)
+	// An account read without a credential version is identified by its
+	// access token alone: the same token in the store is the same credential.
+	if stored.CredentialIdentity() == account.CredentialIdentity() ||
+		(account.CredentialVersion == "" && stored.Token == account.Token) {
+		return accounts.Account{}, false
+	}
+	return stored, true
 }
 
 func (r *AccountRef) Refresh(ctx context.Context, account accounts.Account) (accounts.Account, error) {
@@ -1506,13 +2574,35 @@ func (r *AccountRef) Refresh(ctx context.Context, account accounts.Account) (acc
 	}
 	if account.Provider == accounts.ProviderClaude {
 		var candidateErr error
-		account, candidateErr = r.claudeRefreshCandidate(account)
+		account, candidateErr = r.claudeRefreshCandidate(ctx, account)
 		if candidateErr != nil {
 			return account, candidateErr
 		}
-		refreshed, _, err := r.claudeStore.RefreshAccountIfExpired(ctx, r.client, account)
+		profile, found := r.claudeStore.FindProfile(account.ID)
+		if !found {
+			err := fmt.Errorf("Claude profile %q not found", account.ID)
+			r.noteCredResult(account, err)
+			return account, err
+		}
+		refreshed, presented, _, err := r.claudeStore.RefreshCredentialDetailsIfExpired(ctx, r.client, profile)
 		r.noteCredResult(account, err)
 		if err != nil {
+			// The exchange presented whatever the store held under the
+			// refresh lock, which another process may have changed since
+			// this account was read: a refusal of that grant also goes to
+			// its identity, so claudeRefreshCandidate's store read finds it
+			// dead and does not present it again. Only the provider's own
+			// refusal (invalid_grant, refresh_token_reused) speaks for the
+			// presented grant; a failure after the exchange (the persist)
+			// may come with the rotated credential, which is alive.
+			if irreparableClaudeRefreshFailure(err) && presented != nil && presented.AccessToken != "" {
+				read := account
+				read.Token = presented.AccessToken
+				read.CredentialVersion = accountpkg.OAuthCredentialVersion(presented.AccessToken, presented.RefreshToken)
+				if read.CredentialIdentity() != account.CredentialIdentity() {
+					r.noteCredResult(read, err)
+				}
+			}
 			return account, err
 		}
 		r.replace(refreshed)
@@ -1615,6 +2705,12 @@ func (r *AccountRef) storedAccountStatus(ctx context.Context, stored accounts.St
 		refreshed, didRefresh, refreshErr = r.store.RefreshStoredIfExpired(accounts.WithCodexRefreshReason(ctx, "account-status.if-expired"), r.client, stored)
 	}
 	if refreshErr != nil {
+		// A refresh the caller's clock cut, or a credential store that never
+		// answered, is not a verdict about the account: unchecked, not invalid
+		// (sweepCut).
+		if sweepCut(refreshErr) {
+			status.AuthChecked = false
+		}
 		status.Error = refreshErr.Error()
 		return status
 	}
@@ -1644,6 +2740,10 @@ func (r *AccountRef) claudeProfileStatus(ctx context.Context, profile agentclaud
 		account, didRefresh, err = r.claudeStore.RefreshCredentialIfExpired(ctx, r.client, profile)
 	}
 	if err != nil {
+		// As in storedAccountStatus: a cut or a silent store is unchecked.
+		if sweepCut(err) {
+			status.AuthChecked = false
+		}
 		status.Error = err.Error()
 		return status
 	}
@@ -1656,42 +2756,126 @@ func (r *AccountRef) claudeProfileStatus(ctx context.Context, profile agentclaud
 const usageStatusCacheTTL = 30 * time.Second
 const usageStatusLastGoodTTL = 15 * time.Minute
 
+// usageSweepTimeout bounds a live sweep on ITS OWN clock, never the caller's.
+//
+// The sweep's result is shared state: it is cached for usageStatusCacheTTL and
+// served to every reader, and the scheduler is refreshed from it. Running it
+// under the request context tied that shared state to whichever caller
+// happened to arrive first after the cache expired. A peer daemon probing this
+// endpoint with a 3 s cap, or `sr status` with its 5 s cap, hung up mid-sweep;
+// the Codex phase had used the budget, so every Claude profile then failed
+// instantly with "context canceled" -- and THAT was cached for 30 s, published
+// as auth_valid:false, and read by the peer as a pool with no usable Claude
+// account. Ten healthy accounts reported dead, from a caller that merely left.
+//
+// A var so a test can shrink it; the value is sized for two provider phases
+// of refresh (15 s client default) plus usage fetch (10 s) with slack.
+var usageSweepTimeout = 60 * time.Second
+
+// sweepCut reports whether err is the sweep's own clock running out rather
+// than a verdict about the account. A cut row is published as UNCHECKED:
+// auth_checked:false with the error attached, never auth_valid:false, because
+// "we did not get to look" and "we looked and it is dead" are opposite facts
+// to a reader deciding whether to route to this account.
+//
+// Judged on the error's shape ALONE, never on whether the clock has since run
+// out: the token exchange runs on its own clock (credentialExchangeTimeout),
+// so a refresh that started inside the sweep can return a real verdict --
+// invalid_grant -- after the sweep's deadline, and that verdict must stand.
+//
+// A local credential read that reached no verdict is the same fact from the
+// other end: the keychain or credentials file did not answer, so nobody
+// looked (agentclaude.ErrCredentialUnchecked). It used to reach this row as
+// `has no access token`, published auth_valid:false, which the peer reads as
+// a dead account.
+func sweepCut(err error) bool {
+	if err == nil {
+		return false
+	}
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, agentclaude.ErrCredentialUnchecked) ||
+		isContextErrorMessage(err.Error())
+}
+
+// refreshReachedNoVerdict is sweepCut for the sweep's token refresh: the
+// sweep's own clock or a silent credential store (sweepCut), and also every
+// refresh the request path already calls a blip -- the token endpoint's
+// 429/5xx, a dial, DNS or reset error (refreshFailureIsTransient). The proxy
+// keeps a session on its account for exactly these (errRefreshTransient), and
+// the published row must say the same thing a peer's hold hears: nobody got
+// an answer, so sweep_cut and auth_checked:false, never auth_valid:false.
+//
+// It used to publish only the first two as a cut. A blip on a row with a
+// last-good reading was papered over by the backfill below, but a row with
+// none -- the first 15 minutes after every restart, i.e. every deploy, a
+// newly added account, or a row whose usage reads have failed for 15 minutes
+// -- went out as a checked, invalid credential. The deciding daemon reads that
+// as a dead login: it stops placing there (fair) and ENDS every warm hold on
+// the account as a forced switch (not fair: owner rule P8 lists "a refresh
+// with no verdict" as transient). PATCHES §31, R3 fix 1.
+//
+// Kept apart from sweepCut on purpose: sweepCut also judges the USAGE fetch,
+// whose credential already refreshed, and a network blip there is a stale
+// reading of a live account, not an unchecked one.
+func refreshReachedNoVerdict(err error) bool {
+	return sweepCut(err) || refreshFailureIsTransient(nil, err)
+}
+
 // UsageStatuses serves a cached sweep when one is fresh, and backfills
 // accounts whose live usage fetch transiently failed (the upstream usage
 // endpoints rate-limit bursts) with their last-known-good windows, so brief
 // 429s do not blank a healthy account's quota display.
 //
-// The live sweep runs outside usageStatusMu on a context detached from any
-// one caller (bounded by usageStatusSweepTimeout), and concurrent callers
-// share one sweep. A dashboard client disconnecting therefore neither aborts
-// the sweep other callers wait on nor holds the lock that cache invalidation
-// needs; it only stops waiting, and gets nil back.
+// One sweep at a time, and only the caller that starts it waits for it. A
+// caller arriving while a sweep is running is handed the previous snapshot
+// (stale-while-revalidate): the alternative -- queueing behind a sweep that
+// now runs to completion on its own clock -- made every request that hit the
+// peer probe during a sweep burn its 3 s cap and read the peer as unmeasured.
+// A caller with no snapshot at all waits for the running sweep rather than
+// starting a second one.
+//
+// The sweep runs on a context detached from its caller's cancel (bounded by
+// usageSweepTimeout), so a client disconnecting neither aborts the sweep
+// other callers wait on nor holds the lock that cache invalidation needs.
 func (r *AccountRef) UsageStatuses(ctx context.Context) []AccountUsageStatus {
+	out, _ := r.UsageStatusesAvailable(ctx)
+	return out
+}
+
+// UsageStatusesAvailable is UsageStatuses with "no answer" made distinct from
+// "no accounts". The bool is false only when this caller had no snapshot to
+// serve and its context ended before the running sweep landed. A handler must
+// turn that into an error status, never into an empty list: a peer reads an
+// empty list as a measured-empty pool and stops routing here.
+func (r *AccountRef) UsageStatusesAvailable(ctx context.Context) ([]AccountUsageStatus, bool) {
 	if r == nil {
-		return nil
+		return nil, true
 	}
-	r.usageStatusMu.Lock()
-	if !r.usageStatusAt.IsZero() && time.Since(r.usageStatusAt) < usageStatusCacheTTL && r.usageStatusCache != nil {
-		out := append([]AccountUsageStatus(nil), r.usageStatusCache...)
-		r.usageStatusMu.Unlock()
-		return out
-	}
-	sweep := r.usageStatusSweep
-	if sweep == nil {
-		sweep = &usageStatusSweep{done: make(chan struct{}), epoch: r.usageStatusEpoch}
+	for {
+		r.usageStatusMu.Lock()
+		if r.usageStatusCache != nil && !r.usageStatusAt.IsZero() && time.Since(r.usageStatusAt) < usageStatusCacheTTL {
+			out := append([]AccountUsageStatus(nil), r.usageStatusCache...)
+			r.usageStatusMu.Unlock()
+			return out, true
+		}
+		if inflight := r.usageStatusSweep; inflight != nil {
+			if r.usageStatusCache != nil {
+				out := append([]AccountUsageStatus(nil), r.usageStatusCache...)
+				r.usageStatusMu.Unlock()
+				return out, true
+			}
+			r.usageStatusMu.Unlock()
+			select {
+			case <-inflight.done:
+				continue
+			case <-ctx.Done():
+				return nil, false
+			}
+		}
+		sweep := &usageStatusSweep{done: make(chan struct{}), epoch: r.usageStatusEpoch}
 		r.usageStatusSweep = sweep
-		sweepCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), usageStatusSweepTimeout)
-		go func() {
-			defer cancel()
-			r.runUsageStatusSweep(sweepCtx, sweep)
-		}()
-	}
-	r.usageStatusMu.Unlock()
-	select {
-	case <-sweep.done:
-		return append([]AccountUsageStatus(nil), sweep.result...)
-	case <-ctx.Done():
-		return nil
+		r.usageStatusMu.Unlock()
+		return r.runUsageStatusSweep(ctx, sweep), true
 	}
 }
 
@@ -1699,46 +2883,51 @@ func (r *AccountRef) UsageStatuses(ctx context.Context) []AccountUsageStatus {
 // A sweep already in progress is shared instead of being invalidated and
 // restarted, so concurrent `sr status` callers cannot stampede the provider.
 func (r *AccountRef) UsageStatusesFresh(ctx context.Context) []AccountUsageStatus {
+	out, _ := r.UsageStatusesFreshAvailable(ctx)
+	return out
+}
+
+// UsageStatusesFreshAvailable is UsageStatusesFresh with "no answer" made
+// distinct from "no accounts", as UsageStatusesAvailable does: false when the
+// shared sweep this caller joined did not land before its context ended, or
+// ended without publishing (it panicked).
+func (r *AccountRef) UsageStatusesFreshAvailable(ctx context.Context) ([]AccountUsageStatus, bool) {
 	if r == nil {
-		return nil
+		return nil, true
 	}
 	r.usageStatusMu.Lock()
-	sweep := r.usageStatusSweep
-	if sweep == nil {
-		r.usageStatusAt = time.Time{}
-		r.usageStatusCache = nil
-		r.usageStatusEpoch++
-		// The status lock is held while clearing the per-account observation so
-		// the sweep cannot start between invalidation and the live request.
-		r.usageWindowsMu.Lock()
-		staleAt := time.Now().Add(-usageWindowsTTL - time.Second)
-		for key, entry := range r.usageWindows {
-			// Force the next read to contact the provider, but retain the last
-			// windows so a transient 429 can still render reset metadata.
-			entry.at = staleAt
-			r.usageWindows[key] = entry
+	if sweep := r.usageStatusSweep; sweep != nil {
+		r.usageStatusMu.Unlock()
+		select {
+		case <-sweep.done:
+			return append([]AccountUsageStatus(nil), sweep.result...), sweep.completed
+		case <-ctx.Done():
+			return nil, false
 		}
-		r.usageWindowsLatest = nil
-		// Keep provider Retry-After failures across an explicit refresh. The
-		// refresh makes successful observations stale, but it must not turn a
-		// known cooldown into a new upstream request on every `sr status`.
-		r.usageWindowsEpoch++
-		r.usageWindowsMu.Unlock()
-		sweep = &usageStatusSweep{done: make(chan struct{}), epoch: r.usageStatusEpoch}
-		r.usageStatusSweep = sweep
-		sweepCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), usageStatusSweepTimeout)
-		go func() {
-			defer cancel()
-			r.runUsageStatusSweep(sweepCtx, sweep)
-		}()
 	}
+	r.usageStatusAt = time.Time{}
+	r.usageStatusCache = nil
+	r.usageStatusEpoch++
+	// The status lock is held while clearing the per-account observation so
+	// the sweep cannot start between invalidation and the live request.
+	r.usageWindowsMu.Lock()
+	staleAt := time.Now().Add(-usageWindowsTTL - time.Second)
+	for key, entry := range r.usageWindows {
+		// Force the next read to contact the provider, but retain the last
+		// windows so a transient 429 can still render reset metadata.
+		entry.at = staleAt
+		r.usageWindows[key] = entry
+	}
+	r.usageWindowsLatest = nil
+	// Keep provider Retry-After failures across an explicit refresh. The
+	// refresh makes successful observations stale, but it must not turn a
+	// known cooldown into a new upstream request on every `sr status`.
+	r.usageWindowsEpoch++
+	r.usageWindowsMu.Unlock()
+	sweep := &usageStatusSweep{done: make(chan struct{}), epoch: r.usageStatusEpoch}
+	r.usageStatusSweep = sweep
 	r.usageStatusMu.Unlock()
-	select {
-	case <-sweep.done:
-		return append([]AccountUsageStatus(nil), sweep.result...)
-	case <-ctx.Done():
-		return nil
-	}
+	return r.runUsageStatusSweep(ctx, sweep), true
 }
 
 // UsageStatusSnapshot returns the most recent usage sweep without starting a
@@ -1760,7 +2949,30 @@ func (r *AccountRef) UsageStatusSnapshot() ([]AccountUsageStatus, bool) {
 // RefreshUsageStatusSnapshotFromWindows republishes the last usage snapshot
 // from the per-account window cache. Score refreshes already populate that
 // cache, so this keeps status current without starting a second provider sweep.
+//
+// It updates the windows of rows the last sweep published, and nothing else
+// (upstream #544 also created rows and restamped the cache clock):
+//   - No sweep snapshot (none yet, or InvalidateUsageStatusCache dropped it):
+//     nothing is published. A row built here from one fresh score was a
+//     snapshot missing every other account, served as fresh; a peer reads an
+//     account missing from a measured body as gone and ends its hold
+//     (cachedHoldVerdict). An invalidation is answered by a real sweep.
+//   - usageStatusAt keeps the age of the last sweep. Restamping it on every
+//     Claude reply and score refresh kept the 30 s cache young forever under
+//     traffic, so the sweep -- the only thing that re-checks credentials and
+//     publishes auth_valid, sweep_cut and error rows, and starts the §46
+//     fallback read -- never ran again.
+//
+// It persists the snapshot (persistUsageStatusSnapshot: two fsyncs); the
+// passive reply path uses refreshUsageStatusRowsFromWindows without it, so a
+// reply's headers never wait on the disk.
 func (r *AccountRef) RefreshUsageStatusSnapshotFromWindows(scores ...selectacct.Score) {
+	r.refreshUsageStatusRowsFromWindows(true, scores...)
+}
+
+// refreshUsageStatusRowsFromWindows is RefreshUsageStatusSnapshotFromWindows
+// with the persist step optional.
+func (r *AccountRef) refreshUsageStatusRowsFromWindows(persist bool, scores ...selectacct.Score) {
 	if r == nil {
 		return
 	}
@@ -1787,7 +2999,7 @@ func (r *AccountRef) RefreshUsageStatusSnapshotFromWindows(scores ...selectacct.
 	filterFresh := len(scores) > 0
 
 	r.usageStatusMu.Lock()
-	if publishEpoch != r.usageStatusEpoch {
+	if publishEpoch != r.usageStatusEpoch || r.usageStatusCache == nil {
 		r.usageStatusMu.Unlock()
 		return
 	}
@@ -1815,18 +3027,10 @@ func (r *AccountRef) RefreshUsageStatusSnapshotFromWindows(scores ...selectacct.
 		statusKey := account.ID + "\x00" + string(provider)
 		idx, exists := rowByKey[statusKey]
 		if !exists {
-			idx = len(rows)
-			rowByKey[statusKey] = idx
-			rows = append(rows, AccountUsageStatus{AccountStatus: AccountStatus{
-				ID:          account.ID,
-				Provider:    provider,
-				AuthMode:    account.AuthMode,
-				Label:       account.Label,
-				Email:       account.Email,
-				Source:      account.Source,
-				AuthChecked: true,
-				AuthValid:   true,
-			}})
+			// Not in the last sweep (added since, or cut from it): the next
+			// sweep publishes it with its credential verdict; a row made up
+			// here would claim auth_checked without a check.
+			continue
 		}
 		row := rows[idx]
 		if !row.UsageFetchedAt.IsZero() && !entry.at.After(row.UsageFetchedAt) {
@@ -1845,6 +3049,10 @@ func (r *AccountRef) RefreshUsageStatusSnapshotFromWindows(scores ...selectacct.
 		}
 		row.Windows = mergedWindows
 		row.UsageFresh = true
+		// The reading these windows came from is when the row was measured
+		// (PATCHES §29), as a sweep's row says: its start, not when passive
+		// reply headers arrived (usageWindowsEntry.measuredAt).
+		row.UsageMeasuredAt = entry.measuredAt()
 		// One timestamp describes the account-wide reset cells rendered by
 		// sr status. A feature-only refresh must not re-anchor older relative
 		// reset durations as if the account-wide endpoint had just answered.
@@ -1863,12 +3071,9 @@ func (r *AccountRef) RefreshUsageStatusSnapshotFromWindows(scores ...selectacct.
 		row.Error = ""
 		rows[idx] = row
 	}
-	if len(rows) > 0 {
-		r.usageStatusCache = rows
-		r.usageStatusAt = time.Now()
-	}
+	r.usageStatusCache = rows
 	r.usageStatusMu.Unlock()
-	if len(rows) > 0 {
+	if persist && len(rows) > 0 {
 		r.persistUsageStatusSnapshot(rows)
 	}
 }
@@ -1878,37 +3083,50 @@ type usageStatusSweep struct {
 	done   chan struct{}
 	epoch  uint64
 	result []AccountUsageStatus
+	// completed is set when the sweep ran to its end and result is its
+	// answer; false after a panic, when result is nil and means nothing.
+	completed bool
 }
 
-// usageStatusSweepTimeout bounds a detached status sweep end to end: credential
-// refreshes, provider listings and the usage fan-out (itself bounded by
-// usageStatusFetchTimeout) all share it.
-const usageStatusSweepTimeout = 30 * time.Second
-
-func (r *AccountRef) runUsageStatusSweep(ctx context.Context, sweep *usageStatusSweep) {
+// runUsageStatusSweep runs one live sweep and publishes it, in the goroutine
+// of the caller that started it. Detached from the caller's cancellation and
+// bounded by usageSweepTimeout: a caller that hangs up gets no answer, and the
+// sweep it started still finishes, so the cache and the scheduler are filled
+// from a complete pass instead of from however far that caller's patience
+// reached. Values (refresh reason, breadcrumbs) ride along; only the cancel is
+// dropped.
+//
+// Not a bare goroutine (upstream #378 runs it in one): the sweep refreshes
+// OAuth tokens, and graceful shutdown waits for the handler running it, never
+// for a stray goroutine. A process that exits between the provider's rotation
+// and the save keeps a spent refresh token (PATCHES §18, §44.3).
+func (r *AccountRef) runUsageStatusSweep(ctx context.Context, sweep *usageStatusSweep) []AccountUsageStatus {
+	sweepCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), usageSweepTimeout)
+	defer cancel()
+	// Waiters wake only after the slot is released (deferred below, so it
+	// runs first), so one that finds no snapshot starts the next sweep
+	// instead of finding this finished one still in place. On a panic this
+	// is what keeps every later no-snapshot reader from parking forever:
+	// net/http recovers the panic; this state would not.
 	defer close(sweep.done)
 	defer func() {
-		// A panic must not wedge every future caller on a sweep that never
-		// finishes; release the slot so the next caller starts a new one.
-		recovered := recover()
 		r.usageStatusMu.Lock()
 		if r.usageStatusSweep == sweep {
 			r.usageStatusSweep = nil
 		}
 		r.usageStatusMu.Unlock()
-		if recovered != nil {
-			sweep.result = nil
-		}
 	}()
-	out := r.usageStatusesLive(ctx)
+	out := r.usageStatusesLive(sweepCtx)
 	r.usageStatusMu.Lock()
 	sweep.result = r.mergeUsageStatusesLocked(out, sweep.epoch)
+	sweep.completed = true
 	persist := sweep.epoch == r.usageStatusEpoch && len(sweep.result) > 0
 	result := append([]AccountUsageStatus(nil), sweep.result...)
 	r.usageStatusMu.Unlock()
 	if persist {
 		r.persistUsageStatusSnapshot(result)
 	}
+	return result
 }
 
 // mergeUsageStatusesLocked backfills transient failures from last-known-good
@@ -1916,7 +3134,8 @@ func (r *AccountRef) runUsageStatusSweep(ctx context.Context, sweep *usageStatus
 // ran. Callers hold usageStatusMu.
 func (r *AccountRef) mergeUsageStatusesLocked(out []AccountUsageStatus, epoch uint64) []AccountUsageStatus {
 	// A superseded sweep may finish after a newer refresh. Let its callers
-	// receive their results without publishing old quota history.
+	// receive their results without publishing old quota history: these rows
+	// may describe accounts that were added, removed or re-authed since.
 	if epoch != r.usageStatusEpoch {
 		return out
 	}
@@ -1965,7 +3184,12 @@ func (r *AccountRef) mergeUsageStatusesLocked(out []AccountUsageStatus, epoch ui
 		}
 		snapshot, ok := r.lastGoodUsage[key]
 		if !ok || now.Sub(snapshot.at) > usageStatusLastGoodTTL {
-			if usageStatusThrottleError(status.Error) {
+			// A cut row is not a usage endpoint's 429: a refresh the token
+			// endpoint answered 429 is published as a cut (sweep_cut,
+			// auth_checked:false) and keeps its error, so a peer reads it as
+			// unmeasured, never as a throttled live account (PATCHES §28,
+			// §29.3b).
+			if !status.SweepCut && usageStatusThrottleError(status.Error) {
 				// A plain usage-endpoint 429 is a transient observation failure,
 				// not quota exhaustion or an authentication failure.
 				status.Error = ""
@@ -1981,18 +3205,26 @@ func (r *AccountRef) mergeUsageStatusesLocked(out []AccountUsageStatus, epoch ui
 		restored.Error = ""
 		restored.UsageFresh = false
 		restored.UsageThrottled = status.UsageThrottled
+		// The last-good windows stand in for display, but this pass reached
+		// whatever verdict it reached: a cut row stays cut (and, if the cut
+		// landed before the credential was looked at, stays unchecked).
+		restored.SweepCut = status.SweepCut
+		restored.AuthChecked = status.AuthChecked
+		// The saved reset is this pass's too: last-good windows served over
+		// a failed read publish no reset ("?"), never the old read's "1 left"
+		// (PATCHES §46). Upstream restores the whole snapshot, reset included.
+		restored.ComplimentaryReset = status.ComplimentaryReset
 		out[i] = restored
 	}
-	if epoch == r.usageStatusEpoch {
-		r.usageStatusCache = append([]AccountUsageStatus(nil), out...)
-		r.usageStatusAt = now
-	}
+	r.usageStatusCache = append([]AccountUsageStatus(nil), out...)
+	r.usageStatusAt = now
 	return out
 }
 
 // InvalidateUsageStatusCache drops the cached sweep. A sweep already in flight
-// still answers its waiters but is not cached, and later callers start a new
-// sweep instead of joining it, since it may predate the change that caused
+// still answers its waiters but is not cached; a caller with no snapshot waits
+// for it and then starts a new sweep (one sweep at a time, as
+// UsageStatusesAvailable says), since it may predate the change that caused
 // the invalidation.
 func (r *AccountRef) InvalidateUsageStatusCache() {
 	if r == nil {
@@ -2001,9 +3233,10 @@ func (r *AccountRef) InvalidateUsageStatusCache() {
 	r.usageStatusMu.Lock()
 	defer r.usageStatusMu.Unlock()
 	r.usageStatusAt = time.Time{}
+	// Dropped, not merely aged: a stale snapshot must not be served in place
+	// of the re-sweep that the invalidation exists to force.
 	r.usageStatusCache = nil
 	r.usageStatusEpoch++
-	r.usageStatusSweep = nil
 }
 
 // InvalidateUsageWindowsCache drops cached quota windows, including model
@@ -2256,7 +3489,10 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 	// The status sweep covers all accounts. The short score-fetch deadline
 	// previously expired before many profiles even reached the provider.
 	// An interactive status check gets the full status-sweep budget.
-	sweepCtx, cancelSweep := context.WithTimeout(ctx, usageStatusSweepTimeout)
+	// (Upstream #554's usageStatusSweepTimeout; the fork's sweep budget is
+	// usageSweepTimeout, which the caller's detached sweep context already
+	// carries.)
+	sweepCtx, cancelSweep := context.WithTimeout(ctx, usageSweepTimeout)
 	defer cancelSweep()
 	var wg sync.WaitGroup
 	width := accountFetchConcurrencyFor(len(storedAccounts) + len(claudeProfiles))
@@ -2295,6 +3531,7 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 					defer window.release()
 					if !acquireOrderedFetchSlot(sweepCtx, turn) {
 						next := out[i]
+						next.SweepCut = true
 						next.Error = sweepCtx.Err().Error()
 						out[i] = next
 						return
@@ -2326,7 +3563,12 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 			defer wg.Done()
 			defer window.release()
 			if !acquireOrderedFetchSlot(sweepCtx, turn) {
+				// The sweep's own budget ran out before this row got a slot:
+				// nobody looked at the credential, so it is published as a cut
+				// (sweep_cut, auth_checked:false), never as a verdict.
 				next := out[i]
+				next.AuthChecked = false
+				next.SweepCut = true
 				next.Error = sweepCtx.Err().Error()
 				out[i] = next
 				return
@@ -2338,6 +3580,10 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 			next.Refreshed = didRefresh
 			if refreshErr != nil {
 				next.AuthValid = false
+				if refreshReachedNoVerdict(refreshErr) {
+					next.AuthChecked = false
+					next.SweepCut = true
+				}
 				next.Error = refreshErr.Error()
 				out[i] = next
 				return
@@ -2350,8 +3596,11 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 				return
 			}
 			r.replace(account)
-			details, err := accounts.FetchCodexUsageDetails(sweepCtx, r.client, account)
+			measuredAt := time.Now()
+			details, renewed, err := r.fetchCodexUsageDetails(sweepCtx, r.client, account)
+			next.Refreshed = next.Refreshed || renewed
 			if err != nil {
+				next.SweepCut = sweepCut(err)
 				next.Error = err.Error()
 				out[i] = next
 				return
@@ -2361,27 +3610,37 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 			next.Credits = details.Credits
 			next.ComplimentaryReset = details.ComplimentaryReset
 			next.UsageFresh = true
-			next.UsageFetchedAt = time.Now().UTC()
+			next.UsageMeasuredAt = measuredAt
+			// The reading's time is when its fetch started (PATCHES §29).
+			next.UsageFetchedAt = measuredAt.UTC()
 			out[i] = next
 		}()
 	}
 	activeClaude := r.claudeStore.ActiveProfile()
 	for i, profile := range claudeProfiles {
 		i, profile := claudeOffset+i, profile
+		// The path alone, as claudeProfileEmail takes it: ClaudeConfigDir
+		// prepares the shared history under locks with no deadline -- one of
+		// them shared by every profile -- which this serial loop cannot afford
+		// while the sweep's budget runs (PATCHES §34).
+		source := r.claudeStore.PreferredInstancePath(r.claudeStore.InstancePath(profile.Name))
 		status := AccountUsageStatus{
 			AccountStatus: AccountStatus{
 				ID:          profile.Name,
 				Provider:    accounts.ProviderClaude,
 				AuthMode:    accounts.AuthModeOAuth,
 				Email:       claudeProfileEmail(r.claudeStore, profile.Name),
-				Source:      r.claudeStore.ClaudeConfigDir(profile.Name),
+				Source:      source,
 				AuthChecked: true,
 			},
 			Active:   profile.Name == activeClaude,
 			PlanType: "unknown",
 		}
 		credential := accounts.Account{ID: profile.Name, Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth}
-		if current, err := r.claudeStore.ReadCredential(ctx, r.claudeStore.ClaudeConfigDir(profile.Name)); err == nil && current != nil {
+		// Serial, and the sweep's budget is already running: a keychain answer
+		// moments old is used as the refresh below would use it, with no lock
+		// and no `security` (PATCHES §34).
+		if current, err := r.claudeStore.ProfileCredential(ctx, profile); err == nil && current != nil {
 			credential.Token = current.AccessToken
 			credential.CredentialVersion = accountpkg.OAuthCredentialVersion(
 				current.AccessToken, current.RefreshToken,
@@ -2400,7 +3659,12 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 			defer wg.Done()
 			defer window.release()
 			if !acquireOrderedFetchSlot(sweepCtx, turn) {
+				// The sweep's own budget ran out before this row got a slot:
+				// nobody looked at the credential, so it is published as a cut
+				// (sweep_cut, auth_checked:false), never as a verdict.
 				next := out[i]
+				next.AuthChecked = false
+				next.SweepCut = true
 				next.Error = sweepCtx.Err().Error()
 				out[i] = next
 				return
@@ -2421,12 +3685,22 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 			next.Refreshed = didRefresh
 			if err != nil {
 				next.AuthValid = false
+				if refreshReachedNoVerdict(err) {
+					next.AuthChecked = false
+					next.SweepCut = true
+				}
 				next.Error = err.Error()
 				out[i] = next
 				return
 			}
 			next.AuthValid = true
 			next.PlanType = details.PlanType()
+			// A token that cannot read the saved reset (a setup token) says so,
+			// whatever its usage read does, rather than reading as "none"
+			// (PATCHES §46).
+			if agentclaude.CredentialCannotReadResets(details) {
+				next.ComplimentaryReset = agentclaude.UnreadableResetInfo()
+			}
 			r.replace(account)
 			if since, revoked := claudeCredentialRevokedSince(r.claudeCostStore(), account); revoked {
 				// Anthropic answers a revoked token's usage probe with 429, so
@@ -2437,15 +3711,28 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 				out[i] = next
 				return
 			}
-			windows, fresh, fetchedAt, throttled, err := r.FetchUsageWindowsCachedWithObservation(sweepCtx, r.client, account)
+			read := r.readUsageWindowsCached(sweepCtx, r.client, account)
+			windows, fresh, measuredAt, servedOver, err := read.windows, read.fresh, read.measuredAt, read.servedOver, read.err
+			fetchedAt, throttled := read.measuredAt, read.throttled
 			if err != nil {
+				next.SweepCut = sweepCut(err)
 				next.Error = err.Error()
 				out[i] = next
 				return
 			}
+			// Last-good windows served over a cut fetch: still a cut.
+			next.SweepCut = sweepCut(servedOver)
 			next.Windows = windows
 			next.ExtraUsage = extraUsageFromWindows(windows)
+			// The saved reset rode on the same read (PATCHES §46), and is
+			// published only from a fresh one: last-good windows served over
+			// a failed read publish no reset ("?"), never an old "1 left".
+			// When that read carried no block, the fallback read's is used.
+			if next.ComplimentaryReset == nil && fresh {
+				next.ComplimentaryReset = r.usageReadReset(account, true)
+			}
 			next.UsageFresh = fresh
+			next.UsageMeasuredAt = measuredAt
 			next.UsageFetchedAt = fetchedAt
 			next.UsageThrottled = throttled
 			next.AccountWideUsageFresh = !throttled && !fresh && !fetchedAt.IsZero() && time.Since(fetchedAt) < usageWindowsTTL
@@ -2464,13 +3751,15 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 			defer wg.Done()
 			if !acquireOrderedFetchSlot(sweepCtx, turn) {
 				window.release()
-				sourceBatches[sourceIndex] = []AccountUsageStatus{{AccountStatus: AccountStatus{
-					ID:          string(source.Provider()),
-					Provider:    source.Provider(),
-					AuthMode:    accounts.AuthModeOAuth,
-					AuthChecked: true,
-					Error:       sweepCtx.Err().Error(),
-				}}}
+				sourceBatches[sourceIndex] = []AccountUsageStatus{{
+					AccountStatus: AccountStatus{
+						ID:       string(source.Provider()),
+						Provider: source.Provider(),
+						AuthMode: accounts.AuthModeOAuth,
+						Error:    sweepCtx.Err().Error(),
+					},
+					SweepCut: true,
+				}}
 				return
 			}
 			sourceAccounts, listErr := source.ListAccounts(sweepCtx)
@@ -2513,12 +3802,18 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 					defer window.release()
 					status := batch[accountIndex]
 					if !acquireOrderedFetchSlot(sweepCtx, turn) {
+						status.AuthChecked = false
+						status.SweepCut = true
 						status.Error = sweepCtx.Err().Error()
 						batch[accountIndex] = status
 						return
 					}
 					refreshed, refreshErr := source.RefreshAccount(sweepCtx, r.client, sourceAccount)
 					if refreshErr != nil {
+						if refreshReachedNoVerdict(refreshErr) {
+							status.AuthChecked = false
+							status.SweepCut = true
+						}
 						status.Error = refreshErr.Error()
 						batch[accountIndex] = status
 						return
@@ -2533,6 +3828,7 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 					var planType string
 					var windows []accounts.UsageWindow
 					var usageErr error
+					measuredAt := time.Now()
 					if identitySource, ok := usageSource.(OAuthIdentityUsageSource); ok {
 						var verifiedEmail string
 						verifiedEmail, planType, windows, usageErr = identitySource.FetchUsageIdentity(sweepCtx, r.client, refreshed)
@@ -2552,8 +3848,9 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 					status.Windows = windows
 					status.QuotaUsageKnown = len(windows) > 0
 					status.UsageFresh = usageErr == nil
+					status.UsageMeasuredAt = measuredAt
 					if status.UsageFresh {
-						status.UsageFetchedAt = time.Now().UTC()
+						status.UsageFetchedAt = measuredAt.UTC()
 					}
 					if usageErr != nil && status.QuotaStatus == "" {
 						status.Error = usageErr.Error()
@@ -2699,19 +3996,22 @@ func claudeUsageWindows(usage *agentclaude.UsageResponse) []accounts.UsageWindow
 	add("5h", fiveHourSeconds, usage.FiveHour)
 	add("7d", sevenDaySeconds, usage.SevenDay)
 	add(agentclaude.FableWindowName, sevenDaySeconds, usage.SevenDayOAuthApps)
+	// Opus and Sonnet have no limit of their own -- they spend the general
+	// 5h/7d budget -- and the usage endpoint reports their buckets as null. A
+	// bucket is published only when Anthropic reports one; a null bucket gets
+	// no window, because a 0%-used placeholder reads as a meter that does not
+	// exist. ForModel routes a model pool an account does not publish on the
+	// account-wide windows (absentPoolInheritsAccountScore), so no placeholder
+	// is needed to keep the account in Opus/Sonnet routing.
 	add("opus-weekly", sevenDaySeconds, usage.SevenDayOpus)
 	add("sonnet-weekly", sevenDaySeconds, usage.SevenDaySonnet)
-	// The usage endpoint reports opus/sonnet weekly buckets as null until the
-	// account has used that model family. Null means "unused", not "cannot
-	// serve": emit a 0%-used window so ForModel never zero-fills a fresh
-	// account out of opus/sonnet routing once other accounts grow real
-	// windows.
-	if !usageWindowNamed(windows, "opus-weekly") {
-		windows = append(windows, accounts.UsageWindow{Name: "opus-weekly", LimitWindowSeconds: sevenDaySeconds, Feature: agentclaude.OpusFeature})
-	}
-	if !usageWindowNamed(windows, "sonnet-weekly") {
-		windows = append(windows, accounts.UsageWindow{Name: "sonnet-weekly", LimitWindowSeconds: sevenDaySeconds, Feature: agentclaude.SonnetFeature})
-	}
+	// The fable weekly meter deliberately gets NO fallback here: its absence
+	// is what triggers the fable probe in fetchAccountUsageWindowsLive, which
+	// fetches the real meter. The null-means-unused fallback for fable is
+	// appended there, after the probe has had its chance.
+	//
+	// The "extra" window is paid-usage REPORTING only. It carries ExtraUsage,
+	// which scoreFromUsageWindows skips, so it never becomes a routing window.
 	if usage.ExtraUsage != nil {
 		extra := agentclaude.ExtraUsageInfoFromUsage(usage)
 		used := 0.0
@@ -2781,6 +4081,11 @@ func betterClaudeActiveCandidate(left, right selectacct.Score) bool {
 	return left.AccountID < right.AccountID
 }
 
+// Defer to the router rather than keeping a private rule. This was
+// `Headroom >= 0.40 && ShortHeadroom >= 0.40`, which decided which Claude
+// profile got marked Active using a threshold the router had already stopped
+// applying -- so the account this reported as usable was routinely not the one
+// traffic went to.
 func scoreUsableForNewSession(score selectacct.Score) bool {
 	return score.UsableForNewSession()
 }
@@ -2813,6 +4118,7 @@ func scoreFromUsageWindows(provider accounts.Provider, accountID string, windows
 			ResetAfterSeconds:  window.ResetAfterSeconds,
 			ResetAt:            window.ResetAt,
 			Feature:            window.Feature,
+			SpendCap:           accounts.IsSpendWindow(window),
 		})
 		if window.Feature == "" {
 			for _, feature := range features {
@@ -2829,22 +4135,11 @@ func scoreFromUsageWindows(provider accounts.Provider, accountID string, windows
 	}
 	score := selectacct.ScoreFromLimitWindows(accountID, 0, limitWindows)
 	score.Provider = provider
-	if provider == accounts.ProviderClaude {
-		if extra := extraUsageFromWindows(windows); extra != nil {
-			applyExtra := func(target *selectacct.Score) {
-				target.ClaudeExtraUsageEnabled = extra.IsEnabled
-				if remaining, known := extra.Remaining(); known {
-					target.ClaudeExtraUsageKnown = true
-					target.ClaudeExtraUsageRemaining = remaining
-				}
-			}
-			applyExtra(&score)
-			for key, modelScore := range score.ModelScores {
-				applyExtra(&modelScore)
-				score.ModelScores[key] = modelScore
-			}
-		}
-	}
+	// Paid Claude extra usage is reported (the "extra" window, ExtraUsage on the
+	// usage-status row) but deliberately NOT copied into the routing score: the
+	// fork does not route onto paid overage (upstream 2269757's selection and
+	// retry fallback is unwired), so nothing downstream may read a balance as
+	// capacity.
 	return score
 }
 
@@ -2875,7 +4170,57 @@ func (r *AccountRef) replace(account accounts.Account) {
 	r.mu.Unlock()
 }
 
-func (s Server) Handler() http.Handler {
+// serverRoute is one mounted path plus the single fact that decides whether the
+// PUBLIC listener may serve it.
+//
+// The visibility lives in the route table rather than in the listener because it
+// has to FAIL CLOSED: `public` defaults to false, so a route added later without
+// anyone thinking about exposure is private automatically. The opposite default
+// -- a denylist of admin paths -- leaks the first route somebody forgets, and
+// the leak is silent.
+type serverRoute struct {
+	pattern string
+	handler http.Handler
+	// public marks a route the internet may reach. The admin surface is not
+	// merely gated on the public listener, it is NOT MOUNTED there, because
+	// authorizeAdmin short-circuits on loopback before any token check and
+	// gating that correctly is a far weaker guarantee than not serving it. The
+	// one exception is the owner's opt-in, --public-admin (PATCHES §43.1):
+	// then the routes marked publicAdmin below are mounted too, and only a
+	// named admin-role token opens them.
+	public bool
+	// publicHandler serves this route on the PUBLIC listener when it needs a
+	// different gate there than it uses privately.
+	//
+	// Stats are the case: privately they sit behind requireAdmin, which is
+	// convenient because loopback already satisfies it. Publicly they must sit
+	// behind the PROXY token instead -- the admin token is a strict superset
+	// that also drains, imports and mints, so accepting it as the credential
+	// for a read would put the more powerful secret on the wire for no extra
+	// capability.
+	publicHandler http.Handler
+	// describesDaemon marks a public route whose body reports the daemon's
+	// CONFIGURATION (health: auth mode, account-import state). PublicHandler
+	// serves such a route from the configured server rather than from its
+	// credential-stripped copy, which would misreport a token-protected box as
+	// auth "open" with account import "disabled".
+	describesDaemon bool
+	// publicAdmin marks a PRIVATE admin route that the public listener also
+	// mounts when serve runs with --public-admin (PATCHES §43.1), served by
+	// the public copy's handler, so only a named admin-role token opens it.
+	// An allowlist: a route added to the table is NOT publicly administrable
+	// until someone marks it. Never set on a route whose gate grants on
+	// network position (loopback-only controls, the session-lease gate), on
+	// a self-authenticating or unauthenticated one, or on one that relays a
+	// peer's roster. On a public route with a publicHandler it means a named
+	// admin token is served by handler, and every other caller by
+	// publicHandler as before.
+	publicAdmin bool
+}
+
+// normalized fills the lazily-constructed collaborators. Both handlers need it,
+// and it must run exactly once per handler build rather than per route.
+func (s Server) normalized() Server {
 	FreezeOpenAICompatibleProviders()
 	if s.AccountRef != nil {
 		s.AccountRef.configureAPIKeyUpstreams(s)
@@ -2884,11 +4229,8 @@ func (s Server) Handler() http.Handler {
 	if s.ActiveSessions == nil {
 		s.ActiveSessions = NewActiveSessions()
 	}
-	if s.softMoveState == nil {
-		s.softMoveState = newSoftMoveState()
-	}
 	if s.admission == nil {
-		s.admission = newAdmissionControl()
+		s.admission = s.AccountRef.sharedAdmission()
 	}
 	if s.Lifecycle == nil {
 		s.Lifecycle = NewLifecycle()
@@ -2901,6 +4243,9 @@ func (s Server) Handler() http.Handler {
 	}
 	if s.CacheFlight == nil {
 		s.CacheFlight = newSingleFlight()
+	}
+	if s.quotaResetGate == nil {
+		s.quotaResetGate = &quotaResetGate{}
 	}
 	if s.azureCodexSessions == nil {
 		path := ""
@@ -2934,18 +4279,6 @@ func (s Server) Handler() http.Handler {
 	if s.codexOverloadRerouteCounts == nil {
 		s.codexOverloadRerouteCounts = newCodexOverloadReroutes()
 	}
-	if s.codexCapacity == nil {
-		s.codexCapacity = newCodexCapacityStats()
-	}
-	if s.codexSessionBans == nil {
-		s.codexSessionBans = newCodexSessionBans()
-	}
-	if s.codexPersistLoops == nil {
-		s.codexPersistLoops = newCodexPersistLoops()
-	}
-	if s.codexShedding == nil {
-		s.codexShedding = newCodexSheddingTracker()
-	}
 	if s.overloadHeld == nil {
 		s.overloadHeld = newOverloadHeldGauge()
 	}
@@ -2954,9 +4287,6 @@ func (s Server) Handler() http.Handler {
 	}
 	if s.codexCapacityCounters == nil {
 		s.codexCapacityCounters = &codexCapacityCounterStore{}
-	}
-	if s.retryStatuses == nil {
-		s.retryStatuses = newRetryStatusRegistry()
 	}
 	if s.claudeWebBalances == nil && s.AccountRef != nil {
 		s.claudeWebBalances = newClaudeWebBalanceStore(filepath.Join(s.AccountRef.store.Dir, "claude-web-balances.json"))
@@ -2978,49 +4308,299 @@ func (s Server) Handler() http.Handler {
 		s.claudeHealthFallback = newClaudeCredentialHealth(dir, s.Logger)
 	}
 	s.claudeHealth().setLogger(s.Logger)
-	mux := http.NewServeMux()
-	mux.HandleFunc("/internal/v1/session-leases", s.requireSessionLeaseAdmin(s.handleSessionLeases))
-	mux.HandleFunc("/internal/v1/session-leases/", s.requireSessionLeaseAdmin(s.handleSessionLease))
-	mux.HandleFunc("/_subrouter/health", s.handleHealth)
-	mux.HandleFunc(StoreHandshakePath, s.handleStoreHandshake)
-	mux.HandleFunc("/_subrouter/ready", s.handleReady)
-	mux.HandleFunc("/_subrouter/stream-stats", s.handleStreamStats)
-	mux.HandleFunc("/_subrouter/traffic", s.handleTraffic)
-	mux.HandleFunc("/_subrouter/drain", s.requireAdmin(s.handleDrain))
-	mux.HandleFunc("/_subrouter/drain-status", s.requireAdmin(s.handleDrainStatus))
-	mux.HandleFunc("/_subrouter/quiesce", s.requireAdmin(s.handleQuiesce))
-	mux.HandleFunc("/_subrouter/resume", s.requireAdmin(s.handleResume))
-	mux.HandleFunc("/_subrouter/accounts", s.requireAdmin(s.handleAccounts))
-	mux.HandleFunc("/_subrouter/account-status", s.requireAdmin(s.handleAccountStatus))
-	mux.HandleFunc("/_subrouter/usage-status", s.requireAdmin(s.handleUsageStatus))
-	mux.HandleFunc("/_subrouter/claude-web-balance", s.requireAdmin(s.handleClaudeWebBalance))
-	mux.HandleFunc("/_subrouter/claude-key-credit", s.requireAdmin(s.handleClaudeKeyCredit))
-	mux.HandleFunc("/_subrouter/qwen-console", s.requireAccountImportAuth(s.handleQwenConsoleImport))
-	mux.HandleFunc("/_subrouter/rate-limit-reset", s.requireAdmin(s.handleRateLimitReset))
-	mux.HandleFunc("/_subrouter/reset-credits", s.requireAdmin(s.handleResetCredits))
-	mux.HandleFunc("/_subrouter/reload-accounts", s.requireAdmin(s.handleReloadAccounts))
-	mux.HandleFunc("/_subrouter/account-import", s.requireAccountImportAuth(s.handleAccountImport))
-	mux.HandleFunc("/_subrouter/sessions", s.requireAdmin(s.handleSessions))
-	mux.HandleFunc("/_subrouter/cutover-challenge", s.requireAdmin(s.handleCutoverChallenge))
-	mux.HandleFunc("/_subrouter/dashboard", s.requireAdmin(s.handleDashboard))
-	mux.HandleFunc("/_subrouter/transcripts", s.requireAdmin(s.handleTranscriptList))
-	mux.HandleFunc("/_subrouter/transcripts/", s.requireAdmin(s.handleTranscriptDetail))
-	mux.HandleFunc("/_subrouter/transcript-stats", s.requireAdmin(s.handleTranscriptStats))
-	mux.HandleFunc("/_subrouter/bedrock-cost", s.requireAdmin(s.handleBedrockCost))
-	mux.HandleFunc("/_subrouter/azure-codex-cost", s.requireAdmin(s.handleAzureCodexCost))
-	mux.HandleFunc("/_subrouter/codex-capacity", s.requireAdmin(s.handleCodexCapacity))
-	mux.HandleFunc(PlacementStatsPath, s.requireAdmin(s.handlePlacementStats))
-	mux.HandleFunc(MetricsPath, s.requireAdmin(s.handleMetrics))
-	mux.HandleFunc("/_subrouter/token-usage", s.requireAdmin(s.handleTokenUsage))
-	mux.HandleFunc(ErrorEventsPath, s.requireAdmin(s.handleErrorEvents))
-	mux.HandleFunc(AccountStatePath, s.requireAdmin(s.handleAccountState))
-	mux.HandleFunc(ClaudeCredentialDeathsPath, s.requireAdmin(s.handleClaudeCredentialDeaths))
-	mux.HandleFunc("/_subrouter/device-usage", s.requireAdmin(s.handleDeviceUsage))
-	mux.HandleFunc("/_subrouter/", http.NotFound)
-	if s.Bedrock != nil && !s.RequireSessionLease {
-		mux.Handle("/bedrock/", s.bedrockHandler())
+	return s
+}
+
+// routeTable is the single definition of what this daemon serves and to whom.
+// Handler and PublicHandler both build from it, so the two listeners cannot
+// drift into disagreeing about which surface a path belongs to.
+//
+// Every route added here is PRIVATE unless it says public:true. That includes
+// the routes merged from upstream (store-handshake, quiesce/resume,
+// cutover-challenge, claude-web-balance, qwen-console, azure-codex-cost):
+// upstream mounts them on a flat mux, and pasting that mux in place of this
+// table would silently drop the fail-closed default for the whole surface.
+func (s Server) routeTable() []serverRoute {
+	fn := func(pattern string, h http.HandlerFunc, public bool) serverRoute {
+		return serverRoute{pattern: pattern, handler: h, public: public}
 	}
-	mux.Handle("/", s.proxyHandler())
+	// admin is a PRIVATE admin route that --public-admin also mounts on the
+	// public listener (serverRoute.publicAdmin). Everything else private stays
+	// off that listener whatever the flag says.
+	admin := func(pattern string, h http.HandlerFunc) serverRoute {
+		return serverRoute{pattern: pattern, handler: h, publicAdmin: true}
+	}
+	routes := []serverRoute{
+		fn("/internal/v1/session-leases", s.requireSessionLeaseAdmin(s.handleSessionLeases), false),
+		fn("/internal/v1/session-leases/", s.requireSessionLeaseAdmin(s.handleSessionLease), false),
+		// Liveness is public: a peer must be able to tell "unreachable" from
+		// "up but refusing me" without holding a credential. Both listeners
+		// serve upstream's full body -- auth mode, account-import state,
+		// fallback endpoint names and (on request) store and shadow
+		// attestation proofs. Owner decision 6 (2026-09 merge, round 2): what
+		// this tells the internet about the box is acceptable, and a client
+		// reaching the box by its public URL reads account_import from here.
+		{
+			pattern:         "/_subrouter/health",
+			handler:         http.HandlerFunc(s.handleHealth),
+			public:          true,
+			describesDaemon: true,
+		},
+		fn("/_subrouter/ready", s.handleReady, true),
+		// Self-authenticating (the store directory's secret) and it grants the
+		// CONNECTION admin, so it is private: a same-machine proof has no
+		// business on a listener the internet reaches.
+		fn(StoreHandshakePath, s.handleStoreHandshake, false),
+		// stream-stats is unauthenticated but NOT public -- it reports dropped
+		// stream counts, which is operational detail the internet has no claim
+		// to.
+		fn("/_subrouter/stream-stats", s.handleStreamStats, false),
+		admin("/_subrouter/drain", s.requireAdmin(s.handleDrain)),
+		admin("/_subrouter/drain-status", s.requireAdmin(s.handleDrainStatus)),
+		fn("/_subrouter/quiesce", s.requireAdmin(s.handleQuiesce), false),
+		admin("/_subrouter/resume", s.requireAdmin(s.handleResume)),
+		// STATS. Readable publicly with the SPEND credential, because a peer has
+		// to see capacity to be rankable at all -- the cross-pool ranking reads usage-status,
+		// and without it a publicly-reached peer is invisible to the scheduler
+		// and would simply never be chosen. Privately these keep requireAdmin,
+		// so loopback tooling (srq, srdash, the board) is unchanged.
+		//
+		// A named PEER token (PATCHES §43.1) reads usage-status, the roster
+		// its daemon ranks this pool on, here on the public listener, and
+		// never /_subrouter/accounts. Privately it is not admin, so both stay
+		// closed to it there, as they are to the static proxy token. With
+		// --public-admin, a named admin token on the public listener is served
+		// by the admin handler (publicAdmin).
+		{
+			pattern:       "/_subrouter/accounts",
+			handler:       s.requireAccountsAuth(s.handleAccountsAdmin),
+			public:        true,
+			publicHandler: s.requireProxyToken(s.handleAccountsPublic, false),
+			publicAdmin:   true,
+		},
+		admin("/_subrouter/account-status", s.requireAdmin(s.handleAccountStatus)),
+		{
+			pattern:       "/_subrouter/usage-status",
+			handler:       s.requireAdmin(s.handleUsageStatus),
+			public:        true,
+			publicHandler: s.requireProxyToken(s.handleUsageStatus, true),
+			publicAdmin:   true,
+		},
+		admin("/_subrouter/claude-web-balance", s.requireAdmin(s.handleClaudeWebBalance)),
+		admin("/_subrouter/qwen-console", s.requireAccountImportAuth(s.handleQwenConsoleImport)),
+		admin("/_subrouter/rate-limit-reset", s.requireAdmin(s.handleRateLimitReset)),
+		admin("/_subrouter/reset-credits", s.requireAdmin(s.handleResetCredits)),
+		// Spends a Claude account's one saved usage-limit reset (PATCHES §46).
+		// Admin-gated as rate-limit-reset is. Marked publicAdmin since §46.9
+		// (owner decision 2026-09-30, "make them work over public admin"):
+		// with --public-admin on, a NAMED admin-role token claims through the
+		// public listener too, behind the same gate, rate limiter and by-name
+		// log as every other public admin route; static admin/import tokens,
+		// loopback and tailnet identity are refused there. With the flag off
+		// it is private, as before.
+		admin(ClaudeResetPath, s.requireAdmin(s.handleClaudeReset)),
+		fn("/_subrouter/reload-accounts", s.requireAdmin(s.handleReloadAccounts), false),
+		admin("/_subrouter/account-import", s.requireAccountImportAuth(s.handleAccountImport)),
+		admin("/_subrouter/sessions", s.requireAdmin(s.handleSessions)),
+		fn("/_subrouter/cutover-challenge", s.requireAdmin(s.handleCutoverChallenge), false),
+		fn("/_subrouter/dashboard", s.requireAdmin(s.handleDashboard), false),
+		// Switchboard. The two reads are admin-gated like every other read, which
+		// on this daemon means loopback authorizes a browser for free. The three
+		// writes take the same loopback-only gate handleQuiesce and
+		// handleReloadAccounts use: they rewrite sessions.json, which the daemon
+		// re-reads on every proxied request, and that is not something a bearer
+		// token from across the tailnet should be able to do.
+		fn("/_subrouter/pool", s.requireAdmin(s.handlePoolPage), false),
+		fn("/_subrouter/pool.json", s.requireAdmin(s.handlePoolData), false),
+		fn("/_subrouter/pool/pin", s.requireAdmin(s.requireLoopback(s.handlePoolPin)), false),
+		fn("/_subrouter/pool/unpin", s.requireAdmin(s.requireLoopback(s.handlePoolUnpin)), false),
+		fn("/_subrouter/pool/prune", s.requireAdmin(s.requireLoopback(s.handlePoolPrune)), false),
+		// Every peer's usage body as this daemon's peer link last read it, for
+		// `sr status` when the box's own address is out of reach (PATCHES §32).
+		// Loopback on top of admin: it relays another daemon's roster, read
+		// with a peer credential the caller never presented, so this daemon's
+		// admin token from across the tailnet must not be a way to read it.
+		fn(PeersUsageStatusPath, s.requireAdmin(s.requireLoopback(s.handlePeersUsageStatus)), false),
+		// Transcripts are every session's request and response bodies: admin
+		// on the private listener only, and NOT marked publicAdmin, so
+		// --public-admin never mounts them on :31416 (the owner's package
+		// when he turned the opt-in on, PATCHES §43.2). A named admin token
+		// that leaks off the tailnet reads no conversation.
+		fn("/_subrouter/transcripts", s.requireAdmin(s.handleTranscriptList), false),
+		fn("/_subrouter/transcripts/", s.requireAdmin(s.handleTranscriptDetail), false),
+		admin("/_subrouter/bedrock-cost", s.requireAdmin(s.handleBedrockCost)),
+		admin("/_subrouter/azure-codex-cost", s.requireAdmin(s.handleAzureCodexCost)),
+		// Routes merged from upstream after 1f9bf38 (2026-11 merge). All
+		// PRIVATE and none publicAdmin: the opt-in public admin surface is an
+		// allowlist the owner extends route by route (PATCHES §43.1).
+		// traffic is unauthenticated like stream-stats: request outcome
+		// counts, client versions and account hashes, no names (#428).
+		fn("/_subrouter/traffic", s.handleTraffic, false),
+		fn("/_subrouter/claude-key-credit", s.requireAdmin(s.handleClaudeKeyCredit), false),
+		fn("/_subrouter/codex-capacity", s.requireAdmin(s.handleCodexCapacity), false),
+		// Transcript analytics stay with the transcripts: private only
+		// (PATCHES §43.2).
+		fn("/_subrouter/transcript-stats", s.requireAdmin(s.handleTranscriptStats), false),
+		fn(PlacementStatsPath, s.requireAdmin(s.handlePlacementStats), false),
+		fn(MetricsPath, s.requireAdmin(s.handleMetrics), false),
+		fn("/_subrouter/token-usage", s.requireAdmin(s.handleTokenUsage), false),
+		fn(ErrorEventsPath, s.requireAdmin(s.handleErrorEvents), false),
+		fn(AccountStatePath, s.requireAdmin(s.handleAccountState), false),
+		fn(ClaudeCredentialDeathsPath, s.requireAdmin(s.handleClaudeCredentialDeaths), false),
+		fn("/_subrouter/device-usage", s.requireAdmin(s.handleDeviceUsage), false),
+		// Unlisted /_subrouter/* must 404 rather than fall through to the
+		// catch-all proxy handler below.
+		fn("/_subrouter/", http.NotFound, false),
+	}
+	if s.Bedrock != nil && !s.RequireSessionLease {
+		// Private: /bedrock/ is reached by the local `sr claude-aws` launcher,
+		// never by a forwarding peer, so it stays off the public surface.
+		routes = append(routes, serverRoute{pattern: "/bedrock/", handler: s.bedrockHandler()})
+	}
+	// The provider proxy: /v1/*, /backend-api/*, and everything else a client
+	// sends. This is the whole reason a public listener exists. It is token-
+	// gated by localProxyAuthorized like every other caller.
+	// Wrapped in the hold (PATCHES §58): a transient failure with nothing yet
+	// written to the client is retried until s.Hold's deadline. Outside the
+	// hold, the client-boundary transcript (PATCHES §71) records what the
+	// client sent and received, whoever served it.
+	routes = append(routes, serverRoute{pattern: "/", handler: s.recordClientExchange(s.holdOnTransientFailure(s.proxyHandler())), public: true})
+	return routes
+}
+
+// PublicHandler mounts ONLY the routes marked public. See serverRoute.
+func (s Server) PublicHandler() http.Handler {
+	s = s.normalized()
+
+	// Routes that report configuration are served from the configured server,
+	// captured before publicSurfaceServer strips it. See describesDaemon. Only
+	// publicSurface is set on that copy, so health can leave out what the
+	// public listener must not name; no credential is stripped from it.
+	describingServer := s
+	describingServer.publicSurface = true
+	describing := map[string]http.Handler{}
+	for _, route := range describingServer.routeTable() {
+		if route.public && route.describesDaemon {
+			describing[route.pattern] = route.handler
+		}
+	}
+
+	s = s.publicSurfaceServer()
+	s.rootHealth = describing["/_subrouter/health"]
+
+	mux := http.NewServeMux()
+	for _, route := range s.routeTable() {
+		if !route.public {
+			// Off by default, and then this is the whole of the old loop:
+			// no private route is mounted here (PATCHES §43.1).
+			if s.PublicAdmin && route.publicAdmin {
+				mux.Handle(route.pattern, route.handler)
+			}
+			continue
+		}
+		handler := route.handler
+		if route.publicHandler != nil {
+			handler = route.publicHandler
+			if s.PublicAdmin && route.publicAdmin {
+				handler = s.publicAdminOrPublic(route.handler, route.publicHandler)
+			}
+		}
+		if route.describesDaemon {
+			handler = describing[route.pattern]
+		}
+		mux.Handle(route.pattern, handler)
+	}
+	// Belt and braces around the catch-all: without these, a private path would
+	// fall through to the proxy handler and be forwarded upstream rather than
+	// refused. Registered as subtrees, so the public exact matches above
+	// (/_subrouter/health, /_subrouter/ready) still win.
+	mux.Handle("/_subrouter/", http.NotFoundHandler())
+	mux.Handle("/internal/v1/", http.NotFoundHandler())
+
+	// Rate limiting is PUBLIC-ONLY. The private listener is reached over the
+	// tailnet or loopback by our own fleet, where the limiter could only ever
+	// throttle real work.
+	// Traffic counting (upstream #428) sees the public listener's client
+	// requests too; it skips /_subrouter/* and counts a request once.
+	return newRateLimiter(s.PublicRateLimit, s.Logger).middleware(withoutLocalDataConnection(s.Traffic.trafficCounted(mux)))
+}
+
+// publicSurfaceServer is the copy of s that serves the public listener: every
+// authority that comes from network position or from the admin secret is
+// stripped, and publicSurface makes authorizeAdmin refuse outright.
+func (s Server) publicSurfaceServer() Server {
+	s.publicSurface = true
+
+	// Network position carries no authority on this surface.
+	//
+	// The admin routes are already absent, so this is defence in depth -- but
+	// the exemptions below are the places where "where you connected from"
+	// substitutes for a credential, and none of them should ever apply to a
+	// listener the internet can reach. Clearing them on the COPY costs nothing
+	// and means a future route promoted to public cannot inherit them by
+	// accident.
+	//
+	// AllowLoopbackProxyWithoutToken is the one that would actually bite: it
+	// lets a loopback caller spend the pool with no credential at all, and a
+	// request arriving on the public listener from the box itself presents
+	// exactly that RemoteAddr.
+	s.AllowLoopbackProxyWithoutToken = false
+	// TailnetAuth grants admin and account import to a tailnet identity. That
+	// is network position too, just a better-authenticated one: a public caller
+	// cannot pass `tailscale whois`, but a relay or Funnel in front of this
+	// listener would make the assumption false without anyone noticing.
+	s.TailnetAuth = nil
+
+	// The admin token is not a credential on this surface AT ALL.
+	//
+	// It is a strict superset -- localProxyAuthorized accepts it for the proxy
+	// gate too -- so leaving it valid here would buy a public caller nothing it
+	// could not do with the proxy token, while putting the more powerful secret
+	// on the public wire where it can be captured. Clearing it on the COPY makes
+	// the split real: proxy token spends and reads stats publicly, admin token
+	// works only where it is not exposed.
+	//
+	// A named admin token (PATCHES §43) is held to the same rule by
+	// proxyCaller and namedAdminToken, which refuse it on publicSurface.
+	//
+	// bearerMatches treats an empty expectation as NO MATCH rather than a
+	// wildcard, so the proxy gate cannot become an open door. authorizeAdmin's
+	// tokenless fallback WOULD read the blank as "no admin token configured";
+	// publicSurface is what stops that (see its field comment).
+	s.AdminToken = ""
+	// The import token likewise (PATCHES §43.1). It opens account import and
+	// the account DELETE, which --public-admin mounts here; on this listener
+	// those take a named admin-role token alone (requireAccountImportAuth),
+	// and a copy that does not hold the static secret cannot match it however
+	// a gate is later rewritten. The health handler, which reports whether
+	// import is configured, reads the unstripped server (describesDaemon).
+	s.AccountImportToken = ""
+	return s
+}
+
+// withoutLocalDataConnection strips the store-handshake connection grant from
+// every request it serves.
+//
+// A successful store handshake marks one HTTP CONNECTION as admin
+// (authorizeLocalDataConnection), and authorizeAdmin / requireAccountImportAuth
+// honour that mark. The grant is a same-machine proof for the private
+// listener. Whether it can exist on a public connection depends on which
+// ConnContext the listener's http.Server installs, which is decided in another
+// package; masking it here makes "never on the public listener" a property of
+// the handler instead of a convention of its caller.
+func withoutLocalDataConnection(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx := context.WithValue(r.Context(), localDataConnectionContextKey{}, (*localDataConnectionState)(nil))
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+func (s Server) Handler() http.Handler {
+	s = s.normalized()
+	mux := http.NewServeMux()
+	for _, route := range s.routeTable() {
+		mux.Handle(route.pattern, route.handler)
+	}
 	return s.Traffic.trafficCounted(mux)
 }
 
@@ -3031,6 +4611,10 @@ func normalizedCredentialBroker(value CredentialBroker) CredentialBroker {
 	return value
 }
 
+// handleHealth is upstream's health body, served on both listeners (owner
+// decision 6). The local CLI reads account_import from it. On the public
+// listener it runs against the configured server, not the stripped copy (see
+// serverRoute.describesDaemon).
 func (s Server) handleHealth(w http.ResponseWriter, request *http.Request) {
 	payload := map[string]any{
 		"ok":             true,
@@ -3038,6 +4622,8 @@ func (s Server) handleHealth(w http.ResponseWriter, request *http.Request) {
 		"auth":           s.AuthMode(),
 		"version":        buildversion.Version(),
 		"build":          buildversion.Get(),
+		// The status line reads this for when a session goes unlinked.
+		"warm_idle_seconds": int(warmSessionIdleTTL.Seconds()),
 	}
 	// Compatibility for v1 bindings and direct local daemons. v2 clients use
 	// the mutually authenticated private-socket handshake and never accept this
@@ -3056,6 +4642,25 @@ func (s Server) handleHealth(w http.ResponseWriter, request *http.Request) {
 		payload[ShadowHealthProofField] = proof
 	}
 	payload["codex_provider_selection"] = true
+	if s.ClaudeSocketStatus != nil {
+		payload["claude_socket"] = s.ClaudeSocketStatus()
+	}
+	if s.ClaudeSocketGuard != nil && !s.publicSurface {
+		// The adoption canary: non-zero means a socket session holds a stored
+		// claude.ai login, not the placeholder (claude_socket_guard.go).
+		payload["claude_socket_guard"] = s.ClaudeSocketGuard.Status()
+	}
+	if s.controlPlaneIdentityConfigured() {
+		// Who answers Claude Code's policy and profile calls (control_plane.go):
+		// the only place a missing or dead identity shows before a session
+		// quietly loses its tools. The public listener gets the state only:
+		// an account name can be an email address.
+		identity := s.ControlPlaneIdentityStatus(request.Context())
+		if s.publicSurface {
+			identity.ID, identity.Pin = "", ""
+		}
+		payload["control_plane_identity"] = identity
+	}
 	// Whether the Codex Azure fallback is armed is otherwise invisible until a
 	// pool outage, which is exactly when nobody wants to discover it was
 	// misconfigured. Endpoint names only; keys never leave the process.
@@ -3068,20 +4673,12 @@ func (s Server) handleHealth(w http.ResponseWriter, request *http.Request) {
 	if s.CodexOverloadFailover.enabled() {
 		payload["codex_overload_failover"] = true
 	}
-	if states := s.codexShedding.snapshot(time.Now(), s.codexCapacityRetryBudget(), s.CodexOverloadFailover.enabled()); len(states) > 0 {
-		// Pools whose recent Codex requests hit "model at capacity",
-		// shedding ones first; see codex_capacity_shedding.go.
-		payload["codex_capacity_shedding"] = states
-	}
 	if held := s.overloadHeld.snapshot(); held != nil {
 		// Requests currently waiting out an overload on their own account.
 		payload["overload_retry_held"] = held
 	}
 	if counters := s.recoveryCounters.snapshot(time.Now()); len(counters) > 0 {
 		payload["recovery_counters"] = counters
-	}
-	if retrying := s.retryStatuses.healthSnapshot(); len(retrying) > 0 {
-		payload["active_retries"] = retrying
 	}
 	if release, ok := readReleaseState(s.ReleaseStatePath); ok {
 		// Post-upgrade bake state written by the macOS deploy scripts.
@@ -3174,14 +4771,58 @@ func (s Server) handleDrain(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if !isLoopbackRemote(r.RemoteAddr) {
-		http.Error(w, "drain is only available from loopback", http.StatusForbidden)
+	if !s.drainControlAuthorized(r) {
+		http.Error(w, "drain is only available from loopback or with the admin token", http.StatusForbidden)
 		return
 	}
 	if s.Lifecycle != nil {
 		s.Lifecycle.Drain()
 	}
+	s.logLifecycleControl("drain", r)
 	writeJSON(w, s.lifecycleStatus(true))
+}
+
+// drainControlAuthorized gates drain and its undo, resume: a loopback peer, as
+// upstream has it, or a CONFIGURED admin credential from wherever the private
+// listener is reachable -- the admin token, or a tailnet identity that
+// --tailscale-auth admits.
+//
+// Loopback alone left the box undrainable. It binds only its tailnet address,
+// so nothing reaching it is ever a loopback peer -- not even a curl on the box,
+// whose source address is the tailnet one -- and the route answered 403 exactly
+// where a restart cuts the most (PATCHES §38).
+//
+// Why the admin credential and not a loopback listener: this grants drain to
+// nobody who could not already do worse. The admin token deletes and imports
+// accounts (handleAccountDelete made the same call) and redeems reset credits
+// over the same tailnet; a drain is undone by resume or a restart. A loopback
+// listener would hand drain (or, serving the private mux, the whole admin
+// surface) to every local process on the box with no credential at all, and
+// would need a second bind that the box's socket unit and its bootstrap
+// script's bind check both have to learn.
+//
+// Deliberately not authorizeAdmin, which requireAdmin has already run: its
+// tokenless fallback admits every caller on a daemon with no admin token, and
+// that stays loopback-only here. Publicly the route is mounted only with
+// --public-admin (PATCHES §43.1), and there only a named admin-role token
+// reaches this: requireAdmin's grant is publicAdminGranted, loopbackPeer is
+// false on that listener, and its server copy has no static admin token or
+// tailnet authorizer to match.
+func (s Server) drainControlAuthorized(r *http.Request) bool {
+	if s.loopbackPeer(r) || s.matchesConfiguredAdminToken(r) {
+		return true
+	}
+	_, ok := s.authorizeTailnet(r)
+	return ok
+}
+
+// logLifecycleControl records who changed whether this daemon takes new work.
+// A drain nobody remembers is an outage that looks like a spent pool: new
+// sessions get 503 and nothing else explains it.
+func (s Server) logLifecycleControl(action string, r *http.Request) {
+	if s.Logger != nil {
+		s.Logger.Info("subrouter lifecycle control", "action", action, "remote_addr", clientRemoteIP(r))
+	}
 }
 
 func (s Server) handleDrainStatus(w http.ResponseWriter, r *http.Request) {
@@ -3197,7 +4838,7 @@ func (s Server) handleQuiesce(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if !isLoopbackRemote(r.RemoteAddr) {
+	if !s.loopbackPeer(r) {
 		http.Error(w, "quiesce is only available from loopback", http.StatusForbidden)
 		return
 	}
@@ -3212,14 +4853,41 @@ func (s Server) handleResume(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if !isLoopbackRemote(r.RemoteAddr) {
-		http.Error(w, "resume is only available from loopback", http.StatusForbidden)
+	// The same gate as drain: a drain started remotely must be undoable from
+	// where it was started. A quiesce is not: it was loopback-only to set, so
+	// from anywhere else resume undoes a drain and refuses to touch a quiesce.
+	if !s.drainControlAuthorized(r) {
+		http.Error(w, "resume is only available from loopback or with the admin token", http.StatusForbidden)
 		return
 	}
 	if s.Lifecycle != nil {
-		s.Lifecycle.Resume()
+		var err error
+		if s.loopbackPeer(r) {
+			err = s.Lifecycle.Resume()
+		} else {
+			err = s.Lifecycle.ResumeDrain()
+		}
+		if writeResumeRefusal(w, err) {
+			return
+		}
 	}
+	s.logLifecycleControl("resume", r)
 	writeJSON(w, s.lifecycleStatus(true))
+}
+
+// writeResumeRefusal answers a refused resume and reports whether it did: 409
+// for a process that is shutting down, 403 for a quiesce resumed from off the
+// machine.
+func writeResumeRefusal(w http.ResponseWriter, err error) bool {
+	switch {
+	case err == nil:
+		return false
+	case errors.Is(err, ErrResumeShuttingDown):
+		http.Error(w, err.Error(), http.StatusConflict)
+	default:
+		http.Error(w, err.Error(), http.StatusForbidden)
+	}
+	return true
 }
 
 func (s Server) lifecycleStatus(ok bool) map[string]any {
@@ -3296,32 +4964,51 @@ func (s Server) handleUsageStatus(w http.ResponseWriter, r *http.Request) {
 			// generation published by another worker before serving cached rows.
 			s.accountListSnapshotContext(r.Context())
 		}
+		// The sweep and the scheduler refresh outlive a caller that hangs up:
+		// both feed shared state (the 30 s cache, the router's scores), and a
+		// short-capped reader must not be able to leave either half-filled.
+		// See usageSweepTimeout.
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), usageSweepTimeout)
+		defer cancel()
 		var statuses []AccountUsageStatus
+		ok := true
 		if snapshotOnly {
 			var cached bool
 			statuses, cached = s.AccountRef.UsageStatusSnapshot()
 			if !cached {
 				// Seed the controller once when no snapshot exists. Once seeded,
 				// status reads remain read-only and use the last-known state.
-				statuses = s.AccountRef.UsageStatuses(r.Context())
+				statuses, ok = s.AccountRef.UsageStatusesAvailable(ctx)
 			}
 		} else {
+			// Captured before the sweep: a partial refresh that published while
+			// this sweep ran must not be overwritten by its older view.
 			scoreRevision := uint64(0)
 			if s.SchedulerRef != nil {
 				scoreRevision = s.SchedulerRef.ScoreRevision()
 			}
 			if r.URL.Query().Get("refresh") == "1" {
-				statuses = s.AccountRef.UsageStatusesFresh(r.Context())
+				statuses, ok = s.AccountRef.UsageStatusesFreshAvailable(ctx)
 			} else {
-				statuses = s.AccountRef.UsageStatuses(r.Context())
+				statuses, ok = s.AccountRef.UsageStatusesAvailable(ctx)
 			}
-			if s.SchedulerRef != nil {
-				loaded, generation, credentialRevision := s.AccountRef.CredentialSnapshot()
-				s.SchedulerRef.SyncAccountCredentials(generation, credentialRevision, SchedulerAccounts(loaded))
+			if ok {
+				if s.SchedulerRef != nil {
+					loaded, generation, credentialRevision := s.AccountRef.CredentialSnapshot()
+					s.SchedulerRef.SyncAccountCredentials(generation, credentialRevision, SchedulerAccounts(loaded))
+				}
+				// Scheduler first: normalization reads the scores this call refreshes.
+				s.updateSchedulerFromUsageStatusesAtScoreRevision(ctx, statuses, scoreRevision)
 			}
-			s.updateSchedulerFromUsageStatusesAtScoreRevision(r.Context(), statuses, scoreRevision)
 		}
-		writeJSON(w, s.withCodexCapacityMarks(s.withClaudeCostTiers(s.AccountRef.withResetAdvice(withWeeklyCooked(s.withSessionActivity(s.withSessionCounts(s.withRequestTimeExhaustionWindows(s.withClaudeWebBalances(statuses)))))))))
+		if !ok {
+			// No snapshot and the sweep did not land in time. An error, not
+			// an empty list: readers take a non-200 as "unmeasured" and keep
+			// their last reading, and an empty list as a measured-empty pool.
+			http.Error(w, "usage sweep in progress", http.StatusServiceUnavailable)
+			return
+		}
+		writeJSON(w, s.withNewSessionVerdicts(s.withNormalizedUsage(s.withCodexCapacityMarks(s.withClaudeCostTiers(s.AccountRef.withResetAdvice(withWeeklyCooked(s.withSessionActivity(s.withSessionCounts(s.withRequestTimeExhaustionWindows(s.withClaudeWebBalances(statuses)))))))))))
 		return
 	}
 	accounts := s.accountListContext(r.Context())
@@ -3590,6 +5277,7 @@ func (s Server) updateSchedulerFromUsageStatusesAtScoreRevision(
 		scoreByID[selectacct.ScoreKey(scoreProvider, account.ID)] = len(scores)
 		scores = append(scores, seed)
 	}
+	now := time.Now()
 	scored := 0
 	for _, status := range statuses {
 		if !status.UsageFresh || status.AuthMode != accounts.AuthModeOAuth || len(status.Windows) == 0 {
@@ -3599,6 +5287,13 @@ func (s Server) updateSchedulerFromUsageStatusesAtScoreRevision(
 		if idx, ok := scoreByID[selectacct.ScoreKey(statusProvider, status.ID)]; ok {
 			next := scoreFromUsageWindows(statusProvider, status.ID, status.Windows)
 			next.Fresh = true
+			// The row may be a 30 s-old cached sweep, over windows up to
+			// usageWindowsTTL older still: stamped Fresh, but not evidence
+			// against a 429 that landed since (PATCHES.md §29).
+			next.MeasuredAt = status.UsageMeasuredAt
+			// The row's saved reset came off the same read as its windows;
+			// scores[idx] is still the seed (PATCHES §56).
+			next.ResetHeldUntil = resetHeldUntil(status.ComplimentaryReset, scores[idx], now)
 			scores[idx] = next
 			scored++
 		}
@@ -3608,9 +5303,17 @@ func (s Server) updateSchedulerFromUsageStatusesAtScoreRevision(
 	}
 	scheduler := selectacct.NewScheduler(scores)
 	if s.Sessions != nil {
-		scheduler = scheduler.WithSessionCounts(SchedulerActiveSessionCounts(s.Sessions))
+		scheduler = scheduler.WithSessionCounts(SchedulerSessionCounts(s.Sessions))
 	}
-	s.SchedulerRef.SetForAccountGenerationAtScoreRevision(scheduler, accountGeneration, scoreRevision)
+	// Published as a republication, not as the scheduled refresh. This runs on
+	// every usage-status and pool.json read -- including a peer daemon's 10 s
+	// capacity probe on the public listener -- mostly from the 30 s sweep
+	// cache, and it does not clear the live debits. Through Set it stamped the
+	// refresh clock and cancelled any refresh in flight, so a reader faster
+	// than UsageScoreTTL starved refreshUsageScoresIfStale, the one thing that
+	// clears the debits, and our own accounts drifted below the new-session
+	// gate. See PublishWithoutRefreshForAccountGenerationAtScoreRevision.
+	s.SchedulerRef.PublishWithoutRefreshForAccountGenerationAtScoreRevision(scheduler, accountGeneration, scoreRevision)
 }
 
 func (s Server) withRequestTimeExhaustionWindows(statuses []AccountUsageStatus) []AccountUsageStatus {
@@ -3647,6 +5350,12 @@ func (s Server) withRequestTimeExhaustionWindows(statuses []AccountUsageStatus) 
 			ResetAt:            until,
 			Feature:            feature,
 		}
+		// Copy before writing: out copies only the rows, so Windows still
+		// shares its array with the caller's -- the usage-status cache, the
+		// last-good snapshots, the persisted file -- and replacing the
+		// measured window in place wrote this synthetic 100% into them
+		// (and raced concurrent readers of the same array).
+		status.Windows = append([]accounts.UsageWindow(nil), status.Windows...)
 		updated := false
 		for j := range status.Windows {
 			if status.Windows[j].Name == name {
@@ -3656,7 +5365,7 @@ func (s Server) withRequestTimeExhaustionWindows(statuses []AccountUsageStatus) 
 			}
 		}
 		if !updated {
-			status.Windows = append(append([]accounts.UsageWindow(nil), status.Windows...), exhausted)
+			status.Windows = append(status.Windows, exhausted)
 		}
 	}
 	return out
@@ -3676,7 +5385,7 @@ func (s Server) handleReloadAccounts(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if !isLoopbackRemote(r.RemoteAddr) {
+	if !s.loopbackPeer(r) {
 		http.Error(w, "reload-accounts is only available from loopback", http.StatusForbidden)
 		return
 	}
@@ -3715,6 +5424,138 @@ type antigravityAccountImport struct {
 type claudeAccountImport struct {
 	Name       string                     `json:"name"`
 	Credential agentclaude.CredentialInfo `json:"credential"`
+}
+
+// handleAccountsAdmin serves the admin-gated /_subrouter/accounts route. DELETE
+// lives here and ONLY here: the public listener reaches this path with the proxy
+// token, which every pooled caller holds, and that token must never be able to
+// destroy an account. With --public-admin (PATCHES §43.1) the public listener
+// also serves this handler, to named admin-role tokens only
+// (publicAdminOrPublic); every other public caller still gets
+// handleAccountsPublic, which is read-only.
+//
+// Removal previously had no route at all on this code path -- handleTenantAccountDelete
+// exists but is reachable only through tenantScopedHandler, which is built per
+// resolved tenant, and a single-tenant box has none. So `DELETE /_subrouter/accounts/x`
+// 404'd with a valid admin token and the only way to drop an account was editing
+// claude.json over a root shell.
+//
+// The handler calls reloadAccounts so the removal is reflected and rescored
+// immediately. That is NOT what keeps /_subrouter/accounts honest -- reads go
+// through accountListSnapshotContext, which already reloads when the disk
+// generation changes, and a test with the reload removed still saw the account
+// disappear from the listing. Do not describe this call as the fix for a stale
+// in-memory registry; it makes the effect immediate and deterministic, nothing
+// more.
+// requireAccountsAuth splits authorization on /_subrouter/accounts by method.
+//
+// GET stays admin-only: the listing carries every pooled account's identity and
+// spend, and the existing separation test pins that the account-import token
+// cannot read it.
+//
+// DELETE also accepts the account-import token, so ONE narrow key can add
+// (account-import) and remove accounts without being able to enumerate them.
+// Combined with the fact that no route anywhere returns a credential, that key
+// manages pool membership without any path to take a credential off the box --
+// which is the whole point: a duplicate account is resolved by deleting the
+// box's copy, never by moving the secret back.
+func (s Server) requireAccountsAuth(next func(http.ResponseWriter, *http.Request)) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete {
+			s.requireAccountImportAuth(next)(w, r)
+			return
+		}
+		s.requireAdmin(next)(w, r)
+	}
+}
+
+func (s Server) handleAccountsAdmin(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodDelete {
+		s.handleAccountDelete(w, r)
+		return
+	}
+	s.handleAccounts(w, r)
+}
+
+// handleAccountsPublic is deliberately read-only. See handleAccountsAdmin.
+func (s Server) handleAccountsPublic(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		http.Error(w, "the public listener is read-only", http.StatusMethodNotAllowed)
+		return
+	}
+	s.handleAccounts(w, r)
+}
+
+// handleAccountDelete removes one account from the stored-credential store, the
+// Claude profile registry, or both, then reloads so the in-memory view matches.
+//
+// Deviates from this file's convention of gating destructive writes on loopback
+// (handleQuiesce, handlePoolPin). Loopback-only would mean a shell ON the box,
+// which is the exact cost this route exists to remove. It is admin-gated, the
+// admin surface is not mounted on the public mux unless serve runs with
+// --public-admin (PATCHES §43.1) -- and then only a named admin-role token
+// reaches it there -- and `confirm` must repeat the account id so a stray
+// request cannot delete anything.
+func (s Server) handleAccountDelete(w http.ResponseWriter, r *http.Request) {
+	if s.AccountRef == nil {
+		http.Error(w, "account store unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	id := strings.TrimSpace(r.URL.Query().Get("account"))
+	if id == "" {
+		http.Error(w, "account is required", http.StatusBadRequest)
+		return
+	}
+	if r.URL.Query().Get("confirm") != id {
+		http.Error(w, "confirm must repeat the account id", http.StatusBadRequest)
+		return
+	}
+
+	// A removal is a credential mutation like an import, so it takes the same
+	// path upstream's mutation sites do: the in-process install lock, then the
+	// cross-process account transaction, publishing the new disk generation
+	// before the first durable change. Without the publication a worker that
+	// reloads on generation change (the supervisor model) keeps routing to the
+	// removed account until something else bumps the generation.
+	removedFrom := []string{}
+	mutate := func() (bool, error) {
+		if _, ok, err := s.AccountRef.store.RemoveStored(id); err != nil {
+			return len(removedFrom) > 0, err
+		} else if ok {
+			removedFrom = append(removedFrom, "codex")
+		}
+		ok, err := s.AccountRef.claudeStore.RemoveProfile(id)
+		if ok {
+			removedFrom = append(removedFrom, "claude")
+		}
+		return len(removedFrom) > 0, err
+	}
+	if err := lockMutexContext(r.Context(), &s.AccountRef.installMu); err != nil {
+		http.Error(w, "remove account", http.StatusServiceUnavailable)
+		return
+	}
+	removeErr := publishAccountDiskMutation(r.Context(), s.AccountRef.store, func(string) error {
+		return s.AccountRef.advanceDiskGeneration()
+	}, mutate)
+	// Released before reloadAccounts, which takes installMu itself.
+	s.AccountRef.installMu.Unlock()
+	if removeErr != nil {
+		http.Error(w, "remove account", http.StatusInternalServerError)
+		return
+	}
+	if len(removedFrom) == 0 {
+		http.Error(w, "account not found", http.StatusNotFound)
+		return
+	}
+	if _, _, err := s.reloadAccounts(r.Context()); err != nil {
+		http.Error(w, "account removed but reload failed", http.StatusInternalServerError)
+		return
+	}
+	// A cached usage-status snapshot would keep listing the removed account for
+	// up to usageStatusCacheTTL; the generation bump also stops a sweep that
+	// started before the removal from publishing it back.
+	s.AccountRef.InvalidateUsageStatusCache()
+	writeJSON(w, map[string]any{"ok": true, "account": id, "removed_from": removedFrom})
 }
 
 type kimiAccountImport struct {
@@ -4486,7 +6327,7 @@ func (s Server) finishAccountReload(ctx context.Context, loaded []accounts.Accou
 	}
 	scheduler := selectacct.NewScheduler(scores)
 	if s.Sessions != nil {
-		scheduler = scheduler.WithSessionCounts(SchedulerActiveSessionCounts(s.Sessions))
+		scheduler = scheduler.WithSessionCounts(SchedulerSessionCounts(s.Sessions))
 	}
 	if !s.SchedulerRef.SetForAccountGenerationAtScoreRevision(scheduler, accountGeneration, scoreRevision) {
 		if s.Logger != nil {
@@ -4509,9 +6350,15 @@ type RateLimitResetResult struct {
 	WindowsAfter  []accounts.UsageWindow         `json:"windows_after,omitempty"`
 	// WeeklyWaitSeconds is how long the account would wait for its weekly
 	// window to reset on its own; CreditExpiresAt is its soonest-expiring
-	// available credit. Both are set for sweep candidates.
+	// available credit. Both are set for sweep candidates (all=true and
+	// best=true), so the CLI can preview what --all would spend and a
+	// --min-wait client can check the server honored min_wait_seconds.
 	WeeklyWaitSeconds int64  `json:"weekly_wait_seconds,omitempty"`
 	CreditExpiresAt   string `json:"credit_expires_at,omitempty"`
+	// EarlyUse marks an anytime redeem (PATCHES §46.8) of an account that
+	// was not at its weekly limit: the credit was (or, in a dry run, would
+	// be) spent before it was needed.
+	EarlyUse bool `json:"early_use,omitempty"`
 	// Reason is why the background spender chose the account (early_cook,
 	// expiring, pool_blocked); empty for manual redeems.
 	Reason string `json:"reason,omitempty"`
@@ -4524,6 +6371,14 @@ type RateLimitResetResult struct {
 // consuming a credit. The handler is admin-gated like the other _subrouter
 // endpoints because redeeming a credit is a real, externally-visible action on
 // the upstream account.
+//
+// anytime=true (PATCHES §46.8) redeems the one named account whether or not
+// it is at its weekly limit. Only `sr codex reset <name|email>`, the explicit
+// single-account verb, sends it (the owner's decision, 2026-09-29); it is
+// refused beside all=true or best=true and without an email, and `sr reset`,
+// the smart pick and the Codex auto-reset never send it, so they keep the
+// cooked-only rule. That is the CLI's convention: the daemon honours it from
+// any admin credential, and logs each one (logAnytimeRedeem).
 func (s Server) handleRateLimitReset(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -4536,6 +6391,10 @@ func (s Server) handleRateLimitReset(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	dryRun := parseBoolParam(r, "dry_run", "dry-run")
 	all := parseBoolParam(r, "all", "all_accounts")
+	// min_wait_seconds drops sweep candidates whose weekly window resets on
+	// its own sooner than this: a credit never renews, and one spent on an
+	// account that is back in a few hours buys a few hours. It applies to
+	// all=true and best=true; a named email is the user's explicit choice.
 	var minWait int64
 	if raw := strings.TrimSpace(r.URL.Query().Get("min_wait_seconds")); raw != "" {
 		parsed, err := strconv.ParseInt(raw, 10, 64)
@@ -4549,13 +6408,18 @@ func (s Server) handleRateLimitReset(w http.ResponseWriter, r *http.Request) {
 	if email == "" && r.URL.Query().Has("account") {
 		email = strings.TrimSpace(r.URL.Query().Get("account"))
 	}
+	anytime := parseBoolParam(r, "anytime")
+	if anytime && (all || email == "" || parseBoolParam(r, "best")) {
+		http.Error(w, "anytime=true redeems one named account (email=...); it is refused beside all=true or best=true, and without an email", http.StatusBadRequest)
+		return
+	}
 
 	var results []RateLimitResetResult
 	switch {
 	case all:
 		results = s.rateLimitResetAllAccounts(ctx, dryRun, minWait)
 	case email != "":
-		results = []RateLimitResetResult{s.rateLimitResetOne(ctx, email, dryRun)}
+		results = []RateLimitResetResult{s.rateLimitResetOne(ctx, email, dryRun, anytime)}
 	case parseBoolParam(r, "best"):
 		results = s.rateLimitResetBest(ctx, dryRun, minWait)
 	default:
@@ -4568,6 +6432,9 @@ func (s Server) handleRateLimitReset(w http.ResponseWriter, r *http.Request) {
 		if results[i].Reset {
 			resetCount++
 		}
+	}
+	if anytime && !dryRun {
+		s.logAnytimeRedeem(r, results)
 	}
 	// Invalidate the cached usage-status snapshot so the next status read
 	// reflects the freshly reset windows instead of the pre-reset picture.
@@ -4650,9 +6517,36 @@ func (s Server) handleResetCredits(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{"ok": true, "accounts": out})
 }
 
+// logAnytimeRedeem records every anytime redeem (PATCHES §46.8) at WARN, by
+// caller and listener. It can spend a finite credit on an account that did
+// not need it, and the daemon honours it from any admin credential -- a named
+// admin token on the public listener included -- so a leaked token burning
+// credits must be visible as such, not as one more admin request.
+func (s Server) logAnytimeRedeem(r *http.Request, results []RateLimitResetResult) {
+	if s.Logger == nil {
+		return
+	}
+	caller := "loopback"
+	if token, ok := s.namedAdminToken(r); ok {
+		caller = token.Name
+	} else if matchesConfiguredBearerToken(r, s.AdminToken, adminTokenHeader) {
+		caller = callerStaticAdmin
+	}
+	listener := "private"
+	if s.publicSurface {
+		listener = "public"
+	}
+	for _, result := range results {
+		s.Logger.Warn("codex reset credit redeem anytime", "caller", caller, "listener", listener,
+			"account", result.Email, "redeemed", result.Reset, "early_use", result.EarlyUse,
+			"remote_addr", clientRemoteIP(r), "error", result.Error)
+	}
+}
+
 // rateLimitResetOne resolves a single account by email and redeems a credit if
-// it is cooked on its 7d window and has a credit available.
-func (s Server) rateLimitResetOne(ctx context.Context, email string, dryRun bool) RateLimitResetResult {
+// it is cooked on its 7d window and has a credit available -- or, with
+// anytime, whenever it has one.
+func (s Server) rateLimitResetOne(ctx context.Context, email string, dryRun, anytime bool) RateLimitResetResult {
 	result := RateLimitResetResult{Email: email, DryRun: dryRun}
 	account, ok, err := s.AccountRef.ResolvedAccount(ctx, email)
 	if err != nil {
@@ -4663,7 +6557,7 @@ func (s Server) rateLimitResetOne(ctx context.Context, email string, dryRun bool
 		result.Error = "account not found"
 		return result
 	}
-	return s.redeemAccountIfEligible(ctx, account, dryRun)
+	return s.redeemAccount(ctx, account, dryRun, anytime)
 }
 
 // rateLimitResetCandidate is a stored OAuth account that is cooked on its
@@ -4686,20 +6580,26 @@ const resetCreditExpiringSoon = 48 * time.Hour
 const resetCreditExpiringMinWait = int64(6 * 60 * 60)
 
 // rateLimitResetCandidates fetches usage for every stored OAuth account and
-// returns the ones cooked on their weekly window with a credit available.
-// Accounts whose token cannot be refreshed or whose usage cannot be fetched
-// come back as failures so a sweep never reports "nothing to do" when it
-// could not look.
-func (s Server) rateLimitResetCandidates(ctx context.Context, minWait int64) ([]rateLimitResetCandidate, []RateLimitResetResult, error) {
+// returns the ones cooked on their weekly window with a credit available and
+// a natural weekly wait of at least minWait.
+//
+// Upstream's version of this (#366) also refreshes expired tokens and reports
+// unreadable accounts as failures; that change was not taken here (PATCHES
+// §29.5), so an account whose usage cannot be read is still skipped, as before.
+func (s Server) rateLimitResetCandidates(ctx context.Context, minWait int64) ([]rateLimitResetCandidate, error) {
 	scan, err := s.scanRateLimitReset(ctx, minWait)
-	return scan.candidates, scan.failures, err
+	return scan.candidates, err
 }
 
 // rateLimitResetScan is one pass over the stored OAuth accounts: the reset
-// candidates, the accounts that could not be read, and how many accounts
-// were looked at (total) and could take a request right now (serving).
-// An account that could not be read counts toward both, so an unreadable
-// pool never looks blocked.
+// candidates, and how many accounts were looked at (total) and could take a
+// request right now (serving), which upstream's background spender
+// (reset_autospend.go, #392) reads. An account whose usage could not be read
+// counts toward both, so an unreadable pool never looks blocked.
+//
+// failures stays empty: upstream's #366 reports unreadable accounts there,
+// and that change was not taken (PATCHES §29.5). It is kept so the spender
+// reads one shape.
 type rateLimitResetScan struct {
 	candidates []rateLimitResetCandidate
 	failures   []RateLimitResetResult
@@ -4719,15 +6619,7 @@ func (s Server) scanRateLimitReset(ctx context.Context, minWait int64) (rateLimi
 	sem := make(chan struct{}, 4)
 	var wg sync.WaitGroup
 	candidates := make([]rateLimitResetCandidate, 0, len(storedAccounts))
-	var failures []RateLimitResetResult
 	var mu sync.Mutex
-	fail := func(email, message string) {
-		mu.Lock()
-		failures = append(failures, RateLimitResetResult{Email: email, Error: message})
-		total++
-		serving++
-		mu.Unlock()
-	}
 	for i := range storedAccounts {
 		stored := storedAccounts[i]
 		if stored.IsAPIKey() {
@@ -4738,23 +6630,18 @@ func (s Server) scanRateLimitReset(ctx context.Context, minWait int64) (rateLimi
 		go func() {
 			defer wg.Done()
 			defer func() { <-sem }()
-			// Accounts sitting out a weekly lockout are exactly the ones whose
-			// access token has expired, so refresh before fetching usage.
-			refreshed, didRefresh, err := s.AccountRef.store.RefreshStoredIfExpired(ctx, s.AccountRef.client, stored)
-			if err != nil {
-				fail(stored.Email, "token refresh failed: "+err.Error())
-				return
-			}
-			account, ok := refreshed.Account(refreshed.SourcePath(s.AccountRef.store))
+			account, ok := stored.Account(stored.SourcePath(s.AccountRef.store))
 			if !ok || account.Token == "" {
 				return
 			}
-			if didRefresh {
-				s.AccountRef.replace(account)
-			}
 			details, err := accounts.FetchCodexUsageDetails(ctx, s.AccountRef.client, account)
 			if err != nil {
-				fail(stored.Email, "usage fetch failed: "+err.Error())
+				// Skipped, as before #366 (not taken); counted as serving so
+				// the spender never reads an unreadable pool as blocked.
+				mu.Lock()
+				total++
+				serving++
+				mu.Unlock()
 				return
 			}
 			mu.Lock()
@@ -4769,11 +6656,13 @@ func (s Server) scanRateLimitReset(ctx context.Context, minWait int64) (rateLimi
 			if !rateLimitHasCredit(details) {
 				return
 			}
-			wait := accounts.WeeklyResetWait(details.Windows)
+			wait := weeklyResetWait(details.Windows)
 			if wait < minWait {
 				return
 			}
 			candidate := rateLimitResetCandidate{account: account, before: details.Windows, wait: wait}
+			// Expiry only orders candidates; a failed list leaves it unknown
+			// rather than dropping an otherwise eligible account.
 			if credits, err := accounts.ListRateLimitResetCredits(ctx, s.AccountRef.client, account); err == nil {
 				candidate.creditExpires = soonestAvailableCreditExpiry(credits)
 			}
@@ -4783,20 +6672,23 @@ func (s Server) scanRateLimitReset(ctx context.Context, minWait int64) (rateLimi
 		}()
 	}
 	wg.Wait()
-	sort.Slice(failures, func(i, j int) bool { return failures[i].Email < failures[j].Email })
-	return rateLimitResetScan{candidates: candidates, failures: failures, total: total, serving: serving}, nil
+	return rateLimitResetScan{candidates: candidates, total: total, serving: serving}, nil
 }
 
 // rateLimitResetAllAccounts redeems a credit for every stored OAuth account
 // that is cooked on its weekly window and still has a credit available.
 // Accounts that are healthy or out of credits are skipped silently.
 func (s Server) rateLimitResetAllAccounts(ctx context.Context, dryRun bool, minWait int64) []RateLimitResetResult {
-	candidates, failures, err := s.rateLimitResetCandidates(ctx, minWait)
+	candidates, err := s.rateLimitResetCandidates(ctx, minWait)
 	if err != nil {
 		return []RateLimitResetResult{{Error: err.Error()}}
 	}
+	// The fetch goroutines finish in any order, and the sweep used to redeem
+	// in that order. Sorting gives --all a stable preview and redeems the
+	// expiring credits first, so a sweep interrupted part-way has already
+	// spent the ones that would otherwise be lost.
 	sortResetCandidates(candidates, time.Now())
-	return append(s.redeemRateLimitResetCandidates(ctx, candidates, dryRun), failures...)
+	return s.redeemRateLimitResetCandidates(ctx, candidates, dryRun)
 }
 
 // rateLimitResetBest redeems a credit for the single best candidate, ordered
@@ -4805,15 +6697,15 @@ func (s Server) rateLimitResetAllAccounts(ctx context.Context, dryRun bool, minW
 // Selection happens here rather than in the CLI so the account picked is
 // always one this server's eligibility rule accepts.
 func (s Server) rateLimitResetBest(ctx context.Context, dryRun bool, minWait int64) []RateLimitResetResult {
-	candidates, failures, err := s.rateLimitResetCandidates(ctx, minWait)
+	candidates, err := s.rateLimitResetCandidates(ctx, minWait)
 	if err != nil {
 		return []RateLimitResetResult{{Error: err.Error()}}
 	}
 	if len(candidates) == 0 {
-		return append([]RateLimitResetResult{}, failures...)
+		return []RateLimitResetResult{}
 	}
 	sortResetCandidates(candidates, time.Now())
-	return append(s.redeemRateLimitResetCandidates(ctx, candidates[:1], dryRun), failures...)
+	return s.redeemRateLimitResetCandidates(ctx, candidates[:1], dryRun)
 }
 
 // sortResetCandidates orders candidates by how much a credit is worth on
@@ -4857,6 +6749,13 @@ func soonestAvailableCreditExpiry(credits []accounts.RateLimitResetCredit) time.
 	return soonest
 }
 
+// weeklyResetWait is how long a cooked account waits for its weekly window
+// to reset on its own (0 when it is not cooked).
+func weeklyResetWait(windows []accounts.UsageWindow) int64 {
+	window, _ := accounts.WeeklyCookedWindow(windows)
+	return window.ResetAfterSeconds
+}
+
 func (s Server) redeemRateLimitResetCandidates(ctx context.Context, candidates []rateLimitResetCandidate, dryRun bool) []RateLimitResetResult {
 	results := make([]RateLimitResetResult, 0, len(candidates))
 	for _, c := range candidates {
@@ -4895,14 +6794,31 @@ var rateLimitRedeemMu sync.Mutex
 
 // redeemAccountIfEligible fetches current usage, and if the account is cooked
 // on its weekly window with a credit available, redeems one credit. dryRun lists
-// eligibility without consuming.
+// eligibility without consuming. The sweep, the smart pick, `sr reset <email>`,
+// the Codex auto-reset and the background spender all come through here:
+// cooked only.
 func (s Server) redeemAccountIfEligible(ctx context.Context, account accounts.Account, dryRun bool) RateLimitResetResult {
-	return s.redeemAccountIfApproved(ctx, account, dryRun, nil)
+	return s.redeemAccount(ctx, account, dryRun, false)
+}
+
+// redeemAccount is redeemAccountIfEligible with the cooked rule optional:
+// anytime redeems an account that is not at its weekly limit, and says so
+// (EarlyUse). Only the anytime=true request of `sr codex reset` sets it
+// (PATCHES §46.8).
+func (s Server) redeemAccount(ctx context.Context, account accounts.Account, dryRun, anytime bool) RateLimitResetResult {
+	return s.redeemAccountChecked(ctx, account, dryRun, anytime, nil)
 }
 
 // redeemAccountIfApproved is redeemAccountIfEligible with a policy check
 // (approve, may be nil) run just before the consume.
 func (s Server) redeemAccountIfApproved(ctx context.Context, account accounts.Account, dryRun bool, approve resetApproval) RateLimitResetResult {
+	return s.redeemAccountChecked(ctx, account, dryRun, false, approve)
+}
+
+// redeemAccountChecked is the one redeem every path above takes: the live
+// eligibility check and the consume run under rateLimitRedeemMu, so two
+// overlapping redeems cannot both spend a credit on one reset.
+func (s Server) redeemAccountChecked(ctx context.Context, account accounts.Account, dryRun, anytime bool, approve resetApproval) RateLimitResetResult {
 	if !dryRun {
 		rateLimitRedeemMu.Lock()
 		defer rateLimitRedeemMu.Unlock()
@@ -4915,8 +6831,11 @@ func (s Server) redeemAccountIfApproved(ctx context.Context, account accounts.Ac
 	}
 	result.WindowsBefore = before.Windows
 	if !rateLimitCooked(before) {
-		result.Error = "account is not cooked; skipping (no full weekly window in: " + accounts.DescribeAccountWindows(before.BaseWindows) + ")"
-		return result
+		if !anytime {
+			result.Error = "account is not cooked; skipping"
+			return result
+		}
+		result.EarlyUse = true
 	}
 	if !rateLimitHasCredit(before) {
 		result.Eligible = false
@@ -4930,7 +6849,7 @@ func (s Server) redeemAccountIfApproved(ctx context.Context, account accounts.Ac
 	var check func(accounts.RateLimitResetCredit) error
 	if approve != nil {
 		check = func(credit accounts.RateLimitResetCredit) error {
-			live := rateLimitResetCandidate{account: account, before: before.Windows, wait: accounts.WeeklyResetWait(before.Windows)}
+			live := rateLimitResetCandidate{account: account, before: before.Windows, wait: weeklyResetWait(before.Windows)}
 			live.creditExpires, _ = time.Parse(time.RFC3339, credit.ExpiresAt)
 			return approve(live, time.Now())
 		}
@@ -4942,6 +6861,9 @@ func (s Server) redeemAccountIfApproved(ctx context.Context, account accounts.Ac
 	}
 	result.Credit = &credit
 	result.Reset = true
+	// The 429 that cooked the account also paused its admission gate; every
+	// redeem path comes through here, so the reset ends the pause here.
+	s.admissionGate().clearAccount(schedulerAccountProvider(accounts.ProviderCodex), account.ID)
 	if after, err := accounts.FetchCodexUsageDetails(ctx, s.AccountRef.client, account); err == nil {
 		result.WindowsAfter = after.Windows
 	}
@@ -4971,6 +6893,21 @@ func parseBoolParam(r *http.Request, aliases ...string) bool {
 		}
 	}
 	return false
+}
+
+// ScoreOAuthAccounts is the provider-aware scoring sweep for callers outside
+// this package (serve's startup fetch, the sr auto-switch loop). It resolves
+// the ScoreAccounts test hook exactly the way the internal reload paths do, so
+// wiring a sweep through it is behaviorally identical to the serving path.
+// This — not a provider-blind reimplementation — is the scoring entry point:
+// the retired codex-shaped sweep in cmd/subrouter fetched every account's
+// usage from the Codex endpoint, so Claude accounts 401'd on every sweep and
+// scored zero forever, leaving the scheduler blind.
+func (s Server) ScoreOAuthAccounts(ctx context.Context, available []accounts.Account) ([]selectacct.Score, int) {
+	if s.ScoreAccounts != nil {
+		return s.ScoreAccounts(ctx, available)
+	}
+	return s.scoreAccounts(ctx, available)
 }
 
 func (s Server) scoreAccounts(ctx context.Context, available []accounts.Account) ([]selectacct.Score, int) {
@@ -5025,6 +6962,28 @@ func (s Server) scoreAccounts(ctx context.Context, available []accounts.Account)
 	scored := 0
 	var scoreMu sync.Mutex
 	var wg sync.WaitGroup
+	// The revoked and known-dead skips in the loop below are keyed by the
+	// credential identity held in memory, which another process can have
+	// replaced in the profile's store since (PATCHES §34.5: Claude Code
+	// rotating its own item, an in-place re-login). A skipped account is
+	// never refreshed, so the store is read first (no provider request), and
+	// a different identity there that is neither revoked nor dead is scored
+	// in its place; the refresh then reads it again under its lock. The skip
+	// used to hold such an account out until a reload or a usage-status
+	// sweep.
+	storedReplacement := func(account accounts.Account) (accounts.Account, bool) {
+		stored, ok := s.AccountRef.storedClaudeCredential(sweepCtx, account)
+		if !ok {
+			return account, false
+		}
+		if _, revoked := claudeCredentialRevokedSince(s.claudeCostStore(), stored); revoked {
+			return account, false
+		}
+		if _, dead := s.AccountRef.terminalCredFailure(stored); dead {
+			return account, false
+		}
+		return stored, true
+	}
 	width := accountFetchConcurrencyFor(len(available))
 	window := newOrderedFetchWindow(width)
 	for _, index := range rotatedIndexes(len(available), s.AccountRef.nextSweepStart(width)) {
@@ -5037,7 +6996,7 @@ func (s Server) scoreAccounts(ctx context.Context, available []accounts.Account)
 		if s.SchedulerRef != nil {
 			currentScore := current.ScoreFor(schedulerAccountProvider(account.Provider), account.ID)
 			if _, blocked := knownAccountWideQuotaReset(currentScore, time.Now()); blocked {
-				if account.Provider == accounts.ProviderClaude && currentScore.WeeklyCooked() &&
+				if account.Provider == accounts.ProviderClaude && scoreWeeklyCooked(currentScore, time.Now()) &&
 					s.AccountRef.claimClaudeQuotaProbe(account, time.Now()) {
 					reverifyClaudeQuota = true
 				} else if !s.SchedulerRef.UpdatedAt().IsZero() {
@@ -5058,19 +7017,27 @@ func (s Server) scoreAccounts(ctx context.Context, available []accounts.Account)
 		if _, revoked := claudeCredentialRevokedSince(s.claudeCostStore(), account); revoked {
 			// Refreshing a dead credential would give it a new fingerprint
 			// and silently return it to routing.
-			scoreMu.Lock()
-			setZeroScore(scores, scoreByID, schedulerAccountProvider(account.Provider), account.ID)
-			scoreMu.Unlock()
-			continue
+			replacement, replaced := storedReplacement(account)
+			if !replaced {
+				scoreMu.Lock()
+				setZeroScore(scores, scoreByID, schedulerAccountProvider(account.Provider), account.ID)
+				scoreMu.Unlock()
+				continue
+			}
+			account = replacement
 		}
 		if failure, dead := s.AccountRef.terminalCredFailure(account); dead {
-			if s.Logger != nil {
-				s.Logger.Debug("skipping account with known-dead credential", "account", account.ID, "error", failure)
+			replacement, replaced := storedReplacement(account)
+			if !replaced {
+				if s.Logger != nil {
+					s.Logger.Debug("skipping account with known-dead credential", "account", account.ID, "error", failure)
+				}
+				scoreMu.Lock()
+				setZeroScore(scores, scoreByID, schedulerAccountProvider(account.Provider), account.ID)
+				scoreMu.Unlock()
+				continue
 			}
-			scoreMu.Lock()
-			setZeroScore(scores, scoreByID, schedulerAccountProvider(account.Provider), account.ID)
-			scoreMu.Unlock()
-			continue
+			account = replacement
 		}
 		turn := window.ticket()
 		wg.Add(1)
@@ -5088,19 +7055,19 @@ func (s Server) scoreAccounts(ctx context.Context, available []accounts.Account)
 					s.Logger.Warn("account reload refresh failed", "account", account.ID, "error", err)
 				}
 				// Only zero on a confident auth failure (dead/invalid token).
-				// Transient refresh errors preserve the seed.
-				if authLikeUsageError(err.Error()) {
+				// Transient refresh errors preserve the seed. A credential read
+				// that reached no verdict is transient however its message
+				// reads: this zero is carried forward as the next sweep's seed
+				// and scores the account evicted, the one state that moves a
+				// warm session (agentclaude.ErrCredentialUnchecked). A store that
+				// refused, or stayed silent past its bound, is a verdict: its
+				// text is auth-shaped on purpose and zeroes like a dead login
+				// (agentclaude.ErrCredentialUnavailable).
+				if authLikeUsageError(err.Error()) && !errors.Is(err, agentclaude.ErrCredentialUnchecked) {
 					scoreMu.Lock()
 					setZeroScore(scores, scoreByID, schedulerAccountProvider(account.Provider), account.ID)
 					scoreMu.Unlock()
 				}
-				return
-			}
-			if !s.AccountRef.hasOAuthUsageSource(refreshed.Provider) {
-				// Credential-only OAuth providers deliberately publish no quota API.
-				// Successful refresh proves authentication, not quota recovery. Keep
-				// the seed and publish no positive quota evidence so a request-time
-				// exhaustion overlay remains effective until its own expiry.
 				return
 			}
 			if _, revoked := claudeCredentialRevokedSince(s.claudeCostStore(), refreshed); revoked {
@@ -5117,14 +7084,17 @@ func (s Server) scoreAccounts(ctx context.Context, available []accounts.Account)
 			}
 			var windows []accounts.UsageWindow
 			var fresh bool
+			var measuredAt time.Time
 			if reverifyClaudeQuota {
+				// The probe's reading is as old as its start (PATCHES §29).
+				measuredAt = time.Now()
 				windows, err = s.AccountRef.claudeFableProbe(sweepCtx, client, refreshed)
 				fresh = err == nil && fableProbeHasPrimaryWindows(windows)
 				if err == nil && !fresh {
 					return
 				}
 			} else {
-				windows, fresh, err = s.fetchAccountUsageWindows(sweepCtx, client, refreshed)
+				windows, fresh, measuredAt, err = s.fetchAccountUsageWindows(sweepCtx, client, refreshed)
 			}
 			if err != nil {
 				if s.Logger != nil {
@@ -5144,12 +7114,19 @@ func (s Server) scoreAccounts(ctx context.Context, available []accounts.Account)
 				// the seeded score rather than risk demoting a healthy account.
 				return
 			}
+			// The saved reset this read carried, else the fallback's last
+			// answer: what the sweep publishes on the row (PATCHES §56). The
+			// sweep starts the fallback reads; this never does.
+			reset := s.AccountRef.usageReadReset(refreshed, false)
 			scoreMu.Lock()
 			defer scoreMu.Unlock()
 			scoreProvider := schedulerAccountProvider(account.Provider)
 			if idx, ok := scoreByID[selectacct.ScoreKey(scoreProvider, account.ID)]; ok {
 				next := scoreFromUsageWindows(scoreProvider, account.ID, windows)
 				next.Fresh = true
+				next.MeasuredAt = measuredAt
+				// scores[idx] is still this account's seed.
+				next.ResetHeldUntil = resetHeldUntil(reset, scores[idx], time.Now())
 				scores[idx] = next
 				scored++
 			}
@@ -5159,48 +7136,61 @@ func (s Server) scoreAccounts(ctx context.Context, available []accounts.Account)
 	return scores, scored
 }
 
-// fetchAccountUsageWindows returns an account's usage windows and whether they
-// are fresh (a recent successful fetch) versus a stale last-known-good fallback.
-func (s Server) fetchAccountUsageWindows(ctx context.Context, client *http.Client, account accounts.Account) ([]accounts.UsageWindow, bool, error) {
-	if s.AccountRef != nil {
-		return s.AccountRef.FetchUsageWindowsCached(ctx, client, account)
-	}
-	windows, err := fetchAccountUsageWindowsLive(ctx, client, account)
-	return windows, err == nil, err
+// fetchAccountUsageWindows returns an account's usage windows, whether they
+// are fresh (a recent successful fetch) versus a stale last-known-good
+// fallback, and when they were read upstream (see
+// fetchUsageWindowsCachedReason: a cache hit is as old as its entry).
+func (s Server) fetchAccountUsageWindows(ctx context.Context, client *http.Client, account accounts.Account) ([]accounts.UsageWindow, bool, time.Time, error) {
+	windows, fresh, measuredAt, _, err := s.AccountRef.fetchUsageWindowsCachedReason(ctx, client, account)
+	return windows, fresh, measuredAt, err
 }
 
 func fetchAccountUsageWindowsLive(ctx context.Context, client *http.Client, account accounts.Account) ([]accounts.UsageWindow, error) {
 	if account.Provider == accounts.ProviderClaude {
-		usage, err := agentclaude.FetchUsage(ctx, client, account.Token)
-		var throttle *agentclaude.UsageThrottleError
-		if errors.As(err, &throttle) {
-			// The quota endpoint explicitly asked us to stop. Do not
-			// immediately send a synthetic Messages probe as fallback:
-			// that doubles traffic at precisely the worst moment.
-			return nil, err
-		}
-		windows := claudeUsageWindows(usage)
-		if !usageWindowNamed(windows, agentclaude.FableWindowName) {
-			if fableWindows, probeErr := agentclaude.FetchFableUsageWindows(ctx, client, account.Token); probeErr == nil && len(fableWindows) > 0 {
-				if err == nil || fableProbeHasPrimaryWindows(fableWindows) {
-					windows = mergeUsageWindows(windows, fableWindows)
-				}
-			} else if err != nil {
-				if probeErr != nil {
-					return nil, probeErr
-				}
-				return nil, err
-			}
-		}
-		if err != nil && len(windows) == 0 {
-			return nil, err
-		}
-		return windows, nil
+		windows, _, err := fetchClaudeUsageLive(ctx, client, account)
+		return windows, err
 	}
 	if account.Provider != "" && account.Provider != accounts.ProviderCodex {
 		return nil, fmt.Errorf("%w for provider %q", errOAuthUsageUnavailable, account.Provider)
 	}
 	return accounts.FetchCodexUsage(ctx, client, account)
+}
+
+// fetchClaudeUsageLive reads one Claude account's windows, and the saved
+// reset the same usage answer carries (nil when it carried none).
+func fetchClaudeUsageLive(ctx context.Context, client *http.Client, account accounts.Account) ([]accounts.UsageWindow, *agentclaude.ResetStatus, error) {
+	usage, err := agentclaude.FetchUsage(ctx, client, account.Token)
+	var throttle *agentclaude.UsageThrottleError
+	if errors.As(err, &throttle) {
+		// The quota endpoint explicitly asked us to stop. Do not
+		// immediately send a synthetic Messages probe as fallback:
+		// that doubles traffic at precisely the worst moment (#535).
+		return nil, nil, err
+	}
+	windows := claudeUsageWindows(usage)
+	var reset *agentclaude.ResetStatus
+	if err == nil {
+		// A malformed block is not read, never "none": reset stays nil.
+		if status, statusErr := usage.ResetStatus(); statusErr == nil {
+			reset = status
+		}
+	}
+	if !usageWindowNamed(windows, agentclaude.FableWindowName) {
+		if fableWindows, probeErr := agentclaude.FetchFableUsageWindows(ctx, client, account.Token); probeErr == nil && len(fableWindows) > 0 {
+			if err == nil || fableProbeHasPrimaryWindows(fableWindows) {
+				windows = mergeUsageWindows(windows, fableWindows)
+			}
+		} else if err != nil {
+			if probeErr != nil {
+				return nil, nil, probeErr
+			}
+			return nil, nil, err
+		}
+	}
+	if err != nil && len(windows) == 0 {
+		return nil, nil, err
+	}
+	return agentclaude.WithUnusedFableWindow(windows), reset, nil
 }
 
 func fableProbeHasPrimaryWindows(windows []accounts.UsageWindow) bool {
@@ -5239,8 +7229,9 @@ const defaultUsageFetchTimeout = 10 * time.Second
 // usageScoreRefreshTimeout bounds one whole score-refresh sweep (every OAuth
 // account's token refresh plus usage fetch, serially). The sweep runs detached
 // from the triggering request's context, so this deadline is the only thing
-// keeping a wedged upstream from holding that request's account selection
-// open indefinitely.
+// keeping a wedged upstream from holding the refresh claim -- and, on a
+// never-scored scheduler, that request's account selection -- open
+// indefinitely.
 const usageScoreRefreshTimeout = 60 * time.Second
 
 func setZeroScore(scores []selectacct.Score, scoreByID map[string]int, provider accounts.Provider, accountID string) {
@@ -5283,12 +7274,15 @@ func userEmailHash(value string) string {
 
 // stripClientAcceptEncoding removes the client's Accept-Encoding from an
 // outbound HTTP request. Go's transport then offers gzip itself and decodes
-// the response transparently, so every body inspector (the Claude overload
-// peek, token usage, catalog aggregation, error classifiers) sees plain bytes
-// and the client gets an identity body. Forwarding "gzip, deflate, br, zstd"
-// let api.anthropic.com answer br, which the overload peek cannot parse: it
-// held every compressed Claude stream's headers until its timeout.
-// WebSocket upgrades keep their headers; frames are not HTTP-encoded.
+// the response transparently, so every body inspector sees plain bytes and the
+// client gets an identity body. Forwarding Claude Code's "gzip, deflate, br,
+// zstd" let the provider compress, and the one inspector a session's pin
+// depends on -- the streamed terminal-event check that commits a provisional
+// move (newSessionCommitSSEReadCloser) -- never found message_stop in the
+// compressed bytes: a session evicted from a spent account re-picked on every
+// turn and never moved (PATCHES §25). Upstream's 55ead07 (#439) makes the same
+// cut, for its overload peek and token usage. WebSocket upgrades keep their
+// headers; frames are not HTTP-encoded.
 func stripClientAcceptEncoding(headers http.Header) {
 	headers.Del("Accept-Encoding")
 }
@@ -5304,33 +7298,71 @@ func stripOutboundForwardingHeaders(headers http.Header) {
 
 func (s Server) requireAdmin(next func(http.ResponseWriter, *http.Request)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if reason := s.adminRequestRejection(r); reason != "" {
-			http.Error(w, reason, http.StatusForbidden)
-			return
-		}
+		// No up-front rejection (upstream #374's first lines, which git
+		// spliced back in): authorizeAdmin runs the same checks first on the
+		// private listener, and the public listener must answer a flat 401.
 		if s.authorizeAdmin(r) {
 			next(w, r)
 			return
+		}
+		// authorizeAdmin is the whole decision; this only picks the status. A
+		// request refused for its browser metadata or its Host gets 403 and
+		// the reason, because a token would not help it and "admin token
+		// required" would send whoever hit it looking in the wrong place. The
+		// public listener's copy keeps the flat 401: it is admin to nobody, and
+		// there is nothing on it to diagnose.
+		if !s.publicSurface {
+			if reason := s.adminRequestRejection(r); reason != "" {
+				http.Error(w, reason, http.StatusForbidden)
+				return
+			}
 		}
 		http.Error(w, "admin token required", http.StatusUnauthorized)
 	}
 }
 
 // adminRequestRejection reports why an admin request is refused before any
-// credential is considered, or "" when it may proceed to authorization.
+// credential is considered, or "" when it may go on to authorization. Ported
+// from upstream manaflow-ai/subrouter #374 (f4c6f99), PATCHES §29.
 //
-// Admin endpoints are for command-line and same-origin dashboard use. A
-// request a browser labels as coming from another site is refused on every
-// path. A request trusted because its peer is loopback must also name a
-// loopback host (or the configured public host) unless it carries the admin
-// token, since loopback trust is a statement about this machine rather than
-// about the site that issued the request.
+// The admin surface is for command-line clients and the same-origin pages
+// the daemon serves (the dashboard and the pool board). The laptop daemon
+// listens on 127.0.0.1:31415 and trusts every loopback peer, and the owner's
+// browser IS a loopback peer, whichever page it is showing. Before this, any
+// page could blind-POST rate-limit-reset?all=true (redeeming every cooked
+// account's reset credit, which does not come back), drain or quiesce the
+// daemon, unpin every session on the board, or mint a tenant key -- a no-cors
+// request needs no response to do that. A page that DNS-rebinds its own name
+// to 127.0.0.1 could also READ the admin surface (sessions, accounts, usage),
+// because to the browser that is same-origin.
+//
+// Two checks close those, and they are deliberately independent:
+//
+//   - Browser fetch metadata, on every admin request whatever authorizes it.
+//     A request the browser labels cross-site, or whose Origin is not its own
+//     Host, is refused. The sr CLI, srq, srdash (which fetches server-side),
+//     the peer fallthrough client and every SDK send neither header, so they
+//     are unaffected.
+//   - The Host header, only where loopback position is the credential. A
+//     rebinding page is same-origin, so it carries clean metadata; the one
+//     thing it cannot fake is the name it reached us by. A loopback peer must
+//     name a loopback host or the configured public host.
+//
+// The Host check is waived where the request proves more than position: the
+// admin token, a store-handshake connection (a same-machine secret), or a
+// tenant-scoped server, which the MultiTenant router reaches only after
+// validating the tenant key. None of those is ambient authority a page can
+// borrow, and demanding a loopback Host of them would only break a loopback
+// reverse proxy in front of a hosted deployment.
 func (s Server) adminRequestRejection(r *http.Request) string {
 	if !adminBrowserSignalsAllowed(r) {
 		return "cross-site admin request rejected"
 	}
-	if isLoopbackRemote(r.RemoteAddr) && !localDataConnectionAuthorized(r) &&
-		!s.loopbackAdminHostAllowed(r.Host) && !s.matchesConfiguredAdminToken(r) {
+	if isLoopbackRemote(r.RemoteAddr) &&
+		!s.tenantControlAuthorized &&
+		!localDataConnectionAuthorized(r) &&
+		!s.loopbackAdminHostAllowed(r.Host) &&
+		!s.matchesConfiguredAdminToken(r) {
 		return "admin request host must be a loopback address"
 	}
 	return ""
@@ -5338,10 +7370,13 @@ func (s Server) adminRequestRejection(r *http.Request) string {
 
 // adminBrowserSignalsAllowed accepts requests that carry no browser fetch
 // metadata (CLI and SDK clients) and browser requests that are same-origin or
-// user-initiated. Any other Sec-Fetch-Site value, or an Origin that does not
-// match the request's own Host, is refused.
+// user-initiated (Sec-Fetch-Site "none": typed in, bookmarked). Any other
+// Sec-Fetch-Site value -- including "same-site", which is every other port on
+// 127.0.0.1 -- or an Origin that does not match the request's own Host, is
+// refused. An Origin of "null" (sandboxed frames, some redirects) is refused
+// too: it names no site that could be checked.
 func adminBrowserSignalsAllowed(r *http.Request) bool {
-	if dashboardNavigation(r) {
+	if adminPageNavigation(r) {
 		return true
 	}
 	if site := strings.ToLower(strings.TrimSpace(r.Header.Get("Sec-Fetch-Site"))); site != "" &&
@@ -5363,20 +7398,34 @@ func adminBrowserSignalsAllowed(r *http.Request) bool {
 	return true
 }
 
-// dashboardNavigation reports a top-level GET navigation to the read-only
-// dashboard page, such as following a link to it from chat. The linking site
-// cannot read the response of a navigation, so it gains nothing; the page's
-// own follow-up requests are same-origin. Host validation still applies.
-func dashboardNavigation(r *http.Request) bool {
+// adminPageNavigation reports a top-level GET navigation to one of the two
+// read-only admin PAGES, such as following a link to the board from chat.
+// Upstream (as dashboardNavigation) exempts /_subrouter/dashboard only; this
+// fork also serves the pool board at /_subrouter/pool and links it the same
+// way.
+//
+// Safe because a navigation's response goes to the user's tab, never to the
+// linking site, and both handlers only render: the board is a static document
+// and the dashboard a template over data the owner is already entitled to.
+// Everything either page does next -- pool.json, pin, unpin, prune, the
+// transcript links -- is its own same-origin request and passes the ordinary
+// checks. The exemption is narrow on purpose: GET/HEAD, those two exact paths,
+// mode navigate, destination document. A form POST, a fetch, an iframe or a
+// navigation to any other admin path is still refused, and the Host check
+// still applies, so a rebinding page gains nothing from it.
+func adminPageNavigation(r *http.Request) bool {
 	return (r.Method == http.MethodGet || r.Method == http.MethodHead) &&
-		r.URL.Path == "/_subrouter/dashboard" &&
+		(r.URL.Path == "/_subrouter/dashboard" || r.URL.Path == "/_subrouter/pool") &&
 		strings.EqualFold(strings.TrimSpace(r.Header.Get("Sec-Fetch-Mode")), "navigate") &&
 		strings.EqualFold(strings.TrimSpace(r.Header.Get("Sec-Fetch-Dest")), "document")
 }
 
 // loopbackAdminHostAllowed reports whether a Host header names this machine's
-// loopback interface or the configured public host. An empty Host (HTTP/1.0)
-// is accepted because browsers always send one.
+// loopback interface (localhost, 127.0.0.0/8, ::1) or the configured public
+// host. Only the name is compared: a rebinding page reaches our port under its
+// own name (evil.example:31415), so the port is ours either way and says
+// nothing. An empty Host (an HTTP/1.0 client) is accepted because browsers
+// always send one.
 func (s Server) loopbackAdminHostAllowed(hostHeader string) bool {
 	hostname := normalizedHostname(hostHeader)
 	if hostname == "" {
@@ -5397,6 +7446,9 @@ func (s Server) loopbackAdminHostAllowed(hostHeader string) bool {
 	return false
 }
 
+// normalizedHostname lowercases a Host header and strips its port, IPv6
+// brackets and a trailing root dot, so "LOCALHOST.:31415" and "[::1]:31415"
+// compare as the names they are.
 func normalizedHostname(hostHeader string) string {
 	host := strings.TrimSpace(hostHeader)
 	if h, _, err := net.SplitHostPort(host); err == nil {
@@ -5407,14 +7459,117 @@ func normalizedHostname(hostHeader string) string {
 }
 
 // trustedLoopbackAdminRequest reports whether a request is authorized purely
-// by arriving over loopback, after the browser-origin and Host checks.
+// by arriving over loopback, after the browser-origin and Host checks. It is
+// for the gates that grant loopback on their own terms rather than through
+// authorizeAdmin: the session-lease admin and the MultiTenant reload hook.
+// The Host is checked again here because adminRequestRejection waives it for a
+// token-bearing request, and these callers are asking about position alone.
 func (s Server) trustedLoopbackAdminRequest(r *http.Request) bool {
-	return isLoopbackRemote(r.RemoteAddr) && s.adminRequestRejection(r) == "" &&
+	return s.loopbackPeer(r) && s.adminRequestRejection(r) == "" &&
 		s.loopbackAdminHostAllowed(r.Host)
+}
+
+// requireProxyToken gates a route on the SPEND credential rather than the admin
+// one.
+//
+// This is what makes stats readable on the public listener without putting an
+// admin token on the internet. The two credentials are deliberately different
+// powers: the proxy token spends the pool and reads what the pool looks like;
+// the admin token enumerates, drains, imports and mints, and is a strict
+// superset -- matchesConfiguredAdminToken opens this gate too. A surface that
+// accepted the admin token as its ONLY credential would therefore be inviting
+// the more powerful secret onto the wire for no extra capability.
+//
+// It needs a CONFIGURED proxy token. localProxyAuthorized opens for everyone
+// when none is set -- right for the local spend path, wrong for the account
+// roster on a listener the internet reaches. serve already refuses
+// --public-addr without a proxy token; this keeps the roster closed even for a
+// PublicHandler built some other way.
+//
+// A named MEMBERSHIP token passes the proxy gate and is refused here with 403
+// (PATCHES §43): it spends the pool and nothing else, and the roster is the
+// leak the static token has. A named PEER token (§43.1) reads the route only
+// where peerMayRead says so -- usage-status, which its daemon ranks this pool
+// on -- and is refused /_subrouter/accounts with 403. A named admin token
+// never passes here: the proxy gate refuses it on this listener whatever
+// --public-admin says, and with --public-admin the route's admin handler
+// serves it instead (publicAdminOrPublic). Everything that opened this gate before still does,
+// and a read is logged once an hour per caller -- the peer link polls this,
+// and it is the one static-token use no proxy request line shows.
+func (s Server) requireProxyToken(next func(http.ResponseWriter, *http.Request), peerMayRead bool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if strings.TrimSpace(s.LocalProxyToken) != "" {
+			if caller, ok := s.proxyCaller(r); ok {
+				refusal := ""
+				switch {
+				case caller.role == accesstoken.RoleMembership:
+					refusal = "a membership access token spends the pool; it cannot read the account roster"
+				case caller.role == accesstoken.RolePeer && !peerMayRead:
+					refusal = "a peer access token spends the pool and reads usage-status; it cannot list the accounts"
+				}
+				if refusal != "" {
+					// A client configured with the wrong token polls this
+					// every few seconds; one line a minute per name says it.
+					if s.Logger != nil && s.AccessTokens.ShouldLog("roster-refused:"+caller.label, time.Minute) {
+						s.Logger.Info("access token refused the account roster", "caller", caller.label,
+							"role", string(caller.role), "path", r.URL.Path, "remote_addr", clientRemoteIP(r))
+					}
+					http.Error(w, refusal, http.StatusForbidden)
+					return
+				}
+				s.logRosterRead(caller.label, r)
+				next(w, r)
+				return
+			}
+		}
+		http.Error(w, "proxy token required", http.StatusUnauthorized)
+	}
+}
+
+// logRosterRead records a public roster read by a credential that is not
+// admin (the static proxy token, a named peer token) once an hour per caller:
+// the peer link polls it, and it is the one use of those credentials no proxy
+// request line shows.
+func (s Server) logRosterRead(caller string, r *http.Request) {
+	if s.Logger != nil && s.AccessTokens.ShouldLog("roster-read:"+caller, staticCredentialUseInterval) {
+		s.Logger.Info("account roster read", "caller", caller,
+			"path", r.URL.Path, "remote_addr", clientRemoteIP(r), "sampled", "hourly")
+	}
+}
+
+// requireLoopback is the same gate handleQuiesce and handleReloadAccounts
+// apply inline, as a wrapper. A bearer token proves possession of a secret; it
+// does not prove the caller is sitting at this machine, and these handlers
+// mutate state the local daemon reads on every proxied request.
+func (s Server) requireLoopback(next func(http.ResponseWriter, *http.Request)) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !s.loopbackPeer(r) {
+			http.Error(w, "this control is only available from loopback", http.StatusForbidden)
+			return
+		}
+		next(w, r)
+	}
 }
 
 func (s Server) requireAccountImportAuth(next func(http.ResponseWriter, *http.Request)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if s.publicSurface {
+			// On the public listener (mounted only with --public-admin,
+			// PATCHES §43.1) the import gate is the admin gate and nothing
+			// more: a named admin-role token that passes the browser checks.
+			// None of the grants below applies there -- the static tokens are
+			// blanked on this copy, the tailnet authorizer and the handshake
+			// mark are stripped, and no tenant is routed here -- and asking
+			// only publicAdminGranted keeps it that way.
+			if s.publicAdminGranted(r) {
+				s.logAdminCredentialUse(r)
+				next(w, r)
+				return
+			}
+			s.logNamedTokenRefusal(s.namedToken(presentedCredential(r, adminTokenHeader)))
+			http.Error(w, "protected account import credential required", http.StatusUnauthorized)
+			return
+		}
 		if s.tenantAccountImportAuthorized {
 			next(w, r)
 			return
@@ -5424,6 +7579,7 @@ func (s Server) requireAccountImportAuth(next func(http.ResponseWriter, *http.Re
 			return
 		}
 		if s.matchesConfiguredAccountImportToken(r) || s.matchesConfiguredAdminToken(r) {
+			s.logAdminCredentialUse(r)
 			next(w, r)
 			return
 		}
@@ -5436,43 +7592,93 @@ func (s Server) requireAccountImportAuth(next func(http.ResponseWriter, *http.Re
 			next(w, r)
 			return
 		}
+		s.logNamedTokenRefusal(s.namedToken(presentedCredential(r, adminTokenHeader)))
 		http.Error(w, "protected account import credential required", http.StatusUnauthorized)
 	}
 }
 
 func (s Server) matchesConfiguredAccountImportToken(r *http.Request) bool {
+	if s.publicSurface {
+		// A static secret, like the admin token: never a credential on the
+		// public listener, where --public-admin admits named admin tokens
+		// alone (PATCHES §43.1).
+		return false
+	}
 	return matchesConfiguredBearerToken(r, s.AccountImportToken, "X-Subrouter-Account-Import-Token")
 }
 
+// matchesConfiguredAdminToken is the static admin token, or an active
+// admin-role named token on the private listener (PATCHES §43). Every admin
+// gate reaches a token through here, so this one edit is what makes a named
+// admin token admin.
 func (s Server) matchesConfiguredAdminToken(r *http.Request) bool {
-	return matchesConfiguredBearerToken(r, s.AdminToken, "X-Subrouter-Admin-Token")
+	if matchesConfiguredBearerToken(r, s.AdminToken, adminTokenHeader) {
+		return true
+	}
+	_, ok := s.namedAdminToken(r)
+	return ok
 }
+
+// adminTokenHeader is the dedicated header the admin token may ride in
+// instead of a bearer.
+const adminTokenHeader = "X-Subrouter-Admin-Token"
 
 func matchesConfiguredBearerToken(r *http.Request, configuredToken, dedicatedHeader string) bool {
 	token := strings.TrimSpace(configuredToken)
 	if token == "" {
 		return false
 	}
-	got := strings.TrimSpace(r.Header.Get(dedicatedHeader))
-	if got == "" {
-		auth := strings.TrimSpace(r.Header.Get("Authorization"))
-		if before, after, ok := strings.Cut(auth, " "); ok && strings.EqualFold(before, "Bearer") {
-			got = strings.TrimSpace(after)
-		}
-	}
+	got := presentedCredential(r, dedicatedHeader)
 	return len(got) == len(token) && subtle.ConstantTimeCompare([]byte(got), []byte(token)) == 1
 }
 
+// authorizeAdmin is every admin grant: requireAdmin, tenant CRUD
+// (MultiTenant.handleTenantAdmin) and the session-lease gate all ask it. So it
+// is also where an admin request is logged by the credential it presented
+// (PATCHES §43): a named token by name every time, the static admin token once
+// an hour. A refusal of a revoked, expired or misplaced named token is logged
+// by name here too, and only when the answer is no.
 func (s Server) authorizeAdmin(r *http.Request) bool {
+	if !s.adminGranted(r) {
+		s.logNamedTokenRefusal(s.namedToken(presentedCredential(r, adminTokenHeader)))
+		return false
+	}
+	s.logAdminCredentialUse(r)
+	return true
+}
+
+func (s Server) adminGranted(r *http.Request) bool {
+	if s.publicSurface {
+		// Nothing is admin on the internet-facing listener: not loopback (a
+		// relay on the box presents 127.0.0.1), not a store-handshake
+		// connection, and above all not the tokenless fallback below, which
+		// would read PublicHandler's blanked AdminToken as "none configured".
+		// With --public-admin, a named admin-role token is, and nothing else
+		// (PATCHES §43.1).
+		return s.publicAdminGranted(r)
+	}
+	// Browser metadata and the loopback Host check run before every grant
+	// below, including the tenant delegation and the tokenless fallback: a
+	// cross-site page must not borrow ANY of them (PATCHES §29). After
+	// publicSurface, so the public listener's answer stays a flat no.
 	if s.adminRequestRejection(r) != "" {
 		return false
 	}
+	if s.tenantControlAuthorized {
+		// The MultiTenant router validated the tenant key before routing here,
+		// and only the tenant-visible control paths are routed here at all.
+		return true
+	}
+	// A store handshake proves the caller shares this machine's account store
+	// and marks only its own connection. PublicHandler masks that mark, so it
+	// can never authorize anything on the public listener.
 	if localDataConnectionAuthorized(r) {
 		return true
 	}
 	if isLoopbackRemote(r.RemoteAddr) {
-		// adminRequestRejection already refused a non-loopback Host that lacks
-		// the admin token, so a loopback peer reaching here is trusted.
+		// adminRequestRejection above already refused a loopback peer naming
+		// a foreign Host without the admin token, so what reaches here is a
+		// local client that named this machine.
 		return true
 	}
 	if _, ok := s.authorizeTailnet(r); ok {
@@ -5486,34 +7692,79 @@ func (s Server) authorizeAdmin(r *http.Request) bool {
 		return s.matchesConfiguredAdminToken(r)
 	}
 	if strings.TrimSpace(s.AdminToken) == "" {
-		// Preserve explicitly unsecured legacy/local configurations, but never let
-		// a scoped import token become the only barrier around remote admin APIs.
-		return strings.TrimSpace(s.AccountImportToken) == ""
+		// Upstream's tokenless fallback (owner decision 8, 2026-09 merge round
+		// 2): preserve explicitly unsecured legacy/local configurations, but
+		// never let a scoped import token become the only barrier around
+		// remote admin APIs. It applies to the PRIVATE handler only --
+		// publicSurface returns above, and even with --public-admin its answer
+		// there is publicAdminGranted -- so it cannot expose
+		// drain/import/delete to the internet.
+		// A named admin token (PATCHES §43) is admin here too, including when
+		// the import token closes the fallback.
+		return strings.TrimSpace(s.AccountImportToken) == "" || s.matchesConfiguredAdminToken(r)
 	}
 	return s.matchesConfiguredAdminToken(r)
 }
 
+// Response headers naming where a request was actually served.
+//
+// These exist because the session store answers a different question: it
+// records the account LOCAL selection chose, which for a delegated request is
+// a placeholder the request never touched. Stamping the answer on the response
+// makes it true per request rather than inferred, and it survives one forward
+// hop -- the peer stamps its own account, we relabel the pool as remote.
+const (
+	subrouterAccountHeader = "X-Subrouter-Account"
+	subrouterPoolHeader    = "X-Subrouter-Pool"
+	subrouterPeerHeader    = "X-Subrouter-Peer"
+)
+
+// sessionView is an assignment plus where it is ACTUALLY being served.
+//
+// Assignment alone is misleading for a delegated session: it names the account
+// local selection chose before the request left, which is not the account that
+// answered. Callers reading this to say "you are on X" were reporting a
+// placeholder.
+//
+// A session a peer serves with no local assignment is listed from its hold
+// alone: served_by "remote", account_id empty (PATCHES §49).
+type sessionView struct {
+	session.Assignment
+	// Active reports a turn in flight on this daemon right now (the same
+	// field upstream's sessionAdminView carries, so its readers keep working).
+	Active bool `json:"active"`
+	// ServedBy is "local" or "remote". Empty means never observed serving.
+	ServedBy string `json:"served_by,omitempty"`
+	// ServedAccount is the peer's account when delegated. Empty against a peer
+	// too old to name it -- honestly unknown rather than wrongly local.
+	ServedAccount string `json:"served_account,omitempty"`
+	ServedPeer    string `json:"served_peer,omitempty"`
+}
+
+// handleSessions lists assignments (GET) or drops one (DELETE, upstream's
+// admin repair for a session stuck on the wrong account). Admin-only: it is
+// not mounted on the public listener unless serve runs with --public-admin
+// (PATCHES §43.1), and then only a named admin-role token opens it.
 func (s Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
 		// Optional filters let a client's status line ask about one session
-		// without transferring the whole retained assignment list.
+		// without transferring the whole retained assignment list (#429).
 		filterAgent := session.NormalizeAgentType(r.URL.Query().Get("agent_type"))
 		filterSession := strings.TrimSpace(r.URL.Query().Get("session_id"))
-		assignments := s.Sessions.All()
-		views := make([]sessionAdminView, 0, len(assignments))
-		for _, assignment := range assignments {
-			if filterAgent != "" && session.NormalizeAgentType(assignment.AgentType) != filterAgent {
-				continue
+		views := s.sessionViews()
+		if filterAgent != "" || filterSession != "" {
+			filtered := views[:0]
+			for _, view := range views {
+				if filterAgent != "" && session.NormalizeAgentType(view.AgentType) != filterAgent {
+					continue
+				}
+				if filterSession != "" && session.StickySessionID(view.AgentType, view.SessionID) != session.StickySessionID(view.AgentType, filterSession) {
+					continue
+				}
+				filtered = append(filtered, view)
 			}
-			if filterSession != "" && session.StickySessionID(assignment.AgentType, assignment.SessionID) != session.StickySessionID(assignment.AgentType, filterSession) {
-				continue
-			}
-			views = append(views, sessionAdminView{
-				Assignment: assignment,
-				Active:     s.activeSession(assignment.AgentType, assignment.SessionID),
-				Retry:      s.retryStatuses.forSession(assignment.AgentType, assignment.SessionID),
-			})
+			views = filtered
 		}
 		writeJSON(w, views)
 	case http.MethodDelete:
@@ -5537,6 +7788,88 @@ func (s Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Allow", "GET, DELETE")
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
+}
+
+func (s Server) sessionViews() []sessionView {
+	assignments := s.Sessions.All()
+	out := make([]sessionView, 0, len(assignments))
+	// Accounts is the static list; AccountRef is the live one when configured.
+	// A nil/empty view leaves the map empty, which reports "unknown" rather
+	// than mislabelling every session -- absence of knowledge, not of accounts.
+	local := map[string]bool{}
+	for _, acct := range s.Accounts {
+		local[acct.ID] = true
+	}
+	if s.AccountRef != nil {
+		for _, acct := range s.AccountRef.All() {
+			local[acct.ID] = true
+		}
+	}
+	assigned := make(map[string]bool, len(assignments))
+	for _, assignment := range assignments {
+		view := sessionView{
+			Assignment: assignment,
+			Active:     s.activeSession(assignment.AgentType, assignment.SessionID),
+		}
+		key := session.ScopedSessionKey(assignment.AgentType, assignment.SessionID)
+		assigned[key] = true
+		// Whichever peer holds it (PATCHES §31, D0): the hold names that
+		// peer, so served_peer is the peer that actually serves it.
+		switch _, delegation, ok := s.peerHold(key); {
+		case ok:
+			view.ServedBy = "remote"
+			view.ServedAccount = delegation.Account
+			view.ServedPeer = delegation.Peer
+		case local[assignment.AccountID]:
+			view.ServedBy = "local"
+		default:
+			// The store names an account this daemon does not have, and no live
+			// delegation explains it -- an assignment left behind after the
+			// account moved to a peer, or after a delegation expired. We do not
+			// know where this session is served, and saying "local" would put a
+			// pool member's name on a request this pool never handled. Unknown
+			// is the honest answer.
+			view.ServedBy = ""
+		}
+		out = append(out, view)
+	}
+	// A session a peer serves with NO local assignment (PATCHES §49): with no
+	// local account for its provider, selection never pins it and every turn
+	// is forwarded, so the hold is the session's only record. account_id stays
+	// empty -- no local account is involved -- and updated_at is the hold's
+	// last set or touch. created_at is the zero time: the daemon keeps no start
+	// time for a held session.
+	//
+	// Not on a tenant server: it copies the base daemon's peers, and holds are
+	// keyed by session alone, so the list would name other tenants' and the
+	// operator's sessions (PATCHES §49.3).
+	if s.tenantControlAuthorized {
+		return out
+	}
+	holds := s.peerHolds()
+	keys := make([]string, 0, len(holds))
+	for key := range holds {
+		if !assigned[key] {
+			keys = append(keys, key)
+		}
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		hold := holds[key]
+		agentType, sessionID, _ := strings.Cut(key, ":")
+		out = append(out, sessionView{
+			Assignment: session.Assignment{
+				AgentType: agentType,
+				SessionID: sessionID,
+				UpdatedAt: hold.Until.Add(-remotePoolDelegationTTLFor(agentType)).UTC(),
+			},
+			Active:        s.activeSession(agentType, sessionID),
+			ServedBy:      "remote",
+			ServedAccount: hold.Account,
+			ServedPeer:    hold.Peer,
+		})
+	}
+	return out
 }
 
 // proxyHandler builds the routing handler and publishes successful quota
@@ -5569,11 +7902,24 @@ func (s Server) proxyHandler() http.Handler {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		if !s.localProxyAuthorized(r) {
+		caller, authorized := s.proxyCaller(r)
+		if !authorized {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
+		// Whose credential this is rides the request to the proxy request log
+		// line and to hideServingAccount (PATCHES §43).
+		r = withRequestCaller(r, caller)
+		if caller.role == accesstoken.RoleMembership {
+			// Before the session lease below, which installs its own account
+			// header on r.
+			dropAccountSelectors(r.Header)
+		}
 		if !s.RequireSessionLease && rootHealthProbeRequest(r) {
+			if s.rootHealth != nil {
+				s.rootHealth.ServeHTTP(w, r)
+				return
+			}
 			s.handleHealth(w, r)
 			return
 		}
@@ -5684,20 +8030,36 @@ func (s Server) proxyHandler() http.Handler {
 				return
 			}
 		}
+		// A peer's targeted forward (PATCHES §31) is a HARD placement, stricter
+		// than a preference and, unlike X-Subrouter-Account-ID, judged by the
+		// new-session verdict. Folding it into forcedAccountSelection disarms
+		// every stage that could substitute another account or re-forward:
+		// peerAllowed, Fable/Bedrock, Opus substitution, Azure, usage-limit and
+		// Codex-overload failover. (The same-account overload/capacity retries
+		// stay: targetedOverloadRetryTransport, and the Codex capacity layer
+		// as its ladder only.) Selection reads the header itself, like the
+		// forced one, and refuses rather than substitutes (target_placement.go).
+		targetAccountID := ""
+		if boundLease == nil && s.CredentialBroker == nil && !forcedAccountSelection {
+			targetAccountID = targetAccountFromRequest(routingRequest)
+		}
+		forcedAccountSelection = forcedAccountSelection || targetAccountID != ""
 		preferredAccountID := ""
 		if !forcedAccountSelection {
 			preferredAccountID = session.NormalizeAccountID(routingRequest.Header.Get("X-Subrouter-Preferred-Account-ID"))
 		}
-		retryPolicy := agentRetryPolicyFor(routingRequest)
-		autonomousRetry := autonomousRetryInScope(
-			retryPolicy, noRetry, forcedAccountSelection, boundLease != nil || s.CredentialBroker != nil,
-		)
+		// The peer pool (remote_pool.go) is one more failover stage, so it obeys
+		// the same two switches the local stages do: a strict account pin must
+		// be served by that account or fail, and X-Subrouter-No-Retry (the
+		// cutover canary) gets exactly one observable attempt. Every hook that
+		// can hand this request to the peer checks it.
+		peerAllowed := !noRetry && !forcedAccountSelection
 
 		if s.Lifecycle != nil && s.Lifecycle.Quiesced() {
 			http.Error(w, "subrouter is quiesced", http.StatusServiceUnavailable)
 			return
 		}
-		if s.Lifecycle != nil && s.Lifecycle.Draining() && !s.allowDrainingProxyRequest(agentType, sessionID) {
+		if s.Lifecycle != nil && s.Lifecycle.Draining() && !holdRetry(r) && !s.allowDrainingProxyRequest(agentType, sessionID) {
 			http.Error(w, "subrouter is draining", http.StatusServiceUnavailable)
 			return
 		}
@@ -5713,16 +8075,33 @@ func (s Server) proxyHandler() http.Handler {
 		// or cannot start (no usable OAuth account). Other Claude models use the
 		// normal pool unchanged.
 		requestModel := session.ExtractModel(routingRequest, s.MaxBodyBytes)
+		// The session is settled (lease, realtime call and catalog rewrites
+		// done) and nothing has been served: the client-boundary transcript
+		// learns its file here (PATCHES §71).
+		identifyClientExchange(r, agentTypeForProviderSession(agentType, requestProvider), sessionID, requestModel)
 		requestPoolModel := ""
 		retryPoolModel := requestModel
 		fableFallbackConfigured := false
+		opusSubstitutable := false
 		if requestProvider == accounts.ProviderClaude {
 			requestPoolModel = claudePoolModel(requestModel)
 			retryPoolModel = requestPoolModel
-			fableFallbackConfigured = !noRetry && !autonomousRetry && !forcedAccountSelection && boundLease == nil && s.CredentialBroker == nil &&
-				s.claudeFableEnabled() && claudeFableModel(requestModel) &&
+			// A Fable Messages call on the local subscription pool. boundLease ==
+			// nil and CredentialBroker == nil carry over to the Opus stage too: a
+			// bound lease pins the model, so serving a different one would violate
+			// the lease contract. A forced account selector or X-Subrouter-No-Retry
+			// disarms every stage, Opus included: a strict pin must be served by
+			// that account or fail, and a canary gets one observable attempt.
+			fableRequest := !noRetry && !forcedAccountSelection && boundLease == nil && s.CredentialBroker == nil &&
+				claudeFableModel(requestModel) &&
 				r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/v1/messages")
+			fableFallbackConfigured = fableRequest && s.claudeFableEnabled()
+			// Opus substitution is the chain's LAST stage and, unlike Bedrock and
+			// the dedicated API key, needs nothing configured: Fable and Opus are
+			// metered separately on the same subscription.
+			opusSubstitutable = fableRequest
 		}
+		opusSubstituted := false
 		// Bedrock-primary: when enabled, serve Fable straight from Bedrock before
 		// touching the subscription pool. A non-2xx or unreachable Bedrock restores
 		// the body and falls through to the normal pool path (which still carries
@@ -5766,7 +8145,7 @@ func (s Server) proxyHandler() http.Handler {
 			http.Error(w, forcedCodexProvider(r)+" codex route could not serve this request; configure an API-key endpoint for this provider and check the daemon log", http.StatusBadGateway)
 			return
 		}
-		if azureCodexConfigured && !autonomousRetry {
+		if azureCodexConfigured {
 			azureCodexSessionKey = azureCodexSessionKeyFor(sessionAgentType, sessionID)
 			if !noRetry {
 				if pinned, found := s.azureCodexSessions.lookup(azureCodexSessionKey); found {
@@ -5778,17 +8157,60 @@ func (s Server) proxyHandler() http.Handler {
 				}
 			}
 		}
+		// A side request (telemetry, count_tokens, MCP on the conversation's
+		// key) reads where the conversation lives and never moves it: no pin,
+		// no sticky re-pick, no comparator, and a peer hold it only follows.
+		sideChannel := sideChannelRequest(requestProvider, sessionAgentType, sessionID, r)
+		// What a forward to the peer may do to the session's hold: a model
+		// turn the peer takes sets it; a turn served there for a non-eviction
+		// reason leaves it alone; a side request only ever reads it.
+		peerHoldMode, oneTurnHoldMode := remotePoolHoldSet, remotePoolHoldNone
+		if sideChannel {
+			peerHoldMode, oneTurnHoldMode = remotePoolHoldReadOnly, remotePoolHoldReadOnly
+		}
 		userEmail := session.ExtractUserEmail(r)
 		var account accounts.Account
+		// Set by selection: how much the chosen local account actually has
+		// left, which is what the peer gets compared against.
+		localCapacity := routingCapacity{}
+		// One client request's cross-pool state (PATCHES §31): what failed on
+		// which peer this turn, and the refusal bound, shared by every entry
+		// point below that can forward. crossPool is the turn's ranking, set
+		// only when this turn may go to a peer.
+		turn := newRemotePoolTurn(r.Context())
+		// A subagent's Fable turn does not move its session: on a pinned
+		// account whose Fable pool is spent but which serves Opus, it is
+		// served there as Opus (claude_subagent_fable.go). A held session's
+		// turn is decided in serveHeldTurn; a local pin is rewritten here, so
+		// selection keeps the session on its account on the Opus pool.
+		turn.subagentFable = opusSubstitutable && !sideChannel && claudeSubagentRequest(r)
+		if turn.subagentFable && s.pinSubagentFableToOpus(r, sessionAgentType, sessionID) {
+			requestPoolModel, retryPoolModel = agentclaude.OpusFeature, agentclaude.OpusFeature
+			opusSubstituted, fableFallbackConfigured = true, false
+		}
+		// A session the Codex websocket quota failover forced off its account
+		// mid-socket (markForcedRerank): this turn is that forced switch, so
+		// it re-ranks across every pool like a hold ended by force. Local can
+		// serve it, so a peer without verdicts is not asked (targetedOnly).
+		forcedRerank := !sideChannel && peerAllowed && s.ActiveSessions.takeForcedRerank(sessionAgentType, sessionID)
+		if forcedRerank {
+			turn.forcedSwitch = true
+		}
+		var crossPool *crossPoolRanking
 		var credentialLease *broker.Lease
 		var pendingSessionCommit bool
 		var pendingSessionExpectedAccount string
+		// The account selection chose, before its refresh could fail over
+		// (refreshSelectedAccount), and whether the session is pinned there.
+		var selectedAccountID string
+		sessionPinned := false
 		var pendingSessionMoveReason accountMoveReason
 		var placementReservation *selectacct.PlacementReservation
 		defer func() { placementReservation.Release() }()
 		selectionOptions := accountSelectionOptions{
 			oauthOnly: modelCatalogRequest, preferredAccountID: preferredAccountID,
 			pendingSessionCommit: &pendingSessionCommit, pendingSessionMoveReason: &pendingSessionMoveReason,
+			sideChannel: sideChannel,
 		}
 		// HTTP placements hand the pending debit to the existing routed-request
 		// boundary below. WebSocket connection/turn accounting has a separate
@@ -5822,8 +8244,41 @@ func (s Server) proxyHandler() http.Handler {
 					err = fmt.Errorf("requested account %q is unavailable", forcedAccountID)
 				}
 			}
+		} else if peerAllowed && s.serveHeldTurn(w, r, requestProvider, requestPoolModel, sessionAgentType, sessionID, peerHoldMode, turn) {
+			// This conversation is already being served by a peer, on the
+			// ACCOUNT it was sent for (P4): the held turn names that account
+			// (PATCHES §31). Keep it there rather than re-running local
+			// selection, because prompt-cache warmth is per ACCOUNT: a local 5h
+			// window rolling mid-conversation would otherwise pull the session
+			// back and cold-cache it. The hold ends only on a FORCED switch
+			// (classifyAccountSwitch): the account is evicted or refused, or the
+			// peer declines (its pool is spent) -- or when the session idles
+			// past remotePoolDelegationTTLFor, or is placed as a refugee from a
+			// peer found down (PATCHES §54, §67).
+			// A turn the peer cannot take now waits for its account until the
+			// peer is found down, and is then a refugee (strandedOnPeer,
+			// PATCHES §67); a client cancel serves this one turn locally and
+			// keeps the hold. A side request follows the hold without
+			// refreshing it, and its own 429/503 ends nothing.
+			return
 		} else {
-			account, sessionID, userEmail, err = s.accountForSessionProviderWithOptions(
+			// The ONE cross-pool ranking (PATCHES §31, D7) rides selection
+			// for a turn that may go to a peer: every ranking selection runs --
+			// a new session, a cold session (P9), a session whose hold just
+			// ended by force (P8) -- weighs every eligible peer account next to
+			// the local ones. A side request never places, and a held turn that
+			// failed transiently is served locally without asking anyone else.
+			if peerAllowed && !sideChannel && !turn.stayLocal && s.peerForwardingAllowed(r) {
+				crossPool = s.newCrossPoolRanking(r, requestProvider, requestPoolModel, turn)
+				if forcedRerank {
+					crossPool.targetedPeersOnly()
+				}
+			}
+			// Read at the call: serveHeldTurn above may have ended a hold by
+			// force, which makes this turn a forced switch (P8).
+			selectionOptions.forcedSwitch = turn.forcedSwitch
+			selectionOptions.crossPool = crossPool
+			account, sessionID, userEmail, localCapacity, err = s.accountForSessionProviderWithOptions(
 				requestProvider,
 				sessionAgentType,
 				sessionID,
@@ -5831,11 +8286,12 @@ func (s Server) proxyHandler() http.Handler {
 				selectionOptions,
 			)
 			if err == nil {
-				selectedAccountID := account.ID
 				pendingSessionExpectedAccount = account.ID
+				selectedAccountID = account.ID
 				if s.Sessions != nil {
 					if assignment, ok := s.Sessions.Get(sessionAgentType, sessionID); ok {
 						pendingSessionExpectedAccount = assignment.AccountID
+						sessionPinned = true
 					}
 				}
 				var refreshPendingSessionCommit bool
@@ -5848,8 +8304,10 @@ func (s Server) proxyHandler() http.Handler {
 					routingRequest,
 					account,
 				)
-				pendingSessionCommit = pendingSessionCommit || refreshPendingSessionCommit
-				if refreshPendingSessionCommit {
+				// A side request places nothing: a refresh that failed over to
+				// another account serves it there and leaves the pin alone.
+				pendingSessionCommit = !sideChannel && (pendingSessionCommit || refreshPendingSessionCommit)
+				if refreshPendingSessionCommit && !sideChannel {
 					pendingSessionMoveReason = accountMoveCredential
 				}
 				if err != nil {
@@ -5859,7 +8317,113 @@ func (s Server) proxyHandler() http.Handler {
 					placementReservation = nil
 					_, placementReservation, err = pickAndReserveRoutingAccount(r.Context(), s.scheduler(), s.SchedulerRef, []accounts.Account{account})
 				}
+				if err == nil && refreshPendingSessionCommit && crossPool != nil {
+					// The selected account's credential is dead
+					// (refreshFailureCannotServe), a FORCED switch (P8):
+					// retryAccount named the best LOCAL replacement, and where
+					// the session goes is the one ranking over it and every
+					// peer account (D7), exactly as a forced switch inside the
+					// usage failover is (forcedSwitchAcrossPools). A peer
+					// account that won the turn's ranking already stands; the
+					// dead account's placement is what is replaced.
+					if !crossPool.rankedAlready() || crossPool.placement.Peer == nil {
+						forcedScheduler := s.selectionSchedulerFrom(s.scheduler(), retryPoolModel, "")
+						localCapacity = s.routingCapacityFor(s.scheduler(), forcedScheduler, account)
+						if _, rankErr := crossPool.forcedRerank(forcedScheduler, account); rankErr != nil {
+							crossPool.invalidate()
+						}
+					}
+				}
 			}
+		}
+		if targetAccountID != "" && err != nil && !errors.Is(err, errRefreshTransient) {
+			// The target cannot take this turn: refuse it before upstream and
+			// let the decider recompute (P6). Selection names every refusal it
+			// makes, before any session-store write; a refresh verdict against
+			// the target arrives as auth_invalid from refreshSelectedAccount,
+			// after selection pinned it (KNOWN-ISSUES, §31 gaps). Anything else
+			// (a session-store error) takes today's error path below, which
+			// answers 503 -- a decline the decider already treats as a refusal
+			// of this peer.
+			var refusal *targetRefusedError
+			if errors.As(err, &refusal) {
+				if s.Logger != nil {
+					fields := []any{
+						"agent", sessionAgentType,
+						"session", sessionID,
+						"target_account", refusal.Account,
+						"reason", refusal.Reason,
+						"continuing", refusal.Continuing,
+					}
+					if refusal.Verdict != nil {
+						fields = append(fields,
+							"live_sessions", refusal.Verdict.LiveSessions,
+							"allowed_sessions", refusal.Verdict.AllowedSessions)
+					}
+					s.Logger.Info("targeted placement refused", append(fields, "remote_addr", clientRemoteIP(r))...)
+				}
+				writeTargetRefusal(w, refusal.Account, refusal.Reason, refusal.Continuing, refusal.Verdict)
+				return
+			}
+		}
+		if err != nil && errors.Is(err, errRefreshTransient) {
+			// The account's token refresh reached no verdict -- a cancel, a
+			// network blip, the token endpoint rate limited. That is not an
+			// eviction, so the session keeps its account: this one turn is
+			// served by the peer WITHOUT a hold if it can take it, and otherwise
+			// fails retryably. Running the no-account chain below instead would
+			// hand the session to the peer with a 70m hold (or bill Bedrock).
+			//
+			// The turn leaves a measured account for a reason nothing else
+			// records, so it is named here and on the decision line: the line
+			// used to carry an empty local (account "", local_known=false) and
+			// no cause, which read as an unmeasured pool rather than a
+			// credential read that ran out its clock (PATCHES §34).
+			//
+			// account is the one whose refresh reached no verdict. That is the
+			// account selection chose -- a warm session's own, or a new
+			// session's pick -- unless that one was just found dead and the
+			// failover candidate's refresh is the one that reached no verdict;
+			// then failed_over_from names the dead account, which a pinned
+			// session is still on until its next turn moves it.
+			failedOverFrom := ""
+			if selectedAccountID != account.ID {
+				failedOverFrom = selectedAccountID
+			}
+			if s.Logger != nil {
+				s.Logger.Warn("selected account refresh reached no verdict; this turn is not served on it",
+					"agent", sessionAgentType, "session", sessionID, "account", account.ID,
+					"failed_over_from", failedOverFrom, "session_pinned", sessionPinned, "error", err)
+			}
+			// Selection reports no capacity for a warm session it kept (warm
+			// sessions are not compared), so the account is measured here, the
+			// way the forced line measures its local candidate.
+			local := crossPoolLocal{
+				Account:        account.ID,
+				Capacity:       s.routingCapacityFor(s.scheduler(), s.selectionSchedulerFrom(s.scheduler(), retryPoolModel, ""), account),
+				Cause:          err.Error(),
+				FailedOverFrom: failedOverFrom,
+			}
+			if peerAllowed && s.serveAcrossPeers(w, r, requestProvider, requestPoolModel, sessionAgentType, sessionID, oneTurnHoldMode, turn, local) {
+				return
+			}
+			// No verdict is not a failure the client has to see: the hold
+			// (PATCHES §58) waits it out and runs the turn again.
+			if r.Context().Err() == nil {
+				noteHoldable(r.Context(), holdMark{status: http.StatusBadGateway, reason: refreshHoldReason(err),
+					agent: sessionAgentType, session: sessionID, account: account.ID})
+			}
+			w.Header().Set(remotePoolTransientHeader, "1")
+			w.Header().Set("Retry-After", "2")
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		var identityRefusal *controlPlaneIdentityError
+		if err != nil && errors.As(err, &identityRefusal) {
+			// Nothing else may answer a control-plane call: no fallback stage,
+			// peer or other account (control_plane.go).
+			s.writeControlPlaneIdentityUnavailable(w, r, sessionAgentType, sessionID, identityRefusal)
+			return
 		}
 		if err != nil {
 			if s.SchedulerRef != nil && s.CredentialBroker == nil {
@@ -5871,38 +8435,187 @@ func (s Server) proxyHandler() http.Handler {
 			if fableFallbackConfigured && s.serveRecorded(w, r, sessionAgentType, sessionID, "fable-fallback", s.serveClaudeFableFallback) {
 				return
 			}
-			if !noRetry && !autonomousRetry && azureCodexConfigured && s.serveRecorded(w, r, sessionAgentType, sessionID, "azure-codex", func(w http.ResponseWriter, r *http.Request) bool {
-				return s.serveAzureCodex(w, r, azureCodexSessionKey, -1, "no_usable_account", true)
-			}) {
+			// The Fable pool cannot even start this request: every OAuth account is
+			// scored exhausted for the fable quota. Anthropic meters Fable in a
+			// separate weekly bucket from the account-wide 5h/7d windows that gate
+			// Opus, so the same subscription routinely still has Opus capacity.
+			// Rewrite the model and re-run selection against the Opus pool;
+			// everything downstream (auth headers, transports, exhaustion
+			// accounting, transcripts) then runs unchanged on the correct pool.
+			// When the Opus pool is also out, selection fails again and the original
+			// Fable error is surfaced verbatim.
+			if opusSubstitutable {
+				if from, to, undoOpusRewrite, rewritten := s.rewriteRequestToClaudeOpus(r); rewritten {
+					// The request now draws on the Opus pool, so the turn's
+					// ranking does too: every ranking the Opus selection runs
+					// weighs peer accounts on THEIR Opus pool (P2/D7), never on
+					// the Fable pool the turn's first ranking read. Local
+					// cannot serve Fable, but it can serve Opus, and origin/main
+					// never asked a peer about this turn: a peer without
+					// verdicts is not in it (targetedOnly).
+					var opusRanking *crossPoolRanking
+					if crossPool != nil {
+						opusRanking = s.newCrossPoolRanking(r, requestProvider, agentclaude.OpusFeature, turn)
+						opusRanking.targetedPeersOnly()
+					}
+					// Provisional, like the main selection: a session moving off
+					// its pin commits only once the Opus account answers 2xx. It
+					// used to be written here, before any Opus request went out,
+					// so a turn the Opus account refused -- or a peer served --
+					// left the session on an account that never answered.
+					var opusSelectionPending bool
+					opusAccount, opusSession, opusEmail, opusCapacity, opusErr :=
+						s.accountForSessionProviderWithOptions(requestProvider, sessionAgentType, sessionID, r,
+							accountSelectionOptions{crossPool: opusRanking, pendingSessionCommit: &opusSelectionPending})
+					opusPending := false
+					if opusErr == nil {
+						opusAccount, opusPending, opusErr = s.refreshSelectedAccount(
+							r.Context(), requestProvider, sessionAgentType, opusSession, opusEmail, r, opusAccount)
+					}
+					if opusErr == nil {
+						if s.Logger != nil {
+							s.Logger.Warn("substituting claude opus for exhausted fable pool",
+								"agent", sessionAgentType,
+								"session", opusSession,
+								"account", opusAccount.ID,
+								"from_model", from,
+								"to_model", to,
+								"stage", "pool_selection",
+								"fable_error", err)
+						}
+						account, sessionID, userEmail, err = opusAccount, opusSession, opusEmail, nil
+						localCapacity, crossPool = opusCapacity, opusRanking
+						if opusPending || opusSelectionPending {
+							// Selection moved the session, or the refresh failed over
+							// to another Opus account. As on the main path, that
+							// replacement stays provisional until it answers 2xx.
+							pendingSessionCommit = true
+							pendingSessionExpectedAccount = opusAccount.ID
+							if s.Sessions != nil {
+								if assignment, ok := s.Sessions.Get(sessionAgentType, opusSession); ok {
+									pendingSessionExpectedAccount = assignment.AccountID
+								}
+							}
+						}
+						requestPoolModel = agentclaude.OpusFeature
+						retryPoolModel = agentclaude.OpusFeature
+						opusSubstituted = true
+						// The body now names Opus, so the Fable chain must not be
+						// handed it: the dedicated Fable API key would be billed for
+						// an Opus completion. It was already tried and declined a few
+						// lines above, so disarming it here loses nothing.
+						fableFallbackConfigured = false
+					} else {
+						// No local Opus account either. The turn goes on to the
+						// peer chain below as the Fable request the client sent:
+						// that chain ranks the peers on their FABLE pool (and its
+						// untargeted last resort lets the peer run its own chain,
+						// Opus stage included), and a held session's later turns
+						// are forwarded un-rewritten. Forwarding the rewrite ran
+						// the session's first turn on Opus and the rest on Fable
+						// (PATCHES section 50).
+						undoOpusRewrite()
+						if s.Logger != nil {
+							s.Logger.Warn("claude opus substitution unavailable; surfacing the fable error",
+								"agent", sessionAgentType,
+								"session", sessionID,
+								"from_model", from,
+								"to_model", to,
+								"opus_error", opusErr,
+								"fable_error", err)
+						}
+					}
+				}
+			}
+			// Local selection produced nothing usable. This is the primary
+			// remote-pool case: the retry transport is only installed once an
+			// account exists, so an empty pool never reaches the stage below.
+			// The peer is free, so it is asked before the paid Azure stage.
+			if err != nil && peerAllowed && s.serveAcrossPeers(w, r, requestProvider, requestPoolModel, sessionAgentType, sessionID, peerHoldMode, turn, crossPoolLocal{Cause: err.Error()}) {
 				return
 			}
-			if !autonomousRetry && !forcedAccountSelection && azureCodexUpgradeShouldFallBack(s, boundLease, requestProvider, r) {
-				http.Error(w, "codex pool has no usable account; retry over https", http.StatusUpgradeRequired)
+			if err != nil {
+				if !noRetry && azureCodexConfigured && s.serveRecorded(w, r, sessionAgentType, sessionID, "azure-codex", func(w http.ResponseWriter, r *http.Request) bool {
+					return s.serveAzureCodex(w, r, azureCodexSessionKey, -1, "no_usable_account", true)
+				}) {
+					return
+				}
+				if !forcedAccountSelection && azureCodexUpgradeShouldFallBack(s, boundLease, requestProvider, r) {
+					http.Error(w, "codex pool has no usable account; retry over https", http.StatusUpgradeRequired)
+					return
+				}
+				// The caller pinned an account whose credential is dead, or that
+				// Anthropic has on hold. No retry can serve the pin, and the 503
+				// below made Claude Code retry it ten times; answer once, finally
+				// (PATCHES section 28, pinned_account_unusable.go). forcedAccountID,
+				// not forcedAccountSelection: only the caller's own selector sets
+				// it, never a session lease or any other placement that recovers
+				// by being asked again.
+				if forcedAccountID != "" && pinnedAccountCannotRecover(r.Context(), err) {
+					writePinnedAccountUnusable(w, r, requestProvider, forcedAccountID, err)
+					return
+				}
+				// Nothing upstream was tried, so without this the 503 reaches the
+				// traffic sample with no account and no class, and the log has no
+				// line for it at all (#614). writeAccountSelectionUnavailable
+				// carries a broker's Retry-After as before, and a spent pool's
+				// next reset (#530).
+				reason := accountSelectionFailureReason(err)
+				markTrafficErrorClass(r.Context(), reason)
+				if s.Logger != nil {
+					s.Logger.Warn("account selection failed",
+						"agent", sessionAgentType,
+						"session", sessionID,
+						"provider", requestProvider,
+						"pool_model", requestPoolModel,
+						"reason", reason,
+						"error", err)
+				}
+				// Local cannot serve and no peer could be asked: a peer that
+				// comes back can serve it, so the hold (PATCHES §58) waits. A
+				// peer that answered means the pool really is out, and that
+				// 503 goes out at once. A hold that ends answers 502 instead
+				// of this 503: a spent pool's carries its next reset as
+				// Retry-After, which Claude Code shows to the user and stops on.
+				if peerAllowed && !sideChannel && r.Context().Err() == nil && s.peersUnreachable(r, turn) {
+					noteHoldable(r.Context(), holdMark{status: http.StatusServiceUnavailable, reason: "peers_unreachable:" + reason,
+						agent: sessionAgentType, session: sessionID, giveUp502: true})
+				}
+				w.Header().Set(subrouterReasonHeader, reason)
+				writeAccountSelectionUnavailable(w, err)
 				return
 			}
-			if forcedAccountSelection && pinnedAccountNeedsReauth(err) {
-				// A pinned account whose credential is dead cannot recover by
-				// retrying, and a 503 makes Claude Code and Codex retry it ten
-				// times. Answer with a final, readable error instead.
-				writePinnedAccountUnusable(w, requestProvider, forcedAccountID, err)
-				return
-			}
-			// Nothing upstream was tried, so without this the 503 reaches the
-			// traffic sample with no account and no class, and the log has no
-			// line for it at all.
-			reason := accountSelectionFailureReason(err)
-			markTrafficErrorClass(r.Context(), reason)
-			if s.Logger != nil {
-				s.Logger.Warn("account selection failed",
-					"agent", sessionAgentType,
-					"session", sessionID,
-					"provider", requestProvider,
-					"pool_model", requestPoolModel,
-					"reason", reason,
-					"error", err)
-			}
-			w.Header().Set(subrouterReasonHeader, reason)
-			writeAccountSelectionUnavailable(w, err)
+		}
+		// Local vs peer is ONE ranking (PATCHES §31, D7): the shared
+		// comparator over this daemon's accounts and every eligible account of
+		// every configured peer, each peer account judged by its owner's own
+		// published verdict, with local carrying LocalPreferenceRatio on
+		// weekly pace so local budget is spent first. Selection ran it (the
+		// crossPool option) wherever it ranked; this acts on the answer. The
+		// reserve is NOT local as a whole -- it is the per-account weekly
+		// holdout (Score.Reserve), which selection enforces account by
+		// account, and a peer enforces in its verdict.
+		//
+		// A warm sticky session is never ranked (accountForSessionProvider):
+		// it stays on its account exactly as a delegated one stays on the
+		// peer's. A COLD one is ranked across every pool (owner rule P9) and
+		// the decision line says which it was. The winning peer account is
+		// TARGETED; a refusal or a failed attempt recomputes the same ranking
+		// without it, at most remotePoolMaxTargetRefusals times per turn, then
+		// local -- which is still selected, so asking costs no availability.
+		//
+		// This sits OUTSIDE the `if err != nil` handler above, and that
+		// placement is the whole feature: it acts on a selection that
+		// SUCCEEDED. Local numbers come from selection's own ForModel-narrowed
+		// scheduler, never a post-hoc s.scheduler() lookup, which defaults an
+		// unknown account to fully healthy (selectacct/scheduler.go:524).
+		//
+		// A side request never asks: it would move the conversation on a
+		// request that is not one of its turns. A turn whose selection was
+		// re-run for the Opus pool acts on the Opus ranking that selection ran
+		// (crossPool was replaced with it above).
+		if crossPool != nil && s.serveCrossPoolDecision(w, r, sessionAgentType, sessionID, peerHoldMode,
+			crossPoolLocal{Account: account.ID, Capacity: localCapacity}, crossPool) {
 			return
 		}
 		// A broker lease already carries its own short-lived credential and the
@@ -5920,12 +8633,12 @@ func (s Server) proxyHandler() http.Handler {
 			if fableFallbackConfigured && s.serveRecorded(w, r, sessionAgentType, sessionID, "fable-fallback", s.serveClaudeFableFallback) {
 				return
 			}
-			if !noRetry && !autonomousRetry && azureCodexConfigured && s.serveRecorded(w, r, sessionAgentType, sessionID, "azure-codex", func(w http.ResponseWriter, r *http.Request) bool {
+			if !noRetry && azureCodexConfigured && s.serveRecorded(w, r, sessionAgentType, sessionID, "azure-codex", func(w http.ResponseWriter, r *http.Request) bool {
 				return s.serveAzureCodex(w, r, azureCodexSessionKey, -1, "no_usable_credential", true)
 			}) {
 				return
 			}
-			if !autonomousRetry && !forcedAccountSelection && azureCodexUpgradeShouldFallBack(s, boundLease, requestProvider, r) {
+			if !forcedAccountSelection && azureCodexUpgradeShouldFallBack(s, boundLease, requestProvider, r) {
 				http.Error(w, "codex pool has no usable credential; retry over https", http.StatusUpgradeRequired)
 				return
 			}
@@ -5950,9 +8663,6 @@ func (s Server) proxyHandler() http.Handler {
 			// A voice sideband joins an already-created call. Responses-only
 			// egress diversion and turn replay cannot recreate that call.
 			realtimeSocket := codexLivePath(r.URL.Path)
-			if realtimeSocket {
-				autonomousRetry = false
-			}
 			var azureDivert func(model string) bool
 			if !realtimeSocket && !forcedAccountSelection && boundLease == nil && s.CredentialBroker == nil &&
 				requestProvider == accounts.ProviderCodex && s.CodexEgress.configured() {
@@ -5968,13 +8678,13 @@ func (s Server) proxyHandler() http.Handler {
 					if s.codexEgressWebSocketDivert(sessionAgentType, sessionID, model) {
 						return true
 					}
-					if !autonomousRetry && s.AzureCodex.configured() {
+					if s.AzureCodex.configured() {
 						return s.azureCodexWebSocketDivert(sessionAgentType, sessionID, model)
 					}
 					return false
 				}
 			}
-			if !realtimeSocket && azureDivert == nil && !autonomousRetry && !forcedAccountSelection && boundLease == nil && s.CredentialBroker == nil &&
+			if !realtimeSocket && azureDivert == nil && !forcedAccountSelection && boundLease == nil && s.CredentialBroker == nil &&
 				requestProvider == accounts.ProviderCodex && s.AzureCodex.configured() {
 				key := azureCodexSessionKeyFor(sessionAgentType, sessionID)
 				if _, pinned := s.azureCodexSessions.lookup(key); pinned {
@@ -5988,7 +8698,7 @@ func (s Server) proxyHandler() http.Handler {
 					return s.azureCodexWebSocketDivert(sessionAgentType, sessionID, model)
 				}
 			}
-			s.proxyWebSocket(w, r, account, credentialLease, sessionAgentType, sessionID, userEmail, requestPoolModel, retryPoolModel, upstream, azureDivert, autonomousRetry, pendingSessionCommit, pendingSessionExpectedAccount, pendingSessionMoveReason)
+			s.proxyWebSocket(w, r, account, credentialLease, sessionAgentType, sessionID, userEmail, requestPoolModel, retryPoolModel, upstream, azureDivert, pendingSessionCommit, pendingSessionExpectedAccount, pendingSessionMoveReason)
 			return
 		}
 		proxyRequest := r.Clone(r.Context())
@@ -6019,11 +8729,17 @@ func (s Server) proxyHandler() http.Handler {
 			}
 		}
 		transcriptRequestID := nextTranscriptRequestID()
-		s.recordHTTPMeta(proxyRequest, transcriptRequestID, transcriptClientName(r), sessionAgentType, sessionID, userEmail, account, upstream)
-		if retryPost && postReplayable {
-			s.recordReplayableRequestBody(proxyRequest, transcriptRequestID, sessionAgentType, sessionID)
+		if clientExchangeFrom(r.Context()) != nil {
+			// The client-boundary transcript records this exchange (PATCHES
+			// §71); it only learns where the turn was placed.
+			noteExchangeServed(r.Context(), localExchangeServed(account, upstream))
 		} else {
-			s.captureRequestBody(proxyRequest, transcriptRequestID, sessionAgentType, sessionID)
+			s.recordHTTPMeta(proxyRequest, transcriptRequestID, transcriptClientName(r), sessionAgentType, sessionID, userEmail, account, upstream)
+			if retryPost && postReplayable {
+				s.recordReplayableRequestBody(proxyRequest, transcriptRequestID, sessionAgentType, sessionID)
+			} else {
+				s.captureRequestBody(proxyRequest, transcriptRequestID, sessionAgentType, sessionID)
+			}
 		}
 
 		rp := &httputil.ReverseProxy{
@@ -6033,10 +8749,27 @@ func (s Server) proxyHandler() http.Handler {
 				stripClientAcceptEncoding(pr.Out.Header)
 			},
 		}
-		// chatgpt.com streams Codex turns with no Content-Type; label them
-		// here, below every layer that tells a stream from a body by it.
-		transport := http.RoundTripper(sniffContentTypeTransport{base: s.transport()})
-		azureCodexFallbackReady := !noRetry && !autonomousRetry && azureCodexConfigured && retryPost && postReplayable
+		transport := s.transport()
+		if requestProvider == accounts.ProviderCodex {
+			// chatgpt.com streams a Codex turn with no Content-Type, and every
+			// layer stacked on this transport tells a stream from a body by
+			// it: the usage-limit layer's commit, the capacity layer (#373's
+			// stream check, #389's stay ladder, the marks and their clear, its
+			// commit on the terminal event), the fallbacks, ModifyResponse's
+			// commit, and the client. So the label goes on HERE, under all of
+			// them. Labelled only as high as the capacity layer (fix-up 389-1),
+			// a quota or model-compatibility move the usage-limit layer
+			// made was still an opaque body to that layer, which committed the
+			// move at EOF: a stream that failed after output pinned the session
+			// to the account that failed it. Upstream #450's line as written
+			// (proxy.go, sniffContentTypeTransport on s.transport()), limited
+			// to Codex: upstream wraps every provider, which is the owner's
+			// call, and Codex is the provider whose streams arrive unlabelled.
+			// It waits only for the first body bytes and leaves the body byte
+			// for byte. Fork, PATCHES section 27, fix-up 389-2.
+			transport = sniffContentTypeTransport{base: transport}
+		}
+		azureCodexFallbackReady := !noRetry && azureCodexConfigured && retryPost && postReplayable
 		_, keyedRequestProvider := keyedProviderFor(requestProvider)
 		localUsageFailover := account.AuthMode == accounts.AuthModeOAuth &&
 			(requestProvider == accounts.ProviderCodex || requestProvider == accounts.ProviderClaude ||
@@ -6095,16 +8828,86 @@ func (s Server) proxyHandler() http.Handler {
 						return s.claudeFableFallbackResponse(proxyRequest, fallbackBody)
 					}
 				}
+				var opusSubstitute func(reason string) (*http.Response, bool)
+				if opusSubstitutable && !opusSubstituted {
+					// !opusSubstituted: the handler already moved this request onto the
+					// Opus pool, so there is nothing left to substitute - the first of
+					// the two no-double-substitution guards (onceOpusSubstitute is the
+					// second). Session identity comes from handler scope, not
+					// proxyRequest: StripSubrouterHeaders already removed those headers.
+					// The Opus pick is a forced switch ranked across every pool, on
+					// the Opus pool, wherever this turn may go to a peer.
+					var opusCrossPool func(*http.Request, accounts.Account) (*http.Response, bool)
+					if crossPool != nil {
+						clientPath, clientQuery := r.URL.Path, r.URL.RawQuery
+						opusCrossPool = func(opusRequest *http.Request, next accounts.Account) (*http.Response, bool) {
+							return s.forcedSwitchAcrossPools(opusRequest,
+								s.newCrossPoolRanking(r, requestProvider, agentclaude.OpusFeature, turn),
+								s.selectionSchedulerFrom(s.scheduler(), agentclaude.OpusFeature, ""), next,
+								sessionAgentType, sessionID, clientPath, clientQuery, "opus_substitute")
+						}
+					}
+					// The pin a successful Opus answer moves the session from: the
+					// one the retry transport would commit from (expectedAccount).
+					opusExpectedAccount := pendingSessionExpectedAccount
+					if opusExpectedAccount == "" {
+						opusExpectedAccount = account.ID
+					}
+					opusSubstitute = onceOpusSubstitute(func(reason string) (*http.Response, bool) {
+						return s.claudeOpusSubstituteResponseAcross(
+							proxyRequest, sessionAgentType, sessionID, userEmail, account.ID, opusExpectedAccount, reason, opusCrossPool)
+					})
+				}
+				// Armed for every model and both providers, unlike the two stages
+				// above: a local pool with no headroom left cannot serve anything,
+				// whatever the model. Nil when no peer is configured, which is what
+				// keeps this inert by default.
+				var remotePool func(reason string) (*http.Response, bool)
+				// A forced switch inside local failover recomputes across every
+				// pool (P8), with the turn's ranking and next in it; nil wherever
+				// this turn may not go to a peer at all.
+				var failoverCrossPool func(next accounts.Account, reason string) (*http.Response, bool)
+				if len(s.peers()) > 0 {
+					// Path and query come from r, NOT proxyRequest: line ~2637
+					// already rewrote proxyRequest's path via pathForUpstream for
+					// the chosen account. That rewrite is identity for Claude but
+					// not for Codex, where /backend-api/... has been stripped, and
+					// the peer needs what the client actually sent. Session identity
+					// likewise comes from handler scope, since
+					// StripSubrouterHeaders has removed those headers.
+					clientPath, clientQuery := r.URL.Path, r.URL.RawQuery
+					// The same ranking and refusal loop as every other entry point,
+					// with local absent (it just burned through its accounts), and
+					// the same per-turn bound (PATCHES §31).
+					remotePool = onceRemotePoolStage(func(reason string) (*http.Response, bool) {
+						return s.remotePoolStageAcrossPeers(
+							proxyRequest, requestProvider, requestPoolModel, sessionAgentType, sessionID,
+							clientPath, clientQuery, reason, turn)
+					})
+					// Not once-wrapped, and not remotePool: every forced switch of
+					// the turn recomputes (the per-turn refusal bound still holds),
+					// and one that hands the turn back to local failover must
+					// leave the give-up stage armed for when local runs out.
+					if crossPool != nil {
+						failoverCrossPool = func(next accounts.Account, reason string) (*http.Response, bool) {
+							return s.forcedSwitchAcrossPools(proxyRequest, crossPool,
+								s.selectionSchedulerFrom(s.scheduler(), retryPoolModel, ""), next,
+								sessionAgentType, sessionID, clientPath, clientQuery, reason)
+						}
+					}
+				}
 				layers.usageLimit = &usageLimitRetryTransport{
 					logger:             s.Logger,
 					method:             r.Method,
 					upstream:           upstream.Host,
 					maxAttempts:        usageRetryMaxAttempts,
 					fableFallback:      fableFallback,
+					opusSubstitute:     opusSubstitute,
+					remotePool:         remotePool,
+					crossPool:          failoverCrossPool,
 					commitFirstSuccess: pendingSessionCommit,
 					expectedAccount:    pendingSessionExpectedAccount,
 					pendingMoveReason:  pendingSessionMoveReason,
-					overloadPolicy:     s.ClaudeOverloadRetry.policyFor(r, s.Logger),
 				}
 				usageFailoverInstalled = true
 			}
@@ -6123,20 +8926,31 @@ func (s Server) proxyHandler() http.Handler {
 				maxAttempts: postMaxAttempts,
 				limiter:     replayablePostUploadLimiter,
 			}
-			// Installed by default: without SUBROUTER_CODEX_OVERLOAD_FAILOVER it
-			// only retries capacity failures on the session's own account (its
-			// prompt cache lives there); the failover adds account switching.
-			codexOverloadFailoverReady := !noRetry && !forcedAccountSelection &&
+			// Installed by default (upstream #389): without the failover it only
+			// retries capacity failures on the session's own account (its prompt
+			// cache lives there); the failover adds account switching.
+			//
+			// A TARGETED turn (PATCHES §31) is folded into forcedAccountSelection,
+			// but still gets this layer, as the same-account ladder only
+			// (codexOverloadFailoverTransport.targeted): a provider-side capacity
+			// failure is not the account's, and a box without it handed one bare
+			// 503 to the decider, which read it as the box's pool being spent and
+			// ended the session's hold (P8). The Claude twin is
+			// targetedOverloadRetryTransport, below.
+			codexOverloadFailoverReady := !noRetry && (!forcedAccountSelection || targetAccountID != "") &&
 				requestProvider == accounts.ProviderCodex && azureCodexRequest(r.Method, r.URL.Path) &&
 				account.AuthMode == accounts.AuthModeOAuth && boundLease == nil && s.CredentialBroker == nil
 			if codexOverloadFailoverReady {
 				layers.codexOverload = &codexOverloadFailoverTransport{
-					policy: s.CodexOverloadFailover.codexCapacityRetryPolicyFor(r, s.Logger),
+					targeted: targetAccountID != "",
+					// The layer below commits this move whatever the reason
+					// (commitFirstSuccess); this one must not report it kept.
+					pendingCommit: pendingSessionCommit,
 					// Read from the buffered, replayable body, so the upstream
 					// request is unchanged.
 					serviceTier: session.ExtractServiceTier(proxyRequest, s.MaxBodyBytes),
 					// Same cached inspection; the decoded length, so a zstd body
-					// is not mistaken for a short conversation.
+					// is not mistaken for a short conversation (§27's size cap).
 					inputTokens: codexInputTokensFromBytes(session.ExtractBodySize(proxyRequest, s.MaxBodyBytes)),
 				}
 			}
@@ -6161,11 +8975,19 @@ func (s Server) proxyHandler() http.Handler {
 				}
 			}
 			transport = layers.build(transport, attempt)
-			if autonomousRetry && (requestProvider == accounts.ProviderCodex || requestProvider == accounts.ProviderClaude) {
-				transport = autonomousAgentRetryTransport{
-					base: transport, server: &s, logger: s.Logger, provider: requestProvider,
-					model: retryPoolModel, agent: sessionAgentType, session: sessionID, account: account.ID,
-					budget: requestRetryBudget, retriesPerPass: requestMaxAttempts - 1,
+			// A targeted turn (PATCHES §31) has no usage failover -- it would
+			// substitute an account -- but keeps the same-account overload retry
+			// that the failover carries for every other Claude turn. It wraps the
+			// built stack, so each of its retries is a physical attempt through
+			// the layers below (admission, in-flight accounting, error events).
+			if !installUsageFailover && targetAccountID != "" && requestProvider == accounts.ProviderClaude && !noRetry {
+				transport = targetedOverloadRetryTransport{
+					base:    transport,
+					logger:  s.Logger,
+					agent:   sessionAgentType,
+					session: sessionID,
+					account: account.ID,
+					budget:  requestRetryBudget,
 				}
 			}
 			if layers.codexOutcome {
@@ -6198,10 +9020,6 @@ func (s Server) proxyHandler() http.Handler {
 					return fmt.Errorf("bind realtime call account: %w", err)
 				}
 			}
-			if requestProvider == accounts.ProviderCodex && azureCodexRequest(r.Method, r.URL.Path) &&
-				r.Header.Get(CodexCapacityRetryableHeader) == "1" {
-				response, _ = codexRetryableCapacityResponse(response)
-			}
 			if pendingSessionCommit && !usageFailoverInstalled && response.StatusCode >= 200 && response.StatusCode < 300 {
 				if err := s.commitSuccessfulHTTPResponseWithReason(response, sessionAgentType, sessionID, pendingSessionExpectedAccount, account.ID, userEmail, pendingSessionMoveReason); err != nil {
 					return fmt.Errorf("persist successful session reassignment: %w", err)
@@ -6212,21 +9030,61 @@ func (s Server) proxyHandler() http.Handler {
 			// counts as subrouter's own 502.
 			markTrafficUpstreamStatus(r.Context(), response.StatusCode)
 			defer markUpstreamResponse(r.Context(), true)
+			// Name the account that actually answered: after a failover that
+			// is not the one this handler started with, and blaming the
+			// starting account for another account's 429/401 marked a healthy
+			// account exhausted and evicted every warm session on it.
+			//
+			// The retry transport tags every response with the account that
+			// produced it (tagRoutedResponseAccount), and a fallback stage --
+			// Bedrock, the API key, the Opus substitute, the peer, Azure -- with
+			// an EMPTY account, so nothing is marked on or debited to a
+			// subscription that did not answer. The tag replaced the retry
+			// transport's `answered` pointer: one attribution mechanism, and it
+			// also survives the Azure/egress/overload transports wrapped around
+			// the retry transport, which the pointer could not see.
 			responseAccount := account
 			if routed, ok := routedResponseAccount(response); ok {
 				responseAccount = routed
 			}
-			if requestProvider == accounts.ProviderClaude && s.AccountRef != nil &&
+			if responseAccount.ID != "" {
+				response.Header.Set(subrouterAccountHeader, responseAccount.ID)
+				if !sideChannel && response.StatusCode >= 200 && response.StatusCode < 300 {
+					s.noteAnswered(sessionAgentType, sessionID)
+				}
+				if holdableUpstreamStatus(response.StatusCode) {
+					// A server failure from a pool account, after the same-
+					// account overload retries below gave up: nothing about
+					// the account, and nothing served. The hold (PATCHES §58)
+					// runs the turn again; the attempt's debit comes back.
+					noteHoldable(r.Context(), holdMark{status: response.StatusCode,
+						reason: fmt.Sprintf("upstream_status:%d", response.StatusCode),
+						agent:  sessionAgentType, session: sessionID, account: responseAccount.ID})
+					s.refundUnservedDebit(requestProvider, responseAccount.ID)
+				}
+			}
+			response.Header.Set(subrouterPoolHeader, "local")
+			// A fallback stage (the peer) leaves its own stamp, so this
+			// deletes rather than skips.
+			hideServingAccount(r, response.Header)
+			if requestProvider == accounts.ProviderClaude && s.AccountRef != nil && responseAccount.ID != "" &&
 				response.StatusCode >= 200 && response.StatusCode < 300 &&
 				!claudeResponseRejected(response.Header) {
 				// Learn usable model quota from an ordinary response. No
-				// additional upstream request is made at this boundary.
+				// additional upstream request is made at this boundary (#544).
+				// Only a pool account's answer: a fallback stage's headers
+				// describe no account here.
 				observed, ok, generation, orderAt := s.AccountRef.observeClaudeQuotaHeaders(responseAccount, response.Header, requestStarted)
 				if ok {
 					s.mergeClaudeResponseQuotaScore(responseAccount, observed, generation, responseAccount.CredentialIdentity(), orderAt)
 				}
 			}
+			noteExchangeLocalAnswer(r.Context(), responseAccount, upstream)
 			s.captureResponseBodyForRequest(response, r.Context(), transcriptRequestID, sessionAgentType, sessionID, responseAccount, requestPoolModel, retryPoolModel, proxyRequest.URL.Path)
+			if targetAccountID != "" {
+				// After the capture, so an exhaustion it just marked is read.
+				s.stampTargetedResponse(response, responseAccount, requestPoolModel)
+			}
 			usageSessionKey := ""
 			if tokenUsageTrackedSession(r, sessionID) {
 				usageSessionKey = tokenUsageSessionKey(requestProvider, sessionAgentType, sessionID)
@@ -6240,7 +9098,7 @@ func (s Server) proxyHandler() http.Handler {
 				placedAccountID: account.ID,
 				started:         requestStarted,
 			}, responseAccount)
-			if credentialLease != nil {
+			if credentialLease != nil && responseAccount.ID == account.ID {
 				s.reportCredentialLease(
 					credentialLease.ID,
 					account.Provider,
@@ -6266,11 +9124,54 @@ func (s Server) proxyHandler() http.Handler {
 			markUpstreamResponse(r.Context(), false)
 			markTrafficErrorClass(r.Context(), trafficErrorClass(err))
 			if admissionRejected(err) {
+				// The gate turned the request away before anything was sent,
+				// on the account the error names (a failover may have moved
+				// it off the one placed here): that account gives its debit
+				// back, as every attempt that never left does (PATCHES §58).
+				rejected := account
+				if _, routed, ok := routedErrorAttempt(err); ok {
+					rejected = routed
+				}
+				s.refundUnservedDebit(requestProvider, rejected.ID)
+				if targetAccountID != "" {
+					s.writeTargetedAdmissionRejected(w, err, accounts.Account{ID: rejected.ID, Provider: requestProvider}, requestPoolModel)
+					return
+				}
+				// A full queue drains in seconds, so the hold (PATCHES §58)
+				// waits for a slot instead of answering 503: on 2026-11-19
+				// sessions piled onto one local account got 1,731 of those
+				// (PATCHES §67). A paused account still fails fast.
+				if errors.Is(err, errAdmissionQueueFull) && !errors.Is(err, errAdmissionPaused) {
+					noteHoldable(r.Context(), holdMark{status: http.StatusServiceUnavailable, reason: admissionReasonQueueFull,
+						agent: sessionAgentType, session: sessionID, account: rejected.ID})
+				}
 				writeAdmissionRejected(w, err)
 				return
 			}
 			if s.Logger != nil {
-				s.Logger.Error("proxy request failed", "agent", sessionAgentType, "session", sessionID, "account", account.ID, "method", r.Method, "path", proxyRequest.URL.Path, "upstream", upstream.Host, "error", err)
+				s.Logger.Log(context.Background(), requestFailureLevel(r.Context(), err),
+					"proxy request failed", "agent", sessionAgentType, "session", sessionID, "account", account.ID, "method", r.Method, "path", proxyRequest.URL.Path, "upstream", upstream.Host, "error", err)
+			}
+			// The upstream could not be reached at all -- DNS, a refused or
+			// timed-out dial, a reset -- and nothing has reached the client:
+			// the hold (PATCHES §58) waits it out. A request that never left
+			// also gives back the debit it took above, and may be served by a
+			// peer for this turn instead (the outage spill, PATCHES §59).
+			if cause, neverSent, transient := transientNetworkCause(err); transient && r.Context().Err() == nil {
+				mark := holdMark{status: http.StatusBadGateway, reason: "upstream_unreachable:" + cause,
+					agent: sessionAgentType, session: sessionID, account: account.ID}
+				if neverSent {
+					s.refundUnservedDebit(requestProvider, account.ID)
+					switch {
+					case !peerAllowed:
+					case s.waitsForItsUpstream(r, sessionAgentType, sessionID, oneTurnHoldMode, crossPool.keptWarm()):
+						mark.reason, mark.stranded = "warm_wait:"+mark.reason, true
+					case s.spillUnreachableTurn(w, r, proxyRequest, requestProvider, requestPoolModel,
+						sessionAgentType, sessionID, oneTurnHoldMode, turn, account.ID, cause):
+						return
+					}
+				}
+				noteHoldable(r.Context(), mark)
 			}
 			if credentialLease != nil {
 				s.reportCredentialLease(
@@ -6300,13 +9201,16 @@ func (s Server) proxyHandler() http.Handler {
 			// device / client type). Without them a concurrency spike is an
 			// anonymous wall of user="" sessions that cannot be traced to whatever
 			// fired it (a load-test loader, an agent fleet, etc.).
+			// transport discriminates this from the websocket turn logged under
+			// the same message in proxyWebSocket. One grep for "proxy request"
+			// must find every routed turn regardless of how it was carried.
 			if markerHash, armed := cutoverCanaryRequestEvidence(proxyRequest, sessionAgentType, sessionID, s.activeSession(sessionAgentType, sessionID), s.cutoverChallenges, time.Now().UTC()); armed {
 				// Gate-5 evidence must bind the exact challenged request without
 				// publishing the selected account identity. The normal non-canary log
 				// shape below remains unchanged for operational compatibility.
-				s.Logger.Info("proxy request", privacySafeCutoverRequestLogAttrs(sessionAgentType, sessionID, userEmailHash(userEmail), r.Method, r.URL.Path, upstream.Host, clientRemoteIP(r), r.UserAgent(), markerHash)...)
+				s.Logger.Info("proxy request", privacySafeCutoverRequestLogAttrs(sessionAgentType, sessionID, userEmailHash(userEmail), r.Method, r.URL.Path, upstream.Host, clientRemoteIP(r), r.UserAgent(), markerHash, requestCallerLabel(r))...)
 			} else {
-				s.Logger.Info("proxy request", "agent", sessionAgentType, "session", sessionID, "user_hash", userEmailHash(userEmail), "account", account.ID, "method", r.Method, "path", r.URL.Path, "upstream", upstream.Host, "remote_addr", clientRemoteIP(r), "user_agent", r.UserAgent())
+				s.Logger.Info("proxy request", "agent", sessionAgentType, "session", sessionID, "user_hash", userEmailHash(userEmail), "account", account.ID, "method", r.Method, "path", r.URL.Path, "upstream", upstream.Host, "transport", "http", "remote_addr", clientRemoteIP(r), "user_agent", r.UserAgent(), "caller", requestCallerLabel(r))
 			}
 		}
 
@@ -6317,10 +9221,16 @@ func (s Server) proxyHandler() http.Handler {
 		if r.Method == http.MethodGet && coalescablePath(r.URL.Path) {
 			flight, _ := s.CacheFlight.do(flightKey(r), func() (result flightResult) {
 				// ReverseProxy panics with http.ErrAbortHandler when the
-				// upstream body breaks mid-copy (the detached request keeps
-				// http.ServerContextKey). Nothing has reached the client yet
-				// and every waiter shares this result, so answer 502 for all
-				// of them instead of re-panicking.
+				// upstream body breaks mid-copy: flightRequest below keeps
+				// http.ServerContextKey (WithoutCancel drops only the cancel),
+				// which is how ReverseProxy decides it is serving a client it
+				// should hang up on. Here it is not. It is writing into rec,
+				// nothing has reached any client yet, and every waiter shares
+				// this result, so answer 502 for all of them instead of
+				// letting the panic drop the leader's connection. Without this
+				// the leader's client sees a bare EOF, and before singleFlight
+				// released panicked keys the flight's key was orphaned and
+				// every later request for this catalog hung until a restart.
 				defer func() {
 					if recovered := recover(); recovered != nil {
 						if s.Logger != nil {
@@ -6386,7 +9296,7 @@ func (s Server) proxyHandler() http.Handler {
 	})
 }
 
-func privacySafeCutoverRequestLogAttrs(agent, sessionID, userHash, method, path, upstream, remoteAddr, userAgent, markerHash string) []any {
+func privacySafeCutoverRequestLogAttrs(agent, sessionID, userHash, method, path, upstream, remoteAddr, userAgent, markerHash, caller string) []any {
 	return []any{
 		"agent", agent,
 		"session", sessionID,
@@ -6397,6 +9307,9 @@ func privacySafeCutoverRequestLogAttrs(agent, sessionID, userHash, method, path,
 		"remote_addr", remoteAddr,
 		"user_agent", userAgent,
 		"cutover_marker_hash", markerHash,
+		// A token name or a fixed label: it names a credential, never an
+		// account, so it is as safe here as on the ordinary line (PATCHES §43).
+		"caller", caller,
 	}
 }
 
@@ -6411,18 +9324,18 @@ func azureCodexUpgradeShouldFallBack(s Server, boundLease *sessionLease, provide
 }
 
 func (s Server) localProxyAuthorized(r *http.Request) bool {
-	token := strings.TrimSpace(s.LocalProxyToken)
-	if token == "" {
-		return true
-	}
-	authorization := strings.TrimSpace(r.Header.Get("Authorization"))
-	if len(authorization) <= len("Bearer ") ||
-		!strings.EqualFold(authorization[:len("Bearer ")], "Bearer ") {
+	_, ok := s.proxyCaller(r)
+	return ok
+}
+
+// bearerMatches compares in constant time and treats an unset expectation as no
+// match, so an empty AdminToken can never turn into a wildcard.
+func bearerMatches(got, want string) bool {
+	if want == "" {
 		return false
 	}
-	got := strings.TrimSpace(authorization[len("Bearer "):])
-	return len(got) == len(token) &&
-		subtle.ConstantTimeCompare([]byte(got), []byte(token)) == 1
+	return len(got) == len(want) &&
+		subtle.ConstantTimeCompare([]byte(got), []byte(want)) == 1
 }
 
 func proxyMethodAllowed(method string) bool {
@@ -6596,7 +9509,7 @@ func (s Server) reportCredentialLease(
 	}()
 }
 
-func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account accounts.Account, credentialLease *broker.Lease, agentType, sessionID, userEmail, poolModel, compatibilityModel string, upstream *url.URL, azureDivert func(model string) bool, autonomousRetry bool, pendingSessionCommit bool, pendingSessionExpectedAccount string, pendingSessionMoveReason accountMoveReason) {
+func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account accounts.Account, credentialLease *broker.Lease, agentType, sessionID, userEmail, poolModel, compatibilityModel string, upstream *url.URL, azureDivert func(model string) bool, pendingSessionCommit bool, pendingSessionExpectedAccount string, pendingSessionMoveReason accountMoveReason) {
 	if !webSocketOriginAllowed(r) {
 		http.Error(w, "websocket origin not allowed", http.StatusForbidden)
 		return
@@ -6606,29 +9519,19 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 	// Keep it in the same live-load signal as streaming HTTP until the
 	// connection ends. Broker leases are centrally selected and do not use the
 	// local SchedulerRef, so they stay outside this accounting.
+	//
+	// It takes no admission slot. Upstream #589 held one of an account's six
+	// for the socket's whole life, but a Codex socket stays open, idle,
+	// between turns (PATCHES §33, §38: turns are counted, not sockets), and
+	// this fork's placement neither reads free slots nor spills Codex: the
+	// seventh session pinned to an account hung on its upgrade, and every
+	// model-less Codex request on that account queued behind it, until some
+	// other socket on the account closed.
 	releaseInflight := func() {}
-	var admissionLease *admissionLease
-	if s.CredentialBroker == nil && s.admission != nil {
-		key := admissionKeyFor(schedulerAccountProvider(account.Provider), account.ID, poolModel)
-		var err error
-		admissionLease, err = s.admission.acquireFor(r.Context(), key, admissionSessionKey{agent: agentType, session: sessionID})
-		if err != nil {
-			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				return
-			}
-			writeAdmissionRejected(w, err)
-			return
-		}
-	}
 	if s.SchedulerRef != nil && s.CredentialBroker == nil {
 		releaseInflight = s.SchedulerRef.BeginInflight(schedulerAccountProvider(account.Provider), account.ID)
 	}
-	defer func() {
-		releaseInflight()
-		if admissionLease != nil {
-			admissionLease.release()
-		}
-	}()
+	defer releaseInflight()
 
 	upstreamURL := cloneURL(r.URL)
 	upstreamURL.Scheme = websocketScheme(upstream.Scheme)
@@ -6652,6 +9555,20 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 		return
 	}
 	upstreamConn, response, upstreamSlot, err := s.dialCodexWebSocket(r.Context(), regionPlan, upstreamURL.String(), headers)
+	// Codex opens every model turn as a websocket, and this dial does not go
+	// through Server.transport(): it is the same evidence about this machine's
+	// own network that a peer's breaker reads before it ends holds (PATCHES
+	// §54). A handshake refused with a status is the upstream answering. The
+	// dial carries the client's context (upstream #665), so a dial the client
+	// cancelled is no evidence (clientGone), and a failed dial through an
+	// egress region is that region's, not this machine's.
+	if peers := s.peers(); len(peers) > 0 && (err == nil || response != nil || upstreamSlot == codexRegionLocalSlot) {
+		answered := err == nil || response != nil
+		if answered {
+			noteConnected(peers, time.Now())
+		}
+		noteLocalUpstream(peers, answered, r.Context().Err() != nil, time.Now())
+	}
 	if err != nil {
 		status := 502
 		if response != nil {
@@ -6702,11 +9619,42 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 		defer response.Body.Close()
 	}
 
+	// A SUCCESSFUL upgrade used to log nothing at all. Only the dial failure
+	// above had a log line, so a working pool produced an empty log while a
+	// broken one was loud -- exactly backwards. Codex opens every model turn as
+	// a websocket, so on a daemon serving Codex this was every turn: the account
+	// that spent the quota appeared nowhere.
+	//
+	// Same message as the HTTP path on purpose, with the same fields in the same
+	// order, so existing greps and log tooling pick both up and `transport`
+	// tells them apart.
+	if s.Logger != nil {
+		s.Logger.Info("proxy request",
+			"agent", agentType,
+			"session", sessionID,
+			"user_hash", userEmailHash(userEmail),
+			"account", account.ID,
+			"method", r.Method,
+			"path", r.URL.Path,
+			"upstream", upstreamURL.Host,
+			"transport", "websocket",
+			"remote_addr", clientRemoteIP(r),
+			"user_agent", r.UserAgent(),
+			"caller", requestCallerLabel(r))
+	}
+
 	upgrader := websocket.Upgrader{}
 	responseHeader := http.Header{}
 	if response != nil {
 		responseHeader = cloneWebSocketResponseHeaders(response.Header)
 	}
+	// Name the account, as HTTP responses do: when this daemon is the peer,
+	// the forwarding side records it on the session's hold, which otherwise
+	// could only say "somewhere on the peer".
+	if account.ID != "" {
+		responseHeader.Set(subrouterAccountHeader, account.ID)
+	}
+	hideServingAccount(r, responseHeader)
 	if regionPlan != nil {
 		responseHeader.Set(codexRegionHeader, s.codexRegions.name(upstreamSlot))
 	}
@@ -6728,18 +9676,25 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 	upstreamConn.SetReadLimit(maxWebSocketMessageBytes)
 
 	modelState := &webSocketModelState{
-		model:              compatibilityModel,
-		realtime:           codexLivePath(r.URL.Path),
-		capacityPersist:    s.CodexOverloadFailover.codexCapacityRetryPolicyFor(r, s.Logger).persist,
-		capacityRetryable:  r.Header.Get(CodexCapacityRetryableHeader) == "1",
-		autonomousRetrying: autonomousRetry && account.Provider == accounts.ProviderCodex,
+		model:    compatibilityModel,
+		turns:    webSocketTurnGate{lifecycle: s.Lifecycle},
+		realtime: codexLivePath(r.URL.Path),
+	}
+	defer modelState.turns.releaseAll()
+	if account.Provider == accounts.ProviderCodex && !modelState.realtime {
+		stopWatching := modelState.turns.closeWhenRetired(func() {
+			closeWebSocketWithServiceRestart(clientConn, "subrouter is restarting; reconnect")
+			link.close()
+		})
+		defer stopWatching()
 	}
 	// A connection that could dial other regions retries a self-contained
 	// turn there behind the open socket, a few times, before falling back
-	// to the 1012 reconnect a non-autonomous client sees.
-	modelState.regionRetry = !modelState.autonomousRetrying && link.regional && !modelState.realtime &&
+	// to the 1012 reconnect (upstream #666). Dormant without egress regions
+	// (SUBROUTER_CODEX_EGRESS_PROXIES): link.regional is false.
+	modelState.regionRetry = link.regional && !modelState.realtime &&
 		account.Provider == accounts.ProviderCodex
-	if modelState.autonomousRetrying || modelState.regionRetry {
+	if modelState.regionRetry {
 		regionKey := azureCodexSessionKeyFor(agentType, sessionID)
 		link.redial = func(ctx context.Context) (*websocket.Conn, error) {
 			slot := link.nextRedialSlot(s.codexRegions, webSocketTurnModel(modelState, compatibilityModel), codexFaultFrom(r.Context()), regionKey)
@@ -6794,12 +9749,13 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		s.copyWebSocketMessages(r.Context(), account.Provider, agentType, sessionID, userEmail, account.ID, poolModel, modelState, "client_to_upstream", clientConn, link, nil, nil)
+		s.copyWebSocketMessages(r.Context(), account.Provider, agentType, sessionID, userEmail, account.ID, poolModel, modelState, "client_to_upstream", clientConn, link, nil, nil, false)
 		link.close()
 	}()
 	go func() {
 		defer wg.Done()
-		s.copyWebSocketMessages(r.Context(), account.Provider, agentType, sessionID, userEmail, account.ID, poolModel, modelState, "upstream_to_client", clientConn, link, reportLeaseFailure, azureDivert)
+		s.copyWebSocketMessages(r.Context(), account.Provider, agentType, sessionID, userEmail, account.ID, poolModel, modelState, "upstream_to_client", clientConn, link, reportLeaseFailure, azureDivert,
+			credentialLease == nil && s.CredentialBroker == nil && s.peerForwardingAllowed(r))
 		_ = clientConn.Close()
 	}()
 	wg.Wait()
@@ -6875,28 +9831,21 @@ type webSocketModelState struct {
 	realtime bool
 	// outputForwarded is set once the current response has sent the client
 	// something it renders or records (codexStreamVisibleOutput). From then
-	// on a failure must pass through: a 1012 reroute would make Codex replay
-	// response.create and duplicate the partial answer.
+	// on a failure must pass through: a 1012 reroute (or the fork quota
+	// filter's 1013) would make Codex replay response.create and duplicate
+	// the partial answer. Upstream #373.
 	outputForwarded bool
 	// pendingTiers parallels pending with each response.create's
 	// service_tier, the capacity pool a failure of that turn is marked in.
 	pendingTiers []string
-	// capacityPersist is the connection's capacity retry policy (header on
-	// the upgrade request, or the environment): persist mode widens the
-	// session's reroute allowance.
-	capacityPersist   bool
-	capacityRetryable bool
-	// autonomousRetrying lets pooled launches keep pre-output capacity turns
-	// alive without consuming a server-side reconnect budget.
-	autonomousRetrying bool
-	// regionRetry lets a non-autonomous connection that can dial other
-	// regions retry a self-contained pre-output capacity turn in another
-	// region, up to codexWebSocketRegionRetries times per turn.
+	// regionRetry lets a connection that can dial other regions retry a
+	// self-contained pre-output capacity turn in another region, up to
+	// codexWebSocketRegionRetries times per turn (upstream #666).
 	regionRetry       bool
 	regionRetriesUsed int
 	// pendingBodies parallels pending with each response.create's body, kept
-	// only on autonomous connections so a failed turn can be resent upstream
-	// without the client reconnecting.
+	// only on region-retry connections so a failed turn can be resent
+	// upstream without the client reconnecting.
 	pendingBodies [][]byte
 	// usageClient labels this connection's token usage rows; it is resolved
 	// once per connection at the upgrade.
@@ -6917,25 +9866,139 @@ type webSocketModelState struct {
 	// turn in flight: the turn's latency for token usage.
 	pendingStarts []time.Time
 	headFirstByte time.Time
-	// turnCapacityAccount and turnCapacityFailures count the turn in
-	// flight's consecutive capacity failures on one account, so an
-	// autonomous retry stops replaying it there once the failover's quick
-	// same-account retries are spent.
-	turnCapacityAccount  string
-	turnCapacityFailures int
+	turns         webSocketTurnGate
 }
 
-// noteTurnCapacityFailure records one capacity failure of the turn in flight
-// on accountID and returns how many in a row it has had there.
-func (s *webSocketModelState) noteTurnCapacityFailure(accountID string) int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.turnCapacityAccount != accountID {
-		s.turnCapacityAccount = accountID
-		s.turnCapacityFailures = 0
+type webSocketTurnGate struct {
+	lifecycle *Lifecycle
+	mu        sync.Mutex
+	// ends holds the releases of admitted turns whose finishing event has
+	// not been seen, oldest first; inFlight also counts a finished turn
+	// until its release runs.
+	ends          []func()
+	inFlight      int
+	retired       bool
+	firstTurnOwed bool
+	lastUpstream  time.Time
+	quiet         *time.Timer
+	closed        bool
+	closeIdle     func()
+}
+
+// retiredWebSocketQuiet is how long a retired socket's upstream must have
+// been silent before the socket closes. The turn count pairs turns by event
+// type, and a finishing-class event does not always end its turn: an "error"
+// can come before the rest of the response, which a close at once would cut.
+const retiredWebSocketQuiet = 2 * time.Second
+
+func (g *webSocketTurnGate) closingLocked() bool {
+	return g.retired && g.inFlight == 0 && !g.firstTurnOwed
+}
+
+func (g *webSocketTurnGate) admit() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.closingLocked() {
+		return false
 	}
-	s.turnCapacityFailures++
-	return s.turnCapacityFailures
+	endTurn, admitted := g.lifecycle.TryBeginWebSocketTurn()
+	if !admitted {
+		return false
+	}
+	g.firstTurnOwed = false
+	g.inFlight++
+	g.ends = append(g.ends, func() {
+		endTurn()
+		g.mu.Lock()
+		g.inFlight--
+		g.mu.Unlock()
+		g.closeIfIdle()
+	})
+	return true
+}
+
+func (g *webSocketTurnGate) noteUpstream() {
+	g.mu.Lock()
+	g.lastUpstream = time.Now()
+	g.mu.Unlock()
+}
+
+func (g *webSocketTurnGate) closeIfIdle() {
+	g.mu.Lock()
+	if g.closed || !g.closingLocked() {
+		g.mu.Unlock()
+		return
+	}
+	if wait := retiredWebSocketQuiet - time.Since(g.lastUpstream); wait > 0 {
+		if g.quiet == nil {
+			g.quiet = time.AfterFunc(wait, g.closeIfIdle)
+		} else {
+			g.quiet.Reset(wait)
+		}
+		g.mu.Unlock()
+		return
+	}
+	g.closed = true
+	g.mu.Unlock()
+	g.closeIdle()
+}
+
+// finish dequeues the oldest turn's release. The caller runs it once the
+// finishing event has been delivered: a shutdown that saw the count fall
+// before then could exit before the client had it.
+func (g *webSocketTurnGate) finish() func() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if len(g.ends) == 0 {
+		return func() {}
+	}
+	end := g.ends[0]
+	g.ends = g.ends[1:]
+	return end
+}
+
+// releaseAll ends every turn still counted, when the relay closes: a socket
+// that dies mid-turn must not hold a shutdown open until its deadline.
+func (g *webSocketTurnGate) releaseAll() {
+	g.mu.Lock()
+	ends := g.ends
+	g.ends = nil
+	g.mu.Unlock()
+	for _, end := range ends {
+		end()
+	}
+}
+
+func (g *webSocketTurnGate) closeWhenRetired(closeIdle func()) (stop func()) {
+	g.closeIdle = closeIdle
+	select {
+	case <-g.lifecycle.Retired():
+		g.mu.Lock()
+		g.retired, g.firstTurnOwed = true, true
+		g.mu.Unlock()
+	default:
+	}
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-g.lifecycle.Retired():
+		case <-done:
+			return
+		}
+		g.mu.Lock()
+		g.retired = true
+		g.mu.Unlock()
+		g.closeIfIdle()
+	}()
+	return func() {
+		close(done)
+		g.mu.Lock()
+		g.closed = true
+		if g.quiet != nil {
+			g.quiet.Stop()
+		}
+		g.mu.Unlock()
+	}
 }
 
 // noteUpstreamMessage marks the first upstream message of the turn in flight.
@@ -6962,26 +10025,6 @@ func (s *webSocketModelState) turnTiming(now time.Time) (ttfb time.Duration, ttf
 	return ttfb, ttfbOK, now.Sub(started), true
 }
 
-func (s *webSocketModelState) noteInputTokens(tokens int64) {
-	if tokens <= 0 {
-		return
-	}
-	s.mu.Lock()
-	s.inputTokens = tokens
-	s.mu.Unlock()
-}
-
-// inputTokenEstimate is the connection's conversation size in input tokens,
-// zero when nothing is known yet.
-func (s *webSocketModelState) inputTokenEstimate() int64 {
-	if s == nil {
-		return 0
-	}
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return max(s.inputTokens, codexInputTokensFromBytes(s.requestBytes))
-}
-
 func (s *webSocketModelState) noteOutput(body []byte) {
 	if !codexStreamVisibleOutput(body) {
 		return
@@ -6997,10 +10040,13 @@ func (s *webSocketModelState) hasForwardedOutput() bool {
 	return s.outputForwarded
 }
 
-func (s *webSocketModelState) observe(body []byte) {
-	model, ok := codexWebSocketRequestModelEvent(body)
+func (s *webSocketModelState) admitTurn(body, head []byte) bool {
+	model, ok := codexWebSocketTurnStart(body, head)
 	if !ok {
-		return
+		return true
+	}
+	if !s.turns.admit() {
+		return false
 	}
 	tier := codexWebSocketRequestServiceTier(body)
 	s.mu.Lock()
@@ -7009,13 +10055,14 @@ func (s *webSocketModelState) observe(body []byte) {
 	}
 	s.pending = append(s.pending, model)
 	s.pendingTiers = append(s.pendingTiers, tier)
-	if s.autonomousRetrying || s.regionRetry {
+	if s.regionRetry {
 		// The observed body is a pooled buffer released after forwarding.
 		s.pendingBodies = append(s.pendingBodies, bytes.Clone(body))
 	}
 	s.pendingStarts = append(s.pendingStarts, time.Now())
 	s.requestBytes = max(s.requestBytes, int64(len(body)))
 	s.mu.Unlock()
+	return true
 }
 
 // currentTier is the service tier of the turn in flight.
@@ -7037,9 +10084,9 @@ func (s *webSocketModelState) current() string {
 	return s.model
 }
 
-func (s *webSocketModelState) complete() {
+// complete dequeues the finished turn and returns its release (finish).
+func (s *webSocketModelState) complete() func() {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if len(s.pending) > 0 {
 		s.pending = s.pending[1:]
 	}
@@ -7054,13 +10101,13 @@ func (s *webSocketModelState) complete() {
 	}
 	s.headFirstByte = time.Time{}
 	s.outputForwarded = false
-	s.turnCapacityAccount = ""
-	s.turnCapacityFailures = 0
 	s.regionRetriesUsed = 0
+	s.mu.Unlock()
+	return s.turns.finish()
 }
 
 // pendingCreate is the response.create of the turn in flight, nil when none
-// is buffered (not autonomous, or nothing in flight).
+// is buffered (no region retry, or nothing in flight).
 func (s *webSocketModelState) pendingCreate() []byte {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -7070,59 +10117,35 @@ func (s *webSocketModelState) pendingCreate() []byte {
 	return nil
 }
 
-// turnRetryable reports an autonomous turn in flight whose client has seen
-// none of its output, so the relay may replay it without duplicating text.
+// turnRetryable reports a region-retry turn in flight whose client has seen
+// none of its output and whose retry budget is not spent, so the relay may
+// replay it in another region without duplicating text.
 func (s *webSocketModelState) turnRetryable() bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	if len(s.pendingBodies) == 0 || s.outputForwarded {
+	// A nil body is a response.create too large to inspect (observe's
+	// head-only case): it was never buffered, so it cannot be replayed.
+	if len(s.pendingBodies) == 0 || s.pendingBodies[0] == nil || s.outputForwarded {
 		return false
-	}
-	if s.autonomousRetrying {
-		return true
 	}
 	return s.regionRetry && s.regionRetriesUsed < codexWebSocketRegionRetries &&
 		!codexWebSocketCreateChained(s.pendingBodies[0])
 }
 
-// codexWebSocketRegionRetries bounds the region retries of one turn on a
-// non-autonomous connection: its client did not opt into an open-ended wait.
+// codexWebSocketRegionRetries bounds the region retries of one turn: the
+// client did not opt into an open-ended wait.
 const codexWebSocketRegionRetries = 3
 
-// regionRetryLeft reports a non-autonomous region retry still in budget.
-func (s *webSocketModelState) regionRetryLeft() bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.regionRetry && s.regionRetriesUsed < codexWebSocketRegionRetries
-}
-
 // spendRegionRetry takes one region retry of the turn in flight; false when
-// the connection is autonomous (no budget) or the budget is spent.
+// the budget is spent.
 func (s *webSocketModelState) spendRegionRetry() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.autonomousRetrying {
-		return true
-	}
 	if !s.regionRetry || s.regionRetriesUsed >= codexWebSocketRegionRetries {
 		return false
 	}
 	s.regionRetriesUsed++
 	return true
-}
-
-// codexWebSocketRequestServiceTier reads service_tier from a response.create
-// event, top level or under response.
-func codexWebSocketRequestServiceTier(body []byte) string {
-	var event map[string]any
-	if err := json.Unmarshal(body, &event); err != nil {
-		return ""
-	}
-	if tier := stringField(event, "service_tier"); tier != "" {
-		return strings.ToLower(strings.TrimSpace(tier))
-	}
-	response, _ := event["response"].(map[string]any)
-	return strings.ToLower(strings.TrimSpace(stringField(response, "service_tier")))
 }
 
 func codexWebSocketRequestModel(body []byte) string {
@@ -7142,33 +10165,16 @@ func codexWebSocketRequestModelEvent(body []byte) (string, bool) {
 	return session.NormalizeModel(stringField(response, "model")), true
 }
 
-// webSocketTurnModel is the model of the turn in flight, for capacity
-// marks: the response.create's model, else the connection's.
-func webSocketTurnModel(state *webSocketModelState, fallback string) string {
-	if model := state.current(); model != "" {
-		return model
-	}
-	return fallback
-}
-
-// codexWebSocketResponseCompleted reports a successfully finished turn.
-func codexWebSocketResponseCompleted(body []byte) bool {
-	if !bytes.Contains(body, []byte("response.completed")) {
-		return false
-	}
-	var event map[string]any
-	if err := json.Unmarshal(body, &event); err != nil {
-		return false
-	}
-	return strings.EqualFold(stringField(event, "type"), "response.completed")
-}
-
 func codexWebSocketResponseFinished(body []byte) bool {
 	var event map[string]any
 	if err := json.Unmarshal(body, &event); err != nil {
 		return false
 	}
-	switch strings.ToLower(stringField(event, "type")) {
+	return codexWebSocketFinishingEventType(stringField(event, "type"))
+}
+
+func codexWebSocketFinishingEventType(eventType string) bool {
+	switch strings.ToLower(eventType) {
 	case "error", "response.completed", "response.failed", "response.incomplete", "response.done":
 		return true
 	default:
@@ -7176,15 +10182,133 @@ func codexWebSocketResponseFinished(body []byte) bool {
 	}
 }
 
-func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Provider, agentType, sessionID, userEmail, accountID, poolModel string, modelState *webSocketModelState, direction string, client *websocket.Conn, link *webSocketUpstreamLink, reportLeaseFailure func(int), azureDivert func(model string) bool) {
-	observeMessage := func(messageType int, body []byte) error {
+// codexWebSocketTurnFinished is codexWebSocketResponseFinished for a message
+// that may not have been inspected. A nil body is one too large for the global
+// inspect budget (webSocketMessageObserver); head is then its first bytes,
+// which still name the event when its type comes early.
+func codexWebSocketTurnStart(body, head []byte) (model string, ok bool) {
+	if body == nil {
+		return "", strings.EqualFold(webSocketEventType(head), "response.create")
+	}
+	return codexWebSocketRequestModelEvent(body)
+}
+
+func codexWebSocketTurnFinished(body, head []byte) bool {
+	if body == nil {
+		return codexWebSocketFinishingEventType(webSocketEventType(head))
+	}
+	return codexWebSocketResponseFinished(body)
+}
+
+// webSocketEventType reads a JSON event's top-level "type" from the head of a
+// message that may be cut short. It returns "" when the head is not a JSON
+// object, or ends before the type does.
+func webSocketEventType(head []byte) string {
+	decoder := json.NewDecoder(bytes.NewReader(head))
+	if token, err := decoder.Token(); err != nil || token != json.Delim('{') {
+		return ""
+	}
+	for decoder.More() {
+		token, err := decoder.Token()
+		if err != nil {
+			return ""
+		}
+		if key, _ := token.(string); key == "type" {
+			value, err := decoder.Token()
+			if err != nil {
+				return ""
+			}
+			eventType, _ := value.(string)
+			return eventType
+		}
+		var skipped json.RawMessage
+		if err := decoder.Decode(&skipped); err != nil {
+			return ""
+		}
+	}
+	return ""
+}
+
+// rerankAcrossPools: this connection's turn could have gone to a peer (the
+// dial passed peerForwardingAllowed), so a quota failover marks the reconnect
+// as a forced re-rank across every pool (markForcedRerank).
+func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Provider, agentType, sessionID, userEmail, accountID, poolModel string, modelState *webSocketModelState, direction string, client *websocket.Conn, link *webSocketUpstreamLink, reportLeaseFailure func(int), azureDivert func(model string) bool, rerankAcrossPools bool) {
+	// A Codex quota event on this relay goes through ONE of two paths, never
+	// both:
+	//
+	//   - the filter below (the fork's), for any quota event small
+	//     enough to inspect before delivery -- which is every real one. It marks
+	//     the account, looks for an alternate (holdout-filtered), may redeem a
+	//     rate-limit-reset credit when the whole pool is cooked, and either
+	//     closes 1013 so the client reconnects onto the alternate, or, when
+	//     nothing can take the turn, DELIVERS the provider's own error;
+	//   - upstream's 1012 reroute in observeMessage (cebc2c0), only for a quota
+	//     event the filter did not see.
+	//
+	// filterHandledQuota carries "the filter already acted on this message"
+	// from the filter to the observer of the same message (one goroutine per
+	// direction, so no lock), so a quota error the filter chose to deliver is
+	// neither swallowed behind a 1012 nor marked and reported twice.
+	filterHandledQuota := false
+	noteCodexQuota := func(body []byte) {
+		s.markCodexAccountExhaustedFromBody(provider, accountID, poolModel, body)
+		if reportLeaseFailure != nil {
+			reportLeaseFailure(http.StatusTooManyRequests)
+		}
+	}
+	codexQuotaEvent := func(body []byte) bool {
+		return !codexChatGPTModelUnsupportedJSON(body) &&
+			(usageLimitJSON(body) || codexTurnFailureClass(body) == codexFailureQuota)
+	}
+	// A websocket is selected ONCE, at the upgrade; after that nothing on
+	// this relay reaches the session store. Without a touch per turn, a socket
+	// that stays open longer than session.WarmAssignmentRetention while its
+	// turns keep finishing carries the upgrade's UpdatedAt, and the store's
+	// 512-entry prune reads that live session as idle and drops it -- the next
+	// reconnect then re-picks it cold, a move that is not an eviction
+	// (PATCHES sections 20 and 21). finishCodexTurn ends the turn's model
+	// state and asks for a touch; the loop below touches once the finishing
+	// frame has been delivered, so the client never waits on the store lock.
+	// Touch records in-memory use every call and rewrites UpdatedAt at most
+	// once per write interval, the cost the HTTP sticky path pays per turn.
+	// Only the upstream_to_client goroutine sets or reads touchPending.
+	touchPending := false
+	// The finished turn's lifecycle release, held like touchPending until the
+	// finishing frame has been delivered (webSocketModelState.complete).
+	// Only the upstream_to_client goroutine sets or reads it.
+	endFinishedTurn := func() {}
+	finishCodexTurn := func() {
+		endFinishedTurn = modelState.complete()
+		touchPending = true
+	}
+	// body is nil for a message too large for the global inspect budget, and
+	// head is then its first bytes: every check below reads nothing from it,
+	// but a turn's start and end are still told from the head. A missed end
+	// would keep the turn counted while the socket idles and hold every later
+	// shutdown to its deadline (PATCHES §38).
+	observeMessage := func(messageType int, body, head []byte) error {
 		if modelState.realtime {
+			// Voice events are not Responses turns (upstream #603).
 			return nil
 		}
 		if messageType == websocket.TextMessage && direction == "client_to_upstream" && provider == accounts.ProviderCodex {
-			modelState.observe(body)
+			if !modelState.admitTurn(body, head) {
+				return errWebSocketTurnRefused
+			}
+		}
+		if direction == "upstream_to_client" {
+			modelState.turns.noteUpstream()
 		}
 		if direction == "upstream_to_client" && messageType == websocket.TextMessage {
+			if filterHandledQuota {
+				filterHandledQuota = false
+				if provider == accounts.ProviderCodex && codexWebSocketTurnFinished(body, head) {
+					finishCodexTurn()
+					// A turn's capacity count ends with the turn.
+					link.takeTurnCapacityFailures()
+				}
+				return nil
+			}
 			failureClass := codexFailureNone
 			if provider == accounts.ProviderCodex && !codexChatGPTModelUnsupportedJSON(body) {
 				failureClass = codexTurnFailureClass(body)
@@ -7197,8 +10321,10 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 					Outcome: outcome, Attempts: attempts,
 				})
 			}
+			// The failover's 32k size cap (owner, PATCHES §27): a conversation
+			// it keeps never marks its account and never switches.
+			keptForSize := s.CodexOverloadFailover.failoverKeepsAccount(modelState.inputTokenEstimate())
 			if failureClass == codexFailureServer {
-				s.noteCodexSessionCapacityFailure(agentType, sessionID, accountID)
 				s.codexRegions.note(webSocketTurnModel(modelState, poolModel), link.currentRegion(), true)
 				capacityEvent(codexCapacityOutcomeAttempt, 0)
 				link.noteTurnCapacityFailure()
@@ -7211,10 +10337,12 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 				// now would replay response.create elsewhere and duplicate
 				// that output, so the failure reaches the client as is. The
 				// account is still marked so the next turn avoids it (quota
-				// by the usage-limit case below).
-				if failureClass == codexFailureServer && s.CodexOverloadFailover.enabled() {
-					s.noteCodexCapacityFailure(accountID, azureCodexSessionKeyFor(agentType, sessionID), webSocketTurnModel(modelState, poolModel), modelState.currentTier(), codexCapacityReason(body, "websocket"), s.CodexOverloadFailover.capacityMarkTTL(codexRetryHintJSON(body)))
-					s.recordCodexCapacityOutcome(webSocketTurnModel(modelState, poolModel), modelState.currentTier(), true)
+				// by the usage-limit case below). Upstream #373, with #454's
+				// size gate: a size-kept conversation never marks its account.
+				// (A quota event normally never gets here: the filter below
+				// applies the same rule to it before delivery.)
+				if failureClass == codexFailureServer && s.CodexOverloadFailover.enabled() && !keptForSize {
+					s.markAccountOverloadedReason(accountID, webSocketTurnModel(modelState, poolModel), modelState.currentTier(), codexCapacityReason(body, "websocket"), s.CodexOverloadFailover.capacityMarkTTL(codexRetryHintJSON(body)))
 				}
 				if s.Logger != nil {
 					s.Logger.Warn("codex websocket turn failed after output was forwarded; passing the failure through",
@@ -7225,60 +10353,36 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 			if failureClass != codexFailureNone {
 				switch failureClass {
 				case codexFailureQuota:
-					// The event is terminal for Codex, so it must not be
-					// delivered. Mark the account and close 1012: the
-					// reconnect picks another account, and when nothing in
-					// the pool can start it, the upgrade answers 426 and the
-					// HTTP path reaches the fallback.
-					s.markCodexAccountExhaustedFromBody(provider, accountID, poolModel, body)
+					// Reached only for a quota event the filter could not
+					// inspect. The event is terminal for Codex, so it must not
+					// be delivered: mark the account and close 1012, and the
+					// reconnect picks another account (or, with nothing left,
+					// reaches the handler's fallbacks).
+					noteCodexQuota(body)
 					if s.Logger != nil {
 						s.Logger.Warn("codex websocket turn hit a usage limit; rerouting session to another account",
 							"agent", agentType, "session", sessionID, "account", accountID, "pool", poolModel)
 					}
-					if reportLeaseFailure != nil {
-						reportLeaseFailure(http.StatusTooManyRequests)
-					}
 					return errCodexWebSocketReroute
 				case codexFailureServer:
 					if provider == accounts.ProviderCodex && modelState.turnRetryable() {
-						model := webSocketTurnModel(modelState, poolModel)
-						tier := modelState.currentTier()
-						if s.CodexOverloadFailover.enabled() {
-							s.noteCodexCapacityFailure(accountID, azureCodexSessionKeyFor(agentType, sessionID), model, tier, codexCapacityReason(body, "websocket"), s.CodexOverloadFailover.capacityMarkTTL(codexRetryHintJSON(body)))
-						}
-						s.recordCodexCapacityOutcome(model, tier, true)
-						// Replaying a capacity failure on the same account
-						// without end is what kept one session on a shedding
-						// account for hundreds of turns. After the failover's
-						// quick same-account retries, leave it: the account is
-						// marked for this model and the session is banned from
-						// it, so the 1012 reconnect lands on another account.
-						// Only an explicit capacity failure moves the session,
-						// and only when another account can take the model.
-						// A region retry still in budget comes first: it keeps the
-						// account (and its prompt cache) and moves only the region.
-						if s.CodexOverloadFailover.enabled() && codexCapacityFailureJSON(body) &&
-							!modelState.regionRetryLeft() &&
-							modelState.noteTurnCapacityFailure(accountID) > codexCapacitySameAccountRetries &&
-							s.codexCapacitySwitchAvailable(ctx, agentType, sessionID, accountID, model, tier) {
-							if s.Logger != nil {
-								s.Logger.Warn("codex websocket turn still at capacity after a same-account retry; switching account",
-									"agent", agentType, "session", sessionID, "account", accountID, "model", model)
-							}
-							if reportLeaseFailure != nil {
-								reportLeaseFailure(http.StatusServiceUnavailable)
-							}
-							s.codexCapacityCounters.add(codexCapacityCounterAccountSwitch)
-							return errCodexWebSocketReroute
+						// A region retry in budget (upstream #666; only with
+						// egress regions) keeps the account and its prompt
+						// cache and moves only the region. The failure still
+						// marks the account as the 1012 reroute below would
+						// (§27): with the failover on, never a size-kept
+						// conversation.
+						if s.CodexOverloadFailover.enabled() && !keptForSize {
+							s.markAccountOverloadedReason(accountID, webSocketTurnModel(modelState, poolModel), modelState.currentTier(), codexCapacityReason(body, "websocket"), s.CodexOverloadFailover.capacityMarkTTL(codexRetryHintJSON(body)))
 						}
 						s.codexCapacityCounters.add(codexCapacityCounterSameAccountRetry)
 						if s.Logger != nil {
-							s.Logger.Warn("codex websocket turn hit a capacity error; retrying behind the open client socket",
+							s.Logger.Warn("codex websocket turn hit a capacity error; retrying in another region behind the open client socket",
 								"agent", agentType, "session", sessionID, "account", accountID)
 						}
 						return errCodexWebSocketTurnRetry
 					}
-					if s.codexOverloadWebSocketRerouteWithPolicy(ctx, agentType, sessionID, accountID, webSocketTurnModel(modelState, poolModel), modelState.currentTier(), body, modelState.capacityPersist, modelState.autonomousRetrying, modelState.inputTokenEstimate()) {
+					if s.codexOverloadWebSocketReroute(agentType, sessionID, accountID, webSocketTurnModel(modelState, poolModel), modelState.currentTier(), body, modelState.inputTokenEstimate()) {
 						if reportLeaseFailure != nil {
 							reportLeaseFailure(http.StatusServiceUnavailable)
 						}
@@ -7291,11 +10395,6 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 						}
 						if azureDivert(model) {
 							return errAzureCodexWebSocketDivert
-						}
-					}
-					if modelState.capacityRetryable && codexCapacityFailureJSON(body) {
-						if s.codexRetryableCapacityWebSocketReroute(ctx, agentType, sessionID, modelState.capacityPersist) {
-							return errCodexWebSocketCapacityRetry
 						}
 					}
 					// No layer took the turn: the failure goes to the client.
@@ -7325,10 +10424,15 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 				}
 			}
 			if provider == accounts.ProviderCodex {
+				// Upstream #373: remember visible output, so a later failure
+				// in this response passes through instead of rerouting.
 				modelState.noteOutput(body)
 				modelState.noteUpstreamMessage(time.Now())
+				// Also the size cap's websocket estimate (§27): it notes the
+				// finished turn's input tokens with the failover's cap set.
 				s.recordWebSocketTokenUsage(provider, accountID, modelState.usageSessionKey, modelState, poolModel, body)
 				if codexWebSocketResponseCompleted(body) {
+					// Before finishCodexTurn: it dequeues the turn's model.
 					region := link.currentRegion()
 					s.codexRegions.note(webSocketTurnModel(modelState, poolModel), region, false)
 					if failures := link.takeTurnCapacityFailures(); failures > 0 {
@@ -7347,18 +10451,99 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 						}
 					}
 					s.clearAccountCapacity(accountID, webSocketTurnModel(modelState, poolModel))
-					s.noteCodexCapacitySuccess(accountID, azureCodexSessionKeyFor(agentType, sessionID))
-					s.noteCodexSessionCapacitySuccess(agentType, sessionID, accountID)
-					s.recordCodexCapacityOutcome(webSocketTurnModel(modelState, poolModel), modelState.currentTier(), false)
 				}
-				if codexWebSocketResponseFinished(body) {
-					modelState.complete()
+				if codexWebSocketTurnFinished(body, head) {
+					finishCodexTurn()
 					// A turn's capacity count ends with the turn.
 					link.takeTurnCapacityFailures()
 				}
 			}
 		}
 		return nil
+	}
+	var filter func(int, []byte) error
+	if provider == accounts.ProviderCodex && direction == "upstream_to_client" {
+		filter = func(messageType int, body []byte) error {
+			if modelState.realtime || messageType != websocket.TextMessage || !codexQuotaEvent(body) {
+				return nil
+			}
+			if modelState.hasForwardedOutput() {
+				// Upstream #373's after-output rule, applied to the fork's
+				// quota path: the client already rendered part of this
+				// response, and a 1013 would make Codex replay
+				// response.create on the alternate and duplicate that
+				// output. Deliver the provider's error instead -- marked and
+				// reported once, exactly like the no-alternate branch below
+				// -- and let the next turn pick another account. Before any
+				// visible output the rotate-and-1013 below is unchanged.
+				noteCodexQuota(body)
+				if s.Logger != nil {
+					s.Logger.Warn("codex websocket turn failed after output was forwarded; passing the failure through",
+						"agent", agentType, "session", sessionID, "account", accountID, "class", int(codexFailureQuota))
+				}
+				filterHandledQuota = true
+				return nil
+			}
+			// Report and rotate before the client can reconnect. A terminal quota
+			// event stops Codex's turn; a retryable close uses its native recovery,
+			// including rebuilding account-local previous_response_id state.
+			noteCodexQuota(body)
+			var next accounts.Account
+			var err error
+			if s.CredentialBroker != nil {
+				var lease broker.Lease
+				lease, err = s.CredentialBroker.Lease(ctx, broker.LeaseRequest{
+					Provider: provider, RequiredAuthMode: accounts.AuthModeOAuth,
+					AgentType: agentType, SessionID: sessionID, UserEmail: userEmail,
+					Model: modelState.current(),
+				})
+				next = lease.Account
+			} else {
+				// oauthRetryAccount commits the session to the alternate so the
+				// reconnect lands there; it never offers an evicted account.
+				next, err = s.oauthRetryAccount(ctx, provider, agentType, sessionID,
+					userEmail, modelState.current(), map[string]struct{}{accountID: {}}, true)
+			}
+			if err != nil || next.ID == "" || next.ID == accountID {
+				// Every account is cooked. Before surrendering the turn to the
+				// upstream's quota error, try to BUY an alternate: a cooked
+				// account may still hold a rate-limit-reset credit. Gated and
+				// off by default -- see codex_quota_reset_failover.go.
+				revived, ok := s.redeemForFailover(ctx, provider, agentType, sessionID, userEmail,
+					map[string]struct{}{accountID: {}})
+				if !ok {
+					if s.Logger != nil && !s.AutoRedeemRateLimitReset {
+						// The silent give-up is the failure mode this whole
+						// path exists to prevent: the client sees "usage limit
+						// reached" and the daemon's log shows nothing tried.
+						s.Logger.Warn("codex quota failover found no alternate account",
+							"session", sessionID, "account", accountID,
+							"model", modelState.current(), "error", err)
+					}
+					// No usable alternate: deliver the actual upstream error, and
+					// tell the observer not to swallow it behind a 1012.
+					filterHandledQuota = true
+					return nil
+				}
+				next = revived
+			}
+			// The quota event is a spent window, a FORCED switch (P8), and
+			// where the session goes is the one ranking across every pool
+			// (D7). It cannot run here -- mid-socket there is no turn to
+			// forward -- so the reconnect runs it: next is committed as the
+			// placeholder local failover always wrote, and the mark makes the
+			// reconnect a forced re-rank rather than a warm turn on next.
+			// Only where a peer could win; with none, the reconnect lands on
+			// next exactly as before.
+			if rerankAcrossPools {
+				s.ActiveSessions.markForcedRerank(agentType, sessionID)
+			}
+			if s.Logger != nil {
+				s.Logger.Warn("codex quota failover reconnect", "session", sessionID,
+					"account", accountID, "next_account", next.ID, "rerank_across_pools", rerankAcrossPools)
+			}
+			return &websocket.CloseError{Code: websocket.CloseTryAgainLater, Text: "account quota exhausted; reconnecting with available account"}
+		}
 	}
 	toUpstream := direction == "client_to_upstream"
 	// reconnectVisible records a 1012 close that ends a turn which hit
@@ -7379,21 +10564,25 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 		if !toUpstream {
 			src, dst = link.current(), client
 			openWriter = func(messageType int) (io.WriteCloser, error) {
-				if modelState.autonomousRetrying || modelState.regionRetry {
+				if modelState.regionRetry {
 					return &bufferedWebSocketWriter{conn: client, messageType: messageType}, nil
 				}
 				return client.NextWriter(messageType)
 			}
 		}
-		err := s.forwardWebSocketMessage(ctx, agentType, sessionID, direction, src, openWriter, observeMessage)
+		err := s.forwardWebSocketMessageFiltered(ctx, agentType, sessionID, direction, src, openWriter, observeMessage, filter)
+		endFinishedTurn()
+		endFinishedTurn = func() {}
+		if touchPending {
+			touchPending = false
+			s.touchSessionBestEffort(agentType, sessionID)
+		}
 		if err != nil {
-			if !toUpstream && provider == accounts.ProviderCodex &&
-				// A region retry covers capacity failures only: an upstream drop
-				// or refusal still reaches a non-autonomous client as before.
-				(errors.Is(err, errCodexWebSocketTurnRetry) || (modelState.autonomousRetrying && modelState.turnRetryable() && webSocketUpstreamLost(err))) {
-				// A failure event leaves the upstream socket usable; any
-				// other error here is the upstream (or client) going away.
-				if s.retryCodexWebSocketTurn(ctx, link, modelState, agentType, sessionID, accountID, errors.Is(err, errCodexWebSocketTurnRetry)) {
+			// A region retry covers capacity failures only: an upstream drop
+			// or refusal still reaches the client as before.
+			if !toUpstream && provider == accounts.ProviderCodex && errors.Is(err, errCodexWebSocketTurnRetry) {
+				// A failure event leaves the upstream socket usable.
+				if s.retryCodexWebSocketTurn(ctx, link, modelState, agentType, sessionID, accountID, true) {
 					continue
 				}
 				select {
@@ -7415,9 +10604,11 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 				closeWebSocketWithServiceRestart(dst, "codex account exhausted; reconnect")
 				return
 			}
-			if errors.Is(err, errCodexWebSocketCapacityRetry) {
-				reconnectVisible()
-				closeWebSocketWithServiceRestart(dst, "codex capacity retry; reconnect")
+			if errors.Is(err, errWebSocketTurnRefused) {
+				// The refused message came FROM the client (this direction's
+				// src) and never reached upstream whole; the 1012 makes Codex
+				// replay it on the process that replaces this one.
+				closeWebSocketWithServiceRestart(src, "subrouter is restarting; reconnect")
 				return
 			}
 			forwardWebSocketClose(dst, err)
@@ -7426,17 +10617,46 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 	}
 }
 
-func (s Server) forwardWebSocketMessage(ctx context.Context, agentType, sessionID, direction string, src *websocket.Conn, openWriter func(messageType int) (io.WriteCloser, error), observe func(int, []byte) error) error {
+// forwardWebSocketMessage relays one message from src to dst. The peer relay
+// (remote_pool.go) uses it as is; the local relay goes through
+// forwardWebSocketMessageFiltered with its own writer.
+func (s Server) forwardWebSocketMessage(ctx context.Context, agentType, sessionID, direction string, src, dst *websocket.Conn, observe func(int, []byte, []byte) error) error {
+	return s.forwardWebSocketMessageFiltered(ctx, agentType, sessionID, direction, src, dst.NextWriter, observe, nil)
+}
+
+// forwardWebSocketMessageFiltered is forwardWebSocketMessage with a filter that
+// sees a small text message BEFORE any of it reaches the writer, so it can end
+// the connection instead of delivering the message (the Codex quota failover),
+// and with the writer opened by openWriter (upstream #505: the upstream link's
+// current socket, or a buffered client writer that a retried turn can drop).
+// observe runs after the message is read and may still veto delivery. It gets
+// the whole message, or, for one too large to inspect, a nil body and the
+// message's head (webSocketMessageObserver.uninspectedHead).
+func (s Server) forwardWebSocketMessageFiltered(ctx context.Context, agentType, sessionID, direction string, src *websocket.Conn, openWriter func(messageType int) (io.WriteCloser, error), observe func(int, []byte, []byte) error, filter func(int, []byte) error) error {
 	messageType, reader, err := src.NextReader()
 	if err != nil {
 		return err
+	}
+	if filter != nil && messageType == websocket.TextMessage {
+		// Quota errors are small JSON envelopes. Bound lookahead so large
+		// output messages retain streaming and bounded memory behavior.
+		prefix, readErr := io.ReadAll(io.LimitReader(reader, 4097))
+		if readErr != nil {
+			return readErr
+		}
+		if len(prefix) <= 4096 {
+			if err := filter(messageType, prefix); err != nil {
+				return err
+			}
+		}
+		reader = io.MultiReader(bytes.NewReader(prefix), reader)
 	}
 	observer := newWebSocketMessageObserver(s.Transcripts, agentType, sessionID, direction, messageType)
 	observer.requestID = transcriptRequestIDFrom(ctx)
 	_, release, err := streamWebSocketMessage(ctx, reader, func() (io.WriteCloser, error) {
 		return openWriter(messageType)
 	}, observer, webSocketForwardBuffers, func(body []byte) error {
-		return observe(messageType, body)
+		return observe(messageType, body, observer.uninspectedHead())
 	})
 	if release != nil {
 		release()
@@ -7515,8 +10735,13 @@ func streamWebSocketMessage(
 		if err := beforeClose(body); err != nil {
 			// The message must not be delivered: mark the writer closed
 			// without closing it, so the final frame is never flushed, and
-			// surface the veto to the copy loop.
+			// surface the veto to the copy loop. A link writer holds the
+			// link's lock until it closes; abandon releases it (and ends the
+			// link) without flushing.
 			writerOpen = false
+			if held, ok := writer.(interface{ abandon() }); ok {
+				held.abandon()
+			}
 			return body, release, err
 		}
 	}
@@ -7547,6 +10772,10 @@ const (
 	// across all connections; 4× the message cap lets one full-size message
 	// capture while other connections keep inspecting.
 	webSocketInspectBudgetBytes = 4 * maxWebSocketMessageBytes
+	// webSocketEventHeadBytes is how much of a message too large to inspect
+	// is kept anyway, outside the budget, to tell which event it was: the
+	// quota filter's lookahead.
+	webSocketEventHeadBytes = 4 << 10
 )
 
 var (
@@ -7650,6 +10879,8 @@ type webSocketMessageObserver struct {
 	bytesRead   int64
 	chunks      int
 	chunked     bool
+	// head is the first webSocketEventHeadBytes of a chunked message.
+	head []byte
 }
 
 func newWebSocketMessageObserver(recorder *transcript.Recorder, agentType, sessionID, direction string, messageType int) *webSocketMessageObserver {
@@ -7669,6 +10900,7 @@ func (o *webSocketMessageObserver) observe(body []byte) {
 	}
 	if !o.chunked {
 		o.chunked = true
+		o.keepHead(o.capture)
 		o.recordChunks(o.capture, 0)
 		if o.reserved > 0 {
 			webSocketInspectBudget.release(o.reserved)
@@ -7676,8 +10908,24 @@ func (o *webSocketMessageObserver) observe(body []byte) {
 		o.reserved = 0
 		o.capture = nil
 	}
+	o.keepHead(body)
 	o.recordChunks(body, o.bytesRead)
 	o.bytesRead += int64(len(body))
+}
+
+func (o *webSocketMessageObserver) keepHead(body []byte) {
+	if room := webSocketEventHeadBytes - len(o.head); room > 0 {
+		o.head = append(o.head, body[:min(room, len(body))]...)
+	}
+}
+
+// uninspectedHead is the head of a message finish returns no body for, and
+// nil for one it does.
+func (o *webSocketMessageObserver) uninspectedHead() []byte {
+	if !o.chunked {
+		return nil
+	}
+	return o.head
 }
 
 func (o *webSocketMessageObserver) recordChunks(body []byte, offset int64) {
@@ -7756,7 +11004,7 @@ var errAzureCodexWebSocketDivert = errors.New("codex websocket turn diverted to 
 // reconnect only when nothing in the pool can start it.
 var errCodexWebSocketReroute = errors.New("codex websocket turn rerouted off an exhausted account")
 
-var errCodexWebSocketCapacityRetry = errors.New("codex websocket turn needs a capacity retry")
+var errWebSocketTurnRefused = errors.New("websocket turn refused: this subrouter generation is going away")
 
 // closeWebSocketWithServiceRestart ends the client connection with 1012
 // (service restart), which Codex handles by reconnecting with a full
@@ -7832,23 +11080,22 @@ func (s Server) markAccountExhaustedFromResponseForAccount(account accounts.Acco
 		)
 		return
 	}
+	// No weekly-cooked branch (upstream 2269757's MarkWeeklyExhaustedUntil):
+	// that mark existed only to authorize the paid extra-usage fallback, which
+	// this fork does not route to, and its overlay zeroes WeeklyHeadroom --
+	// here the weekly-pace ranking input, not a raw meter. A 7d rejection is
+	// marked like any other, until the reset the response names. Upstream
+	// #547's family scoping is kept: an account-wide rejection holds every
+	// model family until the account-wide reset, and a later model-specific
+	// reset extends only its own pool.
 	if account.Provider == accounts.ProviderClaude &&
 		claudeRejectionIsExplicitlyAccountWide(status, header) {
-		// A rejected 5h/7d window applies to every Claude model family.
-		// Do not leave an apparently healthy sibling pool selectable, but keep
-		// a later model-specific reset from extending the account-wide hold.
 		now := time.Now()
 		accountResetAt := claudeExhaustionExpiryForPool(header, now, "")
 		poolResetAt := claudeExhaustionExpiryForPool(header, now, poolKey)
-		if claudeResponseCooksWeeklyWindow(header) {
-			s.SchedulerRef.MarkWeeklyExhaustedUntil(
-				schedulerAccountProvider(account.Provider), account.ID, "", accountResetAt,
-			)
-		} else {
-			s.SchedulerRef.MarkExhaustedUntil(
-				schedulerAccountProvider(account.Provider), account.ID, "", accountResetAt,
-			)
-		}
+		s.SchedulerRef.MarkExhaustedUntil(
+			schedulerAccountProvider(account.Provider), account.ID, "", accountResetAt,
+		)
 		if poolKey != "" && poolResetAt.After(accountResetAt) {
 			s.SchedulerRef.MarkExhaustedUntil(
 				schedulerAccountProvider(account.Provider), account.ID, poolKey, poolResetAt,
@@ -7856,13 +11103,7 @@ func (s Server) markAccountExhaustedFromResponseForAccount(account accounts.Acco
 		}
 		return
 	}
-	resetAt := claudeExhaustionExpiryForPool(header, time.Now(), poolKey)
-	if claudeResponseCooksWeeklyWindow(header) {
-		// Record weekly evidence so the hold lasts until the weekly reset.
-		s.SchedulerRef.MarkWeeklyExhaustedUntil(schedulerAccountProvider(account.Provider), account.ID, poolKey, resetAt)
-		return
-	}
-	s.SchedulerRef.MarkExhaustedUntil(schedulerAccountProvider(account.Provider), account.ID, poolKey, resetAt)
+	s.SchedulerRef.MarkExhaustedUntil(schedulerAccountProvider(account.Provider), account.ID, poolKey, claudeExhaustionExpiryForPool(header, time.Now(), poolKey))
 }
 
 // claudeResponseCooksWeeklyWindow reports that the rejected response proves
@@ -7896,6 +11137,10 @@ func (s Server) markAccountExhaustedCredential(provider accounts.Provider, accou
 	s.markAccountExhaustedCredentialForAccount(s.AccountRef.credentialSnapshot(provider, accountID))
 }
 
+// forgetClaudeKeychainAnswer is agentclaude.ForgetKeychainAnswer, a var so a
+// test can see it called.
+var forgetClaudeKeychainAnswer = agentclaude.ForgetKeychainAnswer
+
 func (s Server) markAccountExhaustedCredentialForAccount(account accounts.Account) {
 	if s.SchedulerRef == nil {
 		return
@@ -7911,8 +11156,17 @@ func (s Server) markAccountExhaustedCredentialForAccount(account accounts.Accoun
 	loaded, generation, credentialRevision := s.AccountRef.CredentialSnapshot()
 	current := false
 	for _, candidate := range loaded {
-		if sameCredentialProvider(candidate.Provider, account.Provider) && candidate.ID == account.ID &&
-			candidate.CredentialIdentity() == account.CredentialIdentity() {
+		if !sameCredentialProvider(candidate.Provider, account.Provider) || candidate.ID != account.ID {
+			continue
+		}
+		// A Claude credential the provider refused is never served again from
+		// the keychain answer the store remembers (PATCHES §34): the next
+		// refresh reads the store, where a rotation another process made
+		// shows up and replaces the refused credential's generation.
+		if candidate.Provider == accounts.ProviderClaude {
+			forgetClaudeKeychainAnswer(candidate.Source)
+		}
+		if candidate.CredentialIdentity() == account.CredentialIdentity() {
 			current = true
 			break
 		}
@@ -8056,6 +11310,17 @@ const (
 // codexTurnFailureClass classifies a Codex turn-failure event. Only
 // failure-shaped payloads classify: a response.failed or error event, or one
 // carrying an error object with a code. Everything else is codexFailureNone.
+//
+// The classifier below is upstream manaflow-ai/subrouter's #373 (e2cdd06,
+// unchanged at c9303d3), ported as written (PATCHES section 27). It widens
+// the old one for EVERY caller, not only the capacity failover: the
+// websocket quota filter and server-class reroute, the usage-limit expiry,
+// and the Azure/egress sniffs. An error object's type now stands in for a
+// missing code (so {"error":{"type":"usage_limit_reached"}} is quota and
+// {"error":{"type":"server_overloaded"}} is server), every invalid_* code and
+// the invalid_request_error type are the client's (no longer rerouted), and a
+// bare error object with only a message is failure-shaped. Codex CLI renders
+// all of these the same way, so treating them alike is the point.
 func codexTurnFailureClass(body []byte) codexFailureClass {
 	class, _ := codexTurnFailure(body)
 	return class
@@ -8293,12 +11558,35 @@ func usageLimitMap(event map[string]any) bool {
 }
 
 func usageLimitCode(value string) bool {
-	return strings.EqualFold(value, "usage_limit_reached")
+	return strings.EqualFold(value, "usage_limit_reached") || strings.EqualFold(value, "workspace_usage_limit_reached")
+}
+
+// codexAccountRefusalJSON reports a Codex failure payload whose code says the
+// ACCOUNT cannot serve, whatever the moment: its plan does not include Codex
+// (usage_not_included), or it has no quota left (insufficient_quota,
+// quota_exceeded). codexTurnFailure files these with usage_limit_reached as
+// codexFailureQuota; rate_limit_exceeded, filed there too, is left out on
+// purpose -- over HTTP it is a request rate, the burst 429 that keeps its
+// account (PATCHES §35). The code is read from code or error.type, at any
+// level codexFailureCodeAndMessage looks.
+func codexAccountRefusalJSON(body []byte) bool {
+	var event map[string]any
+	if err := json.Unmarshal(body, &event); err != nil {
+		return false
+	}
+	code, _ := codexFailureCodeAndMessage(event)
+	for _, value := range []string{code, codexFailureErrorType(event)} {
+		switch value {
+		case "usage_not_included", "insufficient_quota", "quota_exceeded":
+			return true
+		}
+	}
+	return false
 }
 
 func usageLimitMessage(value string) bool {
 	lower := strings.ToLower(value)
-	return strings.Contains(lower, "usage limit") &&
+	return (strings.Contains(lower, "usage limit") || strings.Contains(lower, "spend cap")) &&
 		(strings.Contains(lower, "reached") || strings.Contains(lower, "hit") || strings.Contains(lower, "exceeded"))
 }
 
@@ -8486,6 +11774,18 @@ func streamCancelAttribution(clientCtx context.Context, err error) (string, erro
 	return "proxy", nil
 }
 
+// requestFailureLevel is the level of an upstream request that failed with err
+// while clientCtx was the client's context. Warn when the client hung up first
+// -- an interrupted turn, or Codex abandoning its /api/hello and /wham probes,
+// which was most of the daemon's Error lines -- because nothing on this side
+// failed or can be fixed. Error for everything else (PATCHES §39).
+func requestFailureLevel(clientCtx context.Context, err error) slog.Level {
+	if canceledBy, _ := streamCancelAttribution(clientCtx, err); canceledBy == "client" {
+		return slog.LevelWarn
+	}
+	return slog.LevelError
+}
+
 func (s Server) captureResponseBody(response *http.Response, clientCtx context.Context, agentType, sessionID, accountID string, provider accounts.Provider, poolModel, compatibilityModel, path string) {
 	s.captureResponseBodyForAccount(
 		response, clientCtx, agentType, sessionID,
@@ -8530,12 +11830,20 @@ func (s Server) captureResponseBodyForRequest(response *http.Response, clientCtx
 		(claudeAccountUnusableStatus(response.StatusCode) || claudeResponseRejectedForPool(response.Header, poolModel))
 	inspectClaudeCredit := provider == accounts.ProviderClaude && accountID != "" &&
 		claudeCreditExhaustedStatus(response.StatusCode) && s.claudeAuthMode(account) == accounts.AuthModeAPIKey
+	// A Claude control-plane answer is not inference evidence
+	// (control_plane.go): an endpoint the identity may not read, or a rate
+	// limit on it, says nothing about the account's inference, so it sets no
+	// scheduler mark. Before, each refused call renewed a mark that kept the
+	// identity out of inference for as long as clients kept asking. A death
+	// Anthropic names in so many words is a fact about the credential and is
+	// still recorded (noteClaudeCredentialResponse).
+	claudeControlPlane := provider == accounts.ProviderClaude && controlPlanePath(path)
 	if claudeUnusable {
 		// Only poison the routing score when the account is genuinely out of
 		// quota (401, a 429 the upstream marks "rejected", or any response with
 		// the rejected header). A transient "allowed"/"allowed_warning" 429 still
 		// fails over for this request but must not mark a healthy account exhausted.
-		if claudeAccountExhaustedByResponseForPool(response.StatusCode, response.Header, poolModel) {
+		if !claudeControlPlane && claudeAccountExhaustedByResponseForPool(response.StatusCode, response.Header, poolModel) {
 			s.markAccountExhaustedFromResponseForAccount(account, poolModel, response.StatusCode, response.Header)
 		}
 		// Surface the genuine upstream rate-limit signal (headers now, body
@@ -8569,7 +11877,7 @@ func (s Server) captureResponseBodyForRequest(response *http.Response, clientCtx
 				"status", response.StatusCode,
 			}, claudeRateLimitHeaderFields(response.Header)...)...)
 	}
-	inspectUsageLimit := s.SchedulerRef != nil && accountID != "" && responseStatusCanExhaust(response.StatusCode)
+	inspectUsageLimit := s.SchedulerRef != nil && accountID != "" && responseStatusCanExhaust(response.StatusCode) && !claudeControlPlane
 	inspectCredentialFailure := s.SchedulerRef != nil && keyedProvider && accountID != "" &&
 		(response.StatusCode == http.StatusBadRequest || response.StatusCode == http.StatusForbidden)
 	inspectModelCompatibility := s.SchedulerRef != nil && accountID != "" && compatibilityModel != "" &&
@@ -8604,7 +11912,7 @@ func (s Server) captureResponseBodyForRequest(response *http.Response, clientCtx
 			if claudeUnusable && (response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden) {
 				s.noteClaudeCredentialResponse(account, response.StatusCode, response.Header, decoded, sessionID, path)
 			}
-			if claudeUnusable && response.StatusCode == http.StatusForbidden && persistentAuthorizationDenialJSON(decoded) {
+			if claudeUnusable && !claudeControlPlane && response.StatusCode == http.StatusForbidden && persistentAuthorizationDenialJSON(decoded) {
 				s.markPersistentAuthorizationDenial(account)
 			}
 			if inspectClaudeCredit && claudeCreditExhaustedMessage(body) {
@@ -8670,9 +11978,10 @@ func (s Server) captureResponseBodyForRequest(response *http.Response, clientCtx
 	}
 	streamStarted := time.Now()
 	// The catalog session still needs its body inspected for quota signals, so
-	// it reaches here; it just must not be written down.
+	// it reaches here; it just must not be written down. Nor is a response the
+	// client-boundary transcript records as the client reads it (PATCHES §71).
 	bodyRecorder := s.Transcripts
-	if !transcriptWorthRecording(sessionID) {
+	if !transcriptWorthRecording(sessionID) || clientExchangeFrom(clientCtx) != nil {
 		bodyRecorder = nil
 	}
 	response.Body = newStreamingTranscriptReadCloser(streamingTranscriptConfig{
@@ -9041,10 +12350,13 @@ func (s Server) accountFor(agentType string, r *http.Request) (accounts.Account,
 }
 
 func (s Server) accountForSession(agentType, sessionID string, r *http.Request) (accounts.Account, string, string, error) {
-	return s.accountForSessionProvider(providerForRequest(agentType, r.URL.Path), agentType, sessionID, r)
+	// Drops belowFloor: these callers only need an account, not the routing
+	// hint the proxy handler uses to give a peer pool first refusal.
+	account, sid, email, _, err := s.accountForSessionProvider(providerForRequest(agentType, r.URL.Path), agentType, sessionID, r)
+	return account, sid, email, err
 }
 
-func (s Server) accountForSessionProvider(provider accounts.Provider, agentType, sessionID string, r *http.Request) (accounts.Account, string, string, error) {
+func (s Server) accountForSessionProvider(provider accounts.Provider, agentType, sessionID string, r *http.Request) (accounts.Account, string, string, routingCapacity, error) {
 	return s.accountForSessionProviderWithOptions(provider, agentType, sessionID, r, accountSelectionOptions{})
 }
 
@@ -9057,22 +12369,56 @@ type accountSelectionOptions struct {
 	// provisionally rerouted. Request-serving callers commit it only after the
 	// replacement account succeeds; nil preserves eager assignment for direct
 	// selection callers that have no upstream success boundary.
-	pendingSessionCommit     *bool
+	pendingSessionCommit *bool
+	// pendingSessionMoveReason, when set, receives why a provisional move
+	// leaves its account (upstream #532), for the commit's log line.
 	pendingSessionMoveReason *accountMoveReason
-	placementReservation     **selectacct.PlacementReservation
+	// placementReservation is upstream's atomic pick-and-debit hand-off
+	// (#651/#656). Selection here does not reserve: placement is the fork's
+	// ranking (placeForSession, PATCHES §31) and the handler debits the
+	// served account with NoteRouted, as before. Left nil, so the handler's
+	// reservation stays nil.
+	placementReservation **selectacct.PlacementReservation
+	// sideChannel: the request is a side request (sideChannelRequest). It is
+	// served on the conversation's pin unless that account is evicted, and
+	// otherwise on a fresh pick -- but nothing is written: no pin, no sticky
+	// re-pick, no machine binding, and a zero capacity so no comparator
+	// can move the conversation on its behalf.
+	sideChannel bool
+	// forcedSwitch: the session's hold on a peer ended by force (P8). Its
+	// local pin is a placeholder with no warmth to protect, so it re-ranks
+	// like a cold session and the cross-pool ranking runs.
+	forcedSwitch bool
+	// crossPool, when set, makes every ranking this selection runs the ONE
+	// cross-pool placement (placeAcrossPools, PATCHES §31 D7): the local
+	// candidates and every eligible peer account, one comparator. Set by the
+	// proxy handler only for a turn that may go to a peer; nil ranks this
+	// daemon's own pool alone.
+	crossPool *crossPoolRanking
 }
 
-// accountForSessionProviderWithOptions selects or reuses the account for a
-// sticky session, recording provisional moves until the response succeeds.
-func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider, agentType, sessionID string, r *http.Request, options accountSelectionOptions) (accounts.Account, string, string, error) {
+// The trailing bool reports whether the SELECTED account is below
+// the router's own eligibility predicate -- i.e. local is being drained rather than
+// spent. Callers use it to give a peer pool first refusal. It is computed here
+// because this is where the scheduler is narrowed by ForModel, and because a
+// post-hoc Scheduler lookup defaults unknown accounts to fully healthy.
+func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider, agentType, sessionID string, r *http.Request, options accountSelectionOptions) (accounts.Account, string, string, routingCapacity, error) {
 	userEmail := session.ExtractUserEmail(r)
 	forcedAccountID := ""
 	if !options.ignoreForcedAccount {
+		// Strict: a malformed or conflicting selector is an error, never a
+		// silent fall-through to ordinary routing.
 		var err error
 		forcedAccountID, _, err = session.ExtractAccountIDWithPresence(r)
 		if err != nil {
-			return accounts.Account{}, sessionID, userEmail, fmt.Errorf("invalid forced account selector: %w", err)
+			return accounts.Account{}, sessionID, userEmail, routingCapacity{}, fmt.Errorf("invalid forced account selector: %w", err)
 		}
+	}
+	// A peer's target (PATCHES §31), read like the forced selector and losing
+	// to it when both are present. Judged below, once the scheduler is built.
+	targetAccountID := ""
+	if !options.ignoreForcedAccount && forcedAccountID == "" {
+		targetAccountID = targetAccountFromRequest(r)
 	}
 	model := session.ExtractModel(r, s.MaxBodyBytes)
 	availableAccounts := filterAccountsForProvider(s.accountListContext(r.Context()), provider)
@@ -9081,33 +12427,75 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 	}
 	// The upstream prompt cache is per account, so moving a session to another
 	// account re-bills its whole conversation prefix as uncached input. Record
-	// where the session was before any branch can reassign it.
+	// where the session was before any branch can reassign it. The same read
+	// seeds the sticky branch below.
+	stored, hasAssignment := s.Sessions.Get(agentType, sessionID)
 	previousAccountID := ""
-	if assignment, ok := s.Sessions.Get(agentType, sessionID); ok {
-		previousAccountID = assignment.AccountID
+	if hasAssignment {
+		previousAccountID = stored.AccountID
 	}
 	if forcedAccountID != "" {
 		account, ok := findAccount(availableAccounts, forcedAccountID)
 		if !ok {
-			return accounts.Account{}, sessionID, userEmail, fmt.Errorf("requested account %q not found", forcedAccountID)
+			return accounts.Account{}, sessionID, userEmail, routingCapacity{}, fmt.Errorf("requested account %q not found", forcedAccountID)
 		}
 		if provider == accounts.ProviderCodex && codexOAuthRequiredPath(r.URL.Path) && account.AuthMode != accounts.AuthModeOAuth {
-			return accounts.Account{}, sessionID, userEmail, fmt.Errorf("requested account %q cannot be used for ChatGPT backend paths", forcedAccountID)
+			return accounts.Account{}, sessionID, userEmail, routingCapacity{}, fmt.Errorf("requested account %q cannot be used for ChatGPT backend paths", forcedAccountID)
+		}
+		// A forced account is still bound by its owner's holdout: no session
+		// starts or continues inside it, however it was asked for. Upstream's
+		// strict selector has no such check; this one is the fork's (PATCHES
+		// section 20).
+		if s.scheduler().WithReserves(s.AccountReserves).InHoldout(schedulerAccountProvider(account.Provider), account.ID) {
+			return accounts.Account{}, sessionID, userEmail, routingCapacity{}, fmt.Errorf("requested account %q is inside its owner's holdout", forcedAccountID)
+		}
+		// An identity-only account serves the control plane and nothing else,
+		// however it is asked for (control_plane.go).
+		if !controlPlanePath(r.URL.Path) && s.identityOnlyAccount(account) {
+			return accounts.Account{}, sessionID, userEmail, routingCapacity{}, fmt.Errorf("requested account %q answers only the control plane (SUBROUTER_IDENTITY_ONLY)", forcedAccountID)
+		}
+		if options.sideChannel {
+			return account, sessionID, userEmail, routingCapacity{}, nil
 		}
 		s.logAccountMove(agentType, sessionID, model, previousAccountID, account.ID, provider, accountMoveForced, nil, false)
 		assignment, err := s.Sessions.Put(agentType, sessionID, account.ID, userEmail)
 		if err != nil {
-			return accounts.Account{}, sessionID, userEmail, err
+			return accounts.Account{}, sessionID, userEmail, routingCapacity{}, err
 		}
-		return account, sessionID, assignment.UserEmail, nil
+		// Unmeasured on purpose -- see the sticky-reuse note below.
+		return account, sessionID, assignment.UserEmail, routingCapacity{}, nil
+	}
+	if provider == accounts.ProviderClaude && controlPlanePath(r.URL.Path) {
+		// One account answers every control-plane call, so the identity the
+		// client caches cannot change between them. Deliberately NOT written to
+		// s.Sessions: these requests carry no conversation, and binding one
+		// would hand the next inference turn an account the scheduler never
+		// chose. Claude's identity is the pin or nothing when the socket is
+		// configured, and never a dead credential (control_plane.go). Without
+		// a socket it falls through to normal selection only when no live
+		// OAuth account exists at all, where there is nothing stable to pin to.
+		identity := s.claudeControlPlaneIdentity(availableAccounts)
+		switch {
+		case identity.Account.ID != "":
+			return identity.Account, sessionID, userEmail, routingCapacity{}, nil
+		case s.IdentityPinRequired && identity.State == identityDead:
+			// Dead as this daemon holds it. Its refresh reads the store first,
+			// where a new sign-in shows up, and refreshSelectedAccount answers
+			// 503 unless it comes back with a different, live credential:
+			// nothing is sent upstream on the dead one.
+			return identity.Pinned, sessionID, userEmail, routingCapacity{}, nil
+		case s.IdentityPinRequired:
+			return accounts.Account{}, sessionID, userEmail, routingCapacity{}, &controlPlaneIdentityError{
+				State: identity.State, Account: strings.TrimSpace(s.IdentityAccountID),
+			}
+		}
+	} else if controlPlanePath(r.URL.Path) {
+		if account, ok := s.identityAccount(availableAccounts); ok {
+			return account, sessionID, userEmail, routingCapacity{}, nil
+		}
 	}
 	if provider == accounts.ProviderCodex && codexOAuthRequiredPath(r.URL.Path) {
 		availableAccounts = oauthAccounts(availableAccounts)
-	}
-	if provider == accounts.ProviderCodex {
-		availableAccounts = s.withoutCodexSessionBans(agentType, sessionID, availableAccounts)
-		// A failure-rate taint is a capacity mark for the failing model
-		// (noteCodexCapacityFailure), applied below with the other marks.
 	}
 	if provider == accounts.ProviderClaude && !options.allowFableAPIKeyPool && s.claudeFableEnabled() && claudeFableModel(model) {
 		// Fable order is subscription pool -> Bedrock -> dedicated API key, so
@@ -9132,44 +12520,50 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 	if poolModel != "" && s.Logger != nil && base.HasModelPool(poolModel) {
 		s.Logger.Debug("model quota pool matched", "agent", agentType, "model", model, "pool", selectacct.ModelKey(poolModel))
 	}
-	scheduler := base.ForModel(poolModel).WithSessionCounts(SchedulerActiveSessionCounts(s.Sessions))
-	// stickyScheduler decides whether a sticky session leaves its account.
-	// Capacity marks evict a session whose account keeps shedding, but a
-	// conversation too large for the overload failover to move keeps its
-	// account through them: marks left by smaller sessions must not re-bill
-	// its whole cached prefix. The marks still rank any account picked for it.
+	// Machine identity for the sharing policy. On a loopback daemon this is
+	// always 127.0.0.1 and the policy is inert; behind a tailnet it is the
+	// peer's stable per-node address, which is the only field that
+	// discriminates between clients.
+	machineID := ""
+	if s.MachinePolicy.Active() && r != nil {
+		machineID = clientRemoteIP(r)
+	}
+	// ForModel, WithReserves, ScoreKey session counts, live counts and the
+	// machine term: the one scheduler every routing view builds.
+	scheduler := s.selectionSchedulerFrom(base, poolModel, machineID)
+	// stickyScheduler decides whether a sticky session leaves its account;
+	// scheduler ranks any account picked. They differ only for a Codex
+	// conversation too large for the overload failover to move (§27).
 	stickyScheduler := scheduler
 	sizeKeptEstimate := int64(0)
-	if provider == accounts.ProviderCodex && s.SchedulerRef != nil && s.SchedulerRef.HasCapacityMarks() {
-		scheduler = s.withCapacityMarks(scheduler, provider, model, codexCapacitySelectionTier(r, s.MaxBodyBytes))
-		stickyScheduler = scheduler
-		if s.CodexOverloadFailover.enabled() {
-			if estimate := codexInputTokensFromBytes(session.ExtractBodySize(r, s.MaxBodyBytes)); s.CodexOverloadFailover.failoverKeepsAccount(estimate) {
-				stickyScheduler = scheduler.WithCapacityMarks(nil)
-				sizeKeptEstimate = estimate
-			}
-		}
+	if provider == accounts.ProviderCodex && s.SchedulerRef != nil && s.SchedulerRef.HasRankMarks() {
+		// Capacity marks for this request's (model, tier) pool: they rank a
+		// shedding account last within its tier and, repeated, release a
+		// sticky session from it (PATCHES section 27). Rate-limit marks ride
+		// along and only rank (§35.3). Attached here, not in
+		// selectionSchedulerFrom, because only a request knows its tier. A
+		// websocket upgrade names no model: it reads the marks of the model
+		// its session's last capacity reroute marked.
+		scheduler = s.withCapacityMarks(scheduler, provider, s.codexCapacityMarksModel(model, agentType, sessionID, r), codexCapacitySelectionTier(r, s.MaxBodyBytes))
+		stickyScheduler, sizeKeptEstimate = s.codexStickyScheduler(r, scheduler)
 	}
-	var placementReservation *selectacct.PlacementReservation
-	defer func() { placementReservation.Release() }()
-	pickPlacement := func(candidates []accounts.Account) (accounts.Account, error) {
-		if options.placementReservation == nil || s.SchedulerRef == nil {
-			return pickRoutingAccount(scheduler, candidates)
-		}
-		var picked accounts.Account
-		var err error
-		picked, placementReservation, err = pickAndReserveRoutingAccount(r.Context(), scheduler, s.SchedulerRef, candidates)
-		return picked, err
-	}
-	// picked carries a placement decided inside the sticky branch (the
-	// constrained account's replacement) into the shared assignment tail, so
-	// the account that was judged materially better is the one assigned.
+	// picked carries a placement decided before the shared tail (a cold sticky
+	// session's replacement, or a caller's preferred account) into it, so the
+	// machine policy, the eviction refusal and the assignment all judge the
+	// account that is actually going to serve.
 	var picked *accounts.Account
-	if assignment, ok := s.Sessions.Get(agentType, sessionID); ok {
-		if userEmail != "" && userEmail != assignment.UserEmail {
+	if targetAccountID != "" {
+		// Served on exactly the target or refused; never substituted, never
+		// provisional (target_placement.go).
+		return s.selectTargetedAccount(provider, agentType, sessionID, userEmail, model, targetAccountID,
+			r, availableAccounts, scheduler, machineID, stored, hasAssignment, options)
+	}
+	if hasAssignment {
+		assignment := stored
+		if userEmail != "" && userEmail != assignment.UserEmail && !options.sideChannel {
 			updated, err := s.Sessions.Put(agentType, sessionID, assignment.AccountID, userEmail)
 			if err != nil {
-				return accounts.Account{}, sessionID, userEmail, err
+				return accounts.Account{}, sessionID, userEmail, routingCapacity{}, err
 			}
 			assignment = updated
 		}
@@ -9177,166 +12571,239 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 			userEmail = assignment.UserEmail
 		}
 		if account, ok := findAccount(availableAccounts, assignment.AccountID); ok {
-			fromExhausted := scheduler.Exhausted(schedulerAccountProvider(account.Provider), account.ID)
-			fromCapacity := scheduler.CapacityEvicting(schedulerAccountProvider(account.Provider), account.ID)
-			if sizeKeptEstimate == 0 && fromCapacity && !fromExhausted {
-				key := session.ScopedSessionKey(agentType, sessionID)
-				if age, held := s.softMoveState.recentlyMoved(key, time.Now()); held {
-					if s.Logger != nil {
-						s.Logger.Info("holding sticky session during soft account-move cooldown",
-							"agent", agentType,
-							"session", sessionID,
-							"account", account.ID,
-							"move_reason", accountMoveCapacity,
-							"cooldown", softMoveCooldown.String(),
-							"age", age.Round(time.Millisecond).String(),
-						)
-					}
-					s.touchSessionBestEffort(agentType, sessionID)
-					return account, sessionID, userEmail, nil
-				}
-			}
-			if sizeKeptEstimate > 0 && scheduler.CapacityEvicting(schedulerAccountProvider(account.Provider), account.ID) {
+			if sizeKeptEstimate > 0 && !options.sideChannel && scheduler.CapacityEvicting(schedulerAccountProvider(account.Provider), account.ID) {
+				// Too large to move: stickyScheduler skips the eviction (§27).
 				s.logFailoverKeptAccount("placement", agentType, sessionID, account.ID, sizeKeptEstimate)
 			}
-			// Claude API-key assignments created by normal routing are legacy
-			// stickies. Move them onto subscription quota as soon as an OAuth
-			// account can serve this model; an explicit account selector returned
-			// above and remains pinned for that request.
-			if provider == accounts.ProviderClaude && account.AuthMode == accounts.AuthModeAPIKey {
-				subscriptions := claudeSubscriptionCandidatesFromScores(base, scheduler, availableAccounts, poolModel)
-				if len(subscriptions) > 0 {
-					if candidate, pickErr := pickPlacement(subscriptions); pickErr == nil {
-						if s.Logger != nil {
-							s.Logger.Info("moving Claude session from API key to subscription quota",
-								"agent", agentType, "session", sessionID,
-								"from_account", account.ID, "to_account", candidate.ID)
-						}
-						s.SchedulerRef.NoteStickyEviction(schedulerAccountProvider(account.Provider), account.ID)
-						picked = &candidate
-					}
+			// A side request reads the placement the last model turn left and
+			// decides nothing: only eviction sends it elsewhere, and then
+			// without moving the pin -- the next model turn does that.
+			if options.sideChannel {
+				if !scheduler.Evicted(schedulerAccountProvider(account.Provider), account.ID) {
+					return account, sessionID, userEmail, routingCapacity{}, nil
 				}
-			}
-			if picked == nil && s.reuseStickyAssignment(agentType, sessionID, account, stickyScheduler) {
-				s.logStickyReuse(agentType, sessionID, account, stickyScheduler)
+			} else if !options.forcedSwitch && (s.reuseStickyAssignmentAcross(agentType, sessionID, account, stickyScheduler, availableAccounts, options.crossPool) ||
+				// Released by capacity eviction alone, but the pool has no
+				// account that is not shedding and can hold it: stay (§27).
+				// A forced switch (P8: the account refused or cannot serve)
+				// skips both -- capacity keeping is about a shedding model, not
+				// an account that is out. The check reads LOCAL accounts only,
+				// as on origin/main: a peer's capacity marks are not published,
+				// so "a peer account would not shed" is not something this
+				// daemon can know, and staying keeps the cache.
+				s.keepCapacityEvictedSession(agentType, sessionID, account, stickyScheduler, availableAccounts)) {
+				s.logStickyReuse(agentType, sessionID, account, scheduler)
+				// Keeps UpdatedAt tracking use (the store coalesces the writes), so
+				// the session store's retention prune sees a session in use as
+				// recent. A side request never gets here: it writes nothing.
 				s.touchSessionBestEffort(agentType, sessionID)
-				return account, sessionID, userEmail, nil
+				// Warmth is worth protecting only while the account can still
+				// answer. Prompt-cache warmth is per ACCOUNT, so moving a live
+				// conversation re-pays the cold-cache cost on every turn it
+				// was supposed to save -- but an account that cannot serve has
+				// no warmth left to protect, only a queue for a 429.
+				//
+				// A WARM session (either provider) gets exactly the stickiness a
+				// delegated one gets on the peer: it stays until its account is exhausted
+				// (reuseStickyAssignment returns false above) or a turn actually
+				// fails, and a below-floor verdict does not move it. That verdict
+				// is mostly the 5h burn projection, which trips on accounts with
+				// most of their week left; handing it to the peer comparator
+				// moved live conversations off local accounts at 76% headroom and
+				// cold-cached them, while the peer side had no equivalent exit.
+				// Measured 2026-09-10..24: 437 warm local->remote moves, 126k
+				// requests served remote afterwards.
+				//
+				// A cold session has no cache to protect, so it still offers a
+				// below-floor account to the peer comparator. That path is what
+				// keeps a session from sitting on a spent account while the peer
+				// holds capacity: measured on the live pool, 647 of 1184
+				// decisions in ten minutes stayed local when this returned a
+				// zero value unconditionally.
+				//
+				// The shared keyless Codex bucket is never warm here (see
+				// sharedCodexFallbackBucket): a below-floor account under it is
+				// always offered, as before the merge.
+				stickyCapacity := routingCapacity{}
+				warm := account.AuthMode == accounts.AuthModeOAuth &&
+					!sharedCodexFallbackBucket(agentType, sessionID) &&
+					s.sessionWarm(agentType, sessionID)
+				switch {
+				case warm:
+					options.crossPool.keep(crossPoolKeptWarm, "warm")
+				case options.crossPool.rankedAlready():
+					// A cold session its provider re-ranks (Claude,
+					// migrateIdleSession): it was just ranked against every
+					// local AND peer account and its own account won, so the
+					// cross-pool decision is already made (P9). The capacity is
+					// reported for the decision line only.
+					stickyCapacity = s.routingCapacityFor(base, scheduler, account)
+				case s.routingCapacityFor(base, scheduler, account).BelowFloor:
+					// A cold session its provider retains (Codex, the shared
+					// keyless bucket) on an account below the floor is still
+					// offered to the peers, as it always was -- now through
+					// the one ranking: this account against every eligible
+					// peer account.
+					stickyCapacity = s.routingCapacityFor(base, scheduler, account)
+					if _, err := s.placeForSession(scheduler, []accounts.Account{account}, options.crossPool, "cold"); err != nil {
+						options.crossPool.invalidate()
+					}
+				default:
+					options.crossPool.keep(crossPoolKeptColdRetained, "cold")
+				}
+				return account, sessionID, userEmail, stickyCapacity, nil
 			}
-			if picked != nil {
-				// Subscription-first migration selected a destination; the common
-				// assignment tail persists it below.
-			} else {
-				placementCandidates := availableAccounts
-				if provider == accounts.ProviderClaude {
-					if subscriptions := claudeSubscriptionCandidatesFromScores(base, scheduler, availableAccounts, poolModel); len(subscriptions) > 0 {
-						placementCandidates = subscriptions
-					}
-				}
-				candidate, pickErr := pickPlacement(placementCandidates)
-				if pickErr != nil || s.keepConstrainedStickyAssignment(stickyScheduler, account, candidate) {
-					if s.Logger != nil {
-						s.Logger.Info("keeping sticky session on constrained account; no materially better account",
-							"agent", agentType,
-							"session", sessionID,
-							"account", account.ID,
-							"candidate", candidate.ID,
-							"active", s.activeSession(agentType, sessionID),
-							"exhausted", scheduler.Exhausted(schedulerAccountProvider(account.Provider), account.ID),
-						)
-					}
-					s.touchSessionBestEffort(agentType, sessionID)
-					return account, sessionID, userEmail, nil
-				}
-				if candidate.AuthMode == accounts.AuthModeOAuth && provider == accounts.ProviderClaude && scheduler.Exhausted(schedulerAccountProvider(candidate.Provider), candidate.ID) {
-					if fallback, ok := s.pickClaudeExtraUsageFallbackForRequest(scheduler, availableAccounts, poolModel); ok {
-						placementReservation.Release()
-						placementReservation = nil
-						candidate = fallback
-						if options.placementReservation != nil && s.SchedulerRef != nil {
-							var reserveErr error
-							_, placementReservation, reserveErr = pickAndReserveRoutingAccount(r.Context(), scheduler, s.SchedulerRef, []accounts.Account{candidate})
-							if reserveErr != nil {
-								return accounts.Account{}, sessionID, userEmail, reserveErr
-							}
-						}
-					} else {
-						// The whole pool is exhausted: Pick ranks exhausted accounts
-						// last but still returns one, and the post-selection check
-						// below rejects it before the assignment is ever persisted.
-						// Reaching that check through this branch used to log a
-						// "rerouting" to an unusable account that never happened,
-						// once per request for as long as the pool stayed exhausted.
-						// Fail the selection here so the handler goes straight to the
-						// fallback chain.
-						return accounts.Account{}, sessionID, userEmail, s.poolExhaustedError(provider, availableAccounts, poolModel)
-					}
-				}
-				if s.Logger != nil {
-					s.Logger.Info("rerouting cold sticky session from constrained account",
-						"agent", agentType,
-						"session", sessionID,
-						"account", account.ID,
-						"to_account", candidate.ID,
-						"active", s.activeSession(agentType, sessionID),
-						"usable_for_new_session", scheduler.UsableForNewSession(schedulerAccountProvider(account.Provider), account.ID),
-						"usable_for_sticky_session", scheduler.UsableForStickySession(schedulerAccountProvider(account.Provider), account.ID),
-						"exhausted", fromExhausted,
-						"capacity_eviction", fromCapacity,
-					)
-				}
-				s.SchedulerRef.NoteStickyEviction(schedulerAccountProvider(account.Provider), account.ID)
-				picked = &candidate
+			// The session leaves its account. There is no "keep it on a
+			// constrained account" branch here beyond the capacity half,
+			// keepCapacityEvictedSession above (upstream's constrainedMoveGated
+			// is the one knob of providerSelectionPolicy, selection_policy.go,
+			// not taken): reuseStickyAssignment already
+			// returned true for everything short of an eviction, a capacity
+			// eviction with somewhere better to go, or a cold session the
+			// ranking wants elsewhere. A side request lands
+			// here only when its pin is evicted: it is served on this pick, and
+			// the tail returns before anything is written.
+			// The ONE ranking (D7): every local account and, on a turn that may
+			// go to a peer, every eligible peer account. candidate is the best
+			// LOCAL account either way -- what serves the turn if no peer does.
+			// The local half is placeableAccounts' set (PATCHES section 28): a
+			// Claude account whose credential store is in a silent streak is not
+			// a destination while an answering one can take the session. The
+			// ranking remembers this filtered set, so a recompute after a
+			// refusal (P6) never re-offers a silent account either.
+			// Why it leaves, read off the one forced/transient table
+			// (account_switch.go): evicted, or released by two consecutive
+			// "model at capacity" answers with somewhere better to go
+			// (PATCHES section 27) -- both forced, both a re-rank across
+			// every pool (P8) -- or merely cold.
+			state := "cold"
+			leave := classifyAccountSwitch(accountSwitchEvidence{
+				Evicted:         evictionCause(scheduler, account),
+				CapacityEvicted: stickyScheduler.CapacityEvicting(schedulerAccountProvider(account.Provider), account.ID),
+			})
+			switch {
+			case options.forcedSwitch:
+				state = "forced"
+			case leave.Kind == switchForced && leave.Reason == "capacity_evicted":
+				state = "capacity_evicted"
+			case leave.Kind == switchForced:
+				state = "evicted"
 			}
+			placement, pickErr := s.placeForSession(scheduler, placeableAccounts(availableAccounts, func(candidate accounts.Account) bool {
+				return selectionRefusesAccount(provider, scheduler, candidate)
+			}), options.crossPool, state)
+			if pickErr != nil {
+				return accounts.Account{}, sessionID, userEmail, routingCapacity{}, pickErr
+			}
+			candidate := placement.Account
+			if selectionRefusesAccount(provider, scheduler, candidate) {
+				// The whole pool is evicted: Pick ranks evicted accounts last but
+				// still returns one, and the tail would refuse it. Refuse here
+				// instead, before logging a "rerouting" to an account that is
+				// never used, so the handler goes straight to its fallbacks.
+				return accounts.Account{}, sessionID, userEmail, routingCapacity{}, s.poolExhaustedError(provider, availableAccounts, poolModel)
+			}
+			// A peer account can win the ranking while the session's own
+			// account stays the best LOCAL one (P9): then nothing local moves
+			// and there is no reroute to report -- the decision line says where
+			// the turn went.
+			if s.Logger != nil && !options.sideChannel && candidate.ID != account.ID {
+				s.Logger.Info("rerouting cold sticky session from constrained account",
+					"agent", agentType,
+					"session", sessionID,
+					"account", account.ID,
+					"to_account", candidate.ID,
+					"active", s.activeSession(agentType, sessionID),
+					"usable_for_new_session", scheduler.UsableForNewSession(schedulerAccountProvider(account.Provider), account.ID),
+					"evicted", scheduler.Evicted(schedulerAccountProvider(account.Provider), account.ID),
+					"exhausted", scheduler.Exhausted(schedulerAccountProvider(account.Provider), account.ID),
+					"capacity_evicting", scheduler.CapacityEvicting(schedulerAccountProvider(account.Provider), account.ID),
+				)
+			}
+			picked = &candidate
 		}
 	}
-
-	var account accounts.Account
 	if picked == nil && options.preferredAccountID != "" {
 		preferred, ok := findAccount(availableAccounts, options.preferredAccountID)
-		// A preference is intentionally softer than a pin. If the selected
-		// account disappeared after the picker ran or is already known exhausted,
-		// start on the scheduler's current recommendation instead of failing the
-		// pooled launch before a request.
-		if ok && !scheduler.Exhausted(schedulerAccountProvider(preferred.Provider), preferred.ID) {
+		// A preference is intentionally softer than a pin. If the preferred
+		// account disappeared after the picker ran, or is evicted (spent, or
+		// inside its owner's holdout, where no session may start), start on the
+		// scheduler's current recommendation instead of failing the pooled
+		// launch before a request.
+		if ok && !scheduler.Evicted(schedulerAccountProvider(preferred.Provider), preferred.ID) && !credentialStoreNotAnswering(preferred) {
 			picked = &preferred
 		}
 	}
+	var account accounts.Account
 	if picked != nil {
 		account = *picked
 	} else {
-		var err error
-		placementCandidates := availableAccounts
-		if provider == accounts.ProviderClaude && previousAccountID == "" {
-			// Use the quota information already in the scheduler for NEW
-			// sessions. Preserve forced/preferred picks and all sticky
-			// reassignment decisions made above.
-			placementCandidates = claudeNewSessionCandidatesFromScores(base, scheduler, availableAccounts, poolModel)
+		state := "new"
+		if hasAssignment {
+			// The pinned account is gone from the pool.
+			state = "account_gone"
 		}
-		account, err = pickPlacement(placementCandidates)
+		// placeableAccounts as at the sticky site above (PATCHES section 28).
+		placement, err := s.placeForSession(scheduler, placeableAccounts(availableAccounts, func(candidate accounts.Account) bool {
+			return selectionRefusesAccount(provider, scheduler, candidate)
+		}), options.crossPool, state)
 		if err != nil {
-			return accounts.Account{}, sessionID, userEmail, err
+			return accounts.Account{}, sessionID, userEmail, routingCapacity{}, err
+		}
+		account = placement.Account
+	}
+	// Machine-sharing policy. Selection sorts refused accounts last rather than
+	// dropping them, so a refusal here means every candidate was refused.
+	//
+	// Unlike the scheduler's usage view -- which is a hint and must never gate,
+	// because stale scores produced bogus "no usable accounts" 503s -- binding
+	// and lease state is local, authoritative, and cheap to read. It can gate.
+	// But only in enforce mode, and only after a week of observation.
+	if reason, refused := scheduler.MachineRefusal(account); refused {
+		if s.Logger != nil {
+			s.Logger.Info("machine sharing decision",
+				"mode", string(s.MachinePolicy.Mode),
+				"enforced", s.MachinePolicy.Enforcing(),
+				"machine", machineID,
+				"account", account.ID,
+				"provider", string(account.Provider),
+				"reason", reason,
+			)
+		}
+		if s.MachinePolicy.Enforcing() {
+			return accounts.Account{}, sessionID, userEmail, routingCapacity{},
+				fmt.Errorf("no account available to this machine: %s", reason)
 		}
 	}
-	if account.AuthMode == accounts.AuthModeOAuth && provider == accounts.ProviderClaude && scheduler.Exhausted(schedulerAccountProvider(account.Provider), account.ID) {
-		fallback, ok := s.pickClaudeExtraUsageFallbackForRequest(scheduler, availableAccounts, poolModel)
-		if !ok {
-			return accounts.Account{}, sessionID, userEmail, s.poolExhaustedError(provider, availableAccounts, poolModel)
+	// Record real usage, not considered options: this renews the lease and
+	// refreshes or creates the binding. A side request is served, not placed,
+	// so it binds nothing.
+	if s.MachinePolicy.Active() && machineID != "" && !options.sideChannel {
+		if isNew := s.MachinePolicy.Note(account.Provider, account.ID, machineID); isNew && s.Logger != nil {
+			s.Logger.Info("machine bound to account",
+				"machine", machineID,
+				"account", account.ID,
+				"provider", string(account.Provider),
+				"bindings", len(s.MachinePolicy.Bindings(account.Provider, account.ID)),
+				"cap", selectacct.MaxMachinesPerAccount,
+			)
 		}
-		// Paid fallback may choose a different account. Its reservation must
-		// follow that account rather than leave load attached to the rejected pick.
-		if fallback.ID != account.ID {
-			placementReservation.Release()
-			placementReservation = nil
-		}
-		account = fallback
+	}
+	// Pick only lands on an evicted account when nothing else is left. A spent
+	// Claude window is refused outright; so, for every provider, is an account
+	// inside its owner's holdout -- no session may START there. There is no
+	// paid-overage substitute here: upstream's Claude extra-usage fallback
+	// (2269757) is deliberately not wired into selection.
+	if selectionRefusesAccount(provider, scheduler, account) {
+		return accounts.Account{}, sessionID, userEmail, routingCapacity{}, s.poolExhaustedError(provider, availableAccounts, poolModel)
 	}
 	if account.AuthMode == accounts.AuthModeAPIKey && provider == accounts.ProviderClaude &&
 		scheduler.Exhausted(schedulerAccountProvider(account.Provider), account.ID) {
 		// Selection tiers rank a held-out key last, so picking one means
 		// every Claude account is spent. Answer the pool-exhausted 503 now
 		// rather than forwarding a request Anthropic will reject with a
-		// billing 400 the client cannot fall back on.
-		return accounts.Account{}, sessionID, userEmail, s.poolExhaustedError(provider, availableAccounts, poolModel)
+		// billing 400 the client cannot fall back on (upstream #569/#598).
+		return accounts.Account{}, sessionID, userEmail, routingCapacity{}, s.poolExhaustedError(provider, availableAccounts, poolModel)
 	}
 	if account.AuthMode == accounts.AuthModeOAuth && !scheduler.UsableForNewSession(schedulerAccountProvider(account.Provider), account.ID) && s.Logger != nil {
 		// Never refuse here based on the scheduler's view. Usage scores can be
@@ -9351,9 +12818,44 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 		s.Logger.Warn("selected OAuth account below new-session headroom; routing optimistically",
 			"provider", provider,
 			"account", account.ID,
-			"exhausted", scheduler.Exhausted(schedulerAccountProvider(account.Provider), account.ID),
-			"threshold", selectacct.MinNewSessionHeadroom)
+			"exhausted", scheduler.Exhausted(schedulerAccountProvider(account.Provider), account.ID))
 	}
+	if options.sideChannel {
+		// Served on this pick and placed nowhere: the conversation's first
+		// model turn makes its own pick. A zero capacity keeps the comparator
+		// from moving the conversation on a side request's behalf.
+		return account, sessionID, userEmail, routingCapacity{}, nil
+	}
+	// Below the new-session floor means this pick is draining the pool rather
+	// than spending it -- the endgame widening will hand back an account at 1%
+	// quite happily. Computed here because `scheduler` is the ForModel-narrowed
+	// one; asking a fresh Scheduler later defaults unknown accounts to fully
+	// healthy (selectacct/scheduler.go:524) and silently answers "fine".
+	//
+	// The headroom NUMBER travels with the verdict because the floor alone
+	// cannot answer "is the peer pool meaningfully healthier than this one?".
+	// One measurement, one implementation. This was a duplicate of
+	// routingCapacityFor that drifted the moment a field was added to only one
+	// of them: Score was set on the sticky path and omitted here, so every
+	// FRESH session carried an empty Score.AccountID, tripped the old
+	// two-candidate peer decision's warm-session guard, and could never spill
+	// -- exactly inverted from the bug that guard was written to fix.
+	capacity := s.routingCapacityFor(base, scheduler, account)
+	if options.crossPool != nil && !options.crossPool.rankedAlready() {
+		// Placed without the pool-wide ranking -- a caller's preferred
+		// account -- it still competes with every eligible peer account, as
+		// it always did against the peer's best before §31.
+		state := "new"
+		if hasAssignment {
+			state = "cold"
+		}
+		if _, err := s.placeForSession(scheduler, []accounts.Account{account}, options.crossPool, state); err != nil {
+			options.crossPool.invalidate()
+		}
+	}
+	// Why the session leaves the account it held, for the move log and the
+	// pending commit (upstream #532). The move rules themselves are the
+	// fork's (PATCHES §20, §21, §27, §31); this only names them.
 	moveReason := accountMovePlacement
 	if previousAccountID != "" {
 		if scheduler.Exhausted(schedulerAccountProvider(provider), previousAccountID) {
@@ -9364,143 +12866,168 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 			moveReason = accountMoveRetention
 		}
 	}
-	if options.placementReservation != nil && s.SchedulerRef != nil {
-		if placementReservation == nil {
-			_, reservation, reserveErr := s.SchedulerRef.PickAndReserveContext(r.Context(), scheduler, SchedulerAccounts([]accounts.Account{account}))
-			if reserveErr != nil {
-				return accounts.Account{}, sessionID, userEmail, reserveErr
-			}
-			placementReservation = reservation
-		}
-		*options.placementReservation = placementReservation
-		placementReservation = nil // The caller now commits or releases it.
+	if previousAccountID != "" && previousAccountID != account.ID && s.SchedulerRef != nil {
+		// Placement statistics (upstream #388): selection released a sticky
+		// session from its account. Counted when decided, as upstream does,
+		// whether or not the move is later committed; it decides nothing.
+		s.SchedulerRef.NoteStickyEviction(schedulerAccountProvider(provider), previousAccountID)
 	}
 	if options.pendingSessionCommit != nil && previousAccountID != "" && previousAccountID != account.ID {
+		// Moving an existing session is provisional: the caller commits it
+		// (compare-and-swap against previousAccountID) only once the new
+		// account has answered 2xx, so a failed move leaves the session where
+		// its cache is. A turn the peer ends up serving never commits it.
 		*options.pendingSessionCommit = true
 		if options.pendingSessionMoveReason != nil {
 			*options.pendingSessionMoveReason = moveReason
 		}
 		s.logAccountMove(agentType, sessionID, model, previousAccountID, account.ID, provider, moveReason, &scheduler, true)
-		return account, sessionID, userEmail, nil
+		return account, sessionID, userEmail, capacity, nil
 	}
 	s.logAccountMove(agentType, sessionID, model, previousAccountID, account.ID, provider, moveReason, &scheduler, false)
 	assignment, err := s.Sessions.Put(agentType, sessionID, account.ID, userEmail)
 	if err != nil {
-		if options.placementReservation != nil && *options.placementReservation != nil {
-			(*options.placementReservation).Release()
-			*options.placementReservation = nil
-		}
-		return accounts.Account{}, sessionID, userEmail, err
+		return accounts.Account{}, sessionID, userEmail, routingCapacity{}, err
 	}
-	if moveReason == accountMoveCapacity && previousAccountID != "" {
-		s.softMoveState.note(session.ScopedSessionKey(agentType, sessionID), time.Now())
-	}
-	if previousAccountID == "" {
+	if previousAccountID == "" && s.SchedulerRef != nil {
+		// Placement statistics (upstream #388); they decide nothing.
 		s.SchedulerRef.NotePlacement(schedulerAccountProvider(account.Provider), account.ID, placementPool(base, provider, poolModel))
 	}
-	return account, sessionID, assignment.UserEmail, nil
+	return account, sessionID, assignment.UserEmail, capacity, nil
 }
 
-func claudeExtraUsageEligible(score selectacct.Score) bool {
-	return score.ClaudeExtraUsageEnabled && score.ClaudeExtraUsageKnown && score.ClaudeExtraUsageRemaining > 0
+// selectionRefusesAccount is selection's one hard refusal: an OAuth account
+// whose Claude window is spent, or (any provider) one inside its owner's
+// holdout. Everything softer is a ranking hint, never a gate.
+func selectionRefusesAccount(provider accounts.Provider, scheduler selectacct.Scheduler, account accounts.Account) bool {
+	if account.AuthMode != accounts.AuthModeOAuth {
+		return false
+	}
+	scoreProvider := schedulerAccountProvider(account.Provider)
+	return (provider == accounts.ProviderClaude && scheduler.Exhausted(scoreProvider, account.ID)) ||
+		scheduler.InHoldout(scoreProvider, account.ID)
 }
 
-// pickClaudeExtraUsageFallback returns the funded paid-usage account with the
-// most remaining balance, only when every Claude subscription account in the
-// candidate pool is unusable for this request: exhausted on its 5h window,
-// its weekly window, or the request's model pool. Extra usage is tier 3 of
-// the Claude cost order (see claude_cost_tiers.go): a 5h-only cooldown still
-// reaches it, because the alternative is the client's paid Bedrock route, not
-// a free wait. The funded account must be unusable too, or it would serve the
-// request from plan quota anyway. Only a known positive remaining balance
-// under the account's own monthly limit authorizes paid use.
-func pickClaudeExtraUsageFallback(scheduler selectacct.Scheduler, candidates []accounts.Account) (accounts.Account, bool) {
-	var best accounts.Account
-	bestRemaining := -1.0
-	seenSubscription := false
-	for _, candidate := range candidates {
-		if accountProviderOrCodex(candidate) != accounts.ProviderClaude || candidate.AuthMode != accounts.AuthModeOAuth {
-			continue
-		}
-		seenSubscription = true
-		if !scheduler.Exhausted(accounts.ProviderClaude, candidate.ID) {
-			return accounts.Account{}, false
-		}
-		score := scheduler.ScoreFor(accounts.ProviderClaude, candidate.ID)
-		if claudeExtraUsageEligible(score) && score.ClaudeExtraUsageRemaining > bestRemaining {
-			best = candidate
-			bestRemaining = score.ClaudeExtraUsageRemaining
+// placeableAccounts is the candidate set for a NEW placement -- a session with
+// no account yet, one leaving an evicted account, a failover, a preference --
+// without the Claude accounts whose credential store is in a silent streak
+// (agentclaude.CredentialStoreNotAnswering). Such an account keeps its score,
+// since its reads reached no verdict, and a kept score used to keep drawing
+// new sessions onto a store that would not answer: each waited on the read and
+// then answered 502 or went to the peer, turn by turn -- probed, 5 of 5 new
+// sessions over 55 minutes while the next account sat idle.
+//
+// It is eligibility only, local to this pick. Nothing is marked, zeroed or
+// evicted; the scheduler, the published status and every warm pin are
+// untouched, so a warm session keeps its account through the silence (P8),
+// and the first read that answers -- a warm turn, a sweep -- makes the account
+// placeable again. When every candidate is silent the set is returned whole:
+// a new session is then placed as before and answers the same marked 502, the
+// peer's cue to serve it, rather than a local "no accounts" refusal.
+//
+// The same holds when every account whose store answers would be REFUSED by
+// the caller's hard gate (refused: selection's spent-window/holdout refusal,
+// or Evicted on a failover). The pick ranks refused accounts last but still
+// returns one, and the caller then answers "no non-exhausted claude accounts"
+// -- so dropping the silent ones from [a silent, b 5h-spent] turned a session
+// that a could have served into a 503. A silent store is only a preference
+// against an account; a refusal is a gate. Silent accounts are dropped only
+// while at least one answering candidate passes that gate; otherwise the
+// whole set is offered and the silent account gets its chance, which is also
+// the read that ends its streak if the store has recovered.
+//
+// Each account's streak is read ONCE, and the count and the filter both use
+// that reading. They used to read it twice, and a warm turn, a sweep or a
+// reload on another goroutine can start a streak between the two: the count
+// saw b answering, so the silent a was dropped, and the filter then dropped
+// b as well, handing the pick an empty set -- `no claude accounts`, a 503 --
+// in 17,823 of 5.77M calls under a concurrent reader (review r4, R4-1). With
+// one reading the set always holds the answering account the count saw.
+//
+// Crosspool's forced-vs-transient classifier (D4b) must read none of this as a
+// verdict: an account skipped here is not Evicted and not gone, a targeted turn
+// at it still reaches its own refresh and comes back refresh_no_verdict, and a
+// hold on it is kept. Only ErrCredentialUnavailable is forced. A peer that
+// ranks this daemon's accounts for new sessions may skip a silent one the same
+// way, and for the same reason only.
+func placeableAccounts(candidates []accounts.Account, refused func(accounts.Account) bool) []accounts.Account {
+	notAnswering := make([]bool, len(candidates))
+	silent, answeringUsable := 0, 0
+	for i, account := range candidates {
+		notAnswering[i] = credentialStoreNotAnswering(account)
+		if notAnswering[i] {
+			silent++
+		} else if !refused(account) {
+			answeringUsable++
 		}
 	}
-	return best, seenSubscription && bestRemaining > 0
+	if silent == 0 || answeringUsable == 0 {
+		return candidates
+	}
+	out := make([]accounts.Account, 0, len(candidates)-silent)
+	for i, account := range candidates {
+		if !notAnswering[i] {
+			out = append(out, account)
+		}
+	}
+	return out
 }
 
-// pickClaudeExtraUsageFallbackForRequest applies request-time controller
-// exclusions before considering Claude extra usage. An exhausted account
-// can have an extra-usage balance while still being held out by a live
-// upstream rejection; selecting it would bypass the controller's cooldown.
-func (s Server) pickClaudeExtraUsageFallbackForRequest(
-	scheduler selectacct.Scheduler,
-	candidates []accounts.Account,
-	poolModel string,
-) (accounts.Account, bool) {
-	if s.SchedulerRef == nil && s.admission == nil {
-		return pickClaudeExtraUsageFallback(scheduler, candidates)
+// evictionCause is Scheduler.Evicted as the switch table's evidence: the
+// spent window or the owner's holdout, "" when the account is not evicted.
+func evictionCause(scheduler selectacct.Scheduler, account accounts.Account) string {
+	provider := schedulerAccountProvider(account.Provider)
+	switch {
+	case !scheduler.Evicted(provider, account.ID):
+		return ""
+	case scheduler.Exhausted(provider, account.ID):
+		return selectacct.VerdictExhausted
+	default:
+		return selectacct.VerdictHoldout
 	}
+}
+
+func credentialStoreNotAnswering(account accounts.Account) bool {
+	return account.Provider == accounts.ProviderClaude && account.AuthMode == accounts.AuthModeOAuth &&
+		account.Source != "" && agentclaude.CredentialStoreNotAnswering(account.Source)
+}
+
+// routingCapacityFor is the same measurement the post-selection path builds,
+// factored out so the sticky path can report a pinned account honestly instead
+// of returning a zero value.
+//
+// numbers from the ForModel-narrowed scheduler, freshness and the weekly window
+// from the base one -- each from the only place that holds it.
+func (s Server) routingCapacityFor(base, scheduler selectacct.Scheduler, account accounts.Account) routingCapacity {
+	score := scheduler.ScoreFor(account.Provider, account.ID)
+	headroom := score.Headroom
+	if score.ShortHeadroom < headroom {
+		headroom = score.ShortHeadroom
+	}
+	baseScore := base.ScoreFor(account.Provider, account.ID)
 	now := time.Now()
-	eligible := make([]accounts.Account, 0, len(candidates))
-	for _, candidate := range candidates {
-		provider := schedulerAccountProvider(candidate.Provider)
-		if _, blocked := s.SchedulerRef.ExplicitBlockedUntilFor(provider, candidate.ID, poolModel, now); blocked {
-			continue
-		}
-		if s.admission.paused(admissionKeyFor(provider, candidate.ID, poolModel), now) {
-			// A transient pause is not proof that plan quota is cooked. Keep
-			// a paused healthy subscription from unlocking paid extra usage,
-			// while allowing another funded account when quotas really are out.
-			if !scheduler.Exhausted(provider, candidate.ID) {
-				return accounts.Account{}, false
-			}
-			continue
-		}
-		eligible = append(eligible, candidate)
+	pace, paceOK := baseScore.WeeklyPace(now)
+	secondsToRefresh, refreshOK := baseScore.SecondsToWeeklyReset(now)
+	return routingCapacity{
+		BelowFloor:       !scheduler.UsableForNewSession(account.Provider, account.ID),
+		Headroom:         headroom,
+		Pace:             pace,
+		PaceOK:           paceOK,
+		Endgame:          baseScore.BurndownCause(now) != "",
+		WeeklyOnly:       baseScore.WeeklyOnly,
+		SecondsToRefresh: secondsToRefresh,
+		RefreshOK:        refreshOK,
+		Known:            baseScore.Fresh,
+		// The whole score, so the local/remote decision runs the same
+		// comparator selection just ran instead of re-deriving a worse one.
+		// Headroom comes off the narrowed scheduler, everything else off base.
+		Score: func() selectacct.Score {
+			merged := baseScore
+			merged.Headroom = headroom
+			merged.ShortHeadroom = score.ShortHeadroom
+			return merged
+		}(),
 	}
-	return pickClaudeExtraUsageFallback(scheduler, eligible)
-}
-
-// claudeExtraUsageResponseAllowed is the request-time guard for a 200 that
-// Anthropic served from extra usage on a rejected account. It is accepted only
-// in the state where routing would choose extra usage itself: this account
-// and every other subscription are unusable for the request, and no Claude
-// API key (tier 2) could take it instead. Otherwise the request fails over
-// to the cheaper tier.
-func (s Server) claudeExtraUsageResponseAllowed(ctx context.Context, accountID, poolModel string) bool {
-	if s.SchedulerRef == nil {
-		return false
-	}
-	scheduler := s.scheduler().ForModel(poolModel)
-	current := scheduler.ScoreFor(accounts.ProviderClaude, accountID)
-	if !claudeExtraUsageEligible(current) || !scheduler.Exhausted(accounts.ProviderClaude, accountID) {
-		return false
-	}
-	pool := filterAccountsForProvider(s.accountListContext(ctx), accounts.ProviderClaude)
-	if s.claudeAPIKeyCandidateAvailable(scheduler, pool, poolModel) {
-		return false
-	}
-	seenCurrent := false
-	for _, candidate := range pool {
-		if candidate.AuthMode != accounts.AuthModeOAuth {
-			continue
-		}
-		if candidate.ID == accountID {
-			seenCurrent = true
-			continue
-		}
-		if !scheduler.Exhausted(accounts.ProviderClaude, candidate.ID) {
-			return false
-		}
-	}
-	return seenCurrent
 }
 
 type accountMoveReason string
@@ -9538,8 +13065,8 @@ func (s Server) logAccountMove(agentType, sessionID, model, fromAccountID, toAcc
 	} else {
 		fields = append(fields,
 			"from_exhausted", scheduler.Exhausted(schedulerAccountProvider(provider), fromAccountID),
-			"from_usable_for_sticky_session", scheduler.UsableForStickySession(schedulerAccountProvider(provider), fromAccountID),
-			"retention_threshold", selectacct.MinStickyRetentionHeadroom,
+			"from_evicted", scheduler.Evicted(schedulerAccountProvider(provider), fromAccountID),
+			"from_in_holdout", scheduler.InHoldout(schedulerAccountProvider(provider), fromAccountID),
 		)
 	}
 	s.Logger.Warn("session moved to another account; upstream prompt cache is cold", fields...)
@@ -9561,6 +13088,76 @@ func (s Server) logStickyReuse(agentType, sessionID string, account accounts.Acc
 	)
 }
 
+// warmSessionIdleTTL is how long a session must go untouched before it may be
+// moved to a different account. The owner's rule (PATCHES §20, §21) holds for
+// BOTH providers: a warm session -- a turn in flight, its last turn inside this
+// window, or unseen since a restart this recent -- keeps its account until it
+// is forced off (a spent 5h or weekly window, the holdout). Nothing softer (a
+// burn projection, a ranking, a side request, a transient error) moves it.
+//
+// The window is sized for Claude's prompt cache. On a Claude subscription, Claude Code requests the one-hour prompt-cache TTL
+// automatically, and every cache hit resets that timer -- so a session in use
+// never goes cold and only a genuinely dormant one does. Caches are isolated
+// between organisations and each pool account is its own organisation, so a
+// migration is always a total cache miss rather than a partial one. It is the
+// hour itself, with no margin (owner, 2026-11-19: "I'd rather they go
+// unlinked at 60"): this idle clock starts when a turn ends and the cache's
+// clock at that turn's cache read, so a session idle an hour here has a cache
+// at least an hour old. Measured: no expiry miss in 335 one-hour pairs up to 58
+// minutes (PATCHES §67). A stranded chat gives up on the same clock
+// (DefaultStrandedGiveUp).
+const warmSessionIdleTTL = 60 * time.Minute
+
+// sessionIdle reports how long a session (either provider) has gone without a
+// locally served turn. known=false means there is no evidence either way, which
+// callers must read as possibly-warm.
+func (s Server) sessionIdle(agentType, sessionID string) (time.Duration, bool) {
+	idle, seen := s.ActiveSessions.IdleSince(agentType, sessionID)
+	if seen {
+		return idle, true
+	}
+	// This process has observed no turn: lastSeen is in-memory and a restart
+	// wipes it. The assignment's UpdatedAt is NOT a substitute -- it is when
+	// the session was last ASSIGNED, not last used, so a session placed 48h
+	// ago and busy every minute read as 48h idle after every deploy, and the
+	// owner's rule (a warm session moves only on eviction) was broken for
+	// every live conversation at once.
+	//
+	// What IS known: any turn since this process started would have been
+	// seen. Once the process has run for a full idle bound, an unseen session
+	// is genuinely idle at least that long. Before that, it may have taken a
+	// turn just before the restart, so it reads as possibly-warm. Misreading
+	// a cold session as warm only keeps it where it is; misreading a warm one
+	// as cold throws away its cache.
+	if uptime, ok := s.ActiveSessions.Uptime(); ok && uptime >= warmSessionIdleTTL {
+		return uptime, true
+	}
+	return 0, false
+}
+
+// sessionWarm reports whether a session (either provider) is still warm on its
+// account: a turn in flight, a turn inside warmSessionIdleTTL, or no evidence
+// at all.
+func (s Server) sessionWarm(agentType, sessionID string) bool {
+	if s.activeSession(agentType, sessionID) {
+		return true
+	}
+	idle, known := s.sessionIdle(agentType, sessionID)
+	return !known || idle < warmSessionIdleTTL
+}
+
+// sharedCodexFallbackBucket reports the one sticky key every keyless Codex
+// request shares: session.StickySessionID collapses each client's
+// `fallback:<hash>` into codex:fallback (it keeps the identity calls -- wham,
+// plugins -- on one account). That bucket is not a conversation, so one
+// client's keyless turn must not make every other client's keyless turn warm:
+// it would glue the bucket to a burn-refused account and hide it from the peer
+// comparator. Claude does not collapse its fallback keys -- each is one
+// client's session -- and they stay under the warm rule.
+func sharedCodexFallbackBucket(agentType, sessionID string) bool {
+	return session.ScopedSessionKey(agentType, sessionID) == "codex:fallback"
+}
+
 func (s Server) touchSessionBestEffort(agentType, sessionID string) {
 	if s.Sessions == nil {
 		return
@@ -9574,113 +13171,205 @@ func (s Server) touchSessionBestEffort(agentType, sessionID string) {
 	}
 }
 
-// providerSelectionPolicy states, per provider, how session routing treats
-// the account that already holds a session's upstream prompt cache. Add one
-// entry when onboarding a provider; every knob defaults to false, which is
-// the safest choice for a provider whose cache and quota economics are
-// unknown: sessions stay on their account unconditionally short of
-// exhaustion, and exhaustion-driven moves keep their existing semantics.
-// Placement spreading needs no entry here at all — Scheduler.Pick spreads
-// within equal-pressure bands for every provider, and the provider's own
-// usage windows (whether they carry reset-time pressure) decide how wide a
-// band gets.
-type providerSelectionPolicy struct {
-	// retentionFloorGated: an idle session leaves its account once the
-	// account's measured headroom falls below MinStickyRetentionHeadroom.
-	// Codex sets this (#216): its per-account prompt cache makes moving
-	// expensive, but holding a session on a truly empty account is worse.
-	retentionFloorGated bool
-	// constrainedMoveGated: when a session must consider leaving, the move
-	// happens only for a materially better target (see
-	// keepConstrainedStickyAssignment). Codex sets this to stop
-	// constrained-pool ping-pong. Claude must NOT set it: a Claude session
-	// only reaches the constrained branch when its account is exhausted, and
-	// for fable an exhausted pool has to surface a selection failure so the
-	// Bedrock fallback chain runs instead of a keep.
-	constrainedMoveGated bool
+// reuseStickyAssignment is the warm-session rule (PATCHES sections 20 and 21):
+// a WARM session, of either provider, keeps its account unless that account is
+// EVICTED -- a spent window or the owner's holdout (Scheduler.Evicted) -- or,
+// for Codex, CAPACITY-EVICTING (PATCHES section 27). The warm check runs before
+// anything provider-specific, so no retention gate below ever sees a warm
+// session. What happens to a COLD one is the provider's row of
+// providerSelectionPolicies (selection_policy.go).
+//
+// Capacity eviction is upstream's rule, taken as written on the owner's
+// 2026-09-28 decision: an account that answered "model at capacity" for the
+// request's (model, service tier) pool CapacityStickyEvictFailures (2) times in
+// a row, with the mark still live, releases even an active or warm session.
+// One failure never does -- the mark only ranks -- and the account's first
+// success resets the count. A released session still moves only when
+// keepCapacityEvictedSession finds an account that is not shedding the pool
+// and can hold the session; otherwise it stays, cache intact. Marks exist only
+// for Codex and only with the overload failover on, so Claude, and Codex with
+// the failover off, see exactly the warm rule above.
+//
+// Only a COLD session reaches the softer checks. A cold OAuth session of
+// either provider -- idle past warmSessionIdleTTL, or a delegated one whose
+// peer hold lapsed on that same bound -- re-ranks across every pool
+// (migrateIdleSessionAcross, owner rule P9). The shared keyless
+// codex:fallback bucket, which is never warm but rarely stale, reads
+// UsableForStickySession between turns: the same eligibility predicate as a
+// new session, on the MEASURED score, so live debits between refreshes cannot
+// push a 30%-headroom account under the floor and move it (upstream 1a1fcee).
+func (s Server) reuseStickyAssignment(agentType, sessionID string, account accounts.Account, scheduler selectacct.Scheduler, availableAccounts []accounts.Account) bool {
+	return s.reuseStickyAssignmentAcross(agentType, sessionID, account, scheduler, availableAccounts, nil)
 }
 
-var providerSelectionPolicies = map[accounts.Provider]providerSelectionPolicy{
-	accounts.ProviderCodex:  {retentionFloorGated: true, constrainedMoveGated: true},
-	accounts.ProviderClaude: {},
-}
-
-func selectionPolicyFor(account accounts.Account) providerSelectionPolicy {
-	return providerSelectionPolicies[accountProviderOrCodex(account)]
-}
-
-func (s Server) reuseStickyAssignment(agentType, sessionID string, account accounts.Account, scheduler selectacct.Scheduler) bool {
-	if scheduler.Exhausted(schedulerAccountProvider(account.Provider), account.ID) {
+// reuseStickyAssignmentAcross is reuseStickyAssignment with the turn's
+// cross-pool ranking, so a cold session its provider re-ranks is ranked
+// against every peer account too (P9). It decides only WHETHER the session
+// leaves; the per-provider cold rules are the providerSelectionPolicy table
+// (selection_policy.go).
+func (s Server) reuseStickyAssignmentAcross(agentType, sessionID string, account accounts.Account, scheduler selectacct.Scheduler, availableAccounts []accounts.Account, ranking *crossPoolRanking) bool {
+	// What evicts a warm session: its account spent a window or reached the
+	// owner's holdout. Nothing softer -- a burn projection, a ranking, a
+	// single transient error -- moves it.
+	if scheduler.Evicted(schedulerAccountProvider(account.Provider), account.ID) {
 		return false
 	}
+	// The one owner-approved exception (PATCHES section 27): the account keeps
+	// shedding this model's requests -- two consecutive capacity failures in
+	// the request's pool, mark still live. Release the session so selection
+	// can move it if the pool has an account that is not shedding
+	// (keepCapacityEvictedSession keeps it otherwise). Upstream's position:
+	// after the hard gate, before activity, so it applies to warm and active
+	// sessions alike. Inert without marks (no failover, no failures, Claude).
 	if scheduler.CapacityEvicting(schedulerAccountProvider(account.Provider), account.ID) {
-		// The account keeps shedding this model's requests: let the
-		// session move if the pool has an account that is not.
 		return false
 	}
-	if s.activeSession(agentType, sessionID) {
+	// Warm keeps its account, for both providers. Codex used to skip this and
+	// re-pick on the 5h burn projection between turns: measured 2026-09-17..24,
+	// 3,700 moves in 39,404 calls for one user, a median 15 s after the
+	// previous call and 1,806 of them straight back.
+	if sharedCodexFallbackBucket(agentType, sessionID) {
+		// Not a conversation, so never warm: the pre-merge cold Codex rule, where
+		// only a turn in flight keeps the account.
+		if s.activeSession(agentType, sessionID) {
+			return true
+		}
+	} else if s.sessionWarm(agentType, sessionID) {
 		return true
 	}
-	if selectionPolicyFor(account).retentionFloorGated && account.AuthMode == accounts.AuthModeOAuth {
-		// Retention, not placement: this session already built the upstream
-		// prompt cache on this account. Gating it on the new-session threshold
-		// moved every idle session off any account past 60% used, which in a
-		// busy pool is all of them, so stickiness stopped existing exactly
-		// when the pool could least afford re-billing whole prefixes.
+	if account.AuthMode != accounts.AuthModeOAuth {
+		return true
+	}
+	policy := selectionPolicyFor(account)
+	// A STALE session -- idle a full warmSessionIdleTTL, so its upstream cache
+	// is gone -- re-ranks across every pool (owner rule P9), for every provider
+	// whose row says coldRerank. The ranking alone decides: a stale session on
+	// an account that still passes the retention floor moves when another local
+	// account or a peer account outranks it, and one below the floor stays when
+	// nothing does (placeAcrossPools already demotes it). Past the warm check a
+	// conversation key is always stale (sessionWarm reads unknown as warm); the
+	// one key that reaches here WITHOUT being stale is Codex's shared keyless
+	// bucket, which is never warm and so falls through to the retention floor.
+	if policy.coldRerank {
+		if idle, known := s.sessionIdle(agentType, sessionID); known && idle >= warmSessionIdleTTL {
+			return !s.migrateIdleSessionAcross(agentType, sessionID, account, scheduler, availableAccounts, ranking)
+		}
+	}
+	if policy.retentionFloorGated {
+		// Not stale (the keyless bucket between turns): the account must still
+		// take a new session, judged on the measured score (T1) rather than the
+		// live-debited one, so live debits between refreshes cannot push a
+		// healthy account under the floor and move the bucket off it. Never
+		// reached by a warm session: the owner's rule above wins.
 		return scheduler.UsableForStickySession(schedulerAccountProvider(account.Provider), account.ID)
 	}
 	return true
 }
 
-// minStickyMoveHeadroomGain is how much more measured headroom a destination
-// account must have before a constrained sticky session moves there. Moving
-// drops the session's per-account upstream prompt cache and re-bills the
-// whole conversation prefix as uncached input, so trading a nearly-empty
-// account for an almost-as-empty one is pure loss.
-const minStickyMoveHeadroomGain = 0.10
-
-// keepConstrainedStickyAssignment reports whether a Codex session whose
-// account fell below the sticky-retention floor should stay there anyway
-// because the pool offers nothing materially better. Overnight before
-// 2026-08-18 every account sat below the retention floor, so every request
-// rerouted its session to an equally-drained account and Pick shuffled the
-// destinations: 26,165 moves in one day, peaking at 8,043 in one hour, each
-// one re-billing a cached prefix. A move is worth that price only when the
-// destination could itself retain the session (at or above the retention
-// floor) AND offers materially more room than the current account; an
-// exhausted account is different — anything non-exhausted beats it. The
-// retention floor itself is unchanged.
+// migrateIdleSession decides whether a dormant session should be re-picked
+// (reuseStickyAssignment calls it for stale OAuth sessions of both providers). Pick already ranks by weekly pace, local preference, the weekly
+// reserve and session spread, but it only runs for sessions with no assignment:
+// a bound session keeps its account until that account is fully exhausted, so a
+// long-lived session sits wherever it happened to land on its first turn and
+// ignores every signal the ranking exists to express.
 //
-// The headroom comparison reads measured scores (ScoreFor), not live-debited
-// ones: the debit floors a busy account's headroom at 0.01, which would veto
-// every destination under load even when it has real room. Non-Codex
-// providers keep their existing move-on-constraint behaviour, including the
-// Claude fable path whose selection failure triggers the Bedrock fallback.
-func (s Server) keepConstrainedStickyAssignment(scheduler selectacct.Scheduler, current, picked accounts.Account) bool {
-	if !selectionPolicyFor(current).constrainedMoveGated || current.AuthMode != accounts.AuthModeOAuth {
+// Past the idle TTL the binding protects nothing, so the session simply
+// re-ranks: whatever Pick names now is where it goes.
+//
+// This used to be one-directional -- movement only ever toward an account
+// inside its weekly roll window -- on the theory that moving between two steady
+// accounts was churn worth avoiding. Both halves of that were wrong. The cache
+// is already gone by this point, so a move costs nothing to be wrong about; and
+// the two rules stranded sessions in the states the ranking most wants to
+// unwind. Requiring the DESTINATION to be draining pinned idle sessions onto an
+// account already at its endgame concurrency cap, since the comparator demotes a
+// capped account below every routable one and the better destination is a steady
+// account by definition -- the taper could shed load onto new sessions but never
+// off the sessions already sitting there. Refusing to leave a draining SOURCE
+// blocked the move from an account rolling in a day to one rolling in an hour,
+// which is the ordering the comparator states outright.
+//
+// Oscillation is bounded by construction rather than by the direction rule: a
+// session re-ranks only after another full idle TTL, and rankBucket quantizes
+// near-ties so two comparable accounts do not trade sessions on noise.
+func (s Server) migrateIdleSession(agentType, sessionID string, account accounts.Account, scheduler selectacct.Scheduler, availableAccounts []accounts.Account) bool {
+	return s.migrateIdleSessionAcross(agentType, sessionID, account, scheduler, availableAccounts, nil)
+}
+
+// migrateIdleSessionAcross is migrateIdleSession through the ONE cross-pool
+// ranking (PATCHES §31 D7, owner rule P9): with the turn's ranking it weighs
+// every eligible peer account alongside the local ones, so a cold session
+// whose own account is still the best LOCAL one moves to a peer account that
+// outranks it -- the gap where the sticky path returned a zero capacity and
+// the peer comparison read the cold session as warm.
+func (s Server) migrateIdleSessionAcross(agentType, sessionID string, account accounts.Account, scheduler selectacct.Scheduler, availableAccounts []accounts.Account, ranking *crossPoolRanking) bool {
+	idle, known := s.sessionIdle(agentType, sessionID)
+	if !known || idle < warmSessionIdleTTL {
 		return false
 	}
-	if picked.ID == current.ID {
+	placement, err := s.placeForSession(scheduler, availableAccounts, ranking, "cold")
+	if err != nil {
+		return false
+	}
+	if placement.Account.ID == account.ID {
+		// The session's own account is still the best LOCAL one, so locally it
+		// stays -- the turn origin/main never compared with the peer at all
+		// (the P9 gap). A peer account with a verdict may take it now; a legacy
+		// peer, reachable only untargeted and free to place it past a burndown
+		// cap, may not (targetedOnly, D1). The best local account does not
+		// depend on the peers, so this is decided before the answer is used.
+		ranking.targetedPeersOnly()
+		if placement.Peer != nil && placement.Peer.Legacy {
+			if placement, err = s.placeForSession(scheduler, availableAccounts, ranking, "cold"); err != nil {
+				return false
+			}
+		}
+	}
+	if !placement.Local && placement.Peer != nil {
+		if s.Logger != nil {
+			s.Logger.Info("re-ranking idle session",
+				"agent", agentType,
+				"provider", accountProviderOrCodex(account),
+				"session", sessionID,
+				"from_account", account.ID,
+				"to_peer", placement.Peer.Peer.name(),
+				"to_account", placement.Peer.Account,
+				"idle_seconds", int64(idle.Seconds()),
+				"idle_threshold_seconds", int64(warmSessionIdleTTL.Seconds()),
+			)
+		}
 		return true
 	}
-	if scheduler.CapacityEvicting(schedulerAccountProvider(current.Provider), current.ID) &&
-		!scheduler.Exhausted(schedulerAccountProvider(current.Provider), current.ID) {
-		// Leaving costs the prompt cache; worth it only for an account that
-		// is not shedding this pool too and can itself hold the session.
-		return scheduler.CapacityFailures(schedulerAccountProvider(picked.Provider), picked.ID) > 0 ||
-			!scheduler.UsableForStickySession(schedulerAccountProvider(picked.Provider), picked.ID)
+	best := placement.Account
+	if best.ID == account.ID {
+		return false
 	}
-	if scheduler.Exhausted(schedulerAccountProvider(current.Provider), current.ID) {
-		return scheduler.Exhausted(schedulerAccountProvider(picked.Provider), picked.ID)
+	// A re-rank is a placement: it never moves a session INTO an account whose
+	// credential store is not answering (placeableAccounts). It never moves one
+	// OFF such an account either -- the session keeps it, as through any other
+	// trouble that has not reached a verdict.
+	if destination, ok := findAccount(availableAccounts, best.ID); ok && credentialStoreNotAnswering(destination) {
+		return false
 	}
-	currentScore := scheduler.ScoreFor(schedulerAccountProvider(current.Provider), current.ID)
-	pickedScore := scheduler.ScoreFor(schedulerAccountProvider(picked.Provider), picked.ID)
-	currentMin := math.Min(currentScore.Headroom, currentScore.ShortHeadroom)
-	pickedMin := math.Min(pickedScore.Headroom, pickedScore.ShortHeadroom)
-	if pickedMin < selectacct.MinStickyRetentionHeadroom {
-		return true
+	// Pick ranks routable accounts above unusable ones and the account this
+	// session already holds is one of the candidates, so the winner is never
+	// worse-tiered than where it sits today. That leaves one case worth
+	// refusing: a pool where everything is spent, where the move buys nothing.
+	if scheduler.Evicted(schedulerAccountProvider(best.Provider), best.ID) {
+		return false
 	}
-	return pickedMin < currentMin+minStickyMoveHeadroomGain
+	if s.Logger != nil {
+		s.Logger.Info("re-ranking idle session",
+			"agent", agentType,
+			"provider", accountProviderOrCodex(account),
+			"session", sessionID,
+			"from_account", account.ID,
+			"to_account", best.ID,
+			"idle_seconds", int64(idle.Seconds()),
+			"idle_threshold_seconds", int64(warmSessionIdleTTL.Seconds()),
+		)
+	}
+	return true
 }
 
 func (s Server) activeSession(agentType, sessionID string) bool {
@@ -9698,6 +13387,63 @@ func (s Server) allowDrainingProxyRequest(agentType, sessionID string) bool {
 	return ok
 }
 
+// sideChannelRequest reports a request that carries a conversation's key but is
+// not one of its model turns: Codex analytics-events and MCP posts, Claude
+// count_tokens. It may READ the conversation's placement (its pin, its peer
+// hold) and never WRITE it. Measured on the box 2026-09-17..24: 49,724 Codex
+// analytics POSTs on the thread key against 39,407 model turns, and 2,029 of
+// 4,893 account moves were made by them; an unpinned one could also hand the
+// whole thread to the peer with a hold the next turn then followed.
+//
+// Not side, and routed exactly as before:
+//   - `fallback:` keys: not a conversation. Codex collapses them all into one
+//     codex:fallback pin, which is what keeps the identity calls (wham,
+//     plugins) on one account.
+//   - /backend-api/files*: an uploaded file is visible only to the account
+//     that took it, so an upload must keep placing the conversation.
+//   - websocket upgrades and model POSTs (poolModelTurnRequest).
+//   - providers other than Codex and Claude.
+//
+// agentType is deliberately not consulted: a model turn is one because of the
+// pool serving it and the endpoint it hits. Session leases always run as agent
+// "pi", and any client may name its own namespace (X-Subrouter-Agent:
+// opencode, gemini, ...) that providerForAgent sends to the Codex pool; judged
+// by agent name (activeSessionRequest, which only knows codex and claude)
+// every one of their model turns read as side -- never pinned, re-Picked on
+// every turn, the comparator never asked.
+func sideChannelRequest(provider accounts.Provider, agentType, sessionID string, r *http.Request) bool {
+	if provider != accounts.ProviderCodex && provider != accounts.ProviderClaude {
+		return false
+	}
+	if r == nil || sessionID == "" || strings.HasPrefix(sessionID, "fallback:") {
+		return false
+	}
+	if strings.HasPrefix(r.URL.Path, "/backend-api/files") {
+		return false
+	}
+	return !poolModelTurnRequest(provider, r)
+}
+
+// poolModelTurnRequest reports a model turn on the Codex or Claude pool, by the
+// pool and the endpoint alone: a websocket upgrade, or a POST to the pool's
+// model endpoint (Codex responses and compact, Claude messages -- not
+// count_tokens).
+func poolModelTurnRequest(provider accounts.Provider, r *http.Request) bool {
+	if websocket.IsWebSocketUpgrade(r) {
+		return true
+	}
+	if r.Method != http.MethodPost {
+		return false
+	}
+	switch provider {
+	case accounts.ProviderCodex:
+		return codexResponsePath(r.URL.Path)
+	case accounts.ProviderClaude:
+		return claudeMessagesPath(r.URL.Path)
+	}
+	return false
+}
+
 func activeSessionRequest(agentType string, r *http.Request) bool {
 	if r == nil {
 		return false
@@ -9705,10 +13451,28 @@ func activeSessionRequest(agentType string, r *http.Request) bool {
 	if websocket.IsWebSocketUpgrade(r) {
 		return true
 	}
-	if session.NormalizeAgentType(agentType) != "codex" || r.Method != http.MethodPost {
+	if r.Method != http.MethodPost {
 		return false
 	}
-	return codexResponsePath(r.URL.Path)
+	switch session.NormalizeAgentType(agentType) {
+	case "codex":
+		return codexResponsePath(r.URL.Path)
+	case "claude":
+		// Claude turns were invisible here until now, which left
+		// activeSessionCountsByAccount empty for every Claude account and so
+		// held Score.LiveSessions at zero -- making the endgame concurrency
+		// taper unreachable for the provider it was written for.
+		return claudeMessagesPath(r.URL.Path)
+	}
+	return false
+}
+
+// claudeMessagesPath matches the model-invoking Claude endpoints. The match is
+// exact so that siblings under the same prefix, notably
+// /v1/messages/count_tokens, do not read as a turn: counting tokens neither
+// consumes quota nor refreshes the upstream prompt cache.
+func claudeMessagesPath(path string) bool {
+	return path == "/v1/messages" || path == "/messages"
 }
 
 func codexResponsePath(path string) bool {
@@ -9728,40 +13492,55 @@ func codexResponsePath(path string) bool {
 // versa.
 //
 // It runs synchronously. The request path goes through
-// refreshUsageScoresForRequest instead, which only blocks on a true cold start.
-//
-// The refresh runs on a context detached from the caller: a client that
-// disconnects or times out mid-refresh would otherwise cancel every remaining
-// per-account refresh and usage fetch with "context canceled", and
-// FinishRefreshForAccountGeneration still stamps the TTL window, so one impatient client starved
-// the whole pool of fresh scores for another full TTL — repeatedly, under
-// load, which pinned exhausted accounts as exhausted long after their windows
-// reset.
+// refreshUsageScoresForRequest instead, which waits only on a scheduler that
+// has never been scored.
 func (s Server) refreshUsageScoresIfStale(ctx context.Context) {
 	allAccounts, accountGeneration, ok := s.claimUsageScoreRefresh(ctx)
 	if !ok {
 		return
 	}
-	s.runClaimedUsageScoreRefresh(context.WithoutCancel(ctx), allAccounts, accountGeneration)
+	s.runClaimedUsageScoreRefresh(ctx, allAccounts, accountGeneration)
 }
 
-// refreshUsageScoresForRequest is the account-selection entry point. Stale
-// scores that exist are served as they are while one background refresh
-// (singleflighted by the SchedulerRef claim) replaces them, so no request
-// waits on a pool-wide usage sweep. Only a true cold start — the scheduler
-// has never been scored — blocks, bounded by usageScoreRefreshTimeout, since
-// there is nothing to route on yet.
+// refreshUsageScoresForRequest is the request path's refresh (selection, the
+// usage failover's pick, retryAccount). Scores that exist but are older than
+// UsageScoreTTL are served as they are while ONE background refresh replaces
+// them -- the SchedulerRef claim is the single flight -- so no request waits
+// on a pool-wide sweep. Only a ref with no scores to route on sweeps inline
+// (upstream #378; PATCHES section 44): a zero SchedulerRef, or one told to
+// re-score first (SetUpdatedAt(time.Time{}), a redeemed rate-limit reset).
+// An account reload also leaves the scores stale but not absent; see
+// SchedulerRef.Scored. serve seeds scores at start, so in the daemon only the
+// request after a redeemed reset waits.
+//
+// The background sweep is Lifecycle work: graceful shutdown waits for it,
+// and a draining process starts none (Lifecycle.StartBackground).
+//
+// The sweep used to run inline on whichever request found the scores stale:
+// every account's credential read and refresh plus its usage fetch, up to
+// usageScoreRefreshTimeout (60 s). With a 30 s TTL that was one request in
+// every half minute of traffic, and on the laptop the keychain reads alone can
+// take seconds. Exhaustion, credential and capacity marks are request-time
+// overlays, not part of the sweep, so a request routed on the previous scores
+// still avoids every account the upstream has refused since.
 func (s Server) refreshUsageScoresForRequest(ctx context.Context) {
 	if s.CredentialBroker != nil || s.SchedulerRef == nil || !s.SchedulerRef.Stale(s.UsageScoreTTL) {
 		return
 	}
-	if _, blocked := s.allOAuthAccountsWaitingForReset(time.Now()); blocked {
-		// A fresh status probe cannot beat the known provider reset clock.
-		// Keep the saved exhaustion state and avoid request-triggered sweeps.
+	if !s.SchedulerRef.Scored() {
+		s.refreshUsageScoresIfStale(ctx)
 		return
 	}
-	if s.SchedulerRef.UpdatedAt().IsZero() {
-		s.refreshUsageScoresIfStale(ctx)
+	if _, blocked := s.allOAuthAccountsWaitingForReset(time.Now()); blocked {
+		// A fresh status probe cannot beat the known provider reset clock.
+		// Keep the saved exhaustion state and avoid request-triggered sweeps
+		// (upstream #549). After the never-scored check above, so a redeemed
+		// reset still re-scores before routing (PATCHES §44.3).
+		return
+	}
+	if s.Lifecycle.Draining() {
+		// Routes on the scores it has: a sweep started now could outlive the
+		// drain.
 		return
 	}
 	allAccounts, accountGeneration, ok := s.claimUsageScoreRefresh(ctx)
@@ -9769,80 +13548,30 @@ func (s Server) refreshUsageScoresForRequest(ctx context.Context) {
 		return
 	}
 	detached := context.WithoutCancel(ctx)
-	go func() {
+	run := func() {
 		defer func() {
-			// runClaimedUsageScoreRefresh already released the claim; keep a
-			// panic in a background sweep from taking down the process.
+			// runClaimedUsageScoreRefresh has already released the claim; a
+			// panic in a background sweep must not take the process down.
 			if recovered := recover(); recovered != nil && s.Logger != nil {
 				s.Logger.Error("background usage score refresh panicked", "panic", fmt.Sprint(recovered))
 			}
 		}()
 		s.runClaimedUsageScoreRefresh(detached, allAccounts, accountGeneration)
-	}()
-}
-
-// RunUsageScoreRefresher keeps usage scores fresh in the background so idle
-// pools do not go stale and busy pools rarely hand a refresh to a request.
-// Each wake refreshes only when the scores are stale (the same TTL and claim
-// the request path uses, so the two never sweep concurrently), then sleeps
-// until the scores next go stale plus a jitter of up to a tenth of the TTL,
-// which keeps workers and tenants from sweeping upstream in lockstep. It
-// returns when ctx ends or the server starts draining; an in-flight sweep is
-// cancelled with ctx.
-func (s Server) RunUsageScoreRefresher(ctx context.Context) {
-	s.CredentialBroker = normalizedCredentialBroker(s.CredentialBroker)
-	if s.UsageScoreTTL <= 0 || s.SchedulerRef == nil || s.CredentialBroker != nil {
+	}
+	if s.startBackgroundScoreRefresh != nil {
+		s.startBackgroundScoreRefresh(run)
 		return
 	}
-	timer := time.NewTimer(s.nextUsageScoreRefreshDelay())
-	defer timer.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-timer.C:
-		}
-		if s.Lifecycle.Draining() || ctx.Err() != nil {
-			return
-		}
-		if allAccounts, accountGeneration, ok := s.claimUsageScoreRefresh(ctx); ok {
-			s.runClaimedUsageScoreRefresh(ctx, allAccounts, accountGeneration)
-		}
-		timer.Reset(s.nextUsageScoreRefreshDelay())
+	if !s.Lifecycle.StartBackground(run) {
+		// The drain began after the check above. The claim is taken: run it
+		// here, in the handler graceful shutdown already waits for.
+		run()
 	}
 }
 
-func (s Server) nextUsageScoreRefreshDelay() time.Duration {
-	ttl := s.UsageScoreTTL
-	floor := ttl / 10
-	if floor <= 0 {
-		floor = time.Millisecond
-	}
-	if resetAt, blocked := s.allOAuthAccountsWaitingForReset(time.Now()); blocked {
-		// When the entire OAuth pool is exhausted, sleep until the earliest
-		// actual reset instead of waking every 30s to poll the same accounts.
-		// Keep a bounded local recheck so a newly published login is noticed
-		// before its replacement credential waits behind the old reset clock.
-		// The recheck only reads account state and scheduler metadata; it does
-		// not start a provider usage request.
-		const maxAccountResetRecheck = time.Minute
-		recheck := min(ttl, maxAccountResetRecheck)
-		wait := min(max(time.Duration(0), time.Until(resetAt)), recheck)
-		jitter := min(floor, max(time.Duration(0), recheck/10))
-		return wait + time.Second + rand.N(jitter+1)
-	}
-	wait := floor
-	if updatedAt := s.SchedulerRef.UpdatedAt(); !updatedAt.IsZero() {
-		if untilStale := ttl - time.Since(updatedAt); untilStale > wait {
-			wait = untilStale
-		}
-	}
-	return wait + rand.N(floor+1)
-}
-
-// claimUsageScoreRefresh takes the SchedulerRef refresh claim when scores are
-// stale. A true result obliges the caller to run runClaimedUsageScoreRefresh,
-// which releases it.
+// claimUsageScoreRefresh takes the SchedulerRef refresh claim when the scores
+// are stale. A true result obliges the caller to run
+// runClaimedUsageScoreRefresh, which releases it.
 func (s Server) claimUsageScoreRefresh(ctx context.Context) ([]accounts.Account, uint64, bool) {
 	// See reloadAccounts: in team mode refreshing local OAuth accounts rotates
 	// refresh tokens the vault owns, which invalidates them for both sides.
@@ -9876,9 +13605,15 @@ func (s Server) runClaimedUsageScoreRefresh(ctx context.Context, allAccounts []a
 	if scoreAccounts == nil {
 		scoreAccounts = s.scoreAccounts
 	}
-	// Callers pass a context that no request owns (see refreshUsageScoresIfStale);
-	// bound the sweep on its own clock.
-	scoreCtx, cancelScore := context.WithTimeout(ctx, usageScoreRefreshTimeout)
+	// The refresh is claimed by whichever request happened to find the scores
+	// stale. Its context must not be that request's: a client that disconnects
+	// or times out mid-refresh cancels every remaining per-account refresh and
+	// usage fetch with "context canceled", and FinishRefresh still stamps the
+	// TTL window, so one impatient client starves the whole pool of fresh
+	// scores for another full TTL — repeatedly, under load, which pinned
+	// exhausted accounts as exhausted long after their windows reset. Detach
+	// from the caller's cancellation and bound the refresh on its own clock.
+	scoreCtx, cancelScore := context.WithTimeout(context.WithoutCancel(ctx), usageScoreRefreshTimeout)
 	defer cancelScore()
 	scores, scored := scoreAccounts(scoreCtx, availableAccounts)
 	if scored == 0 {
@@ -9893,7 +13628,7 @@ func (s Server) runClaimedUsageScoreRefresh(ctx context.Context, allAccounts []a
 	}
 	scheduler := selectacct.NewScheduler(scores)
 	if s.Sessions != nil {
-		scheduler = scheduler.WithSessionCounts(SchedulerActiveSessionCounts(s.Sessions))
+		scheduler = scheduler.WithSessionCounts(SchedulerSessionCounts(s.Sessions))
 	}
 	finished = true
 	if !s.SchedulerRef.FinishRefreshForAccountGeneration(scheduler, true, accountGeneration) {
@@ -10019,7 +13754,9 @@ func (s Server) codexModelCatalogRoutingRequest(r *http.Request) (*http.Request,
 	if account, ok := s.codexCatalogCallerAccount(r); ok {
 		request := r.Clone(r.Context())
 		request.Header = r.Header.Clone()
-		for _, header := range []string{"X-Subrouter-Account-ID", "X-Subrouter-Account", "X-Subrouter-Model", "X-Model"} {
+		// The target header too: the catalog is never placed, so a peer's
+		// targeted forward must not pin it (PATCHES §31).
+		for _, header := range []string{"X-Subrouter-Account-ID", "X-Subrouter-Account", "X-Subrouter-Target-Account", "X-Subrouter-Model", "X-Model"} {
 			request.Header.Del(header)
 		}
 		// A preference, not a pin: an exhausted caller account or a failed
@@ -10032,6 +13769,7 @@ func (s Server) codexModelCatalogRoutingRequest(r *http.Request) (*http.Request,
 	for _, header := range []string{
 		"X-Subrouter-Account-ID",
 		"X-Subrouter-Account",
+		"X-Subrouter-Target-Account",
 		"X-Subrouter-Model",
 		"X-Model",
 	} {
@@ -10210,22 +13948,76 @@ func (s Server) refreshAccount(ctx context.Context, account accounts.Account) (a
 	return refreshed, err
 }
 
+// refreshSelectedAccount refreshes the account selection chose and, only when
+// that credential is proven dead, fails over to another one. The bool reports
+// a failover: the replacement is provisional, and the caller commits the
+// session to it only once it answers 2xx.
+//
+// Order matters, and it is the one thing a merge of this function must keep:
+//
+//  1. A refresh that reached NO verdict (refreshFailureIsTransient: the
+//     caller's cancel, a deadline, a network error, the token endpoint's
+//     429/5xx) is wrapped in errRefreshTransient and returned first. It marks
+//     nothing and moves nothing; the handler serves that one turn from the
+//     peer without a hold, or answers 502 with X-Subrouter-Transient
+//     (PATCHES section 20). Upstream's terminal-only gate alone would return
+//     these unwrapped, and the handler could no longer tell a blip from a
+//     decline.
+//  2. Only a verdict that the credential cannot serve fails over
+//     (refreshFailureCannotServe: upstream 97599d7's terminal allowlist plus
+//     the fork's missing-profile / missing-token states and Anthropic's
+//     account_on_hold). An unrecognised error is surfaced rather than
+//     spending a healthy account's standing.
 func (s Server) refreshSelectedAccount(ctx context.Context, provider accounts.Provider, agentType, sessionID, userEmail string, r *http.Request, account accounts.Account) (accounts.Account, bool, error) {
 	refreshed, err := s.refreshAccount(ctx, account)
 	if err == nil {
+		// A Claude control-plane call is never answered from a credential
+		// recorded dead (control_plane.go). Read after the refresh, which may
+		// have found a new sign-in in the store.
+		if claudeControlPlaneRequest(provider, r) && session.ExtractAccountID(r) == "" && s.claudeCredentialDead()(refreshed) {
+			return refreshed, false, &controlPlaneIdentityError{State: identityDead, Account: refreshed.ID}
+		}
 		return refreshed, false, nil
 	}
 	if session.ExtractAccountID(r) != "" || account.AuthMode != accounts.AuthModeOAuth {
 		return account, false, err
 	}
-	// A refresh that failed for a transient reason (cancelled context, timeout,
-	// upstream 5xx) says nothing about the credential, so failing over would mark
-	// a healthy account exhausted and hold it out for the credential TTL. Only a
-	// terminal credential error justifies that. This applies to every managed
-	// OAuth source, not only the older Codex and Claude stores: otherwise an
-	// expired Kimi profile with a revoked refresh token aborts before the
-	// response-level failover transport can try another profile.
-	if !isTerminalCredentialError(err) {
+	// A refresh that never reached the account says nothing about it. Failing
+	// over on one used to mark the account exhausted for DefaultExhaustedTTL
+	// and rebind the session -- and, when the CLIENT had hung up, the loop below
+	// re-ran every refresh on the same cancelled context, so a single Esc marked
+	// the whole local pool exhausted (2,725 such marks 2026-09-10..24) and
+	// pushed everything else to the peer. A warm session
+	// moves only when its account is evicted; a failed round trip is not that.
+	if refreshFailureIsTransient(ctx, err) {
+		return account, false, fmt.Errorf("%w: %w", errRefreshTransient, err)
+	}
+	// A peer's target (PATCHES §31) is served by that account or refused, so a
+	// refresh verdict against it never fails over to another one. Checked AFTER
+	// the transient test on purpose: a blip keeps its 502 + X-Subrouter-Transient
+	// answer (the decider keeps its hold), and only a verdict refuses. A
+	// credential that cannot serve is marked as the failover below marks it, so
+	// the published verdict stops offering it.
+	if targetAccountFromRequest(r) != "" {
+		if refreshFailureCannotServe(err) {
+			s.markAccountExhaustedRefreshFailure(account, err)
+		}
+		return account, false, &targetRefusedError{Account: account.ID, Reason: targetRefusedAuthInvalid, cause: err}
+	}
+	// The Claude control plane is answered by its one identity or refused
+	// (control_plane.go): a failover would answer this call as another
+	// organization, and the next call would go back to the dead identity.
+	// Checked after the transient test, as for a target: a blip keeps its 502
+	// and the hold.
+	if claudeControlPlaneRequest(provider, r) {
+		return account, false, &controlPlaneIdentityError{State: identityRefreshFailed, Account: account.ID, cause: err}
+	}
+	// Only a credential that cannot serve justifies failing over, for every
+	// managed OAuth source: otherwise an expired Kimi profile with a revoked
+	// refresh token aborts before the response-level failover transport can
+	// try another profile, and an unrecognised error would cost a healthy
+	// account its place for the credential TTL.
+	if !refreshFailureCannotServe(err) {
 		return account, false, err
 	}
 	if s.Logger != nil {
@@ -10246,7 +14038,10 @@ func (s Server) refreshSelectedAccount(ctx context.Context, provider accounts.Pr
 		if err == nil {
 			return refreshed, true, nil
 		}
-		if !isTerminalCredentialError(err) {
+		if refreshFailureIsTransient(ctx, err) {
+			return next, false, fmt.Errorf("%w: %w", errRefreshTransient, err)
+		}
+		if !refreshFailureCannotServe(err) {
 			return next, false, err
 		}
 		lastErr = err
@@ -10292,22 +14087,31 @@ func (s Server) retryAccount(ctx context.Context, provider accounts.Provider, ag
 	if provider == accounts.ProviderCodex || provider == accounts.ProviderClaude {
 		s.refreshUsageScoresForRequest(ctx)
 	}
-	scheduler := s.scheduler()
+	// WithReserves for the same reason as oauthRetryAccount.
+	scheduler := s.scheduler().WithReserves(s.AccountReserves)
 	if s.Sessions != nil {
-		scheduler = scheduler.WithSessionCounts(SchedulerActiveSessionCounts(s.Sessions))
+		scheduler = scheduler.WithSessionCounts(SchedulerSessionCounts(s.Sessions)).
+			WithLiveSessionCounts(SchedulerActiveSessionCounts(s.Sessions, s.ActiveSessions))
 	}
+	// A failover is a placement: prefer an account whose store answers, but
+	// never at the price of the Evicted refusal below (placeableAccounts).
+	untried = placeableAccounts(untried, func(candidate accounts.Account) bool {
+		return scheduler.Evicted(schedulerAccountProvider(candidate.Provider), candidate.ID)
+	})
 	account, err := pickRoutingAccount(scheduler, untried)
 	if err != nil {
 		return accounts.Account{}, err
 	}
 	// Codex usage snapshots can be stale or unavailable after a credential
-	// refresh failure. Try every untried OAuth account and let its refresh (or
-	// the upstream response) establish the truth; explicit credential failures
-	// are still marked and excluded by the caller. Kimi and Antigravity retain
-	// their stricter scheduler gate until their provider-specific semantics are
-	// migrated separately.
-	if (provider != accounts.ProviderCodex || account.AuthMode != accounts.AuthModeOAuth) &&
-		scheduler.Exhausted(schedulerAccountProvider(account.Provider), account.ID) {
+	// refresh failure. Try every untried OAuth account the owner's holdout does
+	// not cover and let its refresh (or the upstream response) establish the
+	// truth; explicit credential failures are still marked and excluded by the
+	// caller (upstream #400). The holdout is never entered (PATCHES §20), and
+	// every other provider keeps the Evicted gate.
+	providerKey := schedulerAccountProvider(account.Provider)
+	staleCodexExhaustion := provider == accounts.ProviderCodex && account.AuthMode == accounts.AuthModeOAuth &&
+		!scheduler.InHoldout(providerKey, account.ID)
+	if scheduler.Evicted(providerKey, account.ID) && !staleCodexExhaustion {
 		return accounts.Account{}, s.poolExhaustedError(provider, untried, "")
 	}
 	return account, nil
@@ -10391,8 +14195,7 @@ func retryableUpstreamPostRequest(provider accounts.Provider, r *http.Request) b
 		if r == nil || r.Method != http.MethodPost {
 			return false
 		}
-		path := r.URL.Path
-		return path == "/v1/messages" || path == "/messages"
+		return claudeMessagesPath(r.URL.Path)
 	}
 	if _, keyed := keyedProviderFor(provider); keyed {
 		if r == nil || r.Method != http.MethodPost {
@@ -10469,6 +14272,14 @@ type replayablePostRetryTransport struct {
 }
 
 type usageLimitRetryTransport struct {
+	// Attribution (PATCHES section 20): RoundTrip tags every response it
+	// returns with the account that produced it -- the failover account after
+	// a failover, an EMPTY account for a fallback stage (Bedrock, API key,
+	// Opus substitute, peer) -- and ModifyResponse attributes the response,
+	// and any exhaustion mark it implies, to that account rather than to the
+	// one the handler started with. The tag (routedResponseAccount) replaced
+	// the fork's `answered` pointer so there is one mechanism, and it is the
+	// one the Azure/egress transports wrapped around this one also read.
 	base              http.RoundTripper
 	server            *Server
 	logger            *slog.Logger
@@ -10494,12 +14305,9 @@ type usageLimitRetryTransport struct {
 	// sleep waits for the backoff duration or until the context is cancelled.
 	// Injectable for tests; nil means a real timer wait.
 	sleep func(context.Context, time.Duration) error
-	// now reads the clock for the Claude overload hold's wall-clock bound.
-	// Injectable for tests; nil means time.Now.
+	// now reads the clock (the transient-429 Retry-After). Injectable for
+	// tests; nil means time.Now.
 	now func() time.Time
-	// overloadPolicy shapes the Claude same-account overload ladder; zero
-	// values mean the defaults.
-	overloadPolicy overloadRetryPolicy
 	// poolModel is the canonicalized quota-pool model for this request (e.g.
 	// "claude-fable"); failover scores candidates against that pool so an
 	// account whose pool is cooked but whose base windows are healthy is not
@@ -10511,7 +14319,29 @@ type usageLimitRetryTransport struct {
 	// it also restricts account failover to OAuth accounts so metered API-key
 	// pool accounts never preempt the Bedrock stage.
 	fableFallback func() (*http.Response, bool)
-	// budget and attempt: see replayablePostRetryTransport.
+	// opusSubstitute, when set, re-serves this Fable request from the Opus
+	// quota pool once the Fable pool has given up and the Bedrock/API-key
+	// stages have declined or are unconfigured. It runs at most once per
+	// client request and only replaces the pool's response on a clean 2xx.
+	opusSubstitute func(reason string) (*http.Response, bool)
+	// remotePool, when set, hands the request to a peer Subrouter daemon once
+	// this daemon's own pool has given up. Unlike the two stages above it is not
+	// Fable-specific and is armed for every model, because a spent local pool is
+	// spent for everything. Nil unless a peer is configured.
+	remotePool func(reason string) (*http.Response, bool)
+	// crossPool, when set, places a FORCED switch (classifyAccountSwitch: a
+	// spent window, a dead credential) on the ONE cross-pool ranking (PATCHES
+	// §31, D7): the session cannot stay, so where it goes is recomputed across
+	// everything this daemon can see (owner rule P8) -- next, the local
+	// failover's candidate, and every peer account. When a peer account wins it
+	// serves the turn, targeted, and a refusal recomputes with next still in
+	// the ranking; false whenever next wins, and local failover continues on
+	// it (forcedSwitchAcrossPools). A transient failover (limited, not spent)
+	// never consults it. Nil unless this turn may go to a peer.
+	crossPool func(next accounts.Account, reason string) (*http.Response, bool)
+	// budget is the request's shared pool-retry allowance; attempt is the
+	// request's shared state, set by upstreamLayers.build (nil when the layer
+	// is constructed on its own): see replayablePostRetryTransport.
 	budget  *attemptBudget
 	attempt *upstreamAttempt
 }
@@ -10545,6 +14375,10 @@ func tagRoutedAttemptError(err error, request *http.Request, account accounts.Ac
 	return &routedAttemptError{err: err, request: request, account: account}
 }
 
+// attemptAccountKey carries the account an outer failover layer switched a
+// request to, so usageLimitRetryTransport marks, retries and attributes
+// against that account instead of the one it was constructed with. Upstream
+// #371 (a794582).
 type attemptAccountKey struct{}
 
 func withAttemptAccount(ctx context.Context, account accounts.Account) context.Context {
@@ -10579,15 +14413,76 @@ func routedResponseAccount(response *http.Response) (accounts.Account, bool) {
 	return routed, ok
 }
 
-// fableFallbackResponse swaps the pool's give-up response for one served by the
-// Fable fallback chain (Bedrock, then the dedicated API key). Returns false
-// when no chain is configured for this request or every stage failed, in which
-// case the caller returns its original response.
-func (t usageLimitRetryTransport) fableFallbackResponse(giveUp *http.Response, accountID, reason string) (*http.Response, bool) {
-	if t.fableFallback == nil {
-		return nil, false
+// failoverLeaveKey carries why usageLimitRetryTransport first left the
+// account it was built with (its firstLeave), beside the routed account, so
+// the Codex capacity layer above it -- which commits every move the layer
+// below made -- keeps the pin on the same transient leaves this layer does
+// (owner rule P8, PATCHES §35). Set only once the layer has left that account.
+type failoverLeaveKey struct{}
+
+func tagFailoverLeave(response *http.Response, leave accountSwitch) *http.Response {
+	if response == nil || leave.Kind == switchNone {
+		return response
 	}
-	fallback, ok := t.fableFallback()
+	request := response.Request
+	if request == nil {
+		request = &http.Request{}
+	}
+	response.Request = request.WithContext(context.WithValue(request.Context(), failoverLeaveKey{}, leave))
+	return response
+}
+
+// failoverLeave is the leave tagFailoverLeave recorded, or switchNone.
+func failoverLeave(response *http.Response) accountSwitch {
+	if response == nil || response.Request == nil {
+		return accountSwitch{}
+	}
+	leave, _ := response.Request.Context().Value(failoverLeaveKey{}).(accountSwitch)
+	return leave
+}
+
+// fableFallbackResponse swaps the pool's give-up response for one served by the
+// Fable fallback chain: Bedrock, then the dedicated API key, then the Opus
+// quota pool on the same subscription, then the peer pool. Returns false when
+// no stage is armed for this request or every stage declined, in which case
+// the caller returns its original response.
+//
+// The Opus and peer stages are this fork's terminal stages: they move the
+// turn (and, on a 2xx, the session's pin or a peer hold) to another
+// subscription account, so they run only where the local pool is spent
+// (localPoolStagesAllowed). Upstream's version of this function is the Fable
+// chain alone, and its transient-throttle give-up (#645) relies on that.
+//
+// keyOnly: Anthropic refused this client on a subscription credential
+// (upstream #671), so the request stays on per-token keys -- the Fable
+// chain's Bedrock and dedicated key -- and never reaches an OAuth account,
+// here or on a peer.
+func (t usageLimitRetryTransport) fableFallbackResponse(giveUp *http.Response, accountID, reason string, keyOnly bool) (*http.Response, bool) {
+	var fallback *http.Response
+	ok := false
+	stage := "chain"
+	if t.fableFallback != nil {
+		fallback, ok = t.fableFallback()
+	}
+	terminal := localPoolStagesAllowed(reason) && !keyOnly
+	if !ok && t.opusSubstitute != nil && terminal {
+		// Opus is the chain's last stage: Bedrock and the dedicated API key keep
+		// priority when configured. Overload is excluded on purpose - a 529 is an
+		// Anthropic-wide capacity problem, not an account quota problem, so a
+		// different model cannot help and retrying there would only amplify load
+		// during an incident.
+		fallback, ok = t.opusSubstitute(reason)
+		stage = "opus"
+	}
+	if !ok && t.remotePool != nil && terminal {
+		// Terminal stage: every local account is spent, so hand the request to
+		// the peer pool. Overload is excluded for the same reason Opus excludes
+		// it -- a 529 is an Anthropic-wide capacity event, and the peer dials
+		// the same api.anthropic.com with different accounts, so forwarding
+		// cannot help and would amplify load during an incident.
+		fallback, ok = t.remotePool(reason)
+		stage = "remote"
+	}
 	if !ok {
 		return nil, false
 	}
@@ -10596,11 +14491,19 @@ func (t usageLimitRetryTransport) fableFallbackResponse(giveUp *http.Response, a
 		if giveUp != nil {
 			giveUpStatus = giveUp.StatusCode
 		}
-		t.logger.Warn("serving claude fable via fallback chain",
+		// The remote stage gets its own line. The Fable message is a monitoring
+		// contract asserted by the Fable tests, and it would be actively wrong
+		// on a forwarded Codex request, which is neither Fable nor a chain stage.
+		message := "serving claude fable via fallback chain"
+		if stage == "remote" {
+			message = "local pool gave up; forwarded to remote pool"
+		}
+		t.logger.Warn(message,
 			"agent", t.agent,
 			"session", t.session,
 			"account", accountID,
 			"reason", reason,
+			"stage", stage,
 			"pool_status", giveUpStatus,
 			"fallback_status", fallback.StatusCode)
 	}
@@ -10613,22 +14516,73 @@ func (t usageLimitRetryTransport) fableFallbackResponse(giveUp *http.Response, a
 	return tagRoutedResponseAccount(fallback, accounts.Account{Provider: t.provider}), true
 }
 
-// claudePoolExhaustedResponse turns a failover give-up into sr's own 503. The
-// provider's last 429 may describe only one account and can advertise a reset
-// several days away even when another account recovers sooner.
-func (t usageLimitRetryTransport) claudePoolExhaustedResponse(giveUp *http.Response, req *http.Request, accountID, reason string) (*http.Response, bool) {
+// localPoolStagesAllowed reports whether a give-up reason may run the Opus
+// substitution and the peer pool. Not on "overload": a 529 is an
+// Anthropic-wide capacity event, so another model or another daemon's
+// accounts cannot help and would only add load during an incident. Not on
+// "transient_throttle": a limited-not-spent 429 on two accounts is a
+// request-scoped burst (upstream #582/#645 hands it back to the client's
+// backoff); the session keeps its account (P8, PATCHES §20, §31), and the
+// Opus stage commits a forced move while the peer stage sets a hold.
+func localPoolStagesAllowed(reason string) bool {
+	return reason != "overload" && reason != "transient_throttle"
+}
+
+// forcedSwitchToPeer is owner rule P8 inside local failover: the account this
+// turn was on was FORCED off it (a spent window, a dead credential), so the
+// next account is chosen across every pool, not just this one. When a peer
+// account outranks the local failover candidate, the peer serves the turn
+// (targeted, through the same refusal loop as every entry point, with next
+// still in every recompute) instead of the local retry. A transient switch --
+// limited, not spent -- keeps today's local failover: nothing moved, so
+// nothing is recomputed.
+func (t usageLimitRetryTransport) forcedSwitchToPeer(giveUp *http.Response, accountID string, next accounts.Account, sw accountSwitch) (*http.Response, bool) {
+	if sw.Kind != switchForced || t.crossPool == nil {
+		return nil, false
+	}
+	fallback, ok := t.crossPool(next, "forced_switch")
+	if !ok {
+		return nil, false
+	}
+	if t.logger != nil {
+		giveUpStatus := 0
+		if giveUp != nil {
+			giveUpStatus = giveUp.StatusCode
+		}
+		t.logger.Warn("forced off local account; a peer account outranks the local failover",
+			"agent", t.agent,
+			"session", t.session,
+			"account", accountID,
+			"reason", sw.Reason,
+			"local_next", next.ID,
+			"pool_status", giveUpStatus,
+			"fallback_status", fallback.StatusCode)
+	}
+	if giveUp != nil && giveUp.Body != nil {
+		_ = giveUp.Body.Close()
+	}
+	// Served by a peer, not by the account that produced the rejection: no
+	// passive capture may attribute it to that account (see fableFallbackResponse).
+	return tagRoutedResponseAccount(fallback, accounts.Account{Provider: t.provider}), true
+}
+
+// claudeCreditPoolExhausted503 answers a Claude give-up whose last account
+// was an API key with a spent credit balance with sr's own 503 and the pool's
+// next reset (upstream #598, #530), never Anthropic's billing 400. The 503 is
+// no account's answer, so it carries an empty routed account like every
+// fallback stage: nothing is marked on or debited to the account the turn
+// started on, and the hold never holds it (PATCHES §58: "never held: ... an
+// exhausted pool's 503").
+func (t usageLimitRetryTransport) claudeCreditPoolExhausted503(giveUp *http.Response, req *http.Request) (*http.Response, bool) {
 	if t.server == nil || t.provider != accounts.ProviderClaude {
 		return nil, false
 	}
 	allCandidates := filterAccountsForProvider(t.server.accountListContext(req.Context()), t.provider)
 	poolErr := t.server.poolExhaustedError(t.provider, allCandidates, t.poolModel)
-	if fallback, ok := t.fableFallbackResponse(giveUp, accountID, reason); ok {
-		return fallback, true
-	}
 	if giveUp != nil && giveUp.Body != nil {
 		_ = giveUp.Body.Close()
 	}
-	return poolExhaustedResponse(poolErr, req), true
+	return tagRoutedResponseAccount(poolExhaustedResponse(poolErr, req), accounts.Account{Provider: t.provider}), true
 }
 
 func (t usageLimitRetryTransport) headerConfirmedClaudeQuota429(response *http.Response) bool {
@@ -10636,9 +14590,10 @@ func (t usageLimitRetryTransport) headerConfirmedClaudeQuota429(response *http.R
 		claudeResponseRejectedForPool(response.Header, t.poolModel)
 }
 
-// providerOverloadMaxRetries bounds same-account overload retries for Kimi
-// 429s, and is how many same-account Claude retries precede the opt-in
-// overload reroute (SUBROUTER_CLAUDE_OVERLOAD_REROUTE=1).
+// providerOverloadMaxRetries bounds same-account overload retries for providers
+// whose overload signal is not account-specific (Anthropic 5xx/529 and Kimi
+// 429). Small on purpose: Subrouter absorbs brief blips without stacking long
+// waits on top of the client's retry budget or amplifying a sustained outage.
 const providerOverloadMaxRetries = 2
 
 // A healthy Claude account can return a non-quota 429 during a short request
@@ -10653,122 +14608,6 @@ func claudeTransient429Backoff(retry int) time.Duration {
 		return 250 * time.Millisecond
 	}
 	return time.Second
-}
-
-// Claude overload ladder. Anthropic overload (529/5xx) is API-wide and
-// should be rare and brief, and the session's prompt cache lives on its
-// account, so by default the request stays there and waits it out: 1s, 2s,
-// 4s, 8s, then every 15s (ClaudeOverloadRetryConfig.Interval; the ramp is
-// capped at it), for up to 8m of wall-clock time from the first attempt
-// (MaxWait; unbounded with SUBROUTER_CLAUDE_OVERLOAD_MAX_WAIT=0), so Claude
-// Code, which gives a request 10 minutes, gets a clean 529 rather than a
-// timeout. The cap counts upstream time: a step whose wait would end past it
-// is shortened to end at the cap, and no retry starts once the cap has
-// passed. Retry-After can lengthen a step (up to 15s) but never shortens it.
-//
-// The ladder is request-wide (claudeOverloadHold lives on the request's
-// attemptBudget), so an outer replay after a transport error continues it
-// instead of starting it over, and cannot spend the opt-in reroute a second
-// time. It does not draw from the shared retry budget, which is sized for
-// account failover and would otherwise cut the ladder short; its wall-clock
-// cap and the client's cancellation bound it instead.
-
-// claudeOverloadHold tracks one request's same-account overload retries, the
-// backoff they have spent, when its first attempt started, whether the
-// opt-in reroute has run, and when the wait was last logged.
-type claudeOverloadHold struct {
-	mu       sync.Mutex
-	retries  int
-	held     time.Duration
-	started  time.Time
-	rerouted bool
-	log      overloadRetryLog
-}
-
-// begin records when the request's first attempt started; later calls (an
-// outer replay) keep the first time.
-func (h *claudeOverloadHold) begin(now time.Time) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if h.started.IsZero() {
-		h.started = now
-	}
-}
-
-// claudeOverloadClaim is one reserved ladder step.
-type claudeOverloadClaim struct {
-	wait    time.Duration
-	retry   int
-	elapsed time.Duration
-	// log reports whether this retry is due a log line (the first, then
-	// about once a minute).
-	log bool
-}
-
-// claim reserves the next ladder step, shortened to end at the policy's
-// wall-clock cap, or reports false once the cap has passed. Elapsed time is
-// the wall clock since the first attempt, and never less than the backoff
-// already spent.
-func (h *claudeOverloadHold) claim(header http.Header, now time.Time, policy overloadRetryPolicy) (claudeOverloadClaim, bool) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	wait := claudeOverloadGap(h.retries, policy.intervalOr(claudeOverloadDefaultInterval))
-	if retryAt := parseRetryAfter(strings.TrimSpace(claudeHeaderGet(header, "Retry-After")), now); !retryAt.IsZero() {
-		// Retry-After can lengthen a step but never shorten it: a 0 or
-		// past value would otherwise fire the whole ladder back to back.
-		wait = max(wait, min(retryAt.Sub(now), claudeOverloadMaxRetryAfter))
-	}
-	elapsed := h.held
-	if !h.started.IsZero() {
-		elapsed = max(elapsed, now.Sub(h.started))
-	}
-	if !policy.unbounded {
-		// Upstream time counts against the hold, so the last step is
-		// shortened to end at the cap instead of being refused outright.
-		left := policy.maxWaitOr(claudeOverloadDefaultMaxWait) - elapsed
-		if left <= 0 {
-			return claudeOverloadClaim{retry: h.retries, elapsed: elapsed}, false
-		}
-		wait = min(wait, left)
-	}
-	h.retries++
-	h.held += wait
-	return claudeOverloadClaim{wait: wait, retry: h.retries, elapsed: elapsed, log: h.log.due(now)}, true
-}
-
-func (h *claudeOverloadHold) spent() int {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	return h.retries
-}
-
-// reroutedOnce reports whether the request already used its one opt-in
-// reroute, in this pass or an earlier outer replay.
-func (h *claudeOverloadHold) reroutedOnce() bool {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	return h.rerouted
-}
-
-func (h *claudeOverloadHold) markRerouted() {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	h.rerouted = true
-}
-
-// claudeOverloadHold returns the request's shared overload ladder, or a fresh
-// one for standalone use without a budget.
-func (b *attemptBudget) claudeOverloadHold() *claudeOverloadHold {
-	if b == nil {
-		return &claudeOverloadHold{}
-	}
-	return &b.claudeOverload
-}
-
-// claudeOverloadRerouteEnabled reports whether the opt-in one-shot reroute
-// to another account is on.
-func (t usageLimitRetryTransport) claudeOverloadRerouteEnabled() bool {
-	return t.server != nil && t.server.ClaudeOverloadReroute
 }
 
 // providerOverloadMaxWait caps a single overload backoff wait, including one
@@ -10875,13 +14714,38 @@ func (t usageLimitRetryTransport) responseUsageLimited(response *http.Response) 
 	case accounts.ProviderCodex:
 		// Codex can return a headerless 429 for a short request burst. Treat it
 		// as request-scoped failover, but do not poison the account scheduler;
-		// only an explicit usage_limit_reached payload marks exhaustion. The
-		// body must be read here: when failover succeeds, the passive response
-		// inspection never sees this 429, and without the mark the account
-		// keeps taking new sessions until its reset (often days).
+		// only an explicit usage_limit_reached payload (or an account refusal,
+		// below) marks exhaustion. The burst gets a rate-limit mark instead,
+		// which only ranks (markCodexAccountRateLimited, PATCHES §35.3). The
+		// body must be read HERE (upstream #399): when the failover succeeds,
+		// the passive response inspection only ever sees the replacement's 200,
+		// so this is the one place the refusal is visible. Without the mark the
+		// account keeps taking new sessions, each paying a 429 and a failover
+		// until its reset -- days for a weekly window, and for a workspace
+		// spend cap or depleted credits indefinitely, since wham/usage reports
+		// the member's own windows as healthy and no sweep catches it.
+		//
+		// A body that cannot be read is no evidence either way. Upstream hands
+		// the read error back, which makes the transport return the 429 to the
+		// client instead of failing over; the status alone always earned a
+		// failover here, so it keeps that and simply does not mark it exhausted
+		// (the rate-limit mark still applies: the status says a request was
+		// refused now, which is all that mark claims).
+		//
+		// A 429 whose code says the account itself cannot serve (a plan
+		// without Codex, no quota left: codexAccountRefusalJSON) is marked
+		// the same way (PATCHES §35). Unmarked, it read as a burst, and since
+		// §35 a burst keeps the session's account, so every turn of a session
+		// pinned to a lapsed account paid the 429 and a failover, for good.
 		if response.StatusCode == http.StatusTooManyRequests {
 			exhausted, err := responseUsageLimit(response)
-			return true, exhausted, false, err
+			if err != nil {
+				return true, false, false, nil
+			}
+			if !exhausted {
+				exhausted = codexAccountRefusalJSON(peekResponseBodyPrefix(response))
+			}
+			return true, exhausted, false, nil
 		}
 		if response.StatusCode == http.StatusUnauthorized {
 			return true, true, true, nil
@@ -11263,15 +15127,31 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 	accountID := t.account
 	accountCredential := t.accountCredential
 	tried := map[string]struct{}{}
-	if selected := a.current(); selected.ID != "" && selected.ID != accountID {
+	// outerMoved: the layer above moved this request off t.account before this
+	// one ran, so why the session left its account -- and whether the pin
+	// follows -- is that layer's to judge (commitSuccessfulFailover).
+	outerMoved := false
+	selected := a.current()
+	if selected.ID == "" || selected.ID == accountID {
+		// A layer that still names its switch on the context (upstream #371's
+		// hand-off) is read the same way.
+		if moved, ok := attemptAccount(req.Context()); ok {
+			selected = moved
+		}
+	}
+	if selected.ID != "" && selected.ID != accountID {
 		// An outer layer (Codex overload failover) already moved this request
 		// to another account and set its auth headers. Keep the original out
 		// of this attempt's failover too: the outer layer rejected it.
+		// Upstream #371, the prerequisite of #389's same-account replay
+		// (PATCHES section 27): without it a quota/auth failure from the
+		// replacement was charged to the account that was merely overloaded.
 		if accountID != "" {
 			tried[accountID] = struct{}{}
 		}
 		accountID = selected.ID
 		accountCredential = selected.CredentialVersion
+		outerMoved = true
 	}
 	// Native AGY includes the project selected by the local CLI in every
 	// generation envelope.  A pooled launch may select a different server
@@ -11336,29 +15216,24 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 	if accountID != "" {
 		tried[accountID] = struct{}{}
 	}
+	// Claude and Kimi overload is retried on the same account a few times
+	// (providerOverloadMaxRetries, 1 s then 2 s), then passed through: the
+	// fork's hold (PATCHES §58) runs a 5xx turn again, and a 529 goes to the
+	// client's own retry. Upstream #389's eight-minute Claude ladder and its
+	// opt-in reroute are not wired in here (PATCHES §27 left them undecided,
+	// and §58 is built on the short ladder).
 	overloadRetries := 0
-	claudeHold := a.budget.claudeOverloadHold()
-	if t.provider == accounts.ProviderClaude {
-		claudeHold.begin(t.clock())
-	}
-	// releaseHeld ends this pass's count in the held-in-overload gauge; set
-	// on its first same-account overload retry.
-	var releaseHeld func()
-	defer func() {
-		if releaseHeld != nil {
-			releaseHeld()
-		}
-	}()
-	// overloadRerouted: this pass is on the one post-overload alternate
-	// account (the request-wide claudeHold remembers the reroute across outer
-	// replays). quotaFailedOver: a usage-limit/model failover moved the
-	// request, which (unlike an overload reroute) justifies moving stickiness.
-	overloadRerouted, quotaFailedOver := false, false
+	// quotaFailedOver: a usage-limit/model/credential failover moved the
+	// request (upstream #532), so an admission spill afterwards does not keep
+	// the session where the failover left it. failoverReason names the move
+	// for the commit's log line. Whether the pin moves at all is the fork's
+	// forced/transient rule (firstLeave, commitSuccessfulFailover).
+	quotaFailedOver := false
 	failoverReason := accountMoveUsageLimit
-	claudeExtraUsageRetried := false
 	// claudeThirdPartyKeyOnly: Anthropic refused this client on a
-	// subscription account (claude_third_party.go), so every later move of
-	// this request goes to another API key, never back to an OAuth account.
+	// subscription account (claude_third_party.go, upstream #671), so every
+	// later move of this request goes to another API key, never back to an
+	// OAuth account.
 	claudeThirdPartyKeyOnly := a.budget != nil && a.budget.claudeThirdPartyKeyOnly.Load()
 	// claudeThirdPartyRedirected: this pass moved a key-only request off the
 	// OAuth account it was addressed to before its first send, so a success
@@ -11370,15 +15245,50 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 	// replayReq is what later attempts rebuild from. It starts as the client's
 	// request and becomes the stripped one once sealed reasoning is dropped,
 	// so a failover that re-reads the body does not send the unreadable blob
-	// again (a 400 while healthy accounts remain). The same-account overload
-	// retry uses it too for consistency, though today it only runs for
-	// providers that never strip.
+	// again (a 400 while healthy accounts remain).
 	replayReq := req
 	// spilledFrom is the sticky account an admission spill moved this
 	// request off. Such a request never moves the session, whatever later
-	// answers it: the sticky account was only busy.
+	// answers it: the sticky account was only busy (upstream #609).
 	spilledFrom := ""
 	defer a.releaseReserved()
+	// firstLeave is why this turn first left the account it was placed on
+	// (classifyAccountSwitch, PATCHES §31 / owner rule P8). Only a FORCED
+	// leave may move the session's pin to the replacement; see
+	// commitSuccessfulFailover.
+	var firstLeave accountSwitch
+	noteLeave := func(previousAccount string, evidence accountSwitchEvidence) {
+		if previousAccount == t.account && firstLeave.Kind == switchNone {
+			firstLeave = classifyAccountSwitch(evidence)
+		}
+	}
+	// noteRouted debits a replacement the request is readdressed to before
+	// any answer (PATCHES §26: every routed request debits its account), as
+	// the usage-limit failover below does. The pre-check, the admission
+	// spill and the admission-rejected failover used to send on accounts
+	// nothing had debited, so the account serving them read as unloaded.
+	noteRouted := func(id string) {
+		if t.server != nil && t.server.SchedulerRef != nil && id != "" {
+			t.server.SchedulerRef.NoteRouted(schedulerAccountProvider(t.provider), id)
+		}
+	}
+	// sentOn: accounts a physical attempt of this pass reached the upstream
+	// on, so a later admission rejection there does not give back the debit
+	// that attempt took.
+	sentOn := map[string]struct{}{}
+	// moveDebit moves the live debit when the request is readdressed before
+	// anything was sent on the account it leaves (PATCHES §58: an attempt the
+	// upstream never served gives its debit back), so the account that
+	// serves reads loaded and the one left behind does not.
+	moveDebit := func(from, to string) {
+		if _, sent := sentOn[from]; !sent && t.server != nil {
+			t.server.refundUnservedDebit(t.provider, from)
+		}
+		noteRouted(to)
+	}
+	// probeSent: the attempt in flight is the recovery probe, the turn's last
+	// resort. Whatever it answers is returned.
+	probeSent := false
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		// A denial can arrive while another request still holds the sticky
 		// assignment. Re-check the controller immediately before every physical
@@ -11399,20 +15309,30 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 				} else {
 					next, pickErr = t.server.oauthRetryCandidate(req.Context(), t.provider, t.agent, t.session, t.userEmail, t.poolModel, tried, t.fableFallback != nil, false)
 				}
-				if pickErr != nil {
-					return nil, pickErr
+				// No alternate (pickErr): upstream (#544) returns pickErr, a
+				// transport error. In this fork the attempt goes to the marked
+				// account anyway, so its answer takes the give-up below (the
+				// fallback stages, the recovery probe, then the pool's own
+				// 429; PATCHES §11, §44.4), the answer an outer replay of this
+				// request got before the pre-check existed.
+				if pickErr == nil {
+					nextReq, replayErr := a.replay(replayReq, &next)
+					if replayErr != nil {
+						return nil, replayErr
+					}
+					// The mark another request set is evidence the account
+					// cannot serve now: a forced leave (P8), like the answer
+					// that set it.
+					noteLeave(accountID, accountSwitchEvidence{Exhausted: true})
+					moveDebit(accountID, next.ID)
+					accountID = next.ID
+					accountCredential = next.CredentialIdentity()
+					tried[accountID] = struct{}{}
+					attemptReq = nextReq
+					quotaFailedOver = true
+					failoverReason = accountMoveCredential
+					continue
 				}
-				nextReq, replayErr := a.replay(replayReq, &next)
-				if replayErr != nil {
-					return nil, replayErr
-				}
-				accountID = next.ID
-				accountCredential = next.CredentialIdentity()
-				tried[accountID] = struct{}{}
-				attemptReq = nextReq
-				quotaFailedOver = true
-				failoverReason = accountMoveCredential
-				continue
 			}
 		}
 		// An outer layer (transport replay) re-sends its own input, addressed
@@ -11429,6 +15349,10 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			if replayErr != nil {
 				return nil, replayErr
 			}
+			noteLeave(accountID, accountSwitchEvidence{ModelUnsupported: true})
+			// The subscription account answered this request in the pass
+			// before the replay: its debit stands; only the key takes one.
+			noteRouted(next.ID)
 			accountID = next.ID
 			accountCredential = next.CredentialIdentity()
 			tried[accountID] = struct{}{}
@@ -11457,13 +15381,18 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 						"to_account", next.ID,
 						"pool_model", t.poolModel)
 				}
-				t.server.admission.noteSpill(admissionSessionKey{agent: t.agent, session: t.session})
+				t.server.admission.noteSpill(admissionKeyFor(schedulerAccountProvider(t.provider), accountID, t.poolModel), lease.key, admissionSessionKey{agent: t.agent, session: t.session})
 				a.reserve(lease)
 				// A request that already failed over off a paused or
-				// exhausted sticky account must still move the session.
-				if spilledFrom == "" && !quotaFailedOver {
+				// exhausted sticky account must still move the session, and
+				// so must one whose selection was already moving the session
+				// off a spent pin (commitFirstSuccess, PATCHES §25): it was
+				// leaving that pin anyway, and the account that serves it
+				// takes the pending move.
+				if spilledFrom == "" && !quotaFailedOver && !t.commitFirstSuccess {
 					spilledFrom = accountID
 				}
+				moveDebit(accountID, next.ID)
 				accountID = next.ID
 				accountCredential = next.CredentialIdentity()
 				tried[accountID] = struct{}{}
@@ -11472,7 +15401,11 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 		}
 		addressed := accounts.Account{ID: accountID, Provider: t.provider, CredentialVersion: accountCredential}
 		response, err := a.send(base, attemptReq, addressed)
+		if !admissionRejected(err) {
+			sentOn[accountID] = struct{}{}
+		}
 		response = tagRoutedResponseAccount(response, addressed)
+		response = tagFailoverLeave(response, firstLeave)
 		// The admission limiter turned this account away before any upstream
 		// call (its queue is full, or it is paused after a rate limit). Nothing
 		// was sent, so another account can take the request; answering 503
@@ -11505,23 +15438,35 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 					}
 					// A full queue means the account is busy, not out of quota:
 					// overflow only this request, as a spill does, so the
-					// session keeps the account that holds its prompt cache. A
-					// paused account is rate limited for a long while, so the
-					// session follows the request.
-					// A request that already failed over off a paused or
-					// exhausted sticky account still moves the session, to
-					// whichever account finally serves it.
-					// A sticky account that stays full moves the session after
-					// admissionOverflowMoveAfter overflows in a row.
-					if errors.Is(err, errAdmissionQueueFull) && !errors.Is(err, errAdmissionPaused) &&
-						!t.server.admission.noteQueueFullOverflow(admissionSessionKey{agent: t.agent, session: t.session}, accountID) {
-						if spilledFrom == "" && !quotaFailedOver {
+					// session keeps the account that holds its prompt cache.
+					// A paused account moves the session only when the
+					// scheduler holds it evicted (a spent window, the owner's
+					// holdout); a pause for a short throttle is transient and
+					// the pin stays (PATCHES §20, P8). Upstream also moves a
+					// session after admissionOverflowMoveAfter overflows in a
+					// row; here a busy account is never an eviction.
+					if errors.Is(err, errAdmissionQueueFull) && !errors.Is(err, errAdmissionPaused) {
+						t.server.admission.noteQueueFullOverflow(admissionSessionKey{agent: t.agent, session: t.session}, accountID)
+						// A move selection already started (commitFirstSuccess)
+						// still commits to the account that serves (§25).
+						if spilledFrom == "" && !quotaFailedOver && !t.commitFirstSuccess {
 							spilledFrom = accountID
 						}
 					} else {
-						quotaFailedOver = true
-						failoverReason = accountMoveCapacity
+						// With the holdout (WithReserves), or a paused account
+						// inside the owner's reserve read as a transient leave.
+						evicted := evictionCause(t.server.scheduler().ForModel(t.poolModel).WithReserves(t.server.AccountReserves), addressed)
+						if evicted != "" {
+							noteLeave(accountID, accountSwitchEvidence{Evicted: evicted})
+							quotaFailedOver = true
+							failoverReason = accountMoveCapacity
+						} else {
+							noteLeave(accountID, accountSwitchEvidence{UsageLimited: true})
+						}
 					}
+					// Nothing was sent on the rejected account: its debit
+					// comes back, and the replacement takes one.
+					moveDebit(accountID, next.ID)
 					accountID = next.ID
 					accountCredential = next.CredentialIdentity()
 					tried[accountID] = struct{}{}
@@ -11533,20 +15478,20 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 		if err != nil || !a.replayable() || req.Context().Err() != nil {
 			return response, tagRoutedAttemptError(err, attemptReq, addressed)
 		}
-		// Anthropic overload (529/5xx): retry the SAME account on a bounded,
-		// growing backoff (claudeOverloadHold). Overload is API-wide, not
-		// account-specific, and the session's prompt cache lives on this
-		// account, so no failover, no exhaustion-marking, and no failover-budget
-		// consumption. Once the ladder is spent the 5xx passes through and the
-		// client's own backoff takes over. Moving the request to another account
-		// once is opt-in (Server.ClaudeOverloadReroute). A 5xx that carries the
-		// rejected unified-status header is NOT overload-retried: rejected means
-		// this account is out of quota regardless of HTTP status, so it falls
-		// through to the usage-limit path below and fails over to a healthy
-		// account instead.
+		// Anthropic overload (529/5xx): retry the SAME account after a bounded
+		// backoff. Overload is API-wide, not account-specific, so no failover, no
+		// exhaustion-marking, and no failover-budget consumption. Once the small
+		// overload budget is spent the 5xx passes through and the client's own
+		// backoff takes over (and the hold, PATCHES §58, for a 5xx). A 5xx that
+		// carries the rejected unified-status header is NOT overload-retried:
+		// rejected means this account is out of quota regardless of HTTP
+		// status, so it falls through to the usage-limit path below and fails
+		// over to a healthy account instead.
 		// A 200 SSE stream whose first decisive event is overloaded_error is the
 		// same overload arriving after the headers; nothing has reached the
-		// client yet, so it is retried exactly like a 529.
+		// client yet, so it is retried exactly like a 529 (upstream #372). The
+		// same peek reads a stream that opens with a permission or credit
+		// error (upstream #585, #598).
 		claudeStreamOverload := false
 		claudeStreamDenial := false
 		claudeStreamCredit := false
@@ -11569,75 +15514,19 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			(claudeOverloadStatus(response.StatusCode) || claudeStreamOverload)
 		kimiOverload := t.provider == accounts.ProviderKimi && response.StatusCode == http.StatusTooManyRequests
 		if claudeOverload || kimiOverload {
-			if claudeOverload && overloadRerouted {
-				// The one opt-in reroute already ran and the other account is
-				// overloaded too: stop here rather than fan out.
-				if fallback, ok := t.fableFallbackResponse(response, accountID, "overload"); ok {
+			if overloadRetries >= providerOverloadMaxRetries {
+				if fallback, ok := t.fableFallbackResponse(response, accountID, "overload", claudeThirdPartyKeyOnly); ok {
 					return fallback, nil
 				}
 				return response, nil
 			}
-			if claudeOverload && !claudeThirdPartyKeyOnly && t.claudeOverloadRerouteEnabled() && !claudeHold.reroutedOnce() &&
-				claudeHold.spent() >= providerOverloadMaxRetries && attempt < maxAttempts {
-				// Opt-in: after the short same-account retries, try exactly one
-				// other account with headroom: a single extra request, not a
-				// fan-out, so a genuinely API-wide overload is not amplified.
-				// Overload is not quota, so the first account is never marked.
-				// With no candidate the request keeps to the same-account ladder.
-				if next, ok := t.claudeOverloadRerouteCandidate(req.Context(), tried); ok && a.consume() {
-					nextReq, retargetErr := a.replay(req, &next)
-					if retargetErr == nil {
-						if t.logger != nil {
-							t.logger.Warn("rerouting claude request once after sustained overload", "agent", t.agent, "session", t.session, "previous_account", accountID, "account", next.ID, "method", t.method, "path", t.path, "status", response.StatusCode)
-						}
-						if response.Body != nil {
-							_ = response.Body.Close()
-						}
-						overloadRerouted = true
-						failoverReason = accountMoveOverload
-						claudeHold.markRerouted()
-						t.server.SchedulerRef.NoteFailover(schedulerAccountProvider(t.provider), accountID, selectacct.FailoverCapacity)
-						accountID = next.ID
-						accountCredential = next.CredentialIdentity()
-						tried[accountID] = struct{}{}
-						if t.server.SchedulerRef != nil {
-							t.server.SchedulerRef.NoteRouted(schedulerAccountProvider(t.provider), accountID)
-						}
-						attemptReq = nextReq
-						continue
-					}
-				}
+			if !a.consume() {
+				return response, nil
 			}
-			var wait time.Duration
-			if claudeOverload {
-				step, ok := claudeHold.claim(response.Header, t.clock(), t.overloadPolicy)
-				if !ok {
-					if t.logger != nil {
-						t.logger.Warn("claude overload wait exhausted; passing the overload through", "agent", t.agent, "session", t.session, "account", accountID, "status", response.StatusCode, "overload_retries", step.retry, "elapsed", step.elapsed.Round(time.Second).String())
-					}
-					if fallback, ok := t.fableFallbackResponse(response, accountID, "overload"); ok {
-						return fallback, nil
-					}
-					return response, nil
-				}
-				wait = step.wait
-				if releaseHeld == nil {
-					releaseHeld = t.server.enterOverloadHold(accounts.ProviderClaude)
-				}
-				if step.log && t.logger != nil {
-					// The first retry, then about once a minute: a long wait
-					// stays visible without a line per retry.
-					t.logger.Warn("waiting out claude overload on the same account", "agent", t.agent, "session", t.session, "account", accountID, "method", t.method, "path", t.path, "status", response.StatusCode, "wait", wait.String(), "overload_retry", step.retry, "elapsed", step.elapsed.Round(time.Second).String())
-				}
-			} else {
-				if overloadRetries >= providerOverloadMaxRetries || !a.consume() {
-					return response, nil
-				}
-				wait = providerOverloadBackoff(response.Header, overloadRetries)
-				overloadRetries++
-				if t.logger != nil {
-					t.logger.Warn("retrying after provider overload", "provider", t.provider, "agent", t.agent, "session", t.session, "account", accountID, "method", t.method, "path", t.path, "upstream", t.upstream, "status", response.StatusCode, "wait", wait.String(), "overload_retry", overloadRetries, "max_overload_retries", providerOverloadMaxRetries)
-				}
+			wait := providerOverloadBackoff(response.Header, overloadRetries)
+			overloadRetries++
+			if t.logger != nil {
+				t.logger.Warn("retrying after provider overload", "provider", t.provider, "agent", t.agent, "session", t.session, "account", accountID, "method", t.method, "path", t.path, "upstream", t.upstream, "status", response.StatusCode, "wait", wait.String(), "overload_retry", overloadRetries, "max_overload_retries", providerOverloadMaxRetries)
 			}
 			if response.Body != nil {
 				_ = response.Body.Close()
@@ -11658,35 +15547,10 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			attempt-- // retry the same account without spending a failover slot
 			continue
 		}
-		// Anthropic can serve a successful response from paid extra usage while
-		// the subscription status header says rejected. Accept and normalize that
-		// response only after the pool-wide fallback guard proves every ordinary
-		// subscription is cooked and this account has enabled, positive balance.
-		if t.provider == accounts.ProviderClaude && response.StatusCode >= 200 && response.StatusCode < 300 &&
-			claudeResponseRejectedForPool(response.Header, t.poolModel) &&
-			strings.EqualFold(strings.TrimSpace(claudeHeaderGet(response.Header, "Anthropic-Ratelimit-Unified-Overage-In-Use")), "true") &&
-			t.server != nil && t.server.claudeExtraUsageResponseAllowed(req.Context(), accountID, t.poolModel) {
-			response.Header.Set("Anthropic-Ratelimit-Unified-Status", "allowed")
-			response.Header.Set("X-Subrouter-Claude-Extra-Usage", "true")
-			if t.logger != nil {
-				t.logger.Warn("serving claude request from extra usage after subscription pool exhausted",
-					"agent", t.agent, "session", t.session, "account", accountID)
-			}
-			commitReason := accountMoveUsageLimit
-			if !quotaFailedOver && t.pendingMoveReason != "" {
-				commitReason = t.pendingMoveReason
-			}
-			if spilledFrom != "" {
-				return response, nil
-			}
-			if err := t.commitSuccessfulFailover(response, attempt, accountID, commitReason); err != nil {
-				if response.Body != nil {
-					_ = response.Body.Close()
-				}
-				return nil, err
-			}
-			return response, nil
-		}
+		// No paid-overage acceptance here: upstream 2269757 rewrote a rejected
+		// 200 served from Claude extra usage to "allowed" once the pool was
+		// weekly-cooked. The fork does not spend money on a turn, so a rejected
+		// response stays rejected and fails over like any other.
 		// A conversation that came back from another provider carries reasoning
 		// that provider sealed, and OpenAI cannot read Azure's any more than
 		// Azure could read OpenAI's. The client sees a hard 400 unless the
@@ -11728,9 +15592,10 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 		if t.provider == accounts.ProviderClaude && !modelUnsupported && t.server != nil &&
 			t.server.claudeAuthMode(accounts.Account{ID: accountID}) != accounts.AuthModeAPIKey {
 			// Anthropic refuses a non-Claude-Code client on a subscription
-			// credential (claude_third_party.go). Every OAuth account answers the
-			// same, and the account is fine, so neither retry another OAuth
-			// account nor mark this one: move to an API key or explain.
+			// credential (claude_third_party.go, upstream #671). Every OAuth
+			// account answers the same, and the account is fine, so neither
+			// retry another OAuth account nor mark this one: move to an API
+			// key or explain. Nothing here buys extra usage.
 			thirdParty, thirdPartyErr := responseClaudeThirdPartyExtraUsage(response)
 			if thirdPartyErr != nil {
 				if t.logger != nil {
@@ -11754,6 +15619,9 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 								_ = response.Body.Close()
 							}
 							markTrafficRetryPath(attemptReq.Context(), "claude_third_party_api_key")
+							// The subscription account cannot serve this client:
+							// forced for the session (P8).
+							noteLeave(accountID, accountSwitchEvidence{ModelUnsupported: true})
 							accountID = next.ID
 							accountCredential = next.CredentialIdentity()
 							markTrafficAccount(attemptReq.Context(), accountID)
@@ -11790,7 +15658,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 		}
 		if claudeCreditExhausted {
 			// A spent API credit balance is quota exhaustion for that key,
-			// reported as a 400 rather than a 429.
+			// reported as a 400 rather than a 429 (upstream #598).
 			usageLimited, exhausted = true, true
 		} else if !modelUnsupported {
 			usageLimited, exhausted, credentialFailure, inspectErr = t.responseUsageLimited(response)
@@ -11814,11 +15682,10 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 					}
 					return response, nil
 				}
-				if persistentAuthorizationDenial {
-					usageLimited, exhausted = true, true
-				}
 			}
 			if persistentAuthorizationDenial {
+				// An OAuth entitlement the organization withdrew does not come
+				// back by retrying (upstream #585).
 				usageLimited, exhausted = true, true
 			}
 		}
@@ -11826,10 +15693,11 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			(response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden) {
 			// Record the credential this attempt used: a concurrent re-login
 			// must not be marked dead by a late response. The body is decoded
-			// first, so a compressed error envelope is still classified.
+			// first, so a compressed error envelope is still classified
+			// (upstream #625's death ledger).
 			deathCredential := accountCredential
-			if selected := a.current(); deathCredential == "" && selected.ID == accountID {
-				deathCredential = selected.CredentialIdentity()
+			if current := a.current(); deathCredential == "" && current.ID == accountID {
+				deathCredential = current.CredentialIdentity()
 			}
 			kind := t.server.noteClaudeCredentialResponse(
 				accounts.Account{ID: accountID, Provider: t.provider, CredentialVersion: deathCredential},
@@ -11841,6 +15709,10 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 				usageLimited, exhausted = true, true
 			}
 		}
+		// A healthy Claude account can return a non-quota 429 during a short
+		// burst. Retry it on the same account a couple of times so a transient
+		// throttle does not discard the session's warm prompt cache (upstream
+		// #582, #645); only then fail over, for this request only.
 		claudeTransient429 := t.provider == accounts.ProviderClaude && response.StatusCode == http.StatusTooManyRequests &&
 			usageLimited && !exhausted && !credentialFailure && !modelUnsupported
 		transientWait := claudeTransient429Backoff(claudeTransient429Retries)
@@ -11873,23 +15745,19 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			continue
 		}
 		if !usageLimited && !modelUnsupported {
-			if overloadRerouted && !quotaFailedOver && !t.commitFirstSuccess {
-				// Served by the one-shot overload reroute: the sticky account is
-				// healthy, just momentarily overloaded, so keep the session there.
+			if spilledFrom != "" {
+				// Served off a busy sticky account: the session stays.
 				return response, nil
 			}
 			commitReason := failoverReason
 			if !quotaFailedOver && t.pendingMoveReason != "" {
 				commitReason = t.pendingMoveReason
 			}
-			if spilledFrom != "" {
-				return response, nil
-			}
 			commitAttempt := attempt
 			if claudeThirdPartyRedirected && commitAttempt < 2 {
 				commitAttempt = 2
 			}
-			if err := t.commitSuccessfulFailover(response, commitAttempt, accountID, commitReason); err != nil {
+			if err := t.commitSuccessfulFailover(response, commitAttempt, accountID, firstLeave, outerMoved, commitReason); err != nil {
 				if response.Body != nil {
 					_ = response.Body.Close()
 				}
@@ -11928,13 +15796,23 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			if exhausted && claudeRejectionIsExplicitlyAccountWide(response.StatusCode, response.Header) {
 				// Account-wide Claude windows apply across every model pool. The
 				// direct retry path sees the headers before passive response
-				// inspection, so it must clear the request model's pool key here.
+				// capture, so it must use the same scope as markAccountExhausted.
 				exhaustionPool = ""
 			}
 		}
-		// A spent credit balance gives up like a confirmed quota 429: the
-		// client must see the pool-exhausted 503 (which `cr claude` turns into
-		// its Bedrock fallback), never Anthropic's billing 400.
+		// A Claude rejection by a model-pool window alone (Fable's weekly
+		// bucket) leaves exhausted false -- the account still serves every
+		// other model -- but it is a spent window for THIS model: forced
+		// (classifyAccountSwitch's pool_exhausted row), so the replacement is
+		// committed and the switch is ranked across every pool.
+		poolRejected := t.provider == accounts.ProviderClaude && !exhausted &&
+			claudeResponseRejected(response.Header) && claudeRejectionIsModelPoolScoped(response.Header)
+		leaveEvidence := accountSwitchEvidence{UsageLimited: usageLimited, Exhausted: exhausted, CredentialFailure: credentialFailure,
+			PoolRejected: poolRejected, ModelUnsupported: modelUnsupported}
+		// A spent credit balance walks the pool on the quota budget like a
+		// confirmed quota 429 (upstream #560, #598). Upstream then answers
+		// the give-up with its own pool-exhausted 503; here the pool's own
+		// answer goes to the client (see the give-up returns below).
 		quota429 := t.headerConfirmedClaudeQuota429(response) || claudeCreditExhausted
 		var compatibilityNext accounts.Account
 		var compatibilityPickErr error
@@ -11964,12 +15842,24 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			t.server.markAccountExhaustedFromResponseBodyForAccount(accounts.Account{
 				ID: accountID, Provider: t.provider, CredentialVersion: accountCredential,
 			}, exhaustionPool, response.StatusCode, response.Header, peekResponseBodyPrefix(response))
+		} else if t.server != nil && t.provider == accounts.ProviderCodex && usageLimited && !modelUnsupported &&
+			response.StatusCode == http.StatusTooManyRequests {
+			// A Codex burst 429: the session keeps its account (P8), but the
+			// next placement need not land on it mid-burst. A rate-limit mark
+			// ranks it last and moves nobody (PATCHES §35.3).
+			t.server.markCodexAccountRateLimited(accountID, response)
+		}
+		if probeSent {
+			// Refused, and re-marked above with the reset it named. Every
+			// stage had declined before the probe went out.
+			t.logClaudeFailoverExhausted(response, accountID, "recovery_probe_refused", attempt, maxAttempts, len(tried))
+			return response, nil
 		}
 		if claudeTransient429 && claudeTransient429Rerouted {
 			// One alternate is enough for a request-scoped throttle. Returning
 			// here lets the client/upstream retry policy provide the next backoff
 			// instead of fanning this burst through every account.
-			if fallback, ok := t.fableFallbackResponse(response, accountID, "transient_throttle"); ok {
+			if fallback, ok := t.fableFallbackResponse(response, accountID, "transient_throttle", claudeThirdPartyKeyOnly); ok {
 				return fallback, nil
 			}
 			return response, nil
@@ -11995,20 +15885,24 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			case budgetExhausted:
 				reason = "retry_budget"
 			}
-			if quota429 {
-				t.logClaudeFailoverExhausted(response, accountID, reason, attempt, maxAttempts, len(tried))
-				if poolResponse, ok := t.claudePoolExhaustedResponse(response, attemptReq, accountID, reason); ok {
-					return poolResponse, nil
-				}
-			}
-			if fallback, ok := t.fableFallbackResponse(response, accountID, reason); ok {
+			if fallback, ok := t.fableFallbackResponse(response, accountID, reason, claudeThirdPartyKeyOnly); ok {
 				return fallback, nil
 			}
 			t.logClaudeFailoverExhausted(response, accountID, reason, attempt, maxAttempts, len(tried))
+			// The pool's own answer reaches the client (PATCHES §11, §44.4):
+			// upstream's #560 replaces a Claude give-up with sr's own 503,
+			// which Claude Code retries where it stops on Anthropic's
+			// rejected 429 and shows the reset; not taken. A spent API-key
+			// credit balance (upstream #598) is the exception: no fork rule
+			// covers it, and Anthropic's billing 400 is no answer to give.
+			if claudeCreditExhausted {
+				if poolResponse, ok := t.claudeCreditPoolExhausted503(response, attemptReq); ok {
+					return poolResponse, nil
+				}
+			}
 			return response, nil
 		}
 		nextAccount, pickErr := compatibilityNext, compatibilityPickErr
-		var nextReservation *selectacct.PlacementReservation
 		if !modelUnsupported && claudeThirdPartyKeyOnly {
 			if next, ok := t.server.claudeAPIKeyRetryCandidate(req.Context(), t.poolModel, tried); ok {
 				nextAccount = next
@@ -12016,16 +15910,29 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 				pickErr = errors.New("no untried Claude API-key account can take a third-party client")
 			}
 		} else if !modelUnsupported {
-			if t.provider == accounts.ProviderClaude {
-				nextAccount, nextReservation, pickErr = t.server.oauthRetryCandidateWithReservation(req.Context(), t.provider, t.agent, t.session, t.userEmail, t.poolModel, tried, t.fableFallback != nil, !claudeExtraUsageRetried)
-			} else {
-				nextAccount, pickErr = t.server.oauthRetryCandidate(req.Context(), t.provider, t.agent, t.session, t.userEmail, t.poolModel, tried, t.fableFallback != nil, !claudeExtraUsageRetried)
+			// No extra-usage revisit (the last argument): the fork does not
+			// route onto paid overage (PATCHES §23).
+			nextAccount, pickErr = t.server.oauthRetryCandidate(req.Context(), t.provider, t.agent, t.session, t.userEmail, t.poolModel, tried, t.fableFallback != nil, false)
+		}
+		if pickErr != nil && !claudeThirdPartyKeyOnly {
+			// Same last resort as the websocket path: a pool where every
+			// account is cooked may still hold a rate-limit-reset credit that
+			// buys one back. Gated, off by default.
+			if revived, ok := t.server.redeemForFailover(req.Context(), t.provider, t.agent, t.session, t.userEmail, tried); ok {
+				nextAccount, pickErr = revived, nil
+			}
+		}
+		// Every forced switch -- a model the account cannot serve included
+		// (compatibilityNext is its local replacement) -- is ranked across
+		// every pool (P8, D7); only a transient one stays local. A key-only
+		// request stays on this daemon's API keys.
+		if pickErr == nil && !claudeThirdPartyKeyOnly {
+			sw := classifyAccountSwitch(leaveEvidence)
+			if fallback, ok := t.forcedSwitchToPeer(response, accountID, nextAccount, sw); ok {
+				return fallback, nil
 			}
 		}
 		if pickErr != nil {
-			if nextReservation != nil {
-				nextReservation.Release()
-			}
 			if t.logger != nil {
 				t.logger.Warn("usage-limit retry has no alternate account", "agent", t.agent, "session", t.session, "account", accountID, "method", t.method, "path", t.path, "upstream", t.upstream, "error", pickErr)
 			}
@@ -12033,23 +15940,35 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 				// A transient key throttle passes through as retryable below.
 				return claudeThirdPartyExtraUsageResponse(response, attemptReq), nil
 			}
-			var poolErr *poolExhaustedError
-			if (quota429 && errors.As(pickErr, &poolErr)) || claudeCreditExhausted {
-				if poolResponse, ok := t.claudePoolExhaustedResponse(response, attemptReq, accountID, "no_alternate_account"); ok {
+			if fallback, ok := t.fableFallbackResponse(response, accountID, "no_alternate_account", claudeThirdPartyKeyOnly); ok {
+				return fallback, nil
+			}
+			// Last, after every stage above declined (the Fable chain, Opus,
+			// the peer pool): one probe of an account whose exhaustion mark
+			// has lapsed but whose score still reads zero (upstream ddb8744,
+			// narrowed; PATCHES section 44). It replaces only the 429 the
+			// client would get here, and its answer is the turn's
+			// (probeSent), so no stage runs twice.
+			if !modelUnsupported && !claudeThirdPartyKeyOnly {
+				if probe, ok := t.server.claimRecoveryProbeCandidate(req.Context(), t.provider, t.poolModel, tried); ok {
+					nextAccount, pickErr, probeSent = probe, nil, true
+				}
+			}
+		}
+		if pickErr != nil {
+			t.logClaudeFailoverExhausted(response, accountID, "no_alternate_account", attempt, maxAttempts, len(tried))
+			// Every fallback stage and the probe declined: the pool's own
+			// answer goes to the client, as above (not upstream #560's 503),
+			// except for a spent API-key credit balance (#598).
+			if claudeCreditExhausted {
+				if poolResponse, ok := t.claudeCreditPoolExhausted503(response, attemptReq); ok {
 					return poolResponse, nil
 				}
 			}
-			if fallback, ok := t.fableFallbackResponse(response, accountID, "no_alternate_account"); ok {
-				return fallback, nil
-			}
-			t.logClaudeFailoverExhausted(response, accountID, "no_alternate_account", attempt, maxAttempts, len(tried))
 			return response, nil
 		}
 		nextReq, replayErr := a.replay(replayReq, &nextAccount)
 		if replayErr != nil {
-			if nextReservation != nil {
-				nextReservation.Release()
-			}
 			if t.logger != nil {
 				t.logger.Warn("usage-limit retry could not replay request body", "agent", t.agent, "session", t.session, "account", accountID, "method", t.method, "path", t.path, "upstream", t.upstream, "error", replayErr)
 			}
@@ -12072,14 +15991,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 		}
 		previousAccount := accountID
 		markTrafficRetryPath(attemptReq.Context(), "account_failover")
-		_, nextWasAlreadyTried := tried[nextAccount.ID]
-		if t.provider == accounts.ProviderClaude && nextWasAlreadyTried {
-			// A funded account may have been tried before the final ordinary
-			// subscription became exhausted. oauthRetryCandidate permits exactly
-			// one revisit after the pool-wide guard becomes true; remember that
-			// distinct paid attempt so another rejection cannot loop back again.
-			claudeExtraUsageRetried = true
-		}
+		noteLeave(previousAccount, leaveEvidence)
 		if claudeTransient429 {
 			claudeTransient429Rerouted = true
 			if a.budget != nil {
@@ -12093,7 +16005,8 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 		} else if modelUnsupported {
 			failoverReason = accountMoveModel
 		}
-		if t.server != nil {
+		if t.server != nil && t.server.SchedulerRef != nil {
+			// Failover statistics (upstream #388); they decide nothing.
 			t.server.SchedulerRef.NoteFailover(schedulerAccountProvider(t.provider), previousAccount, usageFailoverReason(credentialFailure, modelUnsupported))
 		}
 		accountID = nextAccount.ID
@@ -12101,9 +16014,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 		markTrafficAccount(attemptReq.Context(), accountID)
 		claudeTransient429Retries = 0
 		tried[accountID] = struct{}{}
-		if nextReservation != nil {
-			nextReservation.Commit()
-		} else if t.server != nil && t.server.SchedulerRef != nil {
+		if t.server != nil && t.server.SchedulerRef != nil {
 			t.server.SchedulerRef.NoteRouted(schedulerAccountProvider(t.provider), accountID)
 		}
 		// replay rebuilt the upstream URL and auth for the replacement account.
@@ -12133,7 +16044,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 	}
 	addressed := accounts.Account{ID: accountID, Provider: t.provider, CredentialVersion: accountCredential}
 	response, err := a.send(base, attemptReq, addressed)
-	return tagRoutedResponseAccount(response, addressed), err
+	return tagFailoverLeave(tagRoutedResponseAccount(response, addressed), firstLeave), err
 }
 
 // admissionSpill picks the account a request should move to when its own
@@ -12158,7 +16069,12 @@ func (t usageLimitRetryTransport) admissionSpill(ctx context.Context, accountID 
 			break
 		}
 	}
-	scheduler := s.withCapacityMarks(s.scheduler().ForModel(t.poolModel), t.provider, t.poolModel, codexServiceTierFromContext(ctx))
+	// WithReserves: a spill target must see the owner's holdout like every
+	// other pick does (PATCHES §20, the "holdout leaks"). Without it Reserve
+	// read 0, the holdout was inert, and the held-out account -- idle, since
+	// selection starts nothing on it, so the least loaded -- was the first
+	// target a fanned-out session's overflow found.
+	scheduler := s.withCapacityMarks(s.scheduler().ForModel(t.poolModel).WithReserves(s.AccountReserves), t.provider, t.poolModel, codexServiceTierFromContext(ctx))
 	now := time.Now()
 	skip := map[string]struct{}{}
 	for {
@@ -12180,7 +16096,12 @@ func (t usageLimitRetryTransport) admissionSpill(ctx context.Context, accountID 
 					continue
 				}
 			}
-			if !scheduler.UsableForStickySession(candidateProvider, candidate.ID) {
+			// Evicted is the one verdict for a spent window and the holdout
+			// (it honours the §60 final-day release), applied to subscription
+			// accounts as oauthRetryCandidate applies it; the spill starts this
+			// request on the account, so it must not be either.
+			if (candidate.AuthMode == accounts.AuthModeOAuth && scheduler.Evicted(candidateProvider, candidate.ID)) ||
+				!scheduler.UsableForStickySession(candidateProvider, candidate.ID) {
 				continue
 			}
 			free, load := s.admission.freeLoad(admissionKeyFor(candidateProvider, candidate.ID, t.poolModel))
@@ -12216,12 +16137,37 @@ func (t usageLimitRetryTransport) admissionSpill(ctx context.Context, accountID 
 	}
 }
 
-// commitSuccessfulFailover persists a retry-selected account only after the
-// replacement has accepted a clean successful response. Candidate selection is
-// provisional so replay or upstream failures leave the prior assignment intact.
-func (t usageLimitRetryTransport) commitSuccessfulFailover(response *http.Response, attempt int, accountID string, reason accountMoveReason) error {
+// commitSuccessfulFailover moves durable stickiness only after the replacement
+// account has accepted the request. Candidate selection is provisional: a
+// replay/body failure or another upstream error must leave the prior session
+// assignment intact so the next request does not start on an unproven account.
+//
+// And only when the session was FORCED off its account (owner rule P8,
+// PATCHES §31): a window that is spent, a dead credential, a model the account
+// cannot serve. A limited-not-spent 429 is transient -- the replacement serves
+// this one turn and the session keeps its account -- for every provider whose
+// selection policy says so (Claude, and Codex since PATCHES §35). A move that
+// was already under way (commitFirstSuccess: selection or refresh left a spent
+// pin) commits as before: that session was leaving its old account anyway.
+//
+// outerMoved: the Codex capacity layer above moved the request off t.account
+// before this layer ran. This layer never saw why, so it leaves the pin to
+// that layer, which commits its own forced moves and keeps the pin on its
+// transient ones (codexOverloadFailoverTransport). Committing here used to
+// move the session from t.account whenever the replacement failed over once
+// more below, whatever the capacity layer's reason for leaving it.
+//
+// reason names the move for the log line (upstream #532); it decides nothing.
+func (t usageLimitRetryTransport) commitSuccessfulFailover(response *http.Response, attempt int, accountID string, firstLeave accountSwitch, outerMoved bool, reason accountMoveReason) error {
 	if (!t.commitFirstSuccess && attempt <= 1) || response == nil || response.StatusCode < 200 || response.StatusCode >= 300 ||
 		t.server == nil || t.server.Sessions == nil {
+		return nil
+	}
+	if !t.commitFirstSuccess && outerMoved {
+		return nil
+	}
+	if transientFailoverKeepsPin(t.provider, t.commitFirstSuccess, firstLeave) {
+		logTransientFailoverKept(t.logger, t.agent, t.session, t.account, accountID, firstLeave)
 		return nil
 	}
 	expectedAccount := t.expectedAccount
@@ -12244,9 +16190,6 @@ func (s Server) commitSuccessfulHTTPResponseWithReason(response *http.Response, 
 	commit := func() error {
 		swapped, err := s.commitSessionReassignment(agentType, sessionID, expectedAccountID, accountID, userEmail)
 		if err == nil && swapped {
-			if reason == accountMoveCapacity {
-				s.softMoveState.note(session.ScopedSessionKey(agentType, sessionID), time.Now())
-			}
 			if reason != "" && s.Logger != nil {
 				s.Logger.Warn("session account move committed after successful response",
 					"agent", agentType,
@@ -12262,17 +16205,33 @@ func (s Server) commitSuccessfulHTTPResponseWithReason(response *http.Response, 
 	if response == nil || response.Body == nil || response.Body == http.NoBody {
 		return commit()
 	}
+	// A body that ends without the success its move was waiting for leaves the
+	// session where it was, which is correct -- but it used to leave no trace,
+	// and a stream whose terminal event could never be read (PATCHES §25)
+	// failed every commit for days without one line.
+	contentEncoding := response.Header.Get("Content-Encoding")
+	missed := func(reason string) {
+		if s.Logger != nil {
+			s.Logger.Warn("provisional session move not committed",
+				"agent", agentType,
+				"session", sessionID,
+				"from_account", expectedAccountID,
+				"to_account", accountID,
+				"reason", reason,
+				"content_encoding", contentEncoding)
+		}
+	}
 	if strings.HasPrefix(strings.ToLower(response.Header.Get("Content-Type")), "text/event-stream") {
 		// A streaming API has only accepted the request when its terminal event
 		// says the turn completed. HTTP 200 headers alone are not enough: Codex
 		// and Anthropic-shaped providers can end a 200 stream with a failure.
-		response.Body = newSessionCommitSSEReadCloser(response.Body, commit)
+		response.Body = newSessionCommitSSEReadCloser(response.Body, commit, missed)
 		return nil
 	}
 	// A non-streaming 2xx can still reset or truncate while its body is copied
 	// to the client. Commit only on clean EOF so such a response does not pin
 	// the session to the account that failed it.
-	response.Body = newSessionCommitEOFReadCloser(response.Body, commit)
+	response.Body = newSessionCommitEOFReadCloser(response.Body, commit, missed)
 	return nil
 }
 
@@ -12280,11 +16239,13 @@ type sessionCommitEOFReadCloser struct {
 	reader   io.Reader
 	closer   io.Closer
 	commit   func() error
+	missed   func(reason string)
 	finished bool
 }
 
-func newSessionCommitEOFReadCloser(body io.ReadCloser, commit func() error) io.ReadCloser {
-	return &sessionCommitEOFReadCloser{reader: body, closer: body, commit: commit}
+// missed, when set, is told once why the body ended without committing.
+func newSessionCommitEOFReadCloser(body io.ReadCloser, commit func() error, missed func(reason string)) io.ReadCloser {
+	return &sessionCommitEOFReadCloser{reader: body, closer: body, commit: commit, missed: missed}
 }
 
 func (r *sessionCommitEOFReadCloser) Read(p []byte) (int, error) {
@@ -12304,6 +16265,12 @@ func (r *sessionCommitEOFReadCloser) Read(p []byte) (int, error) {
 }
 
 func (r *sessionCommitEOFReadCloser) Close() error {
+	if !r.finished {
+		r.finished = true
+		if r.missed != nil {
+			r.missed("body closed before EOF")
+		}
+	}
 	return r.closer.Close()
 }
 
@@ -12312,6 +16279,7 @@ const sessionCommitSSEMaxLineBytes = 1 << 20
 type sessionCommitSSEReadCloser struct {
 	io.ReadCloser
 	commit       func() error
+	missed       func(reason string)
 	line         []byte
 	eventName    string
 	eventData    []byte
@@ -12319,17 +16287,31 @@ type sessionCommitSSEReadCloser struct {
 	terminal     bool
 }
 
-func newSessionCommitSSEReadCloser(body io.ReadCloser, commit func() error) io.ReadCloser {
-	return &sessionCommitSSEReadCloser{ReadCloser: body, commit: commit}
+// missed, when set, is told once why the stream ended without committing.
+func newSessionCommitSSEReadCloser(body io.ReadCloser, commit func() error, missed func(reason string)) io.ReadCloser {
+	return &sessionCommitSSEReadCloser{ReadCloser: body, commit: commit, missed: missed}
+}
+
+// miss ends the observation without a commit and says why, once.
+func (r *sessionCommitSSEReadCloser) miss(reason string) {
+	if r.terminal {
+		return
+	}
+	r.terminal = true
+	if r.missed != nil {
+		r.missed(reason)
+	}
 }
 
 func (r *sessionCommitSSEReadCloser) Read(p []byte) (int, error) {
 	n, readErr := r.ReadCloser.Read(p)
 	if n > 0 && !r.terminal {
 		terminal, success := r.observe(p[:n], false)
-		if terminal {
+		if terminal && !success {
+			r.miss("stream reported failure")
+		} else if terminal {
 			r.terminal = true
-			if success && r.commit != nil {
+			if r.commit != nil {
 				if err := r.commit(); err != nil {
 					// Do not deliver the terminal-success bytes after failing to
 					// persist their routing consequence. Earlier streamed content
@@ -12342,16 +16324,25 @@ func (r *sessionCommitSSEReadCloser) Read(p []byte) (int, error) {
 	}
 	if readErr == io.EOF && !r.terminal {
 		terminal, success := r.observe(nil, true)
-		if terminal {
+		if terminal && !success {
+			r.miss("stream reported failure")
+		} else if terminal {
 			r.terminal = true
-			if success && r.commit != nil {
+			if r.commit != nil {
 				if err := r.commit(); err != nil {
 					return n, fmt.Errorf("persist successful streamed session reassignment: %w", err)
 				}
 			}
+		} else {
+			r.miss("stream ended without a terminal event")
 		}
 	}
 	return n, readErr
+}
+
+func (r *sessionCommitSSEReadCloser) Close() error {
+	r.miss("stream closed before its terminal event")
+	return r.ReadCloser.Close()
 }
 
 func (r *sessionCommitSSEReadCloser) observe(chunk []byte, _ bool) (bool, bool) {
@@ -12439,9 +16430,29 @@ func (s Server) commitSessionReassignment(agentType, sessionID, expectedAccountI
 	if s.Sessions == nil {
 		return true, nil
 	}
-	_, swapped, err := s.Sessions.CompareAndPut(agentType, sessionID, expectedAccountID, accountID, userEmail)
+	current, swapped, err := s.Sessions.CompareAndPut(agentType, sessionID, expectedAccountID, accountID, userEmail)
 	if err != nil {
 		return false, err
+	}
+	if s.Logger != nil && !swapped {
+		// Correct -- another writer moved the session first, and the newer
+		// assignment wins -- but a refused commit used to be invisible.
+		s.Logger.Warn("provisional session move not committed",
+			"agent", agentType,
+			"session", sessionID,
+			"from_account", expectedAccountID,
+			"to_account", accountID,
+			"reason", "pin changed",
+			"pinned_account", current.AccountID)
+	} else if s.Logger != nil && expectedAccountID != accountID {
+		// Selection skips logAccountMove for a provisional move (nothing has
+		// moved yet), so this is the line that records it once it has.
+		s.Logger.Warn("session moved to another account; upstream prompt cache is cold",
+			"agent", agentType,
+			"session", sessionID,
+			"from_account", expectedAccountID,
+			"to_account", accountID,
+			"committed_after_success", true)
 	}
 	return swapped, nil
 }
@@ -12688,47 +16699,101 @@ func (t usageLimitRetryTransport) logAntigravityUnusableResponse(response *http.
 	t.logger.Warn("antigravity Cloud Code account unusable", fields...)
 }
 
-// accountOnHold reports Anthropic's account_on_hold refusal: the account is
-// restricted by Anthropic, and no re-login fixes it.
-func accountOnHold(err error) bool {
-	return err != nil && strings.Contains(strings.ToLower(err.Error()), "account_on_hold")
-}
-
-// pinnedAccountNeedsReauth reports whether a pinned account failed for a
-// reason retries cannot fix.
-func pinnedAccountNeedsReauth(err error) bool {
-	return accountOnHold(err) || isTerminalCredentialError(err)
-}
-
-// writePinnedAccountUnusable answers a pinned request whose account is dead
-// with a non-retryable 403 in the provider's error shape. x-should-retry:false
-// tells Anthropic and OpenAI SDK clients not to retry it.
-func writePinnedAccountUnusable(w http.ResponseWriter, provider accounts.Provider, accountID string, cause error) {
-	reason := "its credential needs re-login (refresh token invalid or expired); re-add it with 'sr add " + string(provider) + "'"
-	if accountOnHold(cause) {
-		reason = "it is restricted by Anthropic (account_on_hold)"
-	}
-	message := fmt.Sprintf("subrouter: pinned account %q is unusable: %s. Pick another account (sr %s proxy --account) or launch pooled.", accountID, reason, provider)
-	var body []byte
-	if provider == accounts.ProviderClaude {
-		body, _ = json.Marshal(map[string]any{
-			"type":  "error",
-			"error": map[string]string{"type": "permission_error", "message": message},
-		})
-	} else {
-		body, _ = json.Marshal(map[string]any{
-			"error": map[string]string{"type": "invalid_request_error", "code": "account_unusable", "message": message},
-		})
-	}
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("X-Should-Retry", "false")
-	w.WriteHeader(http.StatusForbidden)
-	_, _ = w.Write(body)
-}
-
 // isTerminalCredentialError reports whether an account refresh failed because
 // its credential is dead and re-auth is required (so the account should be
 // dropped from selection), as opposed to a transient or context failure.
+// errRefreshTransient marks a refresh that reached no verdict on the account.
+// The handler serves such a turn once from elsewhere WITHOUT moving the
+// session, and a peer answers it with a marked 502 rather than the 503 that
+// reads as "my pool is spent" -- see remotePoolTransientHeader.
+var errRefreshTransient = errors.New("account token refresh did not complete")
+
+// claudeRefreshStatus pulls the HTTP status out of the Claude store's
+// "Claude OAuth refresh failed: <status> ..." error.
+var claudeRefreshStatus = regexp.MustCompile(`OAuth refresh failed: (\d{3})\b`)
+
+// refreshFailureIsTransient reports a refresh failure that is about the
+// request or the token endpoint, not the account: the client went away, a
+// deadline passed, the network failed before the endpoint answered, or the
+// endpoint itself was rate limited or erroring (429/5xx). None of these is
+// evidence the account cannot serve, so none may mark it or move a session.
+func refreshFailureIsTransient(ctx context.Context, err error) bool {
+	if err == nil {
+		return false
+	}
+	if m := claudeRefreshStatus.FindStringSubmatch(err.Error()); m != nil {
+		if code, convErr := strconv.Atoi(m[1]); convErr == nil && (code == http.StatusTooManyRequests || code >= 500) {
+			return true
+		}
+	}
+	var codexRefresh *accounts.CodexAuthRefreshError
+	if errors.As(err, &codexRefresh) && (codexRefresh.StatusCode == http.StatusTooManyRequests || codexRefresh.StatusCode >= 500) {
+		return true
+	}
+	if ctx != nil && ctx.Err() != nil {
+		return true
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	// The local credential store did not answer: `security` killed on its own
+	// 5 s clock while this request's is still running, a fork that failed
+	// under load, a credentials file that would not read. The account was
+	// never looked at (agentclaude.ErrCredentialUnchecked).
+	if errors.Is(err, agentclaude.ErrCredentialUnchecked) {
+		return true
+	}
+	// url.Error wraps only failures that happened before an HTTP response
+	// existed; a token endpoint that ANSWERED (400/401 and the like) comes back
+	// as a parsed refresh error instead.
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		return true
+	}
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		return true
+	}
+	var dnsErr *net.DNSError
+	return errors.As(err, &dnsErr)
+}
+
+// refreshFailureCannotServe is the failover gate for a refresh that reached a
+// verdict: upstream's terminal credential allowlist, plus the two local
+// "nothing to refresh" states -- the profile is gone, or it holds no access
+// token. Neither is on upstream's list, and the fork measured 1,382 of them in
+// one fortnight (2026-09-10..24, PATCHES section 20): a session waiting on one
+// is stranded, because like invalid_grant only a re-add revives the account.
+// They are kept out of isTerminalCredentialError on purpose, so the credential
+// failure cache and the long credential hold do not change for them.
+func refreshFailureCannotServe(err error) bool {
+	if err == nil {
+		return false
+	}
+	if isTerminalCredentialError(err) {
+		return true
+	}
+	// The local credential store refused, or has not answered for longer than
+	// a transient may last: the account cannot serve until someone fixes the
+	// store, and a session waiting on it would 502 every turn.
+	if errors.Is(err, agentclaude.ErrCredentialUnavailable) {
+		return true
+	}
+	// Anthropic put the account on hold (account_on_hold, a 403 from the
+	// token endpoint): no refresh, retry or re-login lifts it. It is off
+	// isTerminalCredentialError on purpose (PATCHES §29.2), so it keeps the
+	// short mark and not the credential failure cache; but it is a verdict,
+	// and without it here an unpinned request surfaced the refusal unmarked,
+	// the turn ended in a 503, and the next pick could land on the account
+	// again (PATCHES §35). A pin still gets §29.2's final 403.
+	if accountOnHold(err) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "has no access token") ||
+		(strings.Contains(msg, `profile "`) && strings.Contains(msg, `" not found`))
+}
+
 func isTerminalCredentialError(err error) bool {
 	if err == nil {
 		return false
@@ -12819,28 +16884,42 @@ func (s Server) rerouteModelIncompatibilityForReconnect(ctx context.Context, pro
 	return err
 }
 
+// oauthRetryAccount is oauthRetryCandidate plus an immediate sticky commit, for
+// the one caller with no later success boundary of its own to commit at: the
+// websocket quota reconnect (the next connection must land on the new account).
+// The HTTP retry transport and the Opus substitution stage use
+// oauthRetryCandidate and commit once the new account has answered instead.
+func (s Server) oauthRetryAccount(ctx context.Context, provider accounts.Provider, agentType, sessionID, userEmail, poolModel string, tried map[string]struct{}, oauthOnly bool) (accounts.Account, error) {
+	account, err := s.oauthRetryCandidate(ctx, provider, agentType, sessionID, userEmail, poolModel, tried, oauthOnly, false)
+	if err != nil {
+		return accounts.Account{}, err
+	}
+	if s.Sessions != nil {
+		if _, err := s.Sessions.Put(agentType, sessionID, account.ID, userEmail); err != nil {
+			return accounts.Account{}, err
+		}
+	}
+	return account, nil
+}
+
 // oauthRetryCandidate selects and refreshes a candidate without changing the
 // durable sticky assignment. In-request replay commits only after a 2xx
 // response, while pre-request refresh callers return a pending-commit bit to
 // their protocol-specific success boundary.
-func (s Server) oauthRetryCandidate(ctx context.Context, provider accounts.Provider, agentType, sessionID, userEmail, poolModel string, tried map[string]struct{}, oauthOnly, allowTriedClaudeExtraUsage bool) (accounts.Account, error) {
-	account, _, err := s.oauthRetryCandidateInternal(ctx, provider, agentType, sessionID, userEmail, poolModel, tried, oauthOnly, allowTriedClaudeExtraUsage, false)
-	return account, err
-}
-
-// oauthRetryCandidateWithReservation is the Claude failover variant used by
-// the replay transport. It atomically reserves the replacement account before
-// refreshing its credential, so concurrent quota failures cannot all select
-// the same stale best account. The caller must commit the reservation once the
-// replay request is prepared, or release it on failure.
-func (s Server) oauthRetryCandidateWithReservation(ctx context.Context, provider accounts.Provider, agentType, sessionID, userEmail, poolModel string, tried map[string]struct{}, oauthOnly, allowTriedClaudeExtraUsage bool) (accounts.Account, *selectacct.PlacementReservation, error) {
-	return s.oauthRetryCandidateInternal(ctx, provider, agentType, sessionID, userEmail, poolModel, tried, oauthOnly, allowTriedClaudeExtraUsage, true)
-}
-
-func (s Server) oauthRetryCandidateInternal(ctx context.Context, provider accounts.Provider, agentType, sessionID, userEmail, poolModel string, tried map[string]struct{}, oauthOnly, allowTriedClaudeExtraUsage, reserveClaude bool) (accounts.Account, *selectacct.PlacementReservation, error) {
+//
+// Candidates exclude EVICTED OAuth accounts (spent, or inside the owner's
+// holdout) -- the fork's filter, which upstream dropped in ddb8744. The HTTP
+// usage failover alone takes the narrow part of ddb8744 back, after this has
+// nothing left: oauthRecoveryProbeCandidate. The final
+// bool is accepted for call-site compatibility and ignored: it armed upstream's
+// paid Claude extra-usage revisit (2269757), which is not wired here.
+// Upstream's reservation variant (#644, oauthRetryCandidateWithReservation)
+// is not taken: a replacement is debited with NoteRouted when it is used, as
+// selection's pick is (PATCHES §26).
+func (s Server) oauthRetryCandidate(ctx context.Context, provider accounts.Provider, agentType, sessionID, userEmail, poolModel string, tried map[string]struct{}, oauthOnly, _ bool) (accounts.Account, error) {
 	allCandidates := filterAccountsForProvider(s.accountListContext(ctx), provider)
 	if len(allCandidates) == 0 {
-		return accounts.Account{}, nil, fmt.Errorf("no %s accounts available", provider)
+		return accounts.Account{}, fmt.Errorf("no %s accounts available", provider)
 	}
 	s.refreshUsageScoresForRequest(ctx)
 	// Loop so a single account with a dead OAuth token (refresh returns
@@ -12850,17 +16929,19 @@ func (s Server) oauthRetryCandidateInternal(ctx context.Context, provider accoun
 	// though healthy accounts remained untried.
 	var lastErr error
 	for {
-		quotaScheduler := s.scheduler()
-		scheduler := s.withCapacityMarks(quotaScheduler.ForModel(poolModel), provider, poolModel, codexServiceTierFromContext(ctx))
+		// WithReserves: a failover pick must see the holdout like selection does,
+		// or a 429 walks the session straight into the owner's reserve.
+		scheduler := s.scheduler().ForModel(poolModel).WithReserves(s.AccountReserves)
+		// Capacity marks of the caller's tier (every tier when it did not
+		// say): a failover replacement avoids accounts shedding the model.
+		scheduler = s.withCapacityMarks(scheduler, provider, poolModel, codexServiceTierFromContext(ctx))
 		if s.Sessions != nil {
-			scheduler = scheduler.WithSessionCounts(SchedulerActiveSessionCounts(s.Sessions))
+			scheduler = scheduler.WithSessionCounts(SchedulerSessionCounts(s.Sessions)).
+				WithLiveSessionCounts(SchedulerActiveSessionCounts(s.Sessions, s.ActiveSessions))
 		}
 		candidates := make([]accounts.Account, 0, len(allCandidates))
 		for _, account := range allCandidates {
 			if _, ok := tried[account.ID]; ok {
-				continue
-			}
-			if provider == accounts.ProviderCodex && s.codexSessionBanned(agentType, sessionID, account.ID) {
 				continue
 			}
 			if oauthOnly && account.AuthMode != accounts.AuthModeOAuth {
@@ -12868,108 +16949,53 @@ func (s Server) oauthRetryCandidateInternal(ctx context.Context, provider accoun
 			}
 			if provider == accounts.ProviderClaude && s.admission != nil &&
 				s.admission.paused(admissionKeyFor(schedulerAccountProvider(account.Provider), account.ID, poolModel), time.Now()) {
+				// Its admission bucket is paused after a rate limit: a
+				// replay there would only queue behind the pause (upstream
+				// #645).
+				continue
+			}
+			// The holdout filter (PATCHES section 20): a failover pick must not
+			// walk a session into an exhausted account or the owner's reserve.
+			// It is also the decline the Opus substitution reads as "no
+			// capacity". Upstream dropped it (ddb8744). The "trying anyway"
+			// below covers accounts under the new-session floor, not a stale
+			// exhaustion zero, which never gets past this filter; the HTTP
+			// usage failover probes those last (oauthRecoveryProbeCandidate).
+			if account.AuthMode == accounts.AuthModeOAuth && scheduler.Evicted(schedulerAccountProvider(account.Provider), account.ID) {
 				continue
 			}
 			candidates = append(candidates, account)
 		}
-		var account accounts.Account
-		// Cost order: paid extra usage (tier 3) is reached only when no
-		// untried API key (tier 2, free credits) can still take the request.
-		if provider == accounts.ProviderClaude && !s.claudeAPIKeyCandidateAvailable(scheduler, candidates, poolModel) {
-			if fallback, ok := s.pickClaudeExtraUsageFallbackForRequest(scheduler, allCandidates, poolModel); ok {
-				_, alreadyTried := tried[fallback.ID]
-				if !alreadyTried || allowTriedClaudeExtraUsage {
-					account = fallback
-					if alreadyTried {
-						// Consume the one-time revisit before refreshAccount. If that
-						// refresh fails, this function loops internally and must not
-						// select the same broken paid credential indefinitely.
-						allowTriedClaudeExtraUsage = false
-					}
-				}
-			}
-		}
-		if account.ID == "" {
-			// A live controller cooldown is stronger evidence than a stale score,
-			// but a stale score alone must remain probeable. Do not spend replay
-			// attempts on accounts the controller has explicitly held out after an
-			// authoritative 429/401; keep an unmarked account available for the
-			// bounded optimistic failover path.
-			if provider == accounts.ProviderClaude && s.SchedulerRef != nil {
-				now := time.Now()
-				eligible := candidates[:0]
-				for _, candidate := range candidates {
-					candidateProvider := schedulerAccountProvider(candidate.Provider)
-					if _, blocked := s.SchedulerRef.ExplicitBlockedUntilFor(candidateProvider, candidate.ID, poolModel, now); blocked {
-						continue
-					}
-					eligible = append(eligible, candidate)
-				}
-				if len(eligible) == 0 && len(candidates) > 0 {
-					return accounts.Account{}, nil, fmt.Errorf("all %s retry candidates are in controller cooldown: %w", provider, s.poolExhaustedError(provider, allCandidates, poolModel))
-				}
-				candidates = eligible
-			}
-			if provider == accounts.ProviderClaude && len(candidates) > 0 {
-				// Prefer confirmed available model quota over unknown scores,
-				// without fetching another status snapshot before retry.
-				candidates = claudeRetryCandidatesFromScores(quotaScheduler, scheduler, candidates, poolModel, time.Now())
-				// Subscription quota is cheaper than every API-key route,
-				// including a promoted credit grant. Keep stale but non-exhausted
-				// OAuth candidates ahead of keys when telemetry is uncertain.
-				if subscriptions := claudeSubscriptionCandidatesFromScores(quotaScheduler, scheduler, candidates, poolModel); len(subscriptions) > 0 {
-					candidates = subscriptions
-				}
-				if len(candidates) == 0 {
-					return accounts.Account{}, nil, fmt.Errorf("all untried Claude retry candidates have confirmed quota exhaustion or lack model support: %w", s.poolExhaustedError(provider, allCandidates, poolModel))
-				}
-			}
-			if len(candidates) == 0 {
-				if lastErr != nil {
-					return accounts.Account{}, nil, lastErr
-				}
-				return accounts.Account{}, nil, fmt.Errorf("no untried %s accounts available", provider)
-			}
-			var err error
-			if reserveClaude && provider == accounts.ProviderClaude && s.SchedulerRef != nil && allOAuthCandidates(candidates) {
-				var normalized accounts.Account
-				normalizedCandidates := SchedulerAccounts(candidates)
-				normalized, reservation, pickErr := s.SchedulerRef.PickAndReserveContext(ctx, scheduler, normalizedCandidates)
-				if pickErr != nil {
-					return accounts.Account{}, nil, pickErr
-				}
-				for _, candidate := range candidates {
-					if candidate.ID == normalized.ID && accountProviderFor(candidate.Provider) == normalized.Provider {
-						account = candidate
-						break
-					}
-				}
-				if account.ID == "" {
-					reservation.Release()
-					return accounts.Account{}, nil, fmt.Errorf("scheduler returned unknown account %q", normalized.ID)
-				}
-				refreshed, refreshErr := s.refreshAccount(ctx, account)
-				if refreshErr != nil {
-					reservation.Release()
-					if ctx.Err() != nil {
-						return accounts.Account{}, nil, refreshErr
-					}
-					tried[account.ID] = struct{}{}
-					lastErr = refreshErr
-					if isTerminalCredentialError(refreshErr) {
-						s.markAccountExhaustedCredentialForAccount(account)
-					}
+		// A live controller cooldown is stronger evidence than a stale score.
+		// Do not spend replay attempts on accounts the controller has
+		// explicitly held out after an authoritative 429/401 (upstream #544).
+		if provider == accounts.ProviderClaude && s.SchedulerRef != nil {
+			now := time.Now()
+			eligible := candidates[:0]
+			for _, candidate := range candidates {
+				candidateProvider := schedulerAccountProvider(candidate.Provider)
+				if _, blocked := s.SchedulerRef.ExplicitBlockedUntilFor(candidateProvider, candidate.ID, poolModel, now); blocked {
 					continue
 				}
-				return refreshed, reservation, nil
+				eligible = append(eligible, candidate)
 			}
-			account, err = pickRoutingAccount(scheduler, candidates)
-			if err != nil {
-				return accounts.Account{}, nil, err
+			if len(eligible) == 0 && len(candidates) > 0 {
+				return accounts.Account{}, fmt.Errorf("all %s retry candidates are in controller cooldown: %w", provider, s.poolExhaustedError(provider, allCandidates, poolModel))
 			}
+			candidates = eligible
+		}
+		if len(candidates) == 0 {
+			if lastErr != nil {
+				return accounts.Account{}, lastErr
+			}
+			return accounts.Account{}, fmt.Errorf("no untried non-exhausted %s accounts available: %w", provider, s.poolExhaustedError(provider, allCandidates, poolModel))
+		}
+		account, err := pickRoutingAccount(scheduler, candidates)
+		if err != nil {
+			return accounts.Account{}, err
 		}
 		if account.AuthMode == accounts.AuthModeAPIKey {
-			return account, nil, nil
+			return account, nil
 		}
 		// Do not stop failover when the best untried account looks exhausted: scores
 		// can be stale, so trying it (the retry loop is bounded by maxAttempts and
@@ -12979,15 +17005,14 @@ func (s Server) oauthRetryCandidateInternal(ctx context.Context, provider accoun
 			s.Logger.Warn("usage-limit retry selecting OAuth account below new-session headroom; trying anyway",
 				"provider", provider,
 				"account", account.ID,
-				"exhausted", scheduler.Exhausted(schedulerAccountProvider(account.Provider), account.ID),
-				"threshold", selectacct.MinNewSessionHeadroom)
+				"exhausted", scheduler.Exhausted(schedulerAccountProvider(account.Provider), account.ID))
 		}
 		refreshed, err := s.refreshAccount(ctx, account)
 		if err != nil {
 			if ctx.Err() != nil {
 				// The request itself was cancelled or timed out; abort failover
 				// without poisoning the account's routing score.
-				return accounts.Account{}, nil, err
+				return accounts.Account{}, err
 			}
 			// Skip this account for the rest of THIS failover and try the next
 			// untried candidate. Only poison the routing score for a terminal
@@ -13011,10 +17036,12 @@ func (s Server) oauthRetryCandidateInternal(ctx context.Context, provider accoun
 			}
 			continue
 		}
-		return refreshed, nil, nil
+		return refreshed, nil
 	}
 }
 
+// allOAuthCandidates reports a non-empty candidate set of OAuth accounts
+// only (upstream #644's reservation guard; kept for its callers' tests).
 func allOAuthCandidates(candidates []accounts.Account) bool {
 	if len(candidates) == 0 {
 		return false
@@ -13025,6 +17052,100 @@ func allOAuthCandidates(candidates []accounts.Account) bool {
 		}
 	}
 	return true
+}
+
+// oauthRecoveryProbeCandidate is the usage failover's last resort, asked only
+// once oauthRetryCandidate has no account left and every give-up stage
+// (fableFallbackResponse: the Fable chain, Opus, the peer pool) has declined
+// (upstream ddb8744, narrowed; PATCHES section 44): an untried OAuth account
+// that is evicted only because its measured score still reads zero after its
+// authoritative exhaustion mark lapsed.
+//
+// Such a zero may be stale. A mark lapses at the reset the upstream named,
+// but the zero it re-anchored is carried forward (Fresh=false) for as long as
+// that account's usage fetches keep failing, so a recovered account used to
+// stay out of failover until a fetch finally succeeded -- unbounded while the
+// usage endpoint throttles. pruneExpired already grants such an account one
+// optimistic probe (recoveryProbeReady), but only the tenant credential lease
+// ever consumed it. SchedulerRef.BlockedUntilFor reports the allowance: an
+// account with no allowance, a live mark of any kind, or its weekly budget in
+// the owner's holdout is never a probe candidate, so the holdout (§20) and
+// every live refusal still bind. The allowance is consumed right before the
+// attempt goes out (claimRecoveryProbeCandidate); if the account is still
+// spent, its 429 re-marks it with the new reset, one attempt per lapse.
+//
+// Nothing else asks for one: the websocket quota reconnect (oauthRetryAccount),
+// rerouteModelIncompatibility, and the Opus stage, whose oauthRetryCandidate
+// error is its "no capacity" decline (§11), never see a probe candidate.
+func (s Server) oauthRecoveryProbeCandidate(ctx context.Context, provider accounts.Provider, poolModel string, tried map[string]struct{}) (accounts.Account, bool) {
+	if s.SchedulerRef == nil {
+		return accounts.Account{}, false
+	}
+	scheduler := s.scheduler().ForModel(poolModel).WithReserves(s.AccountReserves)
+	// The identity-only account reads exactly as this probe's quarry -- evicted
+	// by a zero, no live mark (withIdentityOnlyOverlay) -- so it is named out.
+	for _, account := range s.withoutIdentityOnly(filterAccountsForProvider(s.accountListContext(ctx), provider)) {
+		if _, ok := tried[account.ID]; ok || account.AuthMode != accounts.AuthModeOAuth {
+			continue
+		}
+		scoreProvider := schedulerAccountProvider(account.Provider)
+		if !scheduler.Exhausted(scoreProvider, account.ID) || scheduler.InHoldout(scoreProvider, account.ID) {
+			continue
+		}
+		if _, blocked := s.SchedulerRef.BlockedUntilFor(scoreProvider, account.ID, poolModel, time.Now()); blocked {
+			continue
+		}
+		refreshed, err := s.refreshAccount(ctx, account)
+		if err != nil {
+			if ctx.Err() != nil {
+				return accounts.Account{}, false
+			}
+			tried[account.ID] = struct{}{}
+			if isTerminalCredentialError(err) {
+				s.markAccountExhaustedCredentialForAccount(account)
+			}
+			if s.Logger != nil {
+				s.Logger.Warn("usage-limit retry skipping recovery probe with failed refresh",
+					"provider", provider, "account", account.ID, "error", err)
+			}
+			continue
+		}
+		return refreshed, true
+	}
+	return accounts.Account{}, false
+}
+
+// claimRecoveryProbeCandidate is the probe the usage failover sends: the first
+// oauthRecoveryProbeCandidate whose allowance this request wins
+// (claimRecoveryProbe), right before the attempt goes out. One whose
+// allowance another request took first is passed over for the next.
+func (s Server) claimRecoveryProbeCandidate(ctx context.Context, provider accounts.Provider, poolModel string, tried map[string]struct{}) (accounts.Account, bool) {
+	for {
+		probe, ok := s.oauthRecoveryProbeCandidate(ctx, provider, poolModel, tried)
+		if !ok {
+			return accounts.Account{}, false
+		}
+		if s.claimRecoveryProbe(probe, poolModel) {
+			if s.Logger != nil {
+				s.Logger.Warn("usage-limit retry probing an account whose exhaustion mark has lapsed",
+					"provider", provider, "account", probe.ID, "pool", selectacct.ModelKey(poolModel))
+			}
+			return probe, true
+		}
+		tried[probe.ID] = struct{}{}
+	}
+}
+
+// claimRecoveryProbe consumes the recovery-probe allowance of account. False
+// means the allowance is gone -- another request probed first, or a new mark
+// landed -- and the attempt must not go.
+func (s Server) claimRecoveryProbe(account accounts.Account, poolModel string) bool {
+	if s.SchedulerRef == nil {
+		return false
+	}
+	_, claimed := s.SchedulerRef.RunIfAccountNotBlocked(
+		schedulerAccountProvider(account.Provider), account.ID, poolModel, time.Now(), func() {})
+	return claimed
 }
 
 // peekResponseBodyPrefix returns up to usageLimitInspectMaxBytes of the
@@ -13117,7 +17238,7 @@ func (t replayablePostRetryTransport) RoundTrip(req *http.Request) (*http.Respon
 			// The last attempt's failure is what the client sees as a 502, so
 			// record how the transport got there before giving up.
 			if err != nil && t.logger != nil {
-				t.logger.Error("replayable upstream request exhausted",
+				t.logger.Log(context.Background(), requestFailureLevel(req.Context(), err), "replayable upstream request exhausted",
 					append([]any{"agent", t.agent, "session", t.session, "account", t.account,
 						"method", t.method, "path", t.path, "upstream", t.upstream,
 						"attempts", attempt, "max_attempts", maxAttempts, "error", err},
@@ -13288,10 +17409,17 @@ func retryablePostTransportError(err error) bool {
 }
 
 func (s Server) transport() http.RoundTripper {
-	if s.Transport != nil {
-		return s.Transport
+	base := s.Transport
+	if base == nil {
+		base = http.DefaultTransport
 	}
-	return http.DefaultTransport
+	// With a peer, every local upstream round trip is also evidence about this
+	// machine's own network, which a peer breaker reads before it ends the
+	// holds on that peer (PATCHES §54). It changes no request.
+	if peers := s.peers(); len(peers) > 0 {
+		return localEgressObserver{base: base, peers: peers}
+	}
+	return base
 }
 
 func NewOutboundTransport() *http.Transport {
@@ -13305,9 +17433,11 @@ func NewOutboundTransport() *http.Transport {
 		Timeout:   30 * time.Second,
 		KeepAlive: 30 * time.Second,
 	}
-	transport.DialContext = func(ctx context.Context, _, addr string) (net.Conn, error) {
+	// A dial whose lookup fails goes to the host's last good address
+	// (PATCHES §59); TLS still checks the certificate against the hostname.
+	transport.DialContext = upstreamLastGood.wrap(func(ctx context.Context, _, addr string) (net.Conn, error) {
 		return dialer.DialContext(ctx, outboundDialNetwork(addr), addr)
-	}
+	})
 	transport.ForceAttemptHTTP2 = false
 	transport.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
 	if transport.TLSClientConfig == nil {
@@ -13377,11 +17507,14 @@ const (
 
 func (s Server) scheduler() selectacct.Scheduler {
 	if s.SchedulerRef != nil {
-		return s.withClaudeCostOverlay(s.SchedulerRef.Get().
-			WithLiveDebits(s.SchedulerRef.LiveDebits()).
-			WithInflightCounts(s.SchedulerRef.InflightCounts()))
+		// No WithInflightCounts: upstream #449's in-flight headroom penalty
+		// is not taken (an open session has spent nothing; LiveSessions
+		// carries concurrency, PATCHES §10). InflightCounts stays
+		// bookkeeping for diagnostics.
+		return s.withIdentityOnlyOverlay(s.withClaudeCostOverlay(s.SchedulerRef.Get().
+			WithLiveDebits(s.SchedulerRef.LiveDebits())))
 	}
-	return s.withClaudeCostOverlay(s.Scheduler)
+	return s.withIdentityOnlyOverlay(s.withClaudeCostOverlay(s.Scheduler))
 }
 
 func findAccount(haystack []accounts.Account, id string) (accounts.Account, bool) {
@@ -13488,9 +17621,10 @@ func outboundWebSocketDialer() *websocket.Dialer {
 		outboundWebSocketDialerValue = &websocket.Dialer{
 			Proxy:            http.ProxyFromEnvironment,
 			HandshakeTimeout: websocketHandshakeTimeout,
-			NetDialContext: func(ctx context.Context, _, addr string) (net.Conn, error) {
+			// The same last good address as the HTTP transports (PATCHES §59).
+			NetDialContext: upstreamLastGood.wrap(func(ctx context.Context, _, addr string) (net.Conn, error) {
 				return dialer.DialContext(ctx, outboundDialNetwork(addr), addr)
-			},
+			}),
 			// Pin http/1.1. A websocket upgrade cannot proceed over h2, and
 			// advertising nothing lets the edge choose, which is what differs
 			// from the working HTTP path.
@@ -13508,3 +17642,54 @@ var (
 	outboundWebSocketDialerOnce  sync.Once
 	outboundWebSocketDialerValue *websocket.Dialer
 )
+
+// selectionSchedulerFrom builds THE scheduler selection uses. Every view that
+// claims to show where traffic will go must build its scheduler here.
+//
+// This exists because it used to be assembled inline at the routing site while
+// the pool board assembled its own — and the board's omitted ForModel,
+// WithReserves and WithMachine while its doc comment claimed to be "the
+// scheduler as ROUTING sees it… the only way the board and the router cannot
+// disagree". They disagreed. The board published acct-p as rank 1 with the
+// reason "inside its weekly roll window; that budget expires either way" while
+// routing sent every request to a different account, and the contradiction cost
+// an afternoon of chasing stickiness, machine bindings and reserves before the
+// two ladders turned out to be different objects.
+//
+// A view that genuinely wants the unscoped ordering may pass an empty model,
+// but it is then showing something other than routing and must say so rather
+// than borrow routing's authority.
+func (s Server) selectionSchedulerFrom(base selectacct.Scheduler, poolModel, machineID string) selectacct.Scheduler {
+	scheduler := base.ForModel(poolModel)
+	if s.Sessions != nil {
+		// Keyed by ScoreKey(provider, id), like every other count upstream
+		// builds: a Codex account and a Claude profile may share an email, and
+		// bare-ID counts let one provider's sessions damp the other's placement.
+		scheduler = scheduler.WithSessionCounts(SchedulerSessionCounts(s.Sessions))
+	}
+	if s.Sessions != nil {
+		// Live concurrency, keyed the same way, so a running Claude session
+		// never damps a Codex account sharing its email. The bare-ID
+		// activeSessionCountsByAccount stays for the pool board, which looks
+		// counts up by account ID.
+		scheduler = scheduler.WithLiveSessionCounts(SchedulerActiveSessionCounts(s.Sessions, s.ActiveSessions))
+	}
+	// The machine term is gated HERE rather than at each call site, because a
+	// caller that passes a machine ID the policy does not honour silently
+	// re-arms a ranking term the router will not apply. That is exactly what
+	// happened the first time: routing set the ID only when the policy was
+	// active, the board passed clientRemoteIP unconditionally, and the board
+	// went back to ranking on bindings that routing had stopped consulting --
+	// a fresh divergence inside the change meant to end divergences.
+	if !s.MachinePolicy.Active() {
+		machineID = ""
+	}
+	return scheduler.
+		WithReserves(s.AccountReserves).
+		WithMachine(machineID, s.MachinePolicy)
+}
+
+// selectionScheduler is selectionSchedulerFrom against the current base.
+func (s Server) selectionScheduler(poolModel, machineID string) selectacct.Scheduler {
+	return s.selectionSchedulerFrom(s.scheduler(), poolModel, machineID)
+}

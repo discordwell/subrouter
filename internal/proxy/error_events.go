@@ -106,9 +106,9 @@ type AccountState struct {
 	BlockedUntil   *time.Time        `json:"blocked_until,omitempty"`
 	Inflight       int               `json:"inflight,omitempty"`
 	Sessions       int               `json:"sessions,omitempty"`
-	// ActiveSessions is the placement load signal: assignments that sent a
-	// request within placementActiveWindow. Sessions counts every retained
-	// assignment.
+	// ActiveSessions is the placement load signal: sessions with a turn in
+	// flight on this daemon (SchedulerActiveSessionCounts, the scheduler's
+	// LiveSessions). Sessions counts every retained assignment.
 	ActiveSessions int `json:"active_sessions,omitempty"`
 }
 
@@ -604,36 +604,37 @@ func (s Server) accountPoolSnapshot(ctx context.Context, provider accounts.Provi
 	candidates := filterAccountsForProvider(s.accountListContext(ctx), provider)
 	scheduler := s.scheduler()
 	active := map[string]int{}
+	sessions := map[string]int{}
 	if s.Sessions != nil {
-		active = SchedulerActiveSessionCounts(s.Sessions)
-		scheduler = scheduler.WithSessionCounts(active)
+		// The fork's two counts, as selection reads them: parked sessions
+		// and live (in-flight) ones (§10). Upstream #617's 30-minute recent
+		// count is not taken.
+		sessions = SchedulerSessionCounts(s.Sessions)
+		active = SchedulerActiveSessionCounts(s.Sessions, s.ActiveSessions)
+		scheduler = scheduler.WithSessionCounts(sessions).WithLiveSessionCounts(active)
 	}
 	scoreProvider := schedulerAccountProvider(provider)
 	inflight := map[string]int{}
 	if s.SchedulerRef != nil {
 		inflight = s.SchedulerRef.InflightCounts()
 	}
-	sessions := map[string]int{}
-	if s.Sessions != nil {
-		sessions = SchedulerSessionCounts(s.Sessions)
-	}
 	now := time.Now()
 	for _, account := range candidates {
 		score, known := scheduler.KnownScore(scoreProvider, account.ID)
 		key := selectacct.ScoreKey(scoreProvider, account.ID)
-		tier := scheduler.SelectionTier(account)
+		usableNew := scheduler.UsableForNewSession(scoreProvider, account.ID)
+		exhausted := scheduler.Exhausted(scoreProvider, account.ID)
 		state := AccountState{
 			Account:        account.ID,
 			AuthMode:       account.AuthMode,
-			Tier:           selectionTierName(tier),
+			Tier:           accountStateTier(account, usableNew, exhausted, scheduler.InHoldout(scoreProvider, account.ID)),
 			Known:          known,
 			Fresh:          score.Fresh,
 			Headroom:       roundHeadroom(score.Headroom),
 			ShortHeadroom:  roundHeadroom(score.ShortHeadroom),
 			WeeklyHeadroom: roundHeadroom(score.WeeklyHeadroom),
-			UsableNew: tier == selectacct.SelectionTierPromotedCredits || tier == selectacct.SelectionTierPlan ||
-				tier == selectacct.SelectionTierAPIKey,
-			Exhausted:      tier == selectacct.SelectionTierPlanExhausted || tier == selectacct.SelectionTierExhaustedAPIKey,
+			UsableNew:      usableNew,
+			Exhausted:      exhausted,
 			Inflight:       inflight[key],
 			Sessions:       sessions[key],
 			ActiveSessions: active[key],
@@ -681,22 +682,26 @@ func roundHeadroom(value float64) float64 {
 	return float64(int(value*1000+0.5)) / 1000
 }
 
-func selectionTierName(tier int) string {
-	switch tier {
-	case selectacct.SelectionTierPromotedCredits:
-		return "promoted_credits"
-	case selectacct.SelectionTierPlan:
-		return "plan"
-	case selectacct.SelectionTierAPIKey:
-		return "api_key"
-	case selectacct.SelectionTierPlanConstrained:
-		return "plan_constrained"
-	case selectacct.SelectionTierPlanExhausted:
-		return "plan_exhausted"
-	case selectacct.SelectionTierExhaustedAPIKey:
+// accountStateTier names where an account stands for a new session, in
+// upstream #600's tier names. Upstream reads its selectacct selection tiers
+// (#569/#570: promoted credits, plan, API key, constrained, exhausted); the
+// fork ranks on its own comparator (PATCHES §10) and has no paid tiers, so
+// the name comes from the same verdicts selection gates on.
+func accountStateTier(account accounts.Account, usableNew, exhausted, holdout bool) string {
+	apiKey := account.AuthMode == accounts.AuthModeAPIKey
+	switch {
+	case exhausted && apiKey:
 		return "api_key_exhausted"
+	case exhausted:
+		return "plan_exhausted"
+	case holdout:
+		return "holdout"
+	case usableNew && apiKey:
+		return "api_key"
+	case usableNew:
+		return "plan"
 	default:
-		return "other"
+		return "plan_constrained"
 	}
 }
 

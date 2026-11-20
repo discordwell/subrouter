@@ -118,7 +118,10 @@ func srStatusAccountState(row srUsageRow) string {
 		return srStatusStateRec
 	case markers["throttled"]:
 		return srStatusStateThrottled
-	case strings.Contains(compactPickReason(row), "protected <"):
+	// Upstream reads "protected <" in the Use text; the fork's Use text says
+	// "not routable" for an account the router will not give a new session
+	// (compactPickReason), so this keys on the same router verdict.
+	case strings.Contains(compactPickReason(row), ", not routable"):
 		return srStatusStateProtected
 	default:
 		return srStatusStateReady
@@ -331,22 +334,4 @@ func (r srRunner) cloudStatusJSON(ctx context.Context) error {
 		return err
 	}
 	return writeSRStatusJSON(r.out, usageRowsFromHostedStatuses(statuses), "", time.Now())
-}
-
-// localStatusJSON is the --json form of the local-store status. Anything
-// the auto-import prints goes to stderr so stdout stays one JSON document.
-func (r srRunner) localStatusJSON(ctx context.Context) error {
-	quiet := r
-	quiet.out = r.errOut
-	if quiet.out == nil {
-		quiet.out = io.Discard
-	}
-	if err := quiet.autoImportIfEmpty(ctx); err != nil {
-		return err
-	}
-	rows, err := r.fetchUsageRows(ctx)
-	if err != nil {
-		return err
-	}
-	return writeSRStatusJSON(r.out, rows, "", time.Now())
 }

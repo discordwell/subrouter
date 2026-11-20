@@ -40,13 +40,16 @@ func TestAdmissionRejectionFailsOverToAnotherAccount(t *testing.T) {
 					control.pause(admissionKeyFor(accounts.ProviderClaude, "pinned@example.com", model), time.Now().Add(time.Hour))
 				}
 			},
-			wantClass:   "admission_paused",
-			wantSession: "free@example.com",
+			wantClass: "admission_paused",
+			// A pause is transient trouble: the turn is served elsewhere and
+			// the pin stays (PATCHES §20, §35.1 P8). Upstream moves the
+			// session.
+			wantSession: "pinned@example.com",
 		},
 		{
 			name: "queue full",
 			prepare: func(control *admissionControl) {
-				control.limit, control.queueCap = 1, 0
+				control.limits.Limit, control.limits.Queue = 1, 0
 				for _, model := range []string{"", "default", "claude-opus", "claude-sonnet", "claude-fable"} {
 					// Names that normalize to one key find its only slot held.
 					if _, err := control.acquire(context.Background(), admissionKeyFor(accounts.ProviderClaude, "pinned@example.com", model)); err != nil && !admissionRejected(err) {
@@ -80,7 +83,7 @@ func TestAdmissionRejectionFailsOverToAnotherAccount(t *testing.T) {
 			if _, err := store.Put("claude", "session-pinned", "pinned@example.com", ""); err != nil {
 				t.Fatal(err)
 			}
-			control := testAdmissionControl(defaultAdmissionLimit, defaultAdmissionQueue)
+			control := newAdmissionControl()
 			tc.prepare(control)
 			events := NewErrorEventLog("", nil)
 			handler := Server{
@@ -138,10 +141,10 @@ func TestAdmissionRejectionFailsOverToAnotherAccount(t *testing.T) {
 // TestQueueFullAfterPausedFailoverStillMovesSession drives Server.Handler()
 // with a session pinned to a paused account. The failover lands on an account
 // whose queue is full and then on a third account, which serves the request.
-// The pause justified moving the session, so it must move to the account that
-// served, not stay on the paused one because the queue-full hop overflowed
-// only the request.
-func TestQueueFullAfterPausedFailoverStillMovesSession(t *testing.T) {
+// Upstream moves the session to the account that served (the pause justified
+// it). In this fork a pause and a full queue are both transient trouble, so
+// the turn is served by last@ and the pin stays (PATCHES §20, §35.1 P8).
+func TestQueueFullAfterPausedFailoverKeepsThePin(t *testing.T) {
 	var mu sync.Mutex
 	hits := map[string]int{}
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -216,15 +219,17 @@ func TestQueueFullAfterPausedFailoverStillMovesSession(t *testing.T) {
 		t.Fatalf("upstream hits = %v, want only the last account", hits)
 	}
 	mu.Unlock()
-	if assignment, ok := store.Get("claude", "session-pinned"); !ok || assignment.AccountID != "last@example.com" {
-		t.Fatalf("session assignment = %+v (found %v), want it moved off the paused account to last@example.com", assignment, ok)
+	if assignment, ok := store.Get("claude", "session-pinned"); !ok || assignment.AccountID != "pinned@example.com" {
+		t.Fatalf("session assignment = %+v (found %v), want it kept on pinned@example.com", assignment, ok)
 	}
 }
 
-// TestQueueFullOverflowMovesSessionAfterStreak drives Server.Handler(): while
-// the sticky account stays full, the first overflows keep the session (and its
-// prompt cache) in place, and the admissionOverflowMoveAfter-th moves it.
-func TestQueueFullOverflowMovesSessionAfterStreak(t *testing.T) {
+// TestQueueFullOverflowKeepsTheSession drives Server.Handler(): while the
+// sticky account stays full, every overflow serves the turn elsewhere and
+// keeps the session (and its prompt cache) in place. Upstream moves it on the
+// admissionOverflowMoveAfter-th overflow; a busy account is never an eviction
+// in this fork (PATCHES §20).
+func TestQueueFullOverflowKeepsTheSession(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.Copy(io.Discard, r.Body)
 		_, _ = w.Write([]byte(`{"id":"msg_ok","type":"message"}`))
@@ -241,8 +246,8 @@ func TestQueueFullOverflowMovesSessionAfterStreak(t *testing.T) {
 	if _, err := store.Put("claude", "session-pinned", "pinned@example.com", ""); err != nil {
 		t.Fatal(err)
 	}
-	control := testAdmissionControl(defaultAdmissionLimit, defaultAdmissionQueue)
-	control.limit, control.queueCap = 1, 0
+	control := newAdmissionControl()
+	control.limits.Limit, control.limits.Queue = 1, 0
 	for _, model := range []string{"", "default", "claude-opus", "claude-sonnet", "claude-fable"} {
 		if _, err := control.acquire(context.Background(), admissionKeyFor(accounts.ProviderClaude, "pinned@example.com", model)); err != nil && !admissionRejected(err) {
 			t.Fatal(err)
@@ -287,9 +292,6 @@ func TestQueueFullOverflowMovesSessionAfterStreak(t *testing.T) {
 			t.Fatalf("turn %d status = %d, want 200 from the free account", turn, response.StatusCode)
 		}
 		want := "pinned@example.com"
-		if turn == admissionOverflowMoveAfter {
-			want = "free@example.com"
-		}
 		if assignment, ok := store.Get("claude", "session-pinned"); !ok || assignment.AccountID != want {
 			t.Fatalf("after turn %d session assignment = %+v (found %v), want %s", turn, assignment, ok, want)
 		}

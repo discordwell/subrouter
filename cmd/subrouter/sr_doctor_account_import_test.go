@@ -33,6 +33,9 @@ func writeDoctorServerFile(t *testing.T, store accounts.CodexStore, server srSer
 
 func TestDoctorFailsWhenServerEntryHasNoImportCredential(t *testing.T) {
 	isolateCloudConfig(t)
+	// A box check: a keyless machine has no selected remote (PATCHES 17), so
+	// doctor rightly skips it there. State the unlock.
+	unlockRemoteGateForTest(t)
 	local := healthServer(t, http.StatusOK)
 	t.Setenv("SUBROUTER_LOCAL_BASE_URL", local.URL+"/v1")
 	t.Setenv("SUBROUTER_CODEX_SERVER", "")
@@ -64,6 +67,9 @@ func TestDoctorFailsWhenServerEntryHasNoImportCredential(t *testing.T) {
 
 func TestDoctorFailsWhenServerRejectsImportCredential(t *testing.T) {
 	isolateCloudConfig(t)
+	// A box check: a keyless machine has no selected remote (PATCHES 17), so
+	// doctor rightly skips it there. State the unlock.
+	unlockRemoteGateForTest(t)
 	local := healthServer(t, http.StatusOK)
 	t.Setenv("SUBROUTER_LOCAL_BASE_URL", local.URL+"/v1")
 	t.Setenv("SUBROUTER_CODEX_SERVER", "")
@@ -89,6 +95,9 @@ func TestDoctorFailsWhenServerRejectsImportCredential(t *testing.T) {
 
 func TestDoctorPassesWhenServerAcceptsImports(t *testing.T) {
 	isolateCloudConfig(t)
+	// A box check: a keyless machine has no selected remote (PATCHES 17), so
+	// doctor rightly skips it there. State the unlock.
+	unlockRemoteGateForTest(t)
 	local := healthServer(t, http.StatusOK)
 	t.Setenv("SUBROUTER_LOCAL_BASE_URL", local.URL+"/v1")
 	t.Setenv("SUBROUTER_CODEX_SERVER", "")

@@ -17,6 +17,18 @@ func knownAccountWideQuotaReset(score selectacct.Score, now time.Time) (time.Tim
 	return until, known && !until.IsZero() && until.After(now)
 }
 
+// scoreWeeklyCooked is upstream's Score.WeeklyCooked (#577: the account's
+// weekly window is spent) on the fork's Score, which has no
+// WeeklyHeadroomKnown: its WeeklyHeadroom and WeeklyRemaining read zero both
+// when unmeasured and when spent. A live WeeklyResetAt says a binding weekly
+// window was measured (selectacct.scoreFromLimitWindows sets it only from
+// one, and it reads as no weekly information once elapsed), and
+// WeeklyRemaining is that reading without the Fable reservation or a live
+// debit.
+func scoreWeeklyCooked(score selectacct.Score, now time.Time) bool {
+	return score.WeeklyResetAt.After(now) && score.WeeklyRemaining <= 0
+}
+
 // mergeClaudeResponseQuotaScore publishes account-wide reset headers learned
 // from a successful model response. This is a partial observation, so merge it
 // into the current scheduler instead of replacing other providers' scores.
@@ -56,10 +68,24 @@ func (s Server) mergeClaudeResponseQuotaScore(account accounts.Account, windows 
 	provider := schedulerAccountProvider(account.Provider)
 	score := scoreFromUsageWindows(provider, account.ID, accountWindows)
 	score.Fresh = true
+	// The headers were measured when Anthropic admitted the request, which
+	// its start bounds (PATCHES §29.3b): a 429 marked after that start --
+	// while this request was in flight -- is newer evidence and stays. With
+	// no MeasuredAt the merge ordered by its own revision, read inside the
+	// publish, and so dropped any mark set before the headers arrived.
+	score.MeasuredAt = orderAt
+	// The merged score replaces the account's whole score; the headers say
+	// nothing about the saved reset, so the §56 hold carries over as every
+	// other score builder carries it (resetHeldUntil with no reading).
+	if seed, known := s.SchedulerRef.Get().LookupScore(provider, account.ID); known {
+		score.ResetHeldUntil = resetHeldUntil(nil, seed, time.Now())
+	}
 	if _, ok := s.SchedulerRef.MergeScoresForAccountGeneration([]selectacct.Score{score}, generation); !ok {
 		return
 	}
-	s.AccountRef.RefreshUsageStatusSnapshotFromWindows(score)
+	// The status rows follow, without persisting: this runs in ModifyResponse,
+	// before the reply's headers reach the client.
+	s.AccountRef.refreshUsageStatusRowsFromWindows(false, score)
 }
 
 // allOAuthAccountsWaitingForReset is true only when every locally managed
@@ -107,7 +133,7 @@ func (s Server) allOAuthAccountsWaitingForReset(now time.Time) (time.Time, bool)
 			continue
 		}
 		score := current.ScoreFor(schedulerAccountProvider(account.Provider), account.ID)
-		if account.Provider == accounts.ProviderClaude && score.WeeklyCooked() &&
+		if account.Provider == accounts.ProviderClaude && scoreWeeklyCooked(score, now) &&
 			s.AccountRef.claudeUsageThrottleActive(account, now) {
 			// A weekly-cooked score paired with a throttled telemetry endpoint is
 			// stale evidence. Let the request path run one cheap Claude Code-shaped

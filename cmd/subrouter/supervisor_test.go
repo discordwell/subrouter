@@ -27,6 +27,7 @@ import (
 	"github.com/manaflow-ai/subrouter/internal/buildversion"
 	"github.com/manaflow-ai/subrouter/internal/front"
 	"github.com/manaflow-ai/subrouter/internal/proxy"
+	"github.com/manaflow-ai/subrouter/internal/testenv"
 )
 
 func privateSocketTempRoot(t *testing.T) string {
@@ -38,10 +39,22 @@ func privateSocketTempRoot(t *testing.T) string {
 }
 
 // TestMain lets the test binary double as a minimal supervised worker so
-// startWorkerGeneration can be exercised end to end without a real build.
+// startWorkerGeneration can be exercised end to end without a real build, as
+// the stand-in serve of the daemon-log tests (runDaemonLogChild), and as main()
+// itself in an ended login session (runMainChild). For the tests themselves it
+// first clears the exported store overrides, so a test's own HOME decides
+// where every store lives (test_env_isolation_test.go).
 func TestMain(m *testing.M) {
 	if os.Getenv("SUBROUTER_TEST_FAKE_WORKER") == "1" {
 		runFakeWorker()
+		return
+	}
+	if os.Getenv("SUBROUTER_TEST_DAEMON_LOG_CHILD") == "1" {
+		runDaemonLogChild()
+		return
+	}
+	if argv := os.Getenv("SUBROUTER_TEST_MAIN_CHILD"); argv != "" {
+		runMainChild(argv)
 		return
 	}
 	// A developer shell with a host identity would stamp claims into every
@@ -49,17 +62,23 @@ func TestMain(m *testing.M) {
 	os.Unsetenv(accounts.HostIDEnv)
 	// A developer shell inside Claude Code (or an sr launch) selects its own
 	// Claude config directory, which the default Claude store now honors.
-	// Tests that need one set it themselves.
+	// Tests that need one set it themselves. (testenv.IsolateHome below
+	// unsets CLAUDE_CONFIG_DIR too, with the other store overrides.)
 	os.Unsetenv("CLAUDE_CONFIG_DIR")
 	os.Unsetenv("CLAUDE_CODE_REMOTE_MEMORY_DIR")
 	// Launch-config tests compare exact header sets; the client name is
 	// host-specific, so it is off unless a test sets it.
 	srClientName = func() string { return "" }
 	srClientVersion = func() string { return "" }
-	os.Exit(m.Run())
+	removeHome := testenv.IsolateHome()
+	isolatedHome = os.Getenv("HOME")
+	code := m.Run()
+	removeHome()
+	os.Exit(code)
 }
 
 func runFakeWorker() {
+	claudeSock := newClaudeSocket("", os.Getenv)
 	listener, err := inheritedListenerFromEnv()
 	if err != nil || listener == nil {
 		fmt.Fprintln(os.Stderr, "fake worker: no inherited listener:", err)
@@ -118,6 +137,33 @@ func runFakeWorker() {
 		}
 		_, _ = w.Write([]byte("fake-worker"))
 	})
+	mux.HandleFunc("/refuse", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("X-Fake-Worker-Pid", pid)
+		http.Error(w, `{"type":"error","error":{"type":"authentication_error","message":"OAuth access token has been revoked"}}`, http.StatusUnauthorized)
+	})
+	mux.HandleFunc("/_subrouter/test-claude-socket-guard", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(claudeSock.socketGuard().Status())
+	})
+	mux.HandleFunc("/_subrouter/test-peer", func(w http.ResponseWriter, request *http.Request) {
+		w.Header().Set("X-Fake-Worker-Pid", pid)
+		_, _ = io.WriteString(w, request.RemoteAddr)
+	})
+	mux.HandleFunc("/stream", func(w http.ResponseWriter, request *http.Request) {
+		w.Header().Set("X-Fake-Worker-Pid", pid)
+		_, _ = io.WriteString(w, "first\n")
+		w.(http.Flusher).Flush()
+		for {
+			if _, err := os.Stat(request.URL.Query().Get("gate")); err == nil {
+				break
+			}
+			select {
+			case <-request.Context().Done():
+				return
+			case <-time.After(5 * time.Millisecond):
+			}
+		}
+		_, _ = io.WriteString(w, "second\n")
+	})
 	mux.HandleFunc("/hold", func(w http.ResponseWriter, request *http.Request) {
 		w.Header().Set("X-Fake-Worker-Pid", pid)
 		_, _ = io.Copy(io.Discard, request.Body)
@@ -125,6 +171,7 @@ func runFakeWorker() {
 		_, _ = io.WriteString(w, "released")
 	})
 	server := &http.Server{Handler: mux}
+	claudeSock.startGuarded(server, "", nil)
 	if retireSignal != nil {
 		signals := make(chan os.Signal, 1)
 		signal.Notify(signals, retireSignal)
@@ -428,7 +475,7 @@ func TestPrivateLocalDataListenerFailureIsFatal(t *testing.T) {
 	extraErr := make(chan error, 1)
 	extraErr <- errors.New("injected local listener failure")
 	server := &http.Server{Addr: "127.0.0.1:0", Handler: http.NotFoundHandler()}
-	err := listenAndServeWithSignalsExtra(server, nil, time.Second, nil, extraErr)
+	err := listenAndServeWithSignalsExtra(server, nil, nil, time.Second, nil, nil, extraErr)
 	if err == nil || !strings.Contains(err.Error(), "injected local listener failure") {
 		t.Fatalf("listener failure = %v, want fatal propagation", err)
 	}
@@ -748,7 +795,7 @@ func TestSlotRetirementDrainsPinnedStreamBeforeSupervisorExit(t *testing.T) {
 	}
 	go s.monitorWorker(initial)
 	runDone := make(chan error, 1)
-	go func() { runDone <- s.run() }()
+	go func() { runDone <- s.run(nil) }()
 	t.Cleanup(func() {
 		select {
 		case <-initial.done:
@@ -900,13 +947,14 @@ func unixHTTPClient(socket string) *http.Client {
 }
 
 type supervisorControlStatus struct {
-	Accepting bool                      `json:"accepting"`
-	Retiring  bool                      `json:"retiring"`
-	Active    front.Backend             `json:"active"`
-	Backends  []front.BackendStatus     `json:"backends"`
-	Worker    activeWorkerProcessStatus `json:"active_worker"`
-	Version   string                    `json:"version"`
-	Inhibited bool                      `json:"upgrade_inhibited"`
+	Accepting    bool                      `json:"accepting"`
+	Retiring     bool                      `json:"retiring"`
+	Active       front.Backend             `json:"active"`
+	Backends     []front.BackendStatus     `json:"backends"`
+	Worker       activeWorkerProcessStatus `json:"active_worker"`
+	Version      string                    `json:"version"`
+	Inhibited    bool                      `json:"upgrade_inhibited"`
+	ClaudeSocket string                    `json:"claude_socket"`
 }
 
 func waitForSupervisorStatus(t *testing.T, client *http.Client, runDone <-chan error) supervisorControlStatus {

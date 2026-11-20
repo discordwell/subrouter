@@ -22,3 +22,16 @@ func TestRecoveryCounterStoreKeepsOneHourPerProvider(t *testing.T) {
 		t.Fatalf("codex counters = %+v", got["codex"])
 	}
 }
+
+// Only the providers that feed the counters in this fork are listed when idle:
+// Codex. A Claude row would always read 0 (PATCHES §27), so it appears only
+// once something records a Claude event.
+func TestRecoveryCounterStoreListsNoIdleClaudeRow(t *testing.T) {
+	got := (&recoveryCounterStore{}).snapshot(time.Now())
+	if _, ok := got[string(accounts.ProviderClaude)]; ok {
+		t.Fatalf("snapshot = %+v, want no idle Claude row", got)
+	}
+	if _, ok := got[string(accounts.ProviderCodex)]; !ok {
+		t.Fatalf("snapshot = %+v, want the Codex row", got)
+	}
+}

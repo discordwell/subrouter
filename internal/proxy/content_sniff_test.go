@@ -17,6 +17,17 @@ import (
 	"github.com/manaflow-ai/subrouter/session"
 )
 
+// Upstream manaflow-ai/subrouter #450 (5d997cf, unchanged at c9303d3; the
+// fixture as redacted by #455), content_sniff_test.go as written, bar two
+// tests (PATCHES section 27). TestTokenUsageScannerSniffsBodyWithoutContentType
+// is not ported: the fork has no scanTokenUsage/TokenUsageRecorder, and its
+// response capture never tells a stream from a body by Content-Type.
+// TestProxyRecordsTokenUsageForCodexStreamWithoutContentType keeps only its
+// client half (byte-for-byte body, text/event-stream), for the same reason.
+// In the fork the sniff is installed in the Codex capacity layer, not under
+// every provider (codex_overload.go), so the proxy tests here are Codex
+// POSTs, which is what upstream's are too.
+
 // codexNoContentTypeCapture is a live chatgpt.com response to a codex_cli_rs
 // POST /v1/responses, captured on the team server: the header set as sent
 // (no Content-Type; Set-Cookie, X-Codex-Turn-State, and safety_identifier

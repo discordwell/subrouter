@@ -410,12 +410,13 @@ func assertLoggedOutConfig(t *testing.T, path string) {
 func TestHostedClaudeUploadGuidanceNamesHostedCMUX(t *testing.T) {
 	configPath := filepath.Join(t.TempDir(), "cloud.json")
 	t.Setenv("SUBROUTER_CLOUD_CONFIG", configPath)
+	unlockRemoteGateForTest(t)
 	saveHostedTestConfig(t, configPath, broker.Config{})
 	runner := srRunner{
 		program: "sr", store: accounts.CodexStore{Dir: t.TempDir()},
 		out: io.Discard, errOut: io.Discard,
 	}
-	err := runner.pushClaudeProfile(context.Background(), "work", true)
+	err := runner.pushClaudeProfileToServer(context.Background(), "work", false)
 	if err == nil || !strings.Contains(err.Error(), "hosted cmux uses") {
 		t.Fatalf("error = %v", err)
 	}

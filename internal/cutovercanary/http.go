@@ -193,9 +193,19 @@ func (c *apiClient) sessionStatuses(ctx context.Context) ([]sessionStatus, error
 	if err != nil || status != http.StatusOK {
 		return nil, errors.New("session inventory unavailable")
 	}
-	var assignments []sessionStatus
-	if err := json.Unmarshal(body, &assignments); err != nil {
+	var rows []sessionStatus
+	if err := json.Unmarshal(body, &rows); err != nil {
 		return nil, errors.New("session inventory invalid")
+	}
+	// A row with no account_id is a session held on a peer with no local
+	// assignment (PATCHES §49). DELETE cannot drop it and every leg here
+	// reads assignments, so it is left out, as it was before the daemon
+	// listed it.
+	assignments := rows[:0]
+	for _, row := range rows {
+		if row.AccountID != "" {
+			assignments = append(assignments, row)
+		}
 	}
 	return assignments, nil
 }

@@ -50,31 +50,23 @@ func codexEgressConfigFromEnvironment(sessionPath string) (*proxy.CodexEgressCon
 // disconnects; ~10s when an egress or Azure fallback is configured), with
 // steady gaps of SUBROUTER_CODEX_CAPACITY_RETRY_INTERVAL (default ~9s, at
 // least 500ms) after the ramp.
-// Account failover is opt-in with SUBROUTER_CODEX_OVERLOAD_FAILOVER=1. The
-// default keeps a live session on its account and waits through capacity instead
-// (~10s ladder), with optional SUBROUTER_CODEX_OVERLOAD_MAX_ACCOUNTS and
-// SUBROUTER_CODEX_OVERLOAD_MARK_TTL (Go duration, default 5m). A conversation
-// that hits capacity itself switches whatever its size; one of more than
-// SUBROUTER_CODEX_OVERLOAD_FAILOVER_MAX_INPUT estimated input tokens
-// (default 32000; 0 = no limit) is only kept from being evicted at placement
-// by marks other sessions left, which would re-bill its prompt cache.
-// Persistent retry is enabled by default for up to
-// SUBROUTER_CODEX_CAPACITY_RETRY_BUDGET (default 10m): on the same
-// account, or across accounts with the failover on. The per-request
-// X-Subrouter-Capacity-Retry and X-Subrouter-Retry headers are honored only
-// with the failover on or SUBROUTER_CODEX_CAPACITY_RETRY_HEADER=1;
-// X-Subrouter-Retry shapes only the same-account wait (failover off), so
-// with the failover on it is accepted but has no effect.
+// The account failover (~10s ladder) is ON unless
+// SUBROUTER_CODEX_OVERLOAD_FAILOVER=0 turns it off (codexOverloadFailoverEnabled
+// says why the fork ships it on where upstream is opt-in), with optional
+// SUBROUTER_CODEX_OVERLOAD_MAX_ACCOUNTS and
+// SUBROUTER_CODEX_OVERLOAD_MARK_TTL (Go duration). A conversation of more
+// than SUBROUTER_CODEX_OVERLOAD_FAILOVER_MAX_INPUT estimated input tokens
+// (default 32000; 0 = no limit) keeps its account and its prompt cache: it
+// takes the same-account wait even with the failover on. Upstream #389 /
+// #454 as at c9303d3, without persist mode and the client retry headers
+// (PATCHES section 27). The config is never nil any more: the same-account
+// ladder needs it with the failover off too.
 func codexOverloadFailoverConfigFromEnvironment() (*proxy.CodexOverloadFailoverConfig, error) {
-	// Capacity failover is opt-in. Keeping it off by default prevents a capacity
-	// response from becoming a websocket 1012 reconnect storm that can end a
-	// live Codex turn; same-account retry remains enabled.
-	config := &proxy.CodexOverloadFailoverConfig{
-		Enabled:              envTrue("SUBROUTER_CODEX_OVERLOAD_FAILOVER"),
-		CapacityRetryPersist: true,
-		CapacityRetryBudget:  10 * time.Minute,
-		CapacityRetryHeader:  envTrue("SUBROUTER_CODEX_CAPACITY_RETRY_HEADER"),
+	enabled, err := codexOverloadFailoverEnabled()
+	if err != nil {
+		return nil, err
 	}
+	config := &proxy.CodexOverloadFailoverConfig{Enabled: enabled}
 	if raw := strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_OVERLOAD_MAX_ACCOUNTS")); raw != "" {
 		n, err := strconv.Atoi(raw)
 		if err != nil || n < 1 {
@@ -104,19 +96,26 @@ func codexOverloadFailoverConfigFromEnvironment() (*proxy.CodexOverloadFailoverC
 	if config.StayInterval, err = overloadIntervalFromEnvironment("SUBROUTER_CODEX_CAPACITY_RETRY_INTERVAL"); err != nil {
 		return nil, err
 	}
-	if raw := os.Getenv("SUBROUTER_CODEX_CAPACITY_RETRY"); strings.TrimSpace(raw) != "" {
-		persist, ok := proxy.ParseCodexCapacityRetryMode(raw)
-		if !ok {
-			return nil, fmt.Errorf("SUBROUTER_CODEX_CAPACITY_RETRY=%q: want persist or default", raw)
-		}
-		config.CapacityRetryPersist = persist
-	}
-	if raw := strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_CAPACITY_RETRY_BUDGET")); raw != "" {
-		budget := proxy.ParseCodexCapacityRetryBudget(raw)
-		if budget <= 0 {
-			return nil, fmt.Errorf("SUBROUTER_CODEX_CAPACITY_RETRY_BUDGET=%q: want a positive duration such as 2m (capped at 10m)", raw)
-		}
-		config.CapacityRetryBudget = budget
-	}
 	return config, nil
+}
+
+// codexOverloadFailoverEnabled reads SUBROUTER_CODEX_OVERLOAD_FAILOVER. The
+// fork ships the capacity failover ON (owner, 2026-09-28: "ship it on"):
+// unset means on, and 0/false/no/off turns it off. Upstream is opt-in (unset
+// means off). On, a small conversation's capacity failure gets one quick
+// same-account retry and then moves to an account that is not shedding
+// (marks, capacity eviction after two in a row); a conversation above the
+// size cap (SUBROUTER_CODEX_OVERLOAD_FAILOVER_MAX_INPUT, 32k) still waits on
+// its own account, keeping its prompt cache. Off, every conversation waits on
+// its account. An unrecognized value is an error rather than a silent guess,
+// like the other capacity knobs.
+func codexOverloadFailoverEnabled() (bool, error) {
+	raw := os.Getenv("SUBROUTER_CODEX_OVERLOAD_FAILOVER")
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "", "1", "true", "yes", "on":
+		return true, nil
+	case "0", "false", "no", "off":
+		return false, nil
+	}
+	return false, fmt.Errorf("SUBROUTER_CODEX_OVERLOAD_FAILOVER=%q: want 1 (the default) or 0", raw)
 }

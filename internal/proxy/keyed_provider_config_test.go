@@ -22,8 +22,18 @@ import (
 
 func resetConfiguredProviders(t *testing.T) {
 	t.Helper()
-	ResetOpenAICompatibleProvidersForTest()
-	t.Cleanup(ResetOpenAICompatibleProvidersForTest)
+	configuredMu.Lock()
+	configuredProviders = nil
+	configuredFrozen = false
+	configuredSignature = ""
+	configuredMu.Unlock()
+	t.Cleanup(func() {
+		configuredMu.Lock()
+		configuredProviders = nil
+		configuredFrozen = false
+		configuredSignature = ""
+		configuredMu.Unlock()
+	})
 }
 
 // A declared provider must route end to end without any code shipping for it:
@@ -474,7 +484,7 @@ func TestQwenAnthropicSchedulingUsesSharedTokenPlanSessionLoad(t *testing.T) {
 		{ID: "qwen-token:a-busy", Provider: accounts.ProviderQwenToken, AuthMode: accounts.AuthModeAPIKey, Token: "busy"},
 		{ID: "qwen-token:z-idle", Provider: accounts.ProviderQwenToken, AuthMode: accounts.AuthModeAPIKey, Token: "idle"},
 	}, accounts.ProviderQwenAnthropic)
-	picked, err := scheduler.PickBest(SchedulerAccounts(candidates))
+	picked, err := scheduler.Pick(SchedulerAccounts(candidates))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -488,4 +498,39 @@ func TestQwenAnthropicSchedulingUsesSharedTokenPlanSessionLoad(t *testing.T) {
 	if candidate.Provider != accounts.ProviderQwenAnthropic {
 		t.Fatalf("transport provider = %q, want Anthropic endpoint", candidate.Provider)
 	}
+}
+
+// The freeze forbids CHANGING the routed providers once a handler exists. An
+// identical re-declaration changes nothing and must pass: an in-process serve
+// after any handler build re-applies the same (often empty) declaration. A real
+// change must still be refused.
+func TestFrozenProvidersAcceptOnlyAnIdenticalRedeclaration(t *testing.T) {
+	resetConfiguredProviders(t)
+	declared := []OpenAICompatibleProvider{{Name: "gateway", BaseURL: "https://gateway.example/v1", Aliases: []string{"gw"}}}
+	if err := ConfigureOpenAICompatibleProviders(declared); err != nil {
+		t.Fatal(err)
+	}
+	FreezeOpenAICompatibleProviders()
+	if err := ConfigureOpenAICompatibleProviders(declared); err != nil {
+		t.Fatalf("identical re-declaration after freeze = %v, want nil", err)
+	}
+	for name, changed := range map[string][]OpenAICompatibleProvider{
+		"removed":     nil,
+		"new base":    {{Name: "gateway", BaseURL: "https://other.example/v1", Aliases: []string{"gw"}}},
+		"new alias":   {{Name: "gateway", BaseURL: "https://gateway.example/v1", Aliases: []string{"gw2"}}},
+		"added entry": append(append([]OpenAICompatibleProvider{}, declared...), OpenAICompatibleProvider{Name: "second", BaseURL: "https://second.example"}),
+	} {
+		if err := ConfigureOpenAICompatibleProviders(changed); err == nil {
+			t.Fatalf("%s: a changed declaration was accepted after freeze", name)
+		}
+	}
+	if got := len(openAICompatibleProvidersSnapshotForTest()); got != 1 {
+		t.Fatalf("configured providers = %d after refused changes, want the original 1", got)
+	}
+}
+
+func openAICompatibleProvidersSnapshotForTest() []keyedProvider {
+	configuredMu.RLock()
+	defer configuredMu.RUnlock()
+	return append([]keyedProvider(nil), configuredProviders...)
 }

@@ -254,8 +254,10 @@ func TestCodexRegionsRecordsClientVisibleFailure(t *testing.T) {
 	proxy := httptest.NewServer(rig.server.Handler())
 	defer proxy.Close()
 
-	if status, _ := codexEgressPost(t, proxy.URL, "visible-1"); status == http.StatusOK {
-		t.Fatalf("status=%d, want the capacity failure", status)
+	// The client gets the pool's own failure, passed through: upstream's
+	// retryable 503 (#491) is not ported (PATCHES §27).
+	if status, body := codexEgressPost(t, proxy.URL, "visible-1"); status != http.StatusOK || !strings.Contains(body, "server_is_overloaded") {
+		t.Fatalf("status=%d body=%s, want the capacity failure passed through", status, body)
 	}
 	events := readCapacityEvents(t, rig.server.CodexCapacityEventsPath)
 	if countEvents(events, codexCapacityOutcomeClientVisible, "") != 1 {
@@ -348,7 +350,10 @@ func TestCodexRegionsSimulatedSheddingRarelyReachesClient(t *testing.T) {
 	const requests = 200
 	failed := 0
 	for index := range requests {
-		if status, _ := codexEgressPost(t, proxy.URL, fmt.Sprintf("sim-%d", index)); status != http.StatusOK {
+		// A failure reaches the client as the pool's own 200 stream with
+		// server_is_overloaded (upstream's retryable 503, #491, is not
+		// ported), so a request counts as served only by its body.
+		if status, body := codexEgressPost(t, proxy.URL, fmt.Sprintf("sim-%d", index)); status != http.StatusOK || !strings.Contains(body, "served-from-") {
 			failed++
 		}
 	}
@@ -363,12 +368,19 @@ func TestCodexRegionsSimulatedSheddingRarelyReachesClient(t *testing.T) {
 	}
 }
 
-func dialRegionWebSocket(t *testing.T, proxyURL, session string, autonomous bool) *websocket.Conn {
+// noTurnRetryDelay removes the region retry's backoff. It and the turn
+// fixtures below are upstream's, from its codex_websocket_turn_retry_test.go,
+// whose autonomous tests (#505) this fork does not carry.
+func noTurnRetryDelay(int) time.Duration { return 0 }
+
+const (
+	turnRetryCapacityFailure = `{"type":"response.failed","response":{"error":{"code":"server_is_overloaded","message":"Selected model is at capacity."}}}`
+	turnRetryCompleted       = `{"type":"response.completed","response":{"id":"resp_ok"}}`
+)
+
+func dialRegionWebSocket(t *testing.T, proxyURL, session string) *websocket.Conn {
 	t.Helper()
 	header := http.Header{"X-Subrouter-Session": []string{session}}
-	if autonomous {
-		header.Set(AgentRetryPolicyHeader, "autonomous")
-	}
 	conn, response, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(proxyURL, "http")+"/responses", header)
 	if err != nil {
 		status := 0
@@ -413,7 +425,7 @@ func TestCodexRegionsPinnedSessionWebSocketDialsThroughEgress(t *testing.T) {
 	if status, body := codexEgressPost(t, proxy.URL, "pinned-ws"); status != http.StatusOK || !strings.Contains(body, "served-from-fra") {
 		t.Fatalf("http turn status=%d body=%s, want Frankfurt", status, body)
 	}
-	conn := dialRegionWebSocket(t, proxy.URL, "pinned-ws", false)
+	conn := dialRegionWebSocket(t, proxy.URL, "pinned-ws")
 	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gpt-6-astra","input":[]}`)); err != nil {
 		t.Fatal(err)
 	}
@@ -422,32 +434,6 @@ func TestCodexRegionsPinnedSessionWebSocketDialsThroughEgress(t *testing.T) {
 	}
 	if local.creates.Load() != 0 {
 		t.Fatalf("local websocket creates=%d, want none", local.creates.Load())
-	}
-}
-
-// An autonomous self-contained turn that hits capacity redials out of the
-// next region behind the open client socket; the client sees only success.
-func TestCodexRegionsAutonomousTurnRedialsInNextRegion(t *testing.T) {
-	local := newRegionPool(t, "local", always(true))
-	fra := newRegionPool(t, "fra", always(false))
-	rig := newRegionRig(t, local, fra)
-	rig.server.codexWebSocketTurnRetryDelay = noTurnRetryDelay
-	proxy := httptest.NewServer(rig.server.Handler())
-	defer proxy.Close()
-
-	conn := dialRegionWebSocket(t, proxy.URL, "auto-ws", true)
-	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gpt-6-astra","input":[]}`)); err != nil {
-		t.Fatal(err)
-	}
-	if turn := readRegionTurn(t, conn); !strings.Contains(turn, "served-from-fra") {
-		t.Fatalf("turn=%s, want it served from Frankfurt", turn)
-	}
-	if local.creates.Load() != 1 || fra.creates.Load() != 1 {
-		t.Fatalf("local=%d fra=%d creates, want one each", local.creates.Load(), fra.creates.Load())
-	}
-	events := readCapacityEvents(t, rig.server.CodexCapacityEventsPath)
-	if countEvents(events, codexCapacityOutcomeAttempt, "local") != 1 || countEvents(events, codexCapacityOutcomeAbsorbed, "") != 1 {
-		t.Fatalf("events=%+v, want one local failure and one absorbed turn", events)
 	}
 }
 
@@ -480,9 +466,11 @@ func TestCodexRegionsSessionReturnsHomeAfterCooldown(t *testing.T) {
 	}
 }
 
-// An autonomous turn's redial skips an egress whose proxy is down instead
-// of retrying it in a loop, and lands on the next region.
-func TestCodexRegionsAutonomousRedialSkipsDeadEgress(t *testing.T) {
+// A turn's region-retry redial skips an egress whose proxy is down instead
+// of retrying it in a loop, and lands on the next region. (Upstream's test
+// ran this on an autonomous connection, #505, which this fork does not port;
+// the region retry, #666, redials the same way within its budget.)
+func TestCodexRegionsRegionRetryRedialSkipsDeadEgress(t *testing.T) {
 	local := newRegionPool(t, "local", always(true))
 	tyo := newRegionPool(t, "tyo", always(false))
 	dead := httptest.NewServer(http.NotFoundHandler())
@@ -496,7 +484,7 @@ func TestCodexRegionsAutonomousRedialSkipsDeadEgress(t *testing.T) {
 	defer proxy.Close()
 
 	for index := range 4 {
-		conn := dialRegionWebSocket(t, proxy.URL, fmt.Sprintf("dead-egress-%d", index), true)
+		conn := dialRegionWebSocket(t, proxy.URL, fmt.Sprintf("dead-egress-%d", index))
 		if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gpt-6-astra","input":[]}`)); err != nil {
 			t.Fatal(err)
 		}
@@ -590,7 +578,7 @@ func TestCodexRegionsNonAutonomousTurnServedFromNextRegion(t *testing.T) {
 	proxy := httptest.NewServer(rig.server.Handler())
 	defer proxy.Close()
 
-	conn := dialRegionWebSocket(t, proxy.URL, "desktop-1", false)
+	conn := dialRegionWebSocket(t, proxy.URL, "desktop-1")
 	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gpt-6-astra","input":[]}`)); err != nil {
 		t.Fatal(err)
 	}
@@ -614,7 +602,7 @@ func TestCodexRegionsNonAutonomousChainedTurnKeepsOldPath(t *testing.T) {
 	proxy := httptest.NewServer(rig.server.Handler())
 	defer proxy.Close()
 
-	conn := dialRegionWebSocket(t, proxy.URL, "desktop-chained", false)
+	conn := dialRegionWebSocket(t, proxy.URL, "desktop-chained")
 	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gpt-6-astra","previous_response_id":"resp_prev","input":[]}`)); err != nil {
 		t.Fatal(err)
 	}
@@ -635,7 +623,7 @@ func TestCodexRegionsNonAutonomousRetriesAreBounded(t *testing.T) {
 	proxy := httptest.NewServer(rig.server.Handler())
 	defer proxy.Close()
 
-	conn := dialRegionWebSocket(t, proxy.URL, "desktop-bounded", false)
+	conn := dialRegionWebSocket(t, proxy.URL, "desktop-bounded")
 	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gpt-6-astra","input":[]}`)); err != nil {
 		t.Fatal(err)
 	}
@@ -674,7 +662,7 @@ func TestCodexRegionsNonAutonomousUpstreamCloseIsNotRetried(t *testing.T) {
 	proxy := httptest.NewServer(rig.server.Handler())
 	defer proxy.Close()
 
-	conn := dialRegionWebSocket(t, proxy.URL, "desktop-policy", false)
+	conn := dialRegionWebSocket(t, proxy.URL, "desktop-policy")
 	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gpt-6-astra","input":[]}`)); err != nil {
 		t.Fatal(err)
 	}

@@ -31,7 +31,7 @@ func withSRClientVersion(t *testing.T, version string) {
 func TestCodexSubrouterHeadersIncludeClientVersion(t *testing.T) {
 	withSRClientVersion(t, "v0.1.174")
 	got := codexSubrouterHeaders("", "", "")
-	if got != `{"X-Subrouter-Agent"="codex","X-Subrouter-Retry-Policy"="autonomous","X-Subrouter-Client-Version"="v0.1.174"}` {
+	if got != `{"X-Subrouter-Agent"="codex","X-Subrouter-Client-Version"="v0.1.174"}` {
 		t.Fatalf("headers = %s", got)
 	}
 }
@@ -53,7 +53,9 @@ func TestClaudeLaunchSettingsIncludeClientVersion(t *testing.T) {
 func TestPersistedClaudeProxyEnvOmitsClientVersion(t *testing.T) {
 	withSRClientVersion(t, "v0.1.174")
 	dir := t.TempDir()
-	if err := writeClaudeProxyEnvCanonical(dir, "http://127.0.0.1:31415", ""); err != nil {
+	// profileOwned=false: the user's own config dir (the fork's writer adds
+	// tool search only to profile directories, PATCHES §29.9.1).
+	if err := writeClaudeProxyEnvCanonical(dir, "http://127.0.0.1:31415", "", false); err != nil {
 		t.Fatal(err)
 	}
 	body, err := os.ReadFile(filepath.Join(dir, "settings.json"))
@@ -136,7 +138,7 @@ func TestDefaultSRClientNameHonorsValidOverride(t *testing.T) {
 func TestCodexSubrouterHeadersIncludeClientName(t *testing.T) {
 	withSRClientName(t, "leos-mbp")
 	got := codexSubrouterHeaders("", "", "")
-	if got != `{"X-Subrouter-Agent"="codex","X-Subrouter-Retry-Policy"="autonomous","X-Subrouter-Client"="leos-mbp"}` {
+	if got != `{"X-Subrouter-Agent"="codex","X-Subrouter-Client"="leos-mbp"}` {
 		t.Fatalf("headers = %s", got)
 	}
 }

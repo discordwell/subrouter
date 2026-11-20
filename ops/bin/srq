@@ -1,0 +1,1563 @@
+#!/usr/bin/env python3
+"""srq — query the local subrouter without stepping on its traps.
+
+Exists because the two things people ask most ("which account is serving me",
+"how is the pool doing") were previously copy-pasted shell snippets, and both
+snippets were wrong in ways that produced confident, plausible, incorrect
+answers:
+
+  * The session lookup globbed ~/.claude/projects/*/*.jsonl and took the newest
+    file. On a multi-session machine that is whichever session wrote last, which
+    is usually not the caller. CLAUDE_CODE_SESSION_ID is in the environment and
+    was there all along.
+
+  * The pool reader looked up window "7d". Codex has no such window -- it uses
+    "primary" -- so every Codex row resolved to None and rendered as "no
+    headroom": five untouched Pro accounts reported as exhausted.
+
+Both classes are fixed here once, with a selftest that fails if they regress.
+
+A third joined them: `srq pool` counted "with headroom" -- rows under 100% on
+the 5h/7d meters -- and on 2026-09-16 said nearly every local Claude account had
+room while every one of them 429'd on the Fable/overage meter it never read.
+It now shows that meter -- a Fable column, and a Fable count that goes loud at
+0 -- and counts the daemon's OWN new-session verdict instead of headroom.
+
+Usage:
+  srq serving [--json]     which account serves this session
+  srq pool    [--json]     per-provider pool status, LOCAL + REMOTE peer
+              [--local|--remote]  restrict to one side
+  srq dir <label>          the profile dir for one account, from the DAEMON
+  srq selftest             run the regression fixtures (no daemon needed)
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+
+BASE = os.environ.get("SUBROUTER_ADDR", "http://127.0.0.1:31415")
+TIMEOUT = 10
+
+# Admin endpoints are unauthenticated ONLY from loopback -- authorizeAdmin
+# short-circuits on isLoopbackRemote. A daemon reached over a tailnet (the
+# box) is not loopback, so every /_subrouter/* read 401s without this.
+# Set SUBROUTER_ADMIN_TOKEN, or SUBROUTER_ADMIN_TOKEN_FILE pointing at a file
+# holding it (e.g. a root-only file on the server).
+def _admin_token():
+    token = (os.environ.get("SUBROUTER_ADMIN_TOKEN") or "").strip()
+    if token:
+        return token
+    path = (os.environ.get("SUBROUTER_ADMIN_TOKEN_FILE") or "").strip()
+    if path and os.path.exists(path):
+        for line in open(path):
+            line = line.strip()
+            # accepts a bare token, or an ADMIN_TOKEN=value line
+            if line.startswith("ADMIN_TOKEN="):
+                return line.split("=", 1)[1].strip().strip("'\"")
+            if line and "=" not in line:
+                return line
+    return ""
+
+# Window vocabulary is provider-specific. There is no shared name for "the
+# weekly bucket", so resolution is a lookup, not a constant. A provider absent
+# from this table yields UNKNOWN -- never zero, never "exhausted".
+WEEKLY_WINDOWS = {
+    "claude": ("7d",),
+    # Usage-based plans (rate_limit: null) publish the workspace spend cap as
+    # "spend" instead of "primary": monthly, account-wide, never short.
+    "codex": ("primary", "spend"),
+}
+SHORT_WINDOWS = {
+    "claude": ("5h",),
+    # Codex dropped its 5h bucket around 2026-07-12; a codex row is weekly-only
+    # and must render its short column as "-", never as a copy of the weekly one.
+    "codex": (),
+}
+# Presence of one of these windows is the real limit-reached signal on codex
+# ("spend/reached" on a usage-based seat); neither exists on claude.
+REACHED_WINDOWS = ("reached", "spend/reached")
+# Claude's Fable meter (seven_day_oauth_apps, the anthropic-ratelimit-unified-
+# 7d_oi header). NOT a per-feature copy of a base window, although it carries
+# Feature "claude-fable" -- which is why account_windows() never sees it. It is
+# the one independent meter, it reads over 100%, and a pool whose 5h/7d look
+# fine can have every account refusing on it. Same match as sr's own
+# isClaudeOAuthAppsWeeklyWindow.
+FABLE_WINDOW_MARKERS = {
+    "claude": ("oauth-apps", "7d_oi"),
+    "codex": (),
+}
+# The quota-pool key usage-status files the Fable verdict under
+# (normalized.pools.<key>), as selectacct.ModelKey spells it.
+FABLE_POOL = "claudefable"
+
+
+class SrqError(Exception):
+    pass
+
+
+def _get(path):
+    request = urllib.request.Request(f"{BASE}{path}")
+    token = _admin_token()
+    if token:
+        request.add_header("Authorization", f"Bearer {token}")
+    try:
+        with urllib.request.urlopen(request, timeout=TIMEOUT) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            # The single most likely cause, said plainly rather than as a traceback.
+            raise SrqError(
+                f"401 from {BASE}{path} -- admin endpoints need a token when the "
+                f"daemon is not on loopback. Set SUBROUTER_ADMIN_TOKEN, or "
+                f"SUBROUTER_ADMIN_TOKEN_FILE=/path/to/tokens"
+                + (" (a token WAS sent, so it may be wrong)" if token else " (no token was sent)")
+            ) from e
+        raise SrqError(f"HTTP {e.code} from {BASE}{path}") from e
+    except urllib.error.URLError as e:
+        raise SrqError(f"cannot reach subrouter at {BASE}{path}: {e}") from e
+
+
+def _get_list(path):
+    """List endpoints, tolerating an empty pool.
+
+    A freshly bootstrapped server serves literal `null` -- not `[]` -- from
+    usage-status and sessions, so iterating the parsed body raised
+    "TypeError: 'NoneType' object is not iterable" on the very first command
+    anyone runs against a new box. Absence of accounts is a normal state, not an
+    error, and it is the state a new server is in by definition.
+    """
+    body = _get(path)
+    if body is None:
+        return []
+    if not isinstance(body, list):
+        raise SrqError(f"expected a list from {path}, got {type(body).__name__}")
+    return body
+
+
+# --- the remote peer pool ----------------------------------------------------
+# The peer serves a large share of this machine's traffic and has NO row in
+# `sr status`: that command renders servers.json (the legacy admin path, which
+# points at the tailnet), while routing actually uses SUBROUTER_REMOTE_POOL. So
+# "read the peer" meant hand-rolled curl -- the exact thing this tool exists to
+# stop. `srq pool` now shows both sides from the daemon's own config.
+
+REMOTE_PLIST = os.path.expanduser(
+    "~/Library/LaunchAgents/ai.manaflow.subrouter.plist")
+REMOTE_UNREADABLE = "!!! remote pool UNREADABLE"
+
+
+def _plist_env():
+    """The daemon's own environment, read from its launchd plist.
+
+    Read the SAME source the daemon reads, so srq can never disagree with
+    routing about which peer is in play. Env vars still win, for the box.
+    """
+    try:
+        import plistlib
+        with open(REMOTE_PLIST, "rb") as fh:
+            return plistlib.load(fh).get("EnvironmentVariables") or {}
+    except Exception:
+        return {}
+
+
+def remote_config(env=None):
+    env = os.environ if env is None else env
+    cache = {}
+
+    def pick(key):
+        v = (env.get(key) or "").strip()
+        if v:
+            return v
+        if "plist" not in cache:
+            cache["plist"] = _plist_env()
+        return (cache["plist"].get(key) or "").strip()
+
+    return {
+        "url": pick("SUBROUTER_REMOTE_POOL").rstrip("/"),
+        "token": pick("SUBROUTER_REMOTE_POOL_TOKEN"),
+        "fingerprint": pick("SUBROUTER_REMOTE_POOL_FINGERPRINT").lower().replace(":", ""),
+    }
+
+
+def remote_configs(env=None):
+    """Every configured peer, in the daemon's order (PATCHES §31).
+
+    SUBROUTER_REMOTE_POOLS_FILE, when set (env or plist), IS the peer set -- the
+    daemon ignores the single-peer variables then, so srq does too. Same rules
+    as the daemon: a file readable by others, or one that does not parse, is a
+    refusal, never a silent fall back to the single peer.
+    """
+    from_process = env is None
+    env = os.environ if env is None else env
+    path = (env.get("SUBROUTER_REMOTE_POOLS_FILE") or "").strip()
+    if not path and from_process:
+        # The daemon's own environment, like remote_config's fallback; an
+        # explicit env (the selftest) is the whole configuration.
+        path = (_plist_env().get("SUBROUTER_REMOTE_POOLS_FILE") or "").strip()
+    if not path:
+        cfg = remote_config(env)
+        return [dict(cfg, name=_peer_label(cfg["url"]))] if cfg["url"] else []
+    try:
+        if os.stat(path).st_mode & 0o077:
+            raise SrqError(f"{path} is readable by others; the daemon arms no peers from it")
+        with open(path) as fh:
+            peers = json.load(fh).get("peers") or []
+    except SrqError:
+        raise
+    except Exception as e:
+        raise SrqError(f"cannot read SUBROUTER_REMOTE_POOLS_FILE ({type(e).__name__}); the daemon arms no peers")
+    return [{"name": p.get("name") or _peer_label(p.get("url")),
+             "url": (p.get("url") or "").rstrip("/"),
+             "token": p.get("token") or "",
+             "fingerprint": (p.get("fingerprint") or "").lower().replace(":", "")}
+            for p in peers]
+
+
+def _check_pin(der, fingerprint):
+    """Verify the peer certificate BEFORE anything secret is sent.
+
+    The public listener carries a self-signed cert, so ordinary verification
+    cannot work and the daemon pins sha256(DER) instead. Turning verification
+    off WITHOUT pinning would hand the proxy token to whatever answers on that
+    address, so a missing or mismatched pin is a refusal, not a warning.
+    """
+    import hashlib
+    if not fingerprint:
+        raise SrqError(
+            "remote pool has no SUBROUTER_REMOTE_POOL_FINGERPRINT -- refusing to "
+            "send the proxy token to an unpinned public endpoint")
+    got = hashlib.sha256(der).hexdigest()
+    if got != fingerprint:
+        raise SrqError(
+            "remote pool certificate does NOT match the pin -- no token was sent"
+            f"\n  expected {fingerprint}\n  got      {got}")
+    return got
+
+
+def _remote_get(cfg, path):
+    import ssl, http.client
+    from urllib.parse import urlparse
+
+    url = cfg.get("url") or ""
+    u = urlparse(url)
+    if u.scheme != "https":
+        raise SrqError(f"remote pool must be https, got {url!r}")
+    conn = http.client.HTTPSConnection(
+        u.hostname, u.port or 443, timeout=TIMEOUT,
+        context=ssl._create_unverified_context())
+    try:
+        conn.connect()
+        _check_pin(conn.sock.getpeercert(binary_form=True), cfg.get("fingerprint"))
+        headers = {}
+        token = cfg.get("token")
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        conn.request("GET", path, headers=headers)
+        r = conn.getresponse()
+        body = r.read()
+        if r.status == 401:
+            # The split is deliberate and load-bearing; naming it saves the hunt.
+            raise SrqError(
+                "401 from the remote pool -- the public listener wants the PROXY "
+                "token or a named peer token. The static admin token never works "
+                "there, and a named admin token only on a box with "
+                "SUBROUTER_PUBLIC_ADMIN=1. A named token may also be revoked or "
+                "expired (PATCHES §43.1)")
+        if r.status != 200:
+            raise SrqError(f"HTTP {r.status} from remote pool {path}")
+        return json.loads(body) if body else None
+    finally:
+        conn.close()
+
+
+def remote_rows(cfg):
+    body = _remote_get(cfg, "/_subrouter/usage-status")
+    if body is None:
+        return []
+    if not isinstance(body, list):
+        raise SrqError(
+            f"expected a list from the remote pool, got {type(body).__name__}")
+    # Same summarize() as local. A separate render path here is precisely how the
+    # codex-weekly-window bug would come back on one side only.
+    return [summarize(r) for r in body]
+
+
+def _remote_failure_lines(url, err):
+    """A peer we cannot read must be LOUD.
+
+    Silently omitting the section renders identically to "the peer is fine and
+    empty", which is the failure mode this whole tool was written against.
+    """
+    return [f"{REMOTE_UNREADABLE}  {url or '(not configured)'}",
+            f"    {err}",
+            "    (local rows above are still valid; the peer half is MISSING)"]
+
+
+def session_id():
+    """This session's id.
+
+    The harness exports it. Deriving it from transcript filenames is a
+    workaround for a problem that does not exist, and the derivation silently
+    picks another session on a busy machine.
+    """
+    sid = (os.environ.get("CLAUDE_CODE_SESSION_ID") or "").strip()
+    if not sid:
+        raise SrqError(
+            "CLAUDE_CODE_SESSION_ID is unset -- not running under Claude Code? "
+            "Pass a session id explicitly: srq serving <session-id>"
+        )
+    return sid
+
+
+def serving(sid, rows):
+    """Where `sid` is ACTUALLY served, or None. Newest assignment wins.
+
+    Returns (account, pool, peer). For a delegated session the local
+    assignment names the account selection picked BEFORE the request left --
+    a placeholder that never served anything. Reporting it as the answer is
+    how this command claimed a session was on twelve-alpha while every one
+    of its requests was answered by sixteen-beta on the peer.
+
+    served_account is empty against a peer too old to name it; "somewhere on
+    <peer>" is honest where a local account name would not be.
+    """
+    matches = [r for r in rows if r.get("session_id") == sid]
+    if not matches:
+        return None, None, None
+    newest = max(matches, key=lambda r: r.get("updated_at") or r.get("created_at") or "")
+    if newest.get("served_by") == "remote":
+        return newest.get("served_account") or None, "remote", newest.get("served_peer") or None
+    return newest.get("account_id") or None, "local", None
+
+
+def account_windows(row):
+    """The ACCOUNT-WIDE windows, excluding per-feature copies.
+
+    Providers duplicate each base window inside every feature pool (opus,
+    sonnet, fable), so a bare name lookup can land on `5h [Feature=claude-opus]`
+    instead of the account's own. Feature-less is the account's own.
+    """
+    return [w for w in (row.get("windows") or []) if not w.get("Feature")]
+
+
+def named_window(row, names):
+    if not names:
+        return None
+    for window in account_windows(row):
+        if window.get("Name") in names:
+            return window
+    return None
+
+
+def raw_usage(row):
+    """Per-window usage read straight from the provider, one window per field.
+
+    EXISTS BECAUSE THE OLD SHAPE MIXED TWO WINDOWS IN ONE ROW: `used_percent`
+    came from the BINDING window (5h on Claude) while `rolls_in_hours` came from
+    the WEEKLY reset, so a row read "36% used, rolls in 12h" and every reader
+    took that as 36% of the week. It was 36% of a 5-hour bucket that refills
+    three times before the week rolls.
+
+    And do NOT compute weekly usage from `normalized.weekly_headroom`: that is
+    spendable, less the daemon's live debit and -- on a daemon before PATCHES
+    §57, or with SUBROUTER_FABLE_RESERVATION=1 -- the fable reservation
+    (weeklyRemaining - 0.5 x fableRemaining x decay), so there a brand-new
+    account reads ~0.50 with both meters untouched. Read as usage it says a
+    fresh account is half spent -- measured 8/14, acct-o reported 51.5% "used"
+    on a 3% week.
+    """
+    provider = (row.get("provider") or "").lower()
+    short = named_window(row, SHORT_WINDOWS.get(provider))
+    weekly = named_window(row, WEEKLY_WINDOWS.get(provider))
+
+    def used(w):
+        if not w:
+            return None
+        v = w.get("UsedPercent")
+        return None if v is None else round(v)
+
+    def hours(w):
+        if not w:
+            return None
+        secs = w.get("ResetAfterSeconds") or 0
+        return round(secs / 3600, 1) if secs else None
+
+    fable = fable_window(row)
+    return {
+        # Whether the provider HAS a short window at all. Codex dropped its 5h
+        # bucket, so its short column is not-applicable, NOT unmeasured -- and a
+        # row that renders "??" for a window the provider does not publish reads
+        # as broken telemetry. Absence by design and absence of evidence must not
+        # print the same. A Claude row with a weekly reading and no 5h one is the
+        # first kind: Anthropic stopped publishing the 5h bucket around
+        # 2026-10-31, so the 5h window was read and is not there.
+        "has_short_window": bool(SHORT_WINDOWS.get(provider)) and (short is not None or weekly is None),
+        "short_used_percent": used(short),
+        "short_reset_hours": hours(short),
+        "weekly_used_percent": used(weekly),
+        "weekly_reset_hours": hours(weekly),
+        # Same not-applicable vs unmeasured split, for the Fable meter.
+        "has_fable_window": bool(FABLE_WINDOW_MARKERS.get(provider)),
+        "fable_used_percent": used(fable),
+        "fable_reset_hours": hours(fable),
+    }
+
+
+def fable_window(row):
+    """The Fable (oauth-apps) weekly window, or None if absent/not applicable.
+
+    Looked up across ALL windows, Feature included: the Fable meter is stamped
+    Feature "claude-fable", and the Feature-less filter that keeps the 5h/7d
+    lookups off the per-feature copies would hide it.
+    """
+    provider = (row.get("provider") or "").lower()
+    markers = FABLE_WINDOW_MARKERS.get(provider)
+    if not markers:
+        return None
+    for window in row.get("windows") or []:
+        name = (window.get("Name") or "").lower()
+        if any(marker in name for marker in markers):
+            return window
+    return None
+
+
+def new_session_verdict(norm):
+    """The daemon's OWN new-session verdict for one account: (bool|None, reason).
+
+    normalized.new_session (PATCHES §31) answers "may a PEER place a new session
+    here": the selection scheduler's tier-0 predicate, with live sessions,
+    reserves, the endgame taper and a dead credential in it. A peer acts on it
+    verbatim. The publishing daemon itself only PREFERS the yes rows: a no that
+    is not evicted (at_cap, short_floor, below_reserve, burn_projection) is
+    demoted, not refused, and still takes a local session when nothing better is
+    left (see _render_sections). normalized.usable is the older, narrower
+    answer (bare UsableForNewSession: no reserve, no live count, no burndown),
+    read only when new_session is absent -- an API-key row, or a daemon from
+    before §31. A daemon older than both publishes neither, and that is None:
+    no verdict, which is neither yes nor no.
+
+    Never reconstructed here from headroom. Every tool that re-derived
+    eligibility eventually disagreed with the router (PATCHES §13).
+    """
+    if not isinstance(norm, dict):
+        return None, None
+    verdict = norm.get("new_session")
+    if isinstance(verdict, dict) and isinstance(verdict.get("eligible"), bool):
+        return verdict["eligible"], verdict.get("reason") or None
+    usable = norm.get("usable")
+    if isinstance(usable, bool):
+        return usable, None
+    return None, None
+
+
+def _evicted(norm):
+    """new_session.evicted: True/False as published, None when there is none.
+
+    Evicted is the one "no" the owning daemon also enforces on itself (a spent
+    window, the owner's holdout, a dead credential). Only an explicit False
+    makes a refused row a local fallback; a verdict without the field, or the
+    older `usable`, says nothing about it.
+    """
+    verdict = norm.get("new_session") if isinstance(norm, dict) else None
+    evicted = verdict.get("evicted") if isinstance(verdict, dict) else None
+    return evicted if isinstance(evicted, bool) else None
+
+
+def _session_counts(norm):
+    """new_session.live_sessions and .allowed_sessions as published, else None.
+
+    live_sessions is the account's sessions with a request in flight on the
+    publishing daemon; allowed_sessions is its endgame taper allowance, 0
+    outside the burndown window (the 24h roll, or since PATCHES §56 a reset
+    holder's early burndown). A verdict without them (an older daemon) gives
+    None for both, never a 0 that would read as a count.
+    """
+    verdict = norm.get("new_session") if isinstance(norm, dict) else None
+    verdict = verdict if isinstance(verdict, dict) else {}
+
+    def count(key):
+        value = verdict.get(key)
+        # bool is an int in Python; a true here is not a session count.
+        return value if type(value) is int else None
+
+    return count("live_sessions"), count("allowed_sessions")
+
+
+def _burndown_cause(norm):
+    """new_session.burndown_cause as published: "roll", "reset", or None.
+
+    Why the account is in the burndown window (PATCHES §56): its 24h roll, or a
+    reset holder's early burndown under 25% of its week. Read, never inferred
+    from a burndown whose roll is days away: srq does not reconstruct verdicts
+    (new_session_verdict). A daemon from before §56 publishes none, and every
+    burndown it publishes is the roll.
+    """
+    verdict = norm.get("new_session") if isinstance(norm, dict) else None
+    cause = verdict.get("burndown_cause") if isinstance(verdict, dict) else None
+    return cause if isinstance(cause, str) and cause else None
+
+
+def _held_reset_hours(norm):
+    """Hours until the account's unclaimed saved reset expires, else None.
+
+    normalized.seconds_to_held_reset_expiry (PATCHES §56) is published only
+    while the owner ranks the account on that hold, at twice its weekly pace:
+    the reset unclaimed, the grant unexpired, its switch on. Absent is no hold,
+    and all a daemon from before §56 can say.
+    """
+    secs = norm.get("seconds_to_held_reset_expiry") if isinstance(norm, dict) else None
+    # bool is an int in Python; a true here is not a duration.
+    if type(secs) not in (int, float) or secs <= 0:
+        return None
+    return round(secs / 3600, 1)
+
+
+def _fable_week_spent_percent(norm):
+    """The account's Fable meter, percent used, as its daemon publishes it, else None.
+
+    normalized.fable_week_spent (PATCHES §65) is the fraction an Opus or Sonnet
+    turn ranks the account on, up to twice its weekly pace when the meter is
+    full, on a daemon running §65 with SUBROUTER_FABLE_SPENT_PREFERENCE on.
+    Absent is untouched or unknown, and all a daemon from before §65 can say.
+    Shown as published, never recomputed from the windows.
+    """
+    spent = norm.get("fable_week_spent") if isinstance(norm, dict) else None
+    # bool is an int in Python; a true here is not a fraction.
+    if type(spent) not in (int, float) or spent <= 0:
+        return None
+    return round(spent * 100)
+
+
+def _verdicts(norm):
+    """Account-wide and Fable-pool verdicts and the reset hold, flattened for summarize()."""
+    eligible, reason = new_session_verdict(norm)
+    live, allowed = _session_counts(norm)
+    pools = norm.get("pools") if isinstance(norm, dict) else None
+    fable = pools.get(FABLE_POOL) if isinstance(pools, dict) else None
+    fable_eligible, fable_reason = new_session_verdict(fable)
+    fable_live, fable_allowed = _session_counts(fable)
+    return {
+        "fable_week_spent_percent": _fable_week_spent_percent(norm),
+        "new_session": eligible,
+        "new_session_reason": reason,
+        "new_session_evicted": _evicted(norm),
+        "new_session_live_sessions": live,
+        "new_session_allowed_sessions": allowed,
+        "new_session_burndown_cause": _burndown_cause(norm),
+        "fable_new_session": fable_eligible,
+        "fable_new_session_reason": fable_reason,
+        "fable_new_session_live_sessions": fable_live,
+        "fable_new_session_allowed_sessions": fable_allowed,
+        "fable_new_session_burndown_cause": _burndown_cause(fable),
+        "held_reset_expires_in_hours": _held_reset_hours(norm),
+    }
+
+
+def weekly_window(row):
+    """The weekly window for this row's provider, or None if absent/unknown.
+
+    None means UNKNOWN. Callers must not render it as 0% or as exhausted.
+    """
+    provider = (row.get("provider") or "").lower()
+    names = WEEKLY_WINDOWS.get(provider)
+    if not names:
+        return None
+    for window in row.get("windows") or []:
+        if window.get("Name") in names:
+            return window
+    return None
+
+
+def summarize(row):
+    """Normalized view of one account row.
+
+    Prefers the server's own `normalized` block, which the scheduler computes and
+    is provider-independent by construction. Falls back to resolving raw windows
+    by provider for daemons predating that field -- the fallback is why
+    WEEKLY_WINDOWS still exists, not the primary path.
+    """
+    reached = any(x.get("Name") in REACHED_WINDOWS for x in row.get("windows") or [])
+    norm = row.get("normalized")
+
+    if isinstance(norm, dict) and "headroom" in norm:
+        headroom = norm.get("headroom")
+        secs = norm.get("seconds_to_weekly_reset") or 0
+        return {
+            "id": row.get("id"),
+            "provider": row.get("provider"),
+            "used_percent": None if headroom is None else round((1 - headroom) * 100),
+            "headroom_percent": None if headroom is None else round(headroom * 100),
+            "rolls_in_hours": round(secs / 3600, 1) if secs else None,
+            "limit_reached": reached,
+            "auth_valid": row.get("auth_valid"),
+            "auth_checked": row.get("auth_checked"),
+            "sweep_cut": row.get("sweep_cut"),
+            "error": row.get("error"),
+            "known": headroom is not None,
+            "fresh": norm.get("fresh"),
+            "source": "normalized",
+            # used_percent above is the BINDING window (5h on Claude), NOT the
+            # week. The raw per-window fields below are the unmixed truth.
+            **raw_usage(row),
+            **_verdicts(norm),
+        }
+
+    w = weekly_window(row)
+    used = w.get("UsedPercent") if w else None
+    return {
+        "id": row.get("id"),
+        "provider": row.get("provider"),
+        "used_percent": used,          # None == unknown, NOT empty
+        "headroom_percent": None if used is None else max(0, 100 - used),
+        "rolls_in_hours": None if not w else round((w.get("ResetAfterSeconds") or 0) / 3600, 1),
+        "limit_reached": reached,
+        "auth_valid": row.get("auth_valid"),
+        "auth_checked": row.get("auth_checked"),
+        "sweep_cut": row.get("sweep_cut"),
+        "error": row.get("error"),
+        "known": w is not None,
+        "fresh": None,
+        "source": "windows",
+        **raw_usage(row),
+        **_verdicts(norm),
+    }
+
+
+def cmd_serving(argv):
+    sid = argv[0] if argv and not argv[0].startswith("-") else session_id()
+    account, pool, peer = serving(sid, _get_list("/_subrouter/sessions"))
+    if "--json" in argv:
+        print(json.dumps({"session_id": sid, "account_id": account,
+                          "pool": pool, "peer": peer}))
+    elif pool == "remote":
+        # Never print a bare account name for a remote serve: it would read
+        # exactly like a local one and that is the confusion being fixed.
+        where = f"{account} on {peer}" if account else f"somewhere on {peer or 'the peer'}"
+        print(f"{where}  [remote]")
+    elif account:
+        print(account)
+    else:
+        # No row. A §49 daemon lists a session a peer serves from its hold
+        # even with no local account, so there this is a session the daemon
+        # keeps nothing for right now. Say only what was seen: srq can be
+        # newer than the daemon, and a pre-§49 daemon lists no held-only row.
+        print(f"unassigned (session {sid}): not listed by the daemon "
+              "(no local assignment; a §49+ daemon also lists live peer holds)")
+    return 0 if (account or pool == "remote") else 1
+
+
+def pool_counts(rows, field="new_session"):
+    """How many of one provider's rows the daemon's verdict says take a new session.
+
+    Returns (ready, judged, basis). basis "verdict" counts the daemon's own
+    new-session verdict (see new_session_verdict); rows with none are left out
+    of `judged`, never guessed. basis "headroom" is only for a daemon that
+    publishes no verdict on ANY row, and says so in the header: headroom is
+    not routability. Counting "under 100% used" is what put 9/10 in the header
+    while every account 429'd on the Fable/overage meter.
+    """
+    judged = [r for r in rows if r.get(field) is not None]
+    if judged:
+        return sum(1 for r in judged if r[field]), len(judged), "verdict"
+    if field != "new_session":
+        return 0, 0, "verdict"
+    known = [r for r in rows if r["known"]]
+    return sum(1 for r in known if (r["used_percent"] or 0) < 100), len(known), "headroom"
+
+
+def local_fallback(r):
+    """A local row the verdict refuses that the daemon still routes to as a fallback.
+
+    The verdict is tier 0 of Pick's ranking. Locally a refused account that is
+    not evicted ranks in tier 2 -- demoted, not refused -- and takes new
+    sessions whenever nothing in tier 0 is left (selectionTier; proxy.go routes
+    it "optimistically"). A peer never does: for a peer the verdict is exact.
+    """
+    return r.get("new_session") is False and r.get("new_session_evicted") is False
+
+
+SLOT_REASONS = ("burndown", "at_cap")
+
+
+def _slots(r, field="new_session"):
+    """The "live/allowed" of a draining (burndown) or full (at_cap) verdict, else None.
+
+    Only those two reasons are about the endgame allowance; on any other row
+    the counts are left out, so it renders as before. None too when the daemon
+    published no counts, or an allowance of 0 (its "outside the burndown
+    window").
+    """
+    live = r.get(f"{field}_live_sessions")
+    allowed = r.get(f"{field}_allowed_sessions")
+    if r.get(f"{field}_reason") not in SLOT_REASONS or live is None or not allowed:
+        return None
+    return f"{live}/{allowed}"
+
+
+def _reason_label(r, field="new_session"):
+    """The verdict's reason, marked `·reset` on a reset holder's early burndown.
+
+    A burndown or at_cap whose cause is "reset" (PATCHES §56) is draining days
+    before its roll, so the row's own roll column cannot explain it. The roll
+    cause, and a daemon that publishes no cause, keep the bare reason.
+    """
+    reason = r.get(f"{field}_reason")
+    if reason in SLOT_REASONS and r.get(f"{field}_burndown_cause") == "reset":
+        return f"{reason}·reset"
+    return reason
+
+
+def _verdict_col(eligible, reason, fallback=False, slots=None):
+    if eligible is None:
+        return "?"
+    if reason and slots:
+        # burndown 1/2, at_cap 2/2: sessions in flight / the drain allowance.
+        reason = f"{reason} {slots}"
+    if eligible:
+        # burndown says why a nearly spent account is taking sessions first.
+        return f"yes ({reason})" if reason and reason != "eligible" else "yes"
+    word = "fallback" if fallback else "NO"
+    return f"{word} ({reason})" if reason else word
+
+
+def _render_sections(rows, where, peer=False):
+    """One section per provider. `peer` renders a PEER's rows, read from its
+    usage-status: its verdict is then exactly what this daemon acts on. For
+    this daemon's own rows the same verdict only ranks (local_fallback).
+    """
+    for provider in sorted({r["provider"] for r in rows if r["provider"]}):
+        sub = [r for r in rows if r["provider"] == provider]
+        ready, judged, basis = pool_counts(sub)
+        if basis == "verdict":
+            unjudged = len(sub) - judged
+            if peer:
+                head = f"{ready}/{judged} take a new session from a peer (its verdict)"
+            else:
+                head = f"{ready}/{judged} preferred for a new session (the daemon's verdict)"
+                fallback = sum(1 for r in sub if local_fallback(r))
+                if fallback:
+                    head += f", {fallback} more only as fallback"
+            if unjudged:
+                head += f", {unjudged} with no verdict"
+        else:
+            unknown = len(sub) - judged
+            head = (f"{ready}/{judged} with headroom{f', {unknown} unknown' if unknown else ''}"
+                    " -- this daemon publishes no new-session verdict, and headroom is NOT routability")
+        show_fable = any(r["has_fable_window"] for r in sub)
+        if show_fable:
+            fable_ready, fable_judged, _ = pool_counts(sub, "fable_new_session")
+            # The base verdict does not read the Fable meter (the base score
+            # excludes every per-model window), so a pool can be all yes above
+            # and take no Fable session at all. That is the 2026-09-16 shape,
+            # and it must not read as a footnote.
+            if fable_judged and not fable_ready:
+                head += f"; !! Fable 0/{fable_judged}: no account takes a new Fable session"
+            elif fable_judged:
+                head += f"; Fable {fable_ready}/{fable_judged}"
+        # A column only in a section with a holder, so every section from a
+        # daemon before §56 (and every pool past the grant's expiry) reads as
+        # before.
+        show_hold = any(r["held_reset_expires_in_hours"] is not None for r in sub)
+        lines, any_slots, any_reset = [], False, False
+        # A column only where the daemon published a spent Fable meter (§65),
+        # so a section from an older daemon, or with no Fable spent, reads as
+        # before.
+        show_spent = any(r["fable_week_spent_percent"] is not None for r in sub)
+        for r in sorted(sub, key=lambda r: (r["rolls_in_hours"] is None, r["rolls_in_hours"] or 0)):
+            # UsedPercent arrives as a float; unrounded it prints 14.000000000000002
+            def col(v, width=4, suffix=""):
+                return f"{'?' * 2:>{width}}{suffix}" if v is None else f"{round(v):>{width}}{suffix}"
+
+            short = "   -" if not r["has_short_window"] else col(r["short_used_percent"])
+            weekly = col(r["weekly_used_percent"])
+            fable = f"  fable={col(r['fable_used_percent'])}%" if show_fable else ""
+            spent = r["fable_week_spent_percent"]
+            fable += (f"  fspent={col(spent)}%" if spent is not None else " " * 14) if show_spent else ""
+            roll = "    -" if r["weekly_reset_hours"] is None else f"{r['weekly_reset_hours']:>5.0f}h"
+            if show_hold:
+                roll += "  2x" if r["held_reset_expires_in_hours"] is not None else "    "
+            fallback = not peer and local_fallback(r)
+            slots = _slots(r)
+            any_slots = any_slots or bool(slots)
+            reason = _reason_label(r)
+            any_reset = any_reset or reason != r["new_session_reason"]
+            flags = f"  new={_verdict_col(r['new_session'], reason, fallback, slots)}"
+            # The case the header used to hide: open for a new session on the
+            # account's own meters, refused for Fable on its own.
+            if r["new_session"] and r["fable_new_session"] is False:
+                fable_label = _reason_label(r, "fable_new_session")
+                any_reset = any_reset or fable_label != r["fable_new_session_reason"]
+                fable_reason = fable_label or "not usable"
+                fable_slots = _slots(r, "fable_new_session")
+                if fable_slots:
+                    fable_reason, any_slots = f"{fable_reason} {fable_slots}", True
+                flags += f"  FABLE-REFUSED ({fable_reason})"
+            if r["limit_reached"]:
+                flags += "  LIMIT-REACHED"
+            flags += _auth_flag(r)
+            if not r["known"]:
+                flags += "  (no weekly window for this provider -- UNKNOWN, not empty)"
+            # Two windows, each labelled. One combined "used" column is what
+            # made a 5h reading get quoted as weekly consumption.
+            lines.append(f"  {r['id']:<34} 5h={short}%  7d={weekly}%{fable}  rolls {roll}{flags}")
+
+        print(f"=== {provider} @ {where} ({len(sub)} accounts): {head}")
+        print("      (5h = short window, refills within hours; 7d = the WEEK, what actually runs out)")
+        fable_legend = "fable = the Fable/oauth-apps week, its own meter; " if show_fable else ""
+        # Only a section that prints an n/m, a ·reset or a 2x explains it, so a
+        # section with none of them (and every row from an older daemon) reads
+        # as before.
+        extra = []
+        if any_slots:
+            extra.append("n/m = sessions in flight / sessions it will take while draining")
+        if show_spent:
+            # Published whatever the owner's switch says; a peer's is ranked
+            # on only by a daemon running §65 with its own switch on.
+            extra.append("fspent = the Fable meter the peer publishes; an Opus or Sonnet turn ranks the account at up to 2x"
+                         " here as it fills, only on §65 with its switch on"
+                         if peer else
+                         "fspent = the Fable meter this daemon publishes: an Opus or Sonnet turn ranks the account at up to"
+                         " 2x its weekly pace as it fills, while SUBROUTER_FABLE_SPENT_PREFERENCE is on")
+        if any_reset:
+            extra.append("·reset = early burndown: holds an unclaimed saved reset and under 25% of its week is left")
+        if show_hold:
+            # A peer's 2x is the peer's word that it holds the reset. This
+            # daemon ranks it at 2x only when it runs §56 with its switch on:
+            # while the box is deployed first, or with the switch off here, a
+            # box holder reads 2x and ranks at 1x.
+            extra.append("2x = the peer says it holds an unclaimed saved reset; ranked 2x here only on §56 with its switch on"
+                         if peer else
+                         "2x = holds an unclaimed saved reset: ranked at twice a local non-holder until claimed or expired")
+        end = ";" if extra else ")"
+        if peer:
+            print(f"      ({fable_legend}new = would this peer take a NEW session placed from here{end}")
+        else:
+            print(f"      ({fable_legend}new = the verdict this daemon publishes for a peer: yes is preferred;")
+            print(f"       fallback = still takes a new session here when nothing preferred is left; NO = evicted{end}")
+        for i, text in enumerate(extra):
+            print(f"       {text}{';' if i < len(extra) - 1 else ')'}")
+        for line in lines:
+            print(line)
+        print()
+
+
+def _context_error(message):
+    return isinstance(message, str) and (
+        "context canceled" in message or "context deadline exceeded" in message)
+
+
+def _auth_flag(r):
+    """auth_valid:false is a VERDICT only when the daemon says it looked.
+
+    A sweep cut by its own clock publishes auth_checked:false -- or, on a daemon
+    predating that field, auth_checked:true with a context error in `error`.
+    Nobody looked at that credential, so it is UNMEASURED: not invalid, and not
+    to be reported as dead. Ten healthy box accounts once printed AUTH-INVALID
+    here for an afternoon on exactly that row.
+    """
+    if r.get("sweep_cut"):
+        # The daemon says so itself, and says it even when it has backfilled
+        # the row with last-good windows -- which is why this check is first.
+        return "  UNMEASURED (sweep cut before this row; not a verdict)"
+    if r.get("auth_valid") is not False:
+        return ""
+    if r.get("auth_checked") is False or _context_error(r.get("error")):
+        return "  UNMEASURED (sweep cut before this row; not a verdict)"
+    return "  AUTH-INVALID"
+
+
+def _peer_label(url):
+    from urllib.parse import urlparse
+    u = urlparse(url or "")
+    return u.netloc or (url or "peer")
+
+
+def cmd_pool(argv):
+    want_local = "--remote" not in argv
+    want_remote = "--local" not in argv
+    cfgs = remote_configs() if want_remote else []
+
+    local_rows = []
+    if want_local:
+        local_rows = [summarize(r) for r in _get_list("/_subrouter/usage-status")]
+    # One section per peer (PATCHES §31): each read, pinned and reported on its
+    # own, so one unreadable peer is loud without hiding the others.
+    remotes = []
+    for cfg in cfgs:
+        rows, err = [], None
+        try:
+            rows = remote_rows(cfg)
+        except SrqError as e:
+            err = str(e)
+        remotes.append({"name": cfg["name"], "url": cfg["url"], "rows": rows, "error": err})
+
+    if "--json" in argv:
+        first = remotes[0] if remotes else {"url": None, "rows": [], "error": None}
+        print(json.dumps({"local": local_rows, "remote": first["rows"],
+                          "remote_peer": first["url"] or None,
+                          "remote_error": first["error"],
+                          "remotes": remotes}, indent=2))
+        return 0
+
+    if want_local:
+        _render_sections(local_rows, "local")
+    if want_remote:
+        if not remotes:
+            print("(no remote pool configured -- SUBROUTER_REMOTE_POOL and SUBROUTER_REMOTE_POOLS_FILE unset)\n")
+        for peer in remotes:
+            if peer["error"]:
+                print("\n".join(_remote_failure_lines(peer["url"], peer["error"])) + "\n")
+            else:
+                _render_sections(peer["rows"], f"peer {peer['name']}", peer=True)
+    return 0
+
+
+def profile_dir(label, rows):
+    """Where THIS account's credentials live, per the daemon itself.
+
+    WRITTEN BECAUSE `sr claude env <name>` IGNORED THE NAME before PATCHES
+    section 36. Asked for seven-alpha and ten-alpha it returned the same path
+    both times -- main's -- so re-authing from it overwrote whatever account was
+    serving you. A pre-36 binary still does. Dir names are the label for some
+    accounts and an opaque _p<epoch> for others, so they cannot be derived:
+    usage-status `source` is the daemon's own answer on any build.
+    """
+    for r in rows:
+        if r.get("id") == label:
+            src = r.get("source")
+            if not src:
+                raise SrqError(f"{label!r} has no source dir published by the daemon")
+            return src
+    known = ", ".join(sorted(r.get("id") or "?" for r in rows)) or "(none)"
+    raise SrqError(f"no account named {label!r}; known: {known}")
+
+
+def cmd_dir(argv):
+    if not argv or argv[0].startswith("-"):
+        raise SrqError("usage: srq dir <label>")
+    print(profile_dir(argv[0], _get_list("/_subrouter/usage-status")))
+    return 0
+
+
+def cmd_selftest(_argv):
+    """Fixtures for the two bugs that motivated this tool."""
+    failures = []
+
+    def check(name, cond):
+        print(("  ok   " if cond else "  FAIL ") + name)
+        if not cond:
+            failures.append(name)
+
+    print("regression: codex weekly window is 'primary', not '7d'")
+    codex = {
+        "id": "five@x", "provider": "codex", "auth_valid": True,
+        "windows": [{"Name": "primary", "UsedPercent": 0, "ResetAfterSeconds": 604800}],
+    }
+    s = summarize(codex)
+    check("codex row resolves its weekly window", s["known"] is True)
+    check("untouched codex account is NOT reported exhausted", s["headroom_percent"] == 100)
+    check("used_percent read from 'primary'", s["used_percent"] == 0)
+
+    print("regression: an unknown provider is UNKNOWN, never empty")
+    s = summarize({"id": "x", "provider": "someday", "windows": []})
+    check("unknown provider -> known=False", s["known"] is False)
+    check("unknown provider -> used_percent is None (not 0)", s["used_percent"] is None)
+    check("unknown provider -> headroom is None (not 0)", s["headroom_percent"] is None)
+
+    print("normalized block is preferred over raw windows when present")
+    s = summarize({
+        "id": "n", "provider": "codex",
+        "normalized": {"headroom": 0.42, "seconds_to_weekly_reset": 7200, "fresh": True},
+        "windows": [{"Name": "primary", "UsedPercent": 99, "ResetAfterSeconds": 1}],
+    })
+    check("normalized wins over windows", s["source"] == "normalized")
+    check("headroom read from normalized (42, not 1)", s["headroom_percent"] == 42)
+    check("roll read from normalized (2h, not 0h)", s["rolls_in_hours"] == 2.0)
+
+    print("a server without the normalized field still works (older daemon)")
+    s = summarize({
+        "id": "o", "provider": "codex",
+        "windows": [{"Name": "primary", "UsedPercent": 0, "ResetAfterSeconds": 604800}],
+    })
+    check("falls back to windows", s["source"] == "windows")
+    check("fallback still reads codex correctly", s["headroom_percent"] == 100)
+
+    print("regression: claude still resolves '7d'")
+    s = summarize({
+        "id": "c", "provider": "claude",
+        "windows": [{"Name": "7d", "UsedPercent": 72, "ResetAfterSeconds": 3600}],
+    })
+    check("claude weekly window resolves", s["known"] is True and s["used_percent"] == 72)
+
+    print("regression: the row must not mix two windows into one number")
+    # The shape that shipped: 5h nearly fresh, week nearly gone. One combined
+    # "used" column read from the BINDING window said 8%, and the roll column
+    # said 12h, so the row was quoted as "8% of the week used with 12h left".
+    mixed = {
+        "id": "acct-p", "provider": "claude", "auth_valid": True,
+        "windows": [
+            {"Name": "5h", "UsedPercent": 8, "ResetAfterSeconds": 4300},
+            {"Name": "7d", "UsedPercent": 91, "ResetAfterSeconds": 44659},
+        ],
+    }
+    s = summarize(mixed)
+    check("5h read from the 5h window", s["short_used_percent"] == 8)
+    check("7d read from the 7d window", s["weekly_used_percent"] == 91)
+    check("the two windows are NOT the same number", s["short_used_percent"] != s["weekly_used_percent"])
+    check("roll hours come from the WEEKLY window", s["weekly_reset_hours"] == 12.4)
+
+    print("a claude row with a 7d reading and no 5h one renders its 5h column as '-'")
+    s = summarize({"id": "main", "provider": "claude", "auth_valid": True,
+                   "windows": [{"Name": "7d", "UsedPercent": 97, "ResetAfterSeconds": 50400}]})
+    check("no 5h window on a measured claude row is not-applicable, not unmeasured",
+          s["has_short_window"] is False)
+    s = summarize({"id": "cut", "provider": "claude", "auth_checked": False, "windows": []})
+    check("a claude row with no reading at all still reads its 5h as unmeasured",
+          s["has_short_window"] is True)
+
+    print("regression: weekly usage is RAW, never the fable-reserved 'spendable'")
+    # normalized.weekly_headroom is weeklyRemaining - 0.5 x fableRemaining x decay,
+    # so a BRAND-NEW account reads ~0.50 with both meters untouched. Read as usage
+    # that says a fresh account is half spent -- measured 8/14: acct-o reported
+    # 51.5% "used" against a 3% week.
+    fresh = {
+        "id": "acct-o", "provider": "claude", "auth_valid": True,
+        "normalized": {"headroom": 0.84, "weekly_headroom": 0.485,
+                       "seconds_to_weekly_reset": 329062, "fresh": True},
+        "windows": [
+            {"Name": "5h", "UsedPercent": 16, "ResetAfterSeconds": 4300},
+            {"Name": "7d", "UsedPercent": 3, "ResetAfterSeconds": 329062},
+        ],
+    }
+    s = summarize(fresh)
+    check("a 3%-used week reports 3, not 51", s["weekly_used_percent"] == 3)
+
+    print("regression: a row the daemon never got to check is UNMEASURED, not AUTH-INVALID")
+    cut = summarize({"id": "chip-3", "provider": "claude", "auth_checked": False,
+                     "auth_valid": False, "error": "context canceled"})
+    check("auth_checked:false is carried through", cut["auth_checked"] is False)
+    check("an unchecked row renders UNMEASURED", "UNMEASURED" in _auth_flag(cut))
+    legacy = summarize({"id": "chip-3", "provider": "claude", "auth_checked": True,
+                        "auth_valid": False, "error": "context canceled"})
+    check("older daemon: a context error is still UNMEASURED", "UNMEASURED" in _auth_flag(legacy))
+    dead = summarize({"id": "x", "provider": "claude", "auth_checked": True, "auth_valid": False,
+                      "error": "Claude OAuth refresh failed: 400 Bad Request: invalid_grant"})
+    check("a real verdict is still AUTH-INVALID", "AUTH-INVALID" in _auth_flag(dead))
+    old = summarize({"id": "y", "provider": "claude", "auth_valid": False})
+    check("no auth_checked field at all (pre-field daemon) stays AUTH-INVALID", "AUTH-INVALID" in _auth_flag(old))
+    live = summarize({"id": "z", "provider": "claude", "auth_checked": True, "auth_valid": True})
+    check("a valid row carries no flag", _auth_flag(live) == "")
+    backfilled = summarize({"id": "w", "provider": "claude", "auth_checked": True, "auth_valid": True,
+                            "sweep_cut": True,
+                            "windows": [{"Name": "7d", "UsedPercent": 40, "ResetAfterSeconds": 3600}]})
+    check("a backfilled row the sweep cut is still UNMEASURED", "UNMEASURED" in _auth_flag(backfilled))
+    check("weekly is not derived from weekly_headroom", s["weekly_used_percent"] != 52)
+
+    print("regression: account-wide windows, not the per-feature copies")
+    # Providers duplicate every base window inside each feature pool. A bare name
+    # lookup can land on the opus copy and report that pool's usage as the
+    # account's.
+    featured = {
+        "id": "f", "provider": "claude", "auth_valid": True,
+        # Feature copies FIRST on purpose: with them last, a first-match lookup
+        # finds the account's own window by accident and the fixture passes even
+        # with the Feature filter removed -- proving nothing.
+        "windows": [
+            {"Name": "5h", "UsedPercent": 99, "ResetAfterSeconds": 3600, "Feature": "claude-opus"},
+            {"Name": "7d", "UsedPercent": 98, "ResetAfterSeconds": 86400, "Feature": "claude-opus"},
+            {"Name": "5h", "UsedPercent": 20, "ResetAfterSeconds": 3600},
+            {"Name": "7d", "UsedPercent": 30, "ResetAfterSeconds": 86400},
+        ],
+    }
+    s = summarize(featured)
+    check("5h ignores the opus copy (20, not 99)", s["short_used_percent"] == 20)
+    check("7d ignores the opus copy (30, not 98)", s["weekly_used_percent"] == 30)
+
+    print("regression: the header counts the DAEMON'S verdict, not headroom")
+    # Headroom says nothing about a holdout, the endgame cap, a reserve or the
+    # burn projection, and nothing at all about the Fable meter. The old header
+    # counted rows under 100% used; on 2026-09-16 it said 9/10 while all 10 429'd.
+    import contextlib, io
+
+    def claude_row(i, eligible, reason, fable_eligible=None, **norm_extra):
+        # evicted as NewSessionVerdict sets it: a spent window or the holdout.
+        norm = {"headroom": 0.6, "fresh": True, "usable": True,
+                "new_session": {"eligible": eligible, "reason": reason,
+                                "evicted": reason in ("exhausted", "holdout", "auth_invalid")}}
+        if fable_eligible is not None:
+            norm["pools"] = {FABLE_POOL: {"headroom": 0 if not fable_eligible else 0.5,
+                                          "usable": fable_eligible,
+                                          "new_session": {"eligible": fable_eligible,
+                                                          "reason": "eligible" if fable_eligible else "exhausted"}}}
+        norm.update(norm_extra)
+        return {"id": f"acct{i}", "provider": "claude", "auth_valid": True, "normalized": norm,
+                "windows": [
+                    {"Name": "5h", "UsedPercent": 20, "ResetAfterSeconds": 3600},
+                    {"Name": "7d", "UsedPercent": 40, "ResetAfterSeconds": 86400},
+                    # Stamped with a Feature, as the daemon publishes it.
+                    {"Name": "oauth-apps-weekly", "Feature": "claude-fable", "UsedPercent": 104.2,
+                     "ResetAfterSeconds": 86400}]}
+
+    def rendered(rows, peer=False):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            _render_sections(rows, "peer box" if peer else "local", peer=peer)
+        return out.getvalue()
+
+    refused = [summarize(claude_row(i, False, r)) for i, r in enumerate(("holdout", "at_cap", "burn_projection"))]
+    check("60% headroom, refused by the daemon -> 0 ready, not 3", pool_counts(refused) == (0, 3, "verdict"))
+    check("the header prints the verdict count",
+          "0/3 preferred for a new session" in rendered(refused) and "with headroom" not in rendered(refused))
+    check("burndown reads as yes, with the reason",
+          _verdict_col(*new_session_verdict({"new_session": {"eligible": True, "reason": "burndown"}})) == "yes (burndown)")
+
+    shadowed = summarize(claude_row(0, False, "exhausted", usable=True))
+    check("new_session wins over the older usable", shadowed["new_session"] is False)
+    older = summarize({"id": "o", "provider": "claude", "normalized": {"headroom": 0.9, "usable": False}})
+    check("usable is read when new_session is absent (API key, pre-§31 daemon)",
+          older["new_session"] is False and older["new_session_reason"] is None)
+    mixed = [summarize(claude_row(0, True, "eligible")),
+             summarize({"id": "n", "provider": "claude", "normalized": {"headroom": 1}})]
+    check("a row with no verdict is not counted as ready", pool_counts(mixed) == (1, 1, "verdict"))
+    check("...and the header says it had none", "1 with no verdict" in rendered(mixed))
+    ancient = [summarize({"id": "a", "provider": "claude",
+                          "windows": [{"Name": "7d", "UsedPercent": 30, "ResetAfterSeconds": 3600}]})]
+    check("no verdict anywhere: headroom, labelled as NOT routability",
+          pool_counts(ancient) == (1, 1, "headroom") and "NOT routability" in rendered(ancient))
+
+    print("regression: locally the verdict ranks; only for a peer does it refuse")
+    # The verdict answers "may a PEER place a new session here". The daemon
+    # that publishes it demotes a non-evicted no to tier 2 and still routes to
+    # it when nothing preferred is left, so "0/N take a new session" for its
+    # own rows was the "0/6 above floor" false alarm again.
+    local = rendered(refused)
+    check("local: a refused, non-evicted row is a fallback, not a NO",
+          "new=fallback (at_cap)" in local and "new=fallback (burn_projection)" in local)
+    check("local: an evicted row is a NO", "new=NO (holdout)" in local)
+    check("local: the header counts the fallbacks", "2 more only as fallback" in local)
+    check("local: never claims the daemon takes nothing", "take a new session" not in local)
+    remote = rendered(refused, peer=True)
+    check("peer: the verdict is exact, so a refused row is a NO",
+          "new=NO (at_cap)" in remote and "fallback" not in remote)
+    check("peer: the header says what a peer may place",
+          "0/3 take a new session from a peer" in remote)
+    unmarked = summarize(claude_row(0, False, "at_cap"))
+    unmarked["new_session_evicted"] = None
+    check("a verdict with no evicted field is not called a fallback", not local_fallback(unmarked))
+
+    print("regression: the Fable meter has a column and a count of its own")
+    fable_spent = [summarize(claude_row(i, True, "eligible", fable_eligible=False)) for i in range(3)]
+    f = fable_spent[0]
+    check("the Fable window is read although it carries a Feature", f["fable_used_percent"] == 104)
+    check("the Fable verdict comes from normalized.pools.claudefable", f["fable_new_session"] is False)
+    text = rendered(fable_spent)
+    # The base verdict does not read the Fable meter: all three are yes above.
+    # The 9/16 shape must not hide behind that count.
+    check("Fable 0/N is loud in the header",
+          "3/3 preferred for a new session" in text
+          and "!! Fable 0/3: no account takes a new Fable session" in text)
+    some = rendered([summarize(claude_row(0, True, "eligible", fable_eligible=True))] + fable_spent[1:])
+    check("a partial Fable count is plain", "; Fable 1/3" in some and "!! Fable" not in some)
+    check("the row shows the Fable column", "fable= 104%" in text)
+    check("open on its own meters but refused for Fable is flagged", "FABLE-REFUSED (exhausted)" in text)
+    cx = summarize({"id": "cx", "provider": "codex",
+                    "windows": [{"Name": "primary", "UsedPercent": 12, "ResetAfterSeconds": 604800}]})
+    check("codex has no Fable meter (not-applicable, not unmeasured)",
+          cx["has_fable_window"] is False and "fable=" not in rendered([cx]))
+
+    print("burndown and at_cap show sessions in flight / the drain allowance (PATCHES §53)")
+    # new=yes (burndown) said nothing about how many more sessions a draining
+    # account takes. The daemon publishes the count and the allowance with
+    # every verdict; a daemon from before §31 had no verdict to carry them.
+
+    def endgame_row(i, eligible, reason, **counts):
+        row = claude_row(i, eligible, reason)
+        row["normalized"]["new_session"].update(counts)
+        return row
+
+    slotted = [endgame_row(0, True, "burndown", live_sessions=1, allowed_sessions=2),
+               endgame_row(1, False, "at_cap", live_sessions=2, allowed_sessions=2)]
+    legend = "       n/m = sessions in flight / sessions it will take while draining)\n"
+    local = rendered([summarize(r) for r in slotted])
+    check("local: burndown reads live/allowed", "new=yes (burndown 1/2)\n" in local)
+    check("local: at_cap reads live/allowed, still a fallback", "new=fallback (at_cap 2/2)\n" in local)
+    check("local: the legend explains n/m", "NO = evicted;\n" + legend in local)
+    saved = globals()["_remote_get"]
+    globals()["_remote_get"] = lambda cfg, path: slotted
+    try:
+        remote = rendered(remote_rows({"url": "https://box:31416", "token": "t", "fingerprint": "f"}),
+                          peer=True)
+    finally:
+        globals()["_remote_get"] = saved
+    check("peer: the same counts on a peer's rows",
+          "new=yes (burndown 1/2)\n" in remote and "new=NO (at_cap 2/2)\n" in remote)
+    check("peer: the legend explains n/m", "placed from here;\n" + legend in remote)
+    old = rendered([summarize(endgame_row(0, True, "burndown")),
+                    summarize(endgame_row(1, False, "at_cap"))])
+    check("a verdict without the counts (older daemon) renders as before",
+          "new=yes (burndown)\n" in old and "new=fallback (at_cap)\n" in old
+          and "NO = evicted)\n" in old and "n/m" not in old)
+    others = [("eligible", True), ("short_floor", False), ("burn_projection", False), ("holdout", False)]
+    check("every other reason renders the same with the counts published",
+          rendered([summarize(endgame_row(i, e, r, live_sessions=1, allowed_sessions=3))
+                    for i, (r, e) in enumerate(others)])
+          == rendered([summarize(endgame_row(i, e, r)) for i, (r, e) in enumerate(others)]))
+    check("an allowance of 0 (outside the window) adds nothing",
+          "new=yes (burndown)\n" in rendered([summarize(endgame_row(0, True, "burndown",
+                                                                   live_sessions=0, allowed_sessions=0))]))
+    fable_full = claude_row(0, True, "eligible", fable_eligible=False)
+    fable_full["normalized"]["pools"][FABLE_POOL]["new_session"] = {
+        "eligible": False, "reason": "at_cap", "evicted": False, "live_sessions": 2, "allowed_sessions": 2}
+    text = rendered([summarize(fable_full)])
+    check("a Fable pool at its cap shows its own counts",
+          "new=yes  FABLE-REFUSED (at_cap 2/2)" in text and legend in text)
+
+    print("a saved reset's early burndown and 2x are marked; an older daemon reads as before (PATCHES §56)")
+    # An account draining at 100h from its roll read exactly like one rolling
+    # tonight, and nothing showed which accounts rank at twice their pace.
+
+    def holder_row(i, eligible, reason, cause=None, hold_secs=None, roll_secs=360000, **counts):
+        row = endgame_row(i, eligible, reason, **counts)
+        if cause:
+            row["normalized"]["new_session"]["burndown_cause"] = cause
+        if hold_secs is not None:
+            row["normalized"]["seconds_to_held_reset_expiry"] = hold_secs
+        row["normalized"]["seconds_to_weekly_reset"] = roll_secs
+        row["windows"][1]["ResetAfterSeconds"] = roll_secs
+        return row
+
+    early = [holder_row(0, True, "burndown", "reset", live_sessions=1, allowed_sessions=2),
+             holder_row(1, False, "at_cap", "reset", live_sessions=2, allowed_sessions=2)]
+    reset_legend = "·reset = early burndown: holds an unclaimed saved reset and under 25% of its week is left"
+    local = rendered([summarize(r) for r in early])
+    check("local: an early burndown 100h from its roll reads burndown·reset n/m",
+          "rolls   100h  new=yes (burndown·reset 1/2)\n" in local)
+    check("local: at its cap it reads at_cap·reset n/m, still a fallback",
+          "new=fallback (at_cap·reset 2/2)\n" in local)
+    check("local: the legend explains ·reset after n/m", legend.replace(")", ";") + f"       {reset_legend})\n" in local)
+    saved = globals()["_remote_get"]
+    globals()["_remote_get"] = lambda cfg, path: early
+    try:
+        remote = rendered(remote_rows({"url": "https://box:31416", "token": "t", "fingerprint": "f"}),
+                          peer=True)
+    finally:
+        globals()["_remote_get"] = saved
+    check("peer: the box's cause on its rows",
+          "new=yes (burndown·reset 1/2)\n" in remote and "new=NO (at_cap·reset 2/2)\n" in remote)
+    rolling = [holder_row(0, True, "burndown", "roll", roll_secs=72000, live_sessions=1, allowed_sessions=2)]
+    check("the roll cause reads as plain burndown, as a daemon with no cause does",
+          rendered([summarize(r) for r in rolling])
+          == rendered([summarize(holder_row(0, True, "burndown", roll_secs=72000,
+                                            live_sessions=1, allowed_sessions=2))]))
+    fable_early = holder_row(0, True, "eligible")
+    fable_early["normalized"]["pools"] = {FABLE_POOL: {"headroom": 0.1, "new_session": {
+        "eligible": False, "reason": "at_cap", "evicted": False, "live_sessions": 1,
+        "allowed_sessions": 1, "burndown_cause": "reset"}}}
+    check("a Fable pool at its early-burndown cap is marked too",
+          "FABLE-REFUSED (at_cap·reset 1/1)" in rendered([summarize(fable_early)]))
+
+    boosted = [holder_row(0, True, "eligible", hold_secs=580000),
+               holder_row(1, True, "eligible", roll_secs=370000)]
+    text = rendered([summarize(r) for r in boosted])
+    lines = [ln for ln in text.splitlines() if ln.startswith("  acct")]
+    check("a holder's row carries 2x next to its roll", "rolls   100h  2x  new=yes\n" in text)
+    check("a non-holder in the same section keeps the columns aligned",
+          len(lines) == 2 and "2x" not in lines[1] and lines[0].index("new=") == lines[1].index("new="))
+    check("the legend explains 2x",
+          "NO = evicted;\n       2x = holds an unclaimed saved reset: ranked at twice a local non-holder"
+          " until claimed or expired)\n" in text)
+    remote = rendered([summarize(r) for r in boosted], peer=True)
+    check("peer: 2x is the peer's word, ranked 2x here only on §56 with its switch on",
+          "rolls   100h  2x  new=yes\n" in remote
+          and "\n       2x = the peer says it holds an unclaimed saved reset; ranked 2x here only on §56"
+              " with its switch on)\n" in remote
+          and "ranked at twice" not in remote)
+    check("--json carries the hold in hours, and its absence as null",
+          summarize(boosted[0])["held_reset_expires_in_hours"] == 161.1
+          and summarize(boosted[1])["held_reset_expires_in_hours"] is None)
+
+    # Literal, captured from the srq before §56: a section with no cause and no
+    # hold must not move a column or gain a legend line.
+    before = [holder_row(0, True, "burndown", roll_secs=72000, live_sessions=1, allowed_sessions=2),
+              holder_row(1, False, "at_cap", roll_secs=79200, live_sessions=2, allowed_sessions=2),
+              holder_row(2, True, "eligible", live_sessions=0, allowed_sessions=0)]
+    check("an older daemon's section (no cause, no hold) renders byte for byte as before",
+          rendered([summarize(r) for r in before]) == (
+              "=== claude @ local (3 accounts): 2/3 preferred for a new session (the daemon's verdict),"
+              " 1 more only as fallback\n"
+              "      (5h = short window, refills within hours; 7d = the WEEK, what actually runs out)\n"
+              "      (fable = the Fable/oauth-apps week, its own meter; new = the verdict this daemon"
+              " publishes for a peer: yes is preferred;\n"
+              "       fallback = still takes a new session here when nothing preferred is left; NO = evicted;\n"
+              "       n/m = sessions in flight / sessions it will take while draining)\n"
+              "  acct0                              5h=  20%  7d=  40%  fable= 104%  rolls    20h"
+              "  new=yes (burndown 1/2)\n"
+              "  acct1                              5h=  20%  7d=  40%  fable= 104%  rolls    22h"
+              "  new=fallback (at_cap 2/2)\n"
+              "  acct2                              5h=  20%  7d=  40%  fable= 104%  rolls   100h  new=yes\n"
+              "\n"))
+
+    print("a published spent Fable meter is shown; an older daemon reads as before (PATCHES §65)")
+    # An Opus or Sonnet turn ranks an account at up to 2x its pace as its Fable
+    # meter fills, and nothing showed which accounts that moved. srq shows the
+    # daemon's published fraction, never one recomputed from the windows; the
+    # §56 literal above is the section with no such field, byte for byte.
+    spent_rows = [claude_row(0, True, "eligible", fable_week_spent=0.58), claude_row(1, True, "eligible")]
+    spent_rows[1]["windows"][1]["ResetAfterSeconds"] = 90000
+    text = rendered([summarize(r) for r in spent_rows])
+    lines = [ln for ln in text.splitlines() if ln.startswith("  acct")]
+    check("the published fraction is shown as a percent", "fable= 104%  fspent=  58%  rolls" in lines[0])
+    check("an account without it keeps the columns aligned",
+          len(lines) == 2 and "fspent" not in lines[1] and lines[0].index("rolls") == lines[1].index("rolls"))
+    check("the legend explains fspent",
+          "\n       fspent = the Fable meter this daemon publishes: an Opus or Sonnet turn ranks the account at up to"
+          " 2x its weekly pace as it fills, while SUBROUTER_FABLE_SPENT_PREFERENCE is on)\n" in text)
+    remote = rendered([summarize(r) for r in spent_rows], peer=True)
+    check("peer: fspent is the peer's word, ranked here only on §65 with its switch on",
+          "fspent=  58%" in remote
+          and "\n       fspent = the Fable meter the peer publishes; an Opus or Sonnet turn ranks the account at up to 2x"
+              " here as it fills, only on §65 with its switch on)\n" in remote)
+    check("--json carries the published percent, and its absence as null",
+          summarize(spent_rows[0])["fable_week_spent_percent"] == 58
+          and summarize(spent_rows[1])["fable_week_spent_percent"] is None)
+    check("zero, a string or a boolean is not a spent meter",
+          all(summarize(claude_row(0, True, "eligible", fable_week_spent=v))["fable_week_spent_percent"] is None
+              for v in (0, "0.5", True)))
+
+    print("regression: codex is weekly-only -- no fake 5h column")
+    s = summarize({
+        "id": "cx", "provider": "codex", "auth_valid": True,
+        "windows": [{"Name": "primary", "UsedPercent": 12, "ResetAfterSeconds": 604800}],
+    })
+    check("codex 7d read from 'primary'", s["weekly_used_percent"] == 12)
+    check("codex short column is None, not a copy of weekly", s["short_used_percent"] is None)
+
+    print("regression: usage-based codex publishes 'spend', not 'primary'")
+    # rate_limit is null on self_serve_business_usage_based; the only meter is
+    # the workspace spend cap, which the daemon publishes as an account-wide
+    # 30-day "spend" window (PATCHES.md §42). Before that fix the seat had zero
+    # windows and read "100% left" at 99% spent; a reader that only knows
+    # "primary" renders it UNKNOWN, which at least is not "healthy".
+    spend = {
+        "id": "seat2@x", "provider": "codex", "auth_valid": True,
+        "windows": [{"Name": "spend", "UsedPercent": 99, "ResetAfterSeconds": 2191576}],
+    }
+    s = summarize(spend)
+    check("codex spend row resolves its weekly-like window", s["known"] is True)
+    check("99% spent reads as 99, not unknown", s["used_percent"] == 99 and s["weekly_used_percent"] == 99)
+    check("spend is NOT a short window", s["short_used_percent"] is None)
+    check("spend rolls in weeks (monthly cap), read from the spend window", s["weekly_reset_hours"] == 608.8)
+    hard = summarize({**spend, "windows": spend["windows"] + [{"Name": "spend/reached", "UsedPercent": 100}]})
+    check("spend/reached is the limit-reached signal on a usage-based seat", hard["limit_reached"] is True)
+    check("a subscription seat's 'primary' is still not limit-reached", summarize(codex)["limit_reached"] is False)
+
+    print("regression: a fresh server serves literal null, not []")
+    saved = globals()["_get"], globals()["remote_configs"]
+    try:
+        globals()["_get"] = lambda path: None
+        # No peer either: the real remote_configs reads this machine's plist,
+        # and a selftest must not reach whatever pool that names.
+        globals()["remote_configs"] = lambda env=None: []
+        check("_get_list turns null into an empty list", _get_list("/anything") == [])
+        with contextlib.redirect_stdout(io.StringIO()):
+            empty = cmd_pool([])
+        check("pool exits 0 on an empty pool (does not crash)", empty == 0)
+        check("serving returns None on an empty session store",
+              serving("whoever", _get_list("/_subrouter/sessions"))[0] is None)
+    finally:
+        globals()["_get"], globals()["remote_configs"] = saved
+
+    print("regression: `srq pool` renders a peer's section as a peer's")
+    at_cap = claude_row(0, False, "at_cap")
+    saved = globals()["_get"], globals()["remote_configs"], globals()["remote_rows"]
+    try:
+        globals()["_get"] = lambda path: [at_cap] if path == "/_subrouter/usage-status" else None
+        globals()["remote_configs"] = lambda env=None: [{"name": "box", "url": "https://box.example"}]
+        globals()["remote_rows"] = lambda cfg: [summarize(at_cap)]
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            cmd_pool([])
+        local_part, _, peer_part = out.getvalue().partition("@ peer box")
+    finally:
+        globals()["_get"], globals()["remote_configs"], globals()["remote_rows"] = saved
+    check("the local section ranks", "new=fallback (at_cap)" in local_part)
+    check("the peer section refuses", "take a new session from a peer" in peer_part
+          and "new=NO (at_cap)" in peer_part)
+
+    print("regression: newest assignment wins, and only the asked-for session")
+    rows = [
+        {"session_id": "mine", "account_id": "old", "updated_at": "2026-01-01T00:00:00Z"},
+        {"session_id": "mine", "account_id": "new", "updated_at": "2026-06-01T00:00:00Z"},
+        {"session_id": "someone-else", "account_id": "wrong", "updated_at": "2026-12-01T00:00:00Z"},
+    ]
+    check("newest assignment for the session wins", serving("mine", rows)[0] == "new")
+    check("a busier OTHER session never leaks in", serving("mine", rows)[0] != "wrong")
+    check("unknown session -> None", serving("nobody", rows)[0] is None)
+    # A delegated session must report the PEER's account, never the local
+    # placeholder -- the whole point of served_by.
+    delegated = [{"session_id": "d", "account_id": "twelve-alpha", "updated_at": "3",
+                  "served_by": "remote", "served_account": "sixteen-beta",
+                  "served_peer": "box"}]
+    acct, pool, peer = serving("d", delegated)
+    check("delegated session reports the peer account", acct == "sixteen-beta")
+    check("delegated session is labelled remote", pool == "remote" and peer == "box")
+    # A peer too old to name its account must not fall back to the local one.
+    vague = [{"session_id": "v", "account_id": "twelve-alpha", "updated_at": "1",
+              "served_by": "remote", "served_peer": "box"}]
+    check("nameless remote serve does not report the local placeholder",
+          serving("v", vague)[0] is None)
+
+    print("regression: a peer-held session with NO local account (PATCHES §49)")
+    # A daemon with zero local accounts forwards every turn, so no assignment
+    # is ever written; since §49 the daemon lists the session from its peer
+    # hold, exactly in this shape. Before, it was not listed at all and
+    # `srq serving` said "unassigned" and exited 1 on a working setup.
+    held_only = [{"agent_type": "claude", "session_id": "p", "account_id": "",
+                  "created_at": "0001-01-01T00:00:00Z",
+                  "updated_at": "2026-10-05T12:00:00Z", "active": False,
+                  "served_by": "remote", "served_account": "b1", "served_peer": "box"}]
+    nameless_held = [dict(held_only[0], served_account="")]
+
+    def run_serving(rows, sid):
+        saved_get = globals()["_get"]
+        out = io.StringIO()
+        try:
+            globals()["_get"] = lambda path: rows if path == "/_subrouter/sessions" else None
+            with contextlib.redirect_stdout(out):
+                code = cmd_serving([sid])
+        finally:
+            globals()["_get"] = saved_get
+        return code, out.getvalue().strip()
+
+    code, line = run_serving(held_only, "p")
+    check("a held-only session prints its peer account and peer, exit 0",
+          code == 0 and line == "b1 on box  [remote]")
+    code, line = run_serving(nameless_held, "p")
+    check("a held-only session on a peer that names no account, exit 0",
+          code == 0 and line == "somewhere on box  [remote]")
+    code, line = run_serving([], "gone")
+    # It may not claim there is no hold: srq can be newer than the daemon, and
+    # a daemon from before §49 never lists a held-only session.
+    check("no row says the daemon lists none, without claiming no hold",
+          code == 1 and "not listed by the daemon" in line
+          and "no local assignment" in line and "no live peer hold" not in line)
+
+    print("remote: the cert pin gates the token, and a missing pin is a REFUSAL")
+    import hashlib
+    der = b"pretend-certificate-bytes"
+    good = hashlib.sha256(der).hexdigest()
+    check("matching pin is accepted", _check_pin(der, good) == good)
+
+    def raises(fn):
+        try:
+            fn()
+            return False
+        except SrqError:
+            return True
+
+    check("WRONG pin refuses (token must not be sent)",
+          raises(lambda: _check_pin(der, "0" * 64)))
+    check("EMPTY pin refuses -- unpinned public endpoint is not a fallback",
+          raises(lambda: _check_pin(der, "")))
+
+    print("remote: an unreachable peer is LOUD, never a silently absent section")
+    lines = _remote_failure_lines("https://peer:31416", "i/o timeout")
+    # Literal, NOT the constant: asserting REMOTE_UNREADABLE against itself is a
+    # tautology that stays green when the marker is deleted (caught by sabotage).
+    check("failure text carries the unmistakable marker",
+          any("UNREADABLE" in ln for ln in lines))
+    check("failure text says the peer half is MISSING, not empty",
+          any("MISSING" in ln for ln in lines))
+
+    print("remote: peer rows go through the SAME summarize (codex bug, one side only)")
+    saved = globals()["_remote_get"]
+    globals()["_remote_get"] = lambda cfg, path: [
+        {"id": "peer@x", "provider": "codex", "auth_valid": True,
+         "windows": [{"Name": "primary", "UsedPercent": 0, "ResetAfterSeconds": 604800}]}]
+    try:
+        pr = remote_rows({"url": "https://peer:31416", "token": "t", "fingerprint": "f"})
+    finally:
+        globals()["_remote_get"] = saved
+    check("peer codex row resolves its weekly window", pr[0]["known"] is True)
+    check("untouched peer codex account is NOT reported exhausted",
+          pr[0]["headroom_percent"] == 100)
+    check("peer rows carry the summarize shape (not a parallel renderer)",
+          "has_short_window" in pr[0])
+
+    print("peers file: several peers, and the single-peer vars are ignored (PATCHES §31)")
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "peers.json")
+        with open(path, "w") as fh:
+            json.dump({"peers": [{"name": "box", "url": "http://a:1/", "token": "t1"},
+                                 {"name": "box2", "url": "https://b:2", "token": "t2",
+                                  "fingerprint": "AB:12"}]}, fh)
+        os.chmod(path, 0o600)
+        env = {"SUBROUTER_REMOTE_POOLS_FILE": path, "SUBROUTER_REMOTE_POOL": "http://single:9"}
+        got = remote_configs(env)
+        check("two peers, in order, named", [c["name"] for c in got] == ["box", "box2"])
+        check("the single-peer variable is ignored when the file is set",
+              all(c["url"] != "http://single:9" for c in got))
+        check("pins normalise like the single peer's", got[1]["fingerprint"] == "ab12")
+        os.chmod(path, 0o644)
+        check("a world-readable peers file is refused, not read",
+              raises(lambda: remote_configs(env)))
+        single = remote_configs({"SUBROUTER_REMOTE_POOL": "http://single:9"})
+        check("no file: the single peer, unchanged",
+              [c["url"] for c in single] == ["http://single:9"])
+
+    print("reauth: the dir comes from the DAEMON, never from `sr claude env`")
+    rows = [{"id": "main", "source": "/x/_p1787439913450"},
+            {"id": "seven-alpha", "source": "/x/_p1787439512239"},
+            {"id": "ten-alpha", "source": "/x/ten-alpha"}]
+    check("each label resolves its OWN dir, not the active profile's",
+          profile_dir("seven-alpha", rows) == "/x/_p1787439512239"
+          and profile_dir("ten-alpha", rows) == "/x/ten-alpha")
+    check("two different labels never resolve to the same dir",
+          profile_dir("seven-alpha", rows) != profile_dir("main", rows))
+
+    def raises2(fn):
+        try:
+            fn()
+            return False
+        except SrqError:
+            return True
+
+    check("an unknown label REFUSES rather than guessing a path",
+          raises2(lambda: profile_dir("nope", rows)))
+    check("a row with no source REFUSES rather than returning None",
+          raises2(lambda: profile_dir("x", [{"id": "x"}])))
+
+    print()
+    if failures:
+        print(f"FAILED: {len(failures)}")
+        return 1
+    print("all regression fixtures pass")
+    return 0
+
+
+COMMANDS = {"serving": cmd_serving, "pool": cmd_pool, "dir": cmd_dir,
+            "selftest": cmd_selftest}
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return 0
+    cmd = COMMANDS.get(argv[0])
+    if not cmd:
+        print(f"unknown command {argv[0]!r}; try: {', '.join(COMMANDS)}", file=sys.stderr)
+        return 2
+    try:
+        return cmd(argv[1:])
+    except SrqError as e:
+        print(f"srq: {e}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

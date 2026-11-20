@@ -23,19 +23,20 @@ base_url = "http://127.0.0.1:31415/v1"
 experimental_bearer_token = "subrouter"
 wire_api = "responses"
 supports_websockets = true
-http_headers = { "X-Subrouter-Agent" = "codex", "X-Subrouter-Retry-Policy" = "autonomous" }
+http_headers = { "X-Subrouter-Agent" = "codex" }
 ```
 
 Subrouter supports Codex WebSocket requests, so the custom provider keeps the
 normal transport behavior.
 This includes Responses WebSockets at `/v1/responses` and realtime WebSockets at `/v1/realtime`.
 
-Do not set a dummy `OPENAI_API_KEY`. The wrapper's non-secret local-hop token
-decouples the client from `~/.codex/auth.json`, so a local ChatGPT logout or
-refresh failure cannot stop the request before proxy-side failover runs.
-Subrouter replaces the outbound Authorization and `ChatGPT-Account-ID` headers
-with the selected `sr` account. Resume with `sr codex resume ...`; a bare
-`codex resume ...` does not recreate wrapper-only overrides.
+Do not set a dummy `OPENAI_API_KEY`. The wrapper authenticates the local hop
+itself and never sends ChatGPT credentials, which decouples the client from
+`~/.codex/auth.json`: a local ChatGPT logout or refresh failure cannot stop the
+request before proxy-side failover runs. Subrouter replaces the outbound
+Authorization and `ChatGPT-Account-ID` headers with the selected `sr` account.
+Resume with `sr codex resume ...`; a bare `codex resume ...` does not recreate
+wrapper-only overrides.
 
 The two launch modes are intentionally independent: plain `codex` uses Codex's
 normal direct OpenAI configuration, while `sr codex` opts that process into the
@@ -47,6 +48,168 @@ also exports `SUBROUTER_CODEX_LAUNCHER="<launcher> codex"` and
 `SUBROUTER_CODEX_RESUME_COMMAND="<launcher> codex resume"` for session managers
 that persist a resume command. The launcher name follows the invoked `sr`,
 `subrouter`, or `cx` alias; unrelated clients can ignore these variables.
+
+### Pool credentials and your own Codex login
+
+`~/.codex/auth.json` is your own interactive login (Codex.app, plain `codex`),
+and only your own Codex client refreshes it. The daemon never writes it: for
+Codex, the periodic `--sr-switch-interval` sweep only refreshes routing scores.
+
+Each pooled account is a separate login of its own. `sr add codex` runs
+`codex login` under a temporary `CODEX_HOME` and stamps the stored record
+`isolated-server-login`. ChatGPT refresh tokens rotate on use, so two holders
+of one refresh-token chain sign each other out; `serve` therefore refuses to use
+or refresh a stored record that is not proven isolated, or whose refresh token
+is the one in `~/.codex/auth.json`. The refusal is terminal for routing, and it
+applies to a fresh access token too, so a pre-provenance record stops serving
+as soon as a gated daemon starts, not at its next expiry.
+
+- `sr codex isolation-check` counts the records that still need repair.
+- `sr codex attest-legacy` repairs pre-provenance records without a browser:
+  it refreshes each one once, requires the provider to rotate the refresh
+  token, and stamps it `server-attested-transfer`. That rotation kills every
+  other copy of the chain, including the same account held by another machine.
+  A record whose refresh token is also `~/.codex/auth.json`'s is skipped; it
+  needs an isolated re-login (`sr add codex` or `sr codex migrate-isolation`).
+- An explicit `sr switch` / `sr g` still copies a pool account into
+  `~/.codex/auth.json`, and doing so demotes that record to
+  `interactive-import`, which takes it out of serving. Using an account
+  interactively is an explicit act of taking it out of the pool.
+
+See [upgrades.md](upgrades.md#credential-origin-rollback-boundary) before
+rolling back to a binary that predates the provenance field.
+
+### Automatic quota failover
+
+When an account reaches its usage limit or workspace spend cap, Subrouter marks
+that account exhausted and fails the request over. The stages run in this
+order, and each runs only when the one before it found nothing:
+
+1. **Another pool account.** For HTTP requests Subrouter retries the rejected
+   request on another OAuth account with available usage, within the
+   request's retry budget. For WebSockets it intercepts the quota error before
+   forwarding it, prepares the alternate account, and sends a retryable 1013
+   close; Codex reconnects and resumes through its native recovery path.
+   Subrouter does not replay model requests or tool calls itself.
+2. **A rate-limit-reset credit** (opt-in, off by default; see below). Runs only
+   when a quota failure finds no alternate account.
+3. **The peer pool** (opt-in, `SUBROUTER_REMOTE_POOL`). The request is
+   forwarded to the peer daemon's pool.
+
+   When this machine and a peer are on one Tailscale tailnet,
+   `SUBROUTER_PEER_TAILNET` makes Subrouter dial the peer's Tailscale address
+   first. A network that refuses new connections while it is busy still
+   passes traffic in a Tailscale tunnel that is already up.
+   The value is a comma-separated list of `name=IP` pairs, for example
+   `box=100.64.0.7,box2=fd7a:115c:a1e0::9`. The name is the peer's name in
+   the `SUBROUTER_REMOTE_POOLS_FILE` file, or the URL's `host:port` for
+   `SUBROUTER_REMOTE_POOL`. Subrouter dials the IP on the URL's port. The
+   URL, the `Host` header, and the certificate pin do not change.
+   A dial to the tailnet address fails when it cannot connect, or when the
+   listener there fails the TLS handshake or the pin. Subrouter then dials
+   the URL. If the URL answers, Subrouter dials the URL first for one
+   minute. During that minute, a dial to the URL that fails, or that does
+   not connect within 2 seconds, is followed by one dial to the tailnet
+   address. While this machine has no address in
+   `fd7a:115c:a1e0::/48`, Subrouter dials only the URL. Each change of route,
+   or of how the tailnet dial failed, logs one
+   `remote pool peer route changed` line. Its `failure` field is `connect`,
+   `handshake_timeout`, `pin_mismatch`, or `handshake`. If any entry is invalid,
+   Subrouter logs a warning and every peer dials its URL. An entry is
+   invalid when it is not `name=IP`, names no configured peer, repeats a
+   peer, gives an address outside `100.64.0.0/10` and
+   `fd7a:115c:a1e0::/48`, or gives an IP that another entry gives to a peer
+   on the same port. Peers on different ports can share one IP. Unset the
+   variable to turn this off.
+4. **The Azure fallback** (opt-in; see [Azure fallback](#azure-fallback)).
+   Azure has no WebSocket Responses surface, so a WebSocket session reaches it
+   only after Codex moves to HTTPS.
+
+If no stage is armed or every armed stage declines, the original quota error
+remains visible.
+
+The credit stage needs a quota error to act on. When the request spent its
+retry budget, or when no account could be selected before anything was sent,
+there is nothing to redeem against: stage 2 is skipped and the peer pool or the
+Azure fallback, when configured, answers instead.
+
+#### When the whole pool is cooked
+
+Failover can only rotate to an account that has quota. When every account is
+cooked there is nothing to rotate to, and the turn dies on the upstream's own
+quota error -- the exact interruption failover exists to prevent. Subrouter now
+says so in the log (`codex quota failover found no alternate account`) instead
+of giving up silently.
+
+A cooked ChatGPT Pro account may still hold complimentary rate-limit-reset
+credits, the ones `sr reset` and `/_subrouter/rate-limit-reset` redeem by hand.
+Set `SUBROUTER_CODEX_AUTO_RATE_LIMIT_RESET=1` to let failover spend one
+automatically as stage 2 above, before any peer or Azure stage: it redeems a
+credit on a cooked account, clears that account's exhaustion marks, invalidates
+the usage scores, pins the session, and reconnects onto the revived account.
+
+It is **off by default and should stay off unless you want it**, because the
+credits are finite and do not regenerate. Three bounds apply once it is on:
+
+- the explicit opt-in above,
+- one redemption at a time daemon-wide, and
+- a 30-minute floor between redemptions, so a burst of failing turns (Codex
+  retries, plus every concurrent session seeing the same cooked pool) cannot
+  drain the reserve.
+
+Eligibility is decided against live upstream usage, never against Subrouter's
+cached scores -- those scores are what just reported the pool empty. An account
+that is not actually cooked, or holds no credit, keeps what it has. A workspace
+**spend cap** is a billing cap, not a rate-limit window: no credit resets it, so
+a spend-capped account is skipped and the cap has to be raised by the workspace
+owner.
+
+Regression coverage includes the workspace spend-cap message, HTTP account
+rotation, WebSocket reconnect and account rotation, unrelated error/output
+passthrough, and the auto-redeem stage (off by default, revives a cooked
+account, honours the interval floor, skips the already-tried account, skips a
+healthy account, and never fires for Claude). The optional native-client test verifies automatic recovery using a
+fake upstream, dummy credentials, and an isolated Codex home:
+
+```sh
+SUBROUTER_TEST_CODEX_BINARY="$(command -v codex)" go test ./internal/proxy -run '^TestCodexClientRecoversRetryableQuotaClose$' -count=1 -v
+```
+
+### Redeeming a reset credit by hand (`sr reset`)
+
+A reset credit is finite and never renews, so every spelling that spends one
+either names its target or previews first.
+
+- **Cooked** means one rule everywhere (`accounts.WeeklyCookedWindow`, shared by
+  `sr status`, `sr switch`, `sr reset` and the server): a fully used
+  account-wide window of at least six days, whether Codex reports it as
+  `primary_window` or `secondary_window`, or a length-less legacy secondary.
+  `limit_reached` counts only when no weekly window is reported and no full
+  shorter window explains it -- a 5h stall recovers on its own within hours,
+  and a credit spent on it is lost. A usage-based seat's `spend` window (its
+  workspace spend cap, which `rate_limit: null` seats publish instead) reads
+  cooked in `sr status` and `sr switch` when full, as does its `spend/reached`
+  hard stop on its own, but never makes a reset candidate: the server and local
+  reset paths judge the rate limit alone, and `--gto` skips a seat cooked on its
+  spend cap and says so. No credit lifts a spend cap.
+- `sr reset` with no target asks the server to pick (`best=true`): an expiring
+  credit on an account stuck at least 6h first, then the longest natural weekly
+  wait. An older server that does not know `best=true` gets the client-side
+  pick instead.
+- `sr reset <email>` resets that account. Flags work on either side of the
+  email: `sr reset <email> --dry-run` previews and redeems nothing.
+- `sr reset --all` lists what it would redeem, with each account's weekly wait
+  and credit expiry, and asks before spending. Without a terminal it refuses;
+  pass `--yes` to confirm from a script. It then redeems exactly the listed
+  accounts, one request per account.
+- `--min-wait D` (e.g. `1d`, `12h`) with no target, `--all` or `--candidates`
+  skips accounts whose weekly window resets on its own within `D`. A server
+  that does not report weekly waits is refused rather than trusted.
+- `--candidates` lists what `--all` would redeem, without redeeming.
+- `--local` uses the tokens on this machine. When `sr` has already routed `reset`
+  to a selected server it is refused; `SUBROUTER_CODEX_SERVER=local sr reset`
+  is the spelling that reaches the local store there.
+- The command exits non-zero when any redemption fails.
 
 ## Server Switching
 
@@ -147,24 +310,18 @@ codex exec \
 
 ## "Selected model is at capacity"
 
-That message is OpenAI shedding load for one model and service tier; pressing retry usually gets through. Subrouter retries it for you, but only before any output reached Codex, so nothing is ever duplicated:
+That message is OpenAI shedding load for one model and service tier; pressing retry usually gets through. Subrouter retries it for you, but only before any output reached Codex, so nothing is ever duplicated (`ops/PATCHES.md` §27):
 
-- Capacity errors should be rare and brief. Subrouter retries before any output reaches Codex, first on the current account and then on other accounts when the conversation is small enough to move safely; large conversations stay on their account to preserve the prompt cache. The autonomous `sr codex` policy follows the pool's known quota-reset deadlines and upstream `Retry-After` instructions without intermediate probes. A client can wait until the next eligible account reset using the `retry after Ns` hint in the error response; if that wait exceeds the current request's 10-minute retry horizon, the proxy returns the original response so the client can resume at the reported time. For overload or transport failures without a known reset time, the proxy uses bounded backoff for up to 10 minutes per logical request. There is no fixed retry-pass count. `SUBROUTER_CODEX_CAPACITY_RETRY_MAX_WAIT`, `SUBROUTER_CODEX_CAPACITY_RETRY_INTERVAL`, and the `--retry-*` flags still shape the explicit legacy bounded policy. A long wait is logged on its first retry and then about once a minute, and `/_subrouter/health` counts requests currently waiting under `overload_retry_held` or `active_retries`.
-- Capacity failover is enabled by default: Subrouter retries the same account once after 250-750ms, then tries other accounts 100-400ms apart (`SUBROUTER_CODEX_OVERLOAD_MAX_ACCOUNTS`, default 3). A WebSocket turn that hits capacity is closed so Codex reconnects on another account. Autonomous pooled sessions do not consume the server-side reconnect counter; explicit bounded policies retain it. Set `SUBROUTER_CODEX_OVERLOAD_FAILOVER_MAX_INPUT` when you want large conversations to stay on their account to preserve the prompt cache. Set `SUBROUTER_CODEX_OVERLOAD_FAILOVER=0` to restore same-account-only behavior.
-- The normal `sr codex` provider sends `X-Subrouter-Retry-Policy: autonomous`. Subrouter owns the replayable HTTP request loop: after each bounded account pass, the outer loop honors provider retry deadlines and starts another pass only when the next wait fits within its 10-minute elapsed retry horizon. There is no launcher retry count and no goal-resume input, so capacity recovery does not print a user-facing `continue` for every attempt. The internal account pass retains its own retry budget to prevent one layer multiplying retries; an in-progress pass can finish after the outer loop's horizon. Explicit account pins and `--persist-capacity` or `--retry-*` flags retain their legacy bounded policy. Cancelling the request in Codex stops the loop.
+- Capacity failover is enabled by default: Subrouter retries the same account once after 250-750ms, then tries other accounts 100-400ms apart (`SUBROUTER_CODEX_OVERLOAD_MAX_ACCOUNTS`, default 3), within a budget of about 10 seconds. A WebSocket turn that hits capacity before any output is closed with 1012 so Codex reconnects on another account. Set `SUBROUTER_CODEX_OVERLOAD_FAILOVER=0` to restore same-account-only behavior.
+- A conversation estimated above `SUBROUTER_CODEX_OVERLOAD_FAILOVER_MAX_INPUT` input tokens (default 32000; `0` means no limit) never switches accounts, so its prompt cache is kept. Like any request with the failover off, it waits on its own account: gaps of about 0.5, 1, 2, 4 and 8 seconds, then about every 9 seconds, for up to 4 minutes from the first attempt (`SUBROUTER_CODEX_CAPACITY_RETRY_MAX_WAIT`, `0` = until the client disconnects; `SUBROUTER_CODEX_CAPACITY_RETRY_INTERVAL`, at least 500ms), capped at about 10 seconds when an egress or Azure fallback is configured. Then the failure goes to that fallback, or to Codex. A long wait is logged on its first retry and then about once a minute, and `/_subrouter/health` counts requests currently waiting under `overload_retry_held`.
+- Not carried from upstream: the autonomous `sr codex` retry policy (`X-Subrouter-Retry-Policy`, upstream #505), persist mode (`sr codex --persist-capacity`), the `X-Subrouter-Retry` header with `sr codex --retry-interval/--retry-max-wait`, and the per-session account bans and escalating marks of upstream #599/#622.
 
-To retry harder on the same account:
+To retry harder on the same account, set it on the daemon:
 
 ```bash
-# daemon: every 2s after the ramp, for up to 4 minutes (the default cap)
+# every 2s after the ramp, for up to 4 minutes (the default cap)
 SUBROUTER_CODEX_CAPACITY_RETRY_INTERVAL=2s subrouter serve
-# or per launch, when the daemon sets SUBROUTER_CODEX_CAPACITY_RETRY_HEADER=1
-sr codex --retry-interval 2s --retry-max-wait 4m
 ```
-
-`sr codex --persist-capacity` remains as a preset of the same thing (1s gaps for the longer of the persist budget and the daemon's wait).
-
-`sr codex` keeps this autonomous policy in the generated shared Codex home as well as one-shot launches. The old goal-resume workaround and its `100/100` provider retry settings are no longer generated.
 
 With the failover on, an account that shed a request ranks below the others for that model and tier for a few minutes, but its sessions stay on it (their prompt cache is there) unless it fails twice in a row. Its first success clears the mark. Without the failover no account is marked. Capacity is never counted as quota.
 
@@ -172,7 +329,7 @@ If you really want to move one conversation, the recommended way is to start or 
 
 ## Azure fallback
 
-`SUBROUTER_AZURE_CODEX_ENDPOINT` plus `SUBROUTER_AZURE_CODEX_API_KEY` (or `SUBROUTER_AZURE_CODEX_CONFIG_FILE` for several Azure resources) lets Subrouter finish a Codex `/responses` request on Azure OpenAI after the pool has spent five retries or has no usable account. It also absorbs the ChatGPT backend's in-stream `server_is_overloaded` failure ("Selected model is at capacity") on both the SSE and WebSocket transports, and `SUBROUTER_AZURE_CODEX_MODELS` limits which requested models it serves. The session then stays on that Azure endpoint for 30 minutes of activity so its prompt cache keeps hitting.
+`SUBROUTER_AZURE_CODEX_ENDPOINT` plus `SUBROUTER_AZURE_CODEX_API_KEY` (or `SUBROUTER_AZURE_CODEX_CONFIG_FILE` for several Azure resources) lets Subrouter finish a Codex `/responses` request on Azure OpenAI after the pool has spent five retries or has no usable account. It is the last stage of [quota failover](#automatic-quota-failover): it sees a request only after pool rotation, the optional rate-limit-reset credit and the optional peer pool have all failed to serve it. It also absorbs the ChatGPT backend's in-stream `server_is_overloaded` failure ("Selected model is at capacity") on both the SSE and WebSocket transports, and `SUBROUTER_AZURE_CODEX_MODELS` limits which requested models it serves. The session then stays on that Azure endpoint for 30 minutes of activity so its prompt cache keeps hitting.
 
 Force the route to test it:
 

@@ -71,11 +71,11 @@ var codexSharedOwnedKeys = [][]string{
 // codexSharedDaemonEligible reports whether a launch can run on the shared
 // server. Anything that needs a per-launch provider setting, or that Codex
 // itself runs embedded, keeps the -c provider block.
-func codexSharedDaemonEligible(args []string, localTarget bool, userEmail, accountID string, persistCapacity bool, retryHeader string) bool {
+func codexSharedDaemonEligible(args []string, localTarget bool, userEmail, accountID string) bool {
 	if strings.TrimSpace(os.Getenv(codexSharedDaemonDisable)) == "0" {
 		return false
 	}
-	if localTarget || userEmail != "" || accountID != "" || persistCapacity || retryHeader != "" {
+	if localTarget || userEmail != "" || accountID != "" {
 		return false
 	}
 	if strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_BASE_URL")) != "" {
@@ -172,7 +172,7 @@ func codexSharedHomeDir(source string) string {
 	if def, err := defaultCodexHome(); err != nil || canonicalPath(source) != canonicalPath(def) {
 		key = append(key, "home="+canonicalPath(source))
 	}
-	if server := explicitServerTarget(); server != "" {
+	if server := codexServerTarget(); server != "" {
 		key = append(key, "server="+server)
 	}
 	if len(key) > 0 {
@@ -447,10 +447,12 @@ func codexSharedGeneratedConfig(user map[string]any, source, target, baseURL str
 		"experimental_bearer_token": "subrouter",
 		"wire_api":                  "responses",
 		"supports_websockets":       true,
-		"stream_idle_timeout_ms":    autonomousAgentClientTimeoutMS,
+		// No stream_idle_timeout_ms or X-Subrouter-Retry-Policy: upstream
+		// raises Codex's idle timeout for its autonomous retry (#505), which
+		// this fork does not port; Codex keeps its own timeout, which the
+		// daemon's 4m stay ladder is sized under (PATCHES §27).
 		"http_headers": map[string]any{
-			"X-Subrouter-Agent":        "codex",
-			"X-Subrouter-Retry-Policy": "autonomous",
+			"X-Subrouter-Agent": "codex",
 		},
 	}
 	out["model_providers"] = providers

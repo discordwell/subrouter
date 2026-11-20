@@ -19,7 +19,7 @@ import (
 //     refused with 426 and pushed onto the HTTP transport;
 //   - a new session avoids the local uplink while it is cooling for the
 //     model, and skips a proxy that cannot be reached;
-//   - an autonomous turn that hits capacity redials in the next healthy
+//   - a turn that hits capacity redials in the next healthy
 //     region instead of resending on the same socket, unless it chains on a
 //     previous_response_id that only the old connection holds.
 

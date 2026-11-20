@@ -40,14 +40,14 @@ func codex(args []string) error {
 	if err != nil {
 		return err
 	}
-	args, persistCapacity := takeCodexPersistCapacityFlag(args)
 	// Keep accepting the old spelling, but do not re-enable the native goal
 	// retry workaround it used to control.
 	args, _ = takeCodexGoalResumeFlag(args)
-	args, retryHeader, err := takeOverloadRetryFlags(args)
-	if err != nil {
-		return err
-	}
+	// Upstream's --persist-capacity (#382) and --retry-interval /
+	// --retry-max-wait (#389) launcher flags, and the autonomous retry
+	// policy it sends by default (#505), are not part of this fork: the
+	// daemon does not port persist mode, the X-Subrouter-Retry header or
+	// autonomous retry (PATCHES §27).
 	if !codexInvocationUsesSubrouter(args) {
 		if accountOptions.requested() {
 			fmt.Fprintf(os.Stderr, "%s: --account ignored; this Codex command does not route model traffic\n", programBase())
@@ -141,7 +141,7 @@ func codex(args []string) error {
 	}
 
 	sharedHome := ""
-	if codexSharedDaemonEligible(args, localTarget, userEmail, accountID, persistCapacity, retryHeader) {
+	if codexSharedDaemonEligible(args, localTarget, userEmail, accountID) {
 		if sharedHome, err = prepareCodexSharedHomeForLaunch(baseURL); err != nil {
 			fmt.Fprintf(os.Stderr, "subrouter: cannot prepare the shared Codex home, starting Codex without its background server: %v\n", err)
 			sharedHome = ""
@@ -159,24 +159,18 @@ func codex(args []string) error {
 		// make Codex skip its background server again.
 		childArgs = sanitizeCodexRoutingArgs(args)
 	}
-	if persistCapacity {
-		childArgs = appendCodexConfigBeforeTerminator(childArgs, codexPersistCapacityConfigArgs())
-	}
-	if retryHeader != "" {
-		childArgs = appendCodexConfigBeforeTerminator(childArgs, codexOverloadRetryConfigArgs(retryHeader))
-	}
-	autonomousRetry := !persistCapacity && retryHeader == "" && accountID == ""
-	if autonomousRetry && sharedHome == "" {
-		childArgs = appendCodexConfigBeforeTerminator(childArgs, codexAutonomousTimeoutConfigArgs())
-	}
-	if persistCapacity || retryHeader != "" {
-		childArgs = appendCodexConfigBeforeTerminator(childArgs, codexAgentRetryPolicyConfigArgs("bounded"))
-	}
 	launchID := ""
 	if codexInvocationRecordsSession(args) {
-		serverName := "local"
-		if !localTarget {
-			serverName = (srRunner{store: accounts.DefaultCodexStore()}).launchServerName()
+		// The server this launch resolved to (§29.5: SUBROUTER_CODEX_SERVER
+		// and the default, never SUBROUTER_SERVER), so the hooks, the status
+		// line and the exit summary ask the server that served it. Upstream
+		// #429 recorded selectedRemoteServer's choice (SUBROUTER_SERVER
+		// first), which named another server, or "local", for a remote Codex
+		// launch here. An unregistered SUBROUTER_CODEX_BASE_URL has no server
+		// to ask: "" leaves it to the ledger's default.
+		serverName := ""
+		if server, ok := codexResolvedServer(localTarget, baseURL); ok {
+			serverName = server.Name
 		}
 		launch, ledgerErr := newSessionLedger(accounts.DefaultCodexStore().StoreDir()).startLaunch(sessionLaunchRecord{
 			Agent:     "codex",
@@ -324,38 +318,7 @@ func tomlTopLevelKeyPresent(body, key string) bool {
 	return false
 }
 
-// codexPersistCapacityFlag asks Subrouter to keep retrying "Selected model
-// is at capacity" (before any output) for this session instead of giving up
-// after the default ladder (up to 4m on the same account, ~10s with an
-// egress or Azure fallback or the account failover). It sends the
-// X-Subrouter-Capacity-Retry header, which the daemon honors only with
-// SUBROUTER_CODEX_OVERLOAD_FAILOVER=1 or SUBROUTER_CODEX_CAPACITY_RETRY_HEADER=1.
-const codexPersistCapacityFlag = "--persist-capacity"
-
 const codexGoalResumeFlag = "--no-goal-resume"
-
-// codexPersistCapacityStreamRetries raises Codex's own stream retry count for
-// a persisting session: over the websocket transport each capacity reroute
-// is a reconnect that Codex counts against stream_max_retries (default 5).
-const codexPersistCapacityStreamRetries = 20
-
-// takeCodexPersistCapacityFlag removes --persist-capacity from the launcher
-// arguments (never after --, where arguments belong to the prompt).
-func takeCodexPersistCapacityFlag(args []string) ([]string, bool) {
-	out := make([]string, 0, len(args))
-	found := false
-	for i, arg := range args {
-		if arg == "--" {
-			return append(out, args[i:]...), found
-		}
-		if arg == codexPersistCapacityFlag {
-			found = true
-			continue
-		}
-		out = append(out, arg)
-	}
-	return out, found
-}
 
 func takeCodexGoalResumeFlag(args []string) ([]string, bool) {
 	out := make([]string, 0, len(args))
@@ -384,15 +347,13 @@ func codexGoalResumeEnabled() bool {
 	}
 }
 
-// codexPersistCapacityConfigArgs go after the launcher's provider table, so
-// Codex's in-order -c overrides add these leaves to it: the persist header
-// on every HTTP request and websocket upgrade, and a higher stream retry
-// count so websocket reroutes are not cut short by the client.
-func codexPersistCapacityConfigArgs() []string {
-	return []string{
-		"-c", `model_providers.subrouter.http_headers.X-Subrouter-Capacity-Retry="persist"`,
-		"-c", "model_providers.subrouter.stream_max_retries=" + strconv.Itoa(codexPersistCapacityStreamRetries),
-	}
+// codexServerTarget is the one-command server a cx/sr codex launch targets:
+// SUBROUTER_CODEX_SERVER, the documented spelling (PATCHES §22). Upstream's
+// explicitServerTarget (#380) lets SUBROUTER_SERVER override it here too;
+// §29.5 did not take that for the Codex launcher, so a SUBROUTER_SERVER set
+// for Claude profile maintenance never redirects a Codex launch.
+func codexServerTarget() string {
+	return strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_SERVER"))
 }
 
 // codexResolvedTargetIsBuiltInLocal distinguishes the built-in local daemon
@@ -403,7 +364,7 @@ func codexResolvedTargetIsBuiltInLocal(store srServerStore, resolvedURL string) 
 	if !sameLocalProxyEndpoint(resolvedURL, local) {
 		return false
 	}
-	if name := explicitServerTarget(); name != "" {
+	if name := codexServerTarget(); name != "" {
 		return isLocalServerName(name)
 	}
 	if strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_BASE_URL")) != "" {
@@ -481,7 +442,7 @@ func codexBaseURL(store srServerStore) (string, error) {
 	if baseURL := strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_BASE_URL")); baseURL != "" {
 		return secureTenantProxyURL(context.Background(), baseURL, "protected-codex-credential")
 	}
-	if serverName := explicitServerTarget(); serverName != "" {
+	if serverName := codexServerTarget(); serverName != "" {
 		return codexBaseURLForNamedServer(store, serverName)
 	}
 	return defaultCodexBaseURLFor(store)
@@ -506,7 +467,7 @@ func codexBaseURLWithTailscaleHealing(store srServerStore, warn io.Writer) (stri
 	if baseURL := strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_BASE_URL")); baseURL != "" {
 		return secureTenantProxyURL(context.Background(), baseURL, "protected-codex-credential")
 	}
-	serverName := explicitServerTarget()
+	serverName := codexServerTarget()
 	if serverName == "local" || serverName == "localhost" {
 		return defaultCodexBaseURL, nil
 	}
@@ -563,16 +524,16 @@ func codexBaseURLWithFallback(store srServerStore, warn io.Writer) (string, erro
 		source == broker.CredentialSourceLocal {
 		local := localBaseURL()
 		if strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_BASE_URL")) != "" ||
-			explicitServerTarget() != "" {
+			codexServerTarget() != "" {
 			pinned, pinErr := codexBaseURLWithTailscaleHealing(store, warn)
 			if pinErr != nil {
 				return "", pinErr
 			}
 			pinnedToBuiltInLocal := strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_BASE_URL")) == "" &&
-				isLocalServerName(explicitServerTarget())
+				isLocalServerName(codexServerTarget())
 			if source == broker.CredentialSourceTeam && !pinnedToBuiltInLocal {
 				return "", fmt.Errorf(
-					"team credentials may only be sent through the local daemon at %s; unset SUBROUTER_CODEX_BASE_URL, SUBROUTER_SERVER and SUBROUTER_CODEX_SERVER",
+					"team credentials may only be sent through the local daemon at %s; unset SUBROUTER_CODEX_BASE_URL and SUBROUTER_CODEX_SERVER",
 					local,
 				)
 			}
@@ -600,7 +561,7 @@ func codexBaseURLWithFallback(store srServerStore, warn io.Writer) (string, erro
 		var repairFailure tailscaleRepairFailure
 		if !errors.As(err, &repairFailure) ||
 			strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_BASE_URL")) != "" ||
-			explicitServerTarget() != "" ||
+			codexServerTarget() != "" ||
 			fallbackDisabled() {
 			return "", err
 		}
@@ -620,7 +581,7 @@ func codexBaseURLWithFallback(store srServerStore, warn io.Writer) (string, erro
 		return local, nil
 	}
 	if strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_BASE_URL")) != "" ||
-		explicitServerTarget() != "" {
+		codexServerTarget() != "" {
 		// A legacy pin is never substituted, but a local pin is still repaired.
 		local := localBaseURL()
 		if sameEndpoint(baseURL, local) &&
@@ -900,18 +861,34 @@ func codexRealtimeCallBaseURL(baseURL string) string {
 // The login's access token then reaches the router, so this applies only to a
 // loopback or tailnet router, and only to a login refreshed within the last
 // week: an older one may need a refresh that a revoked token would fail after
-// launch, where bearer mode needed no login. SUBROUTER_CODEX_CHATGPT_AUTH=0
-// turns it off, for example when the pool holds this same login's refresh
-// chain and two refreshers would invalidate each other.
+// launch, where bearer mode needed no login.
+//
+// This fork turns it on only when SUBROUTER_CODEX_CHATGPT_AUTH=1 (upstream
+// #616 has it on unless the variable is 0). ~/.codex is the human's own login
+// (PATCHES §22): by default a pinned launch never sends its access token to a
+// router, and the router's answers (a 401 from a box that does not know the
+// token, a dead pinned account) never make the Codex child refresh that login.
+// The single-label host rule below would otherwise send it in plain HTTP to
+// whatever a LAN search domain resolves the name to.
 func codexSubrouterProviderAuth(baseURL, accountID string, forceAuthenticatedProvider bool) string {
 	if forceAuthenticatedProvider {
 		return `env_key="SUBROUTER_CODEX_DUMMY_API_KEY"`
 	}
-	if accountID != "" && strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_CHATGPT_AUTH")) != "0" &&
+	if accountID != "" && codexChatGPTAuthOptedIn() &&
 		codexChatGPTAuthTrustedHost(baseURL) && codexHasFreshChatGPTLogin(time.Now()) {
 		return `requires_openai_auth=true`
 	}
 	return `experimental_bearer_token="subrouter"`
+}
+
+// codexChatGPTAuthOptedIn reports whether the owner turned on upstream #616's
+// ChatGPT-login provider auth for pinned launches. Off unless set.
+func codexChatGPTAuthOptedIn() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_CHATGPT_AUTH"))) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
 }
 
 const codexChatGPTLoginMaxAge = 7 * 24 * time.Hour
@@ -952,7 +929,6 @@ func codexSubrouterProviderTable(baseURL, userEmail, accountID, model string, fo
 func codexSubrouterHeaders(userEmail, accountID, model string) string {
 	headers := []string{
 		`"X-Subrouter-Agent"="codex"`,
-		`"X-Subrouter-Retry-Policy"="autonomous"`,
 	}
 	if client := srClientName(); client != "" {
 		headers = append(headers, `"`+clientNameHeader+`"=`+strconv.Quote(client))

@@ -10,11 +10,12 @@ import (
 
 func basePlanInput() setupPlanInput {
 	return setupPlanInput{
-		GOOS:           "darwin",
-		LocalAccounts:  2,
-		TeamModeReady:  true,
-		WantBackground: true,
-		WantConfig:     true,
+		GOOS:                "darwin",
+		LocalCodexAccounts:  2,
+		LocalClaudeAccounts: 2,
+		TeamModeReady:       true,
+		WantBackground:      true,
+		WantConfig:          true,
 	}
 }
 

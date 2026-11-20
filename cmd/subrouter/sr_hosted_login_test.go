@@ -554,6 +554,9 @@ func TestHostedDefaultOutputUsesUsageDashboard(t *testing.T) {
 	for _, key := range []string{"SUBROUTER_SERVER", "SUBROUTER_CODEX_SERVER", "SUBROUTER_STATE_DIR"} {
 		t.Setenv(key, "")
 	}
+	// Hosted storage is a remote path: on a keyless machine the PATCHES 17
+	// gate resolves every credential source to Local (C6).
+	unlockRemoteGateForTest(t)
 	t.Setenv("COLUMNS", "160")
 	tenantKey := "srt_0123456789abcdef0123456789abcdef"
 	var requests int
@@ -617,6 +620,7 @@ func TestHostedDefaultOutputWithoutAccountsSaysHowToAdd(t *testing.T) {
 	for _, key := range []string{"SUBROUTER_SERVER", "SUBROUTER_CODEX_SERVER", "SUBROUTER_STATE_DIR"} {
 		t.Setenv(key, "")
 	}
+	unlockRemoteGateForTest(t) // PATCHES 17 C6, as above
 	tenantKey := "srt_0123456789abcdef0123456789abcdef"
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode([]broker.UsageStatus{})
@@ -643,16 +647,21 @@ func TestHostedDefaultOutputWithoutAccountsSaysHowToAdd(t *testing.T) {
 	}
 }
 
-// An explicit SUBROUTER_SERVER=local must keep bare sr, argless sr switch,
-// and sr status on the local store even when hosted storage is configured.
+// An explicit SUBROUTER_CODEX_SERVER=local must keep bare sr, argless sr
+// switch, and sr status on the local store even when hosted storage is
+// configured. Upstream spells it SUBROUTER_SERVER=local; this fork's run()
+// reads SUBROUTER_CODEX_SERVER (PATCHES 29.5 did not take explicitServerTarget
+// there), and the gate is unlocked so hosted storage is really in play --
+// keyless, C6 would make this pass without the override.
 func TestHostedDefaultOutputHonorsExplicitLocalServer(t *testing.T) {
 	for _, args := range [][]string{nil, {"switch"}, {"status"}} {
 		t.Run(strings.Join(append([]string{"sr"}, args...), " "), func(t *testing.T) {
 			t.Setenv("HOME", t.TempDir())
-			for _, key := range []string{"SUBROUTER_CODEX_SERVER", "SUBROUTER_STATE_DIR"} {
+			for _, key := range []string{"SUBROUTER_SERVER", "SUBROUTER_STATE_DIR"} {
 				t.Setenv(key, "")
 			}
-			t.Setenv("SUBROUTER_SERVER", "local")
+			unlockRemoteGateForTest(t)
+			t.Setenv("SUBROUTER_CODEX_SERVER", "local")
 			tenantKey := "srt_0123456789abcdef0123456789abcdef"
 			var requests int
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

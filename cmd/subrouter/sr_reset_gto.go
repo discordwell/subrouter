@@ -75,22 +75,13 @@ func printResetCredits(out io.Writer, now time.Time, entries []resetCreditsAccou
 // resetListRemote fetches per-account reset-credit detail (count + expiry) from
 // the team server, which alone holds live tokens to query the upstream.
 func (r srRunner) resetListRemote(ctx context.Context, server srServerConfig) error {
-	baseURL, err := serverControlBaseURL(server)
+	res, _, err := r.doServerAdmin(ctx, server, serverAdminCall{
+		method:  http.MethodGet,
+		path:    "/_subrouter/reset-credits",
+		timeout: 60 * time.Second,
+	})
 	if err != nil {
 		return err
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/_subrouter/reset-credits", nil)
-	if err != nil {
-		return redactServerRequestError(err, server)
-	}
-	addServerAdminAuth(req, server)
-	secured, err := r.securedRequestClientForServer(server, baseURL, 60*time.Second)
-	if err != nil {
-		return err
-	}
-	res, err := secured.Do(req)
-	if err != nil {
-		return redactServerRequestError(err, server)
 	}
 	defer res.Body.Close()
 	if res.StatusCode == http.StatusNotFound {
@@ -191,8 +182,9 @@ func complimentaryResetRemaining(info *accounts.ComplimentaryResetInfo) int {
 // what a credit is worth on each (the longest weekly wait first) and reports
 // how many Codex accounts are usable now. Accounts blocked only by the 5h
 // window are neither: a credit would restart their weekly window and waste
-// what is left of it.
-func gtoResetCandidates(rows []srUsageRow) (usableNow int, candidates []gtoResetCandidate) {
+// what is left of it. It also names the credit-holding accounts it passed
+// over because they are cooked on a spend cap, so the caller can say why.
+func gtoResetCandidates(rows []srUsageRow) (usableNow int, candidates []gtoResetCandidate, spendCapped []string) {
 	for _, row := range rows {
 		if row.err != nil || usageProvider(row) != accounts.ProviderCodex || row.authMode != accounts.AuthModeOAuth {
 			continue
@@ -205,6 +197,14 @@ func gtoResetCandidates(rows []srUsageRow) (usableNow int, candidates []gtoReset
 		}
 		credits := complimentaryResetRemaining(row.complimentaryReset)
 		if credits <= 0 {
+			continue
+		}
+		// A usage-based seat cooked on its spend cap is not a candidate: the
+		// credit resets rate limits, and the seat has none (PATCHES.md §42).
+		// Every other reset path already asks the rate limit alone
+		// (accounts.WeeklyLimitCooked); this one reads the published windows.
+		if window, cooked := accounts.WeeklyCookedWindow(row.windows); cooked && accounts.IsSpendWindow(window) {
+			spendCapped = append(spendCapped, displayUsageAccountName(row))
 			continue
 		}
 		candidates = append(candidates, gtoResetCandidate{
@@ -223,14 +223,32 @@ func gtoResetCandidates(rows []srUsageRow) (usableNow int, candidates []gtoReset
 		// so ties fall back to email order.
 		return a.email < b.email
 	})
-	return usableNow, candidates
+	return usableNow, candidates, spendCapped
+}
+
+// printSpendCappedSkips names the credit-holding accounts --gto passed over
+// because they are cooked on a spend cap. Without it the verdict reads as if
+// no cooked account held a credit, while sr status shows one cooked and
+// sr reset --list shows its credits.
+func printSpendCappedSkips(out io.Writer, names []string) {
+	for _, name := range names {
+		fmt.Fprintf(out, "Skipped %s: cooked on its spend cap, which a rate-limit reset credit does not lift.\n", name)
+	}
+}
+
+// noGTOCandidateError is --gto's refusal when nothing is worth a credit.
+func noGTOCandidateError(spendCapped []string) error {
+	if len(spendCapped) > 0 {
+		return fmt.Errorf("no cooked Codex account has a rate-limit reset credit available that can un-cook it (%d skipped: cooked on a spend cap)", len(spendCapped))
+	}
+	return fmt.Errorf("no cooked Codex account has a rate-limit reset credit available")
 }
 
 // assessResetValue turns the best candidate's weekly wait into a one-line
 // verdict plus a worthwhile flag. It never blocks the reset.
 func assessResetValue(usableNow int, candidates []gtoResetCandidate) (verdict string, worthwhile bool) {
 	if len(candidates) == 0 {
-		return "No weekly-cooked Codex account holds a reset credit.", false
+		return "No weekly-cooked Codex account holds a reset credit that can un-cook it.", false
 	}
 	top := candidates[0]
 	usable := ""
@@ -277,14 +295,15 @@ func (r srRunner) resetRemoteGTO(ctx context.Context, server srServerConfig, n i
 		return fmt.Errorf("server %s does not expose usage-status; cannot compute --gto selection", server.Name)
 	}
 	rows := usageRowsFromServerUsageStatuses(statuses)
-	usableNow, candidates := gtoResetCandidates(rows)
+	usableNow, candidates, spendCapped := gtoResetCandidates(rows)
+	printSpendCappedSkips(r.out, spendCapped)
 	verdict, _ := assessResetValue(usableNow, candidates)
 	fmt.Fprintln(r.out, verdict)
 	if len(candidates) == 0 {
 		if dryRun {
 			return nil
 		}
-		return fmt.Errorf("no cooked Codex account has a rate-limit reset credit available")
+		return noGTOCandidateError(spendCapped)
 	}
 	top := candidates
 	if len(top) > n {
@@ -353,14 +372,15 @@ func (r srRunner) resetLocalGTO(ctx context.Context, n int, dryRun bool) error {
 	if err := fetches.err(); err != nil {
 		return err
 	}
-	usableNow, candidates := gtoResetCandidates(rows)
+	usableNow, candidates, spendCapped := gtoResetCandidates(rows)
+	printSpendCappedSkips(r.out, spendCapped)
 	verdict, _ := assessResetValue(usableNow, candidates)
 	fmt.Fprintln(r.out, verdict)
 	if len(candidates) == 0 {
 		if dryRun {
 			return nil
 		}
-		return fmt.Errorf("no cooked Codex account has a rate-limit reset credit available")
+		return noGTOCandidateError(spendCapped)
 	}
 	top := candidates
 	if len(top) > n {

@@ -138,33 +138,45 @@ func readRawAuth(path string) (json.RawMessage, error) {
 // activeCodexAuthWriteMu is the in-process half of the active-auth write lock.
 var activeCodexAuthWriteMu sync.Mutex
 
+// activeCodexAuthWriteWaiting is a test seam: it runs when a writer finds the
+// in-process write lock held and is about to wait for it.
+var activeCodexAuthWriteWaiting func()
+
 func activeCodexAuthWriteLockPath() string {
 	return DefaultCodexAuthPath() + ".write.lock"
 }
 
-// lockActiveCodexAuthWrite serializes every read-compare-write and write of
-// ~/.codex/auth.json performed by subrouter (SwitchActiveStored,
-// WriteActiveCodexAuth, and the post-refresh sync), within this process and
-// across processes.
+// lockActiveCodexAuthWrite serializes every write of ~/.codex/auth.json this
+// binary makes -- SwitchActiveStored, WriteActiveCodexAuth, and the
+// read-compare-write that mirrors a refreshed credential into it -- within this
+// process and across processes. Without it, an `sr` refresh of account A that
+// read auth.json before a concurrent `sr` switch to B wrote A's tokens over B.
 //
-// It is deliberately not ActiveCodexAuthLock: that lock serializes
-// interactive `sr add`/login flows and is held across a browser OAuth that can
-// take minutes, which must not stall a background refresh holding an account
-// lock.
+// It is deliberately not ActiveCodexAuthLock: that lock serializes interactive
+// `sr add`/login flows and is held across a browser OAuth that can take
+// minutes, which must not stall a refresh holding an account lock.
 //
 // Lock order: a per-account lock (lockStoredAccount) may be held while taking
-// this lock, never the reverse. This lock is a leaf: no other lock is acquired
+// this lock, never the reverse. This lock is a leaf: nothing else is acquired
 // while it is held, so it cannot take part in an inversion.
-func lockActiveCodexAuthWrite() (func(), error) {
-	activeCodexAuthWriteMu.Lock()
-	release, err := lockActiveCodexAuthWriteFile()
+//
+// The daemon never takes it: serving stores run with DisableActiveAuthSync
+// and never write auth.json (PATCHES section 23, owner decision 1).
+func lockActiveCodexAuthWrite() (func() error, error) {
+	if !activeCodexAuthWriteMu.TryLock() {
+		if hook := activeCodexAuthWriteWaiting; hook != nil {
+			hook()
+		}
+		activeCodexAuthWriteMu.Lock()
+	}
+	lock, err := lockActiveCodexAuthWriteFile()
 	if err != nil {
 		activeCodexAuthWriteMu.Unlock()
 		return nil, err
 	}
-	return func() {
-		release()
-		activeCodexAuthWriteMu.Unlock()
+	return func() error {
+		defer activeCodexAuthWriteMu.Unlock()
+		return lock.Close()
 	}, nil
 }
 
@@ -177,11 +189,14 @@ func writeCodexActiveAuthLocked(path string, rawAuth json.RawMessage) error {
 	return writeCodexActiveAuth(path, rawAuth)
 }
 
-// writeCodexActiveAuth replaces auth.json atomically: the new content is
-// written and fsynced to a unique temp file in the same directory, the current
-// file is copied to auth.json.bak, and only then is the temp file renamed over
-// auth.json and the directory fsynced. auth.json is never absent, and a failed
-// write leaves the previous file in place. Callers hold lockActiveCodexAuthWrite.
+// writeCodexActiveAuth replaces auth.json atomically: the current file is
+// copied to auth.json.bak, then the new content is written and fsynced to a
+// unique temp file in the same directory and renamed over auth.json, and the
+// directory is fsynced (writeFileAtomic). auth.json is never absent, and a
+// failed write leaves the previous file in place. It used to rename auth.json
+// to .bak first and then write a fixed auth.json.tmp without fsync: a Codex
+// reading in between found no login, and a failed temp write left none at all.
+// Callers hold lockActiveCodexAuthWrite.
 func writeCodexActiveAuth(path string, rawAuth json.RawMessage) error {
 	var auth CodexAuthFile
 	if err := json.Unmarshal(rawAuth, &auth); err != nil {

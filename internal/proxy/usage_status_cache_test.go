@@ -509,6 +509,11 @@ func TestUsageStatusSnapshotRejectsDiskGenerationChange(t *testing.T) {
 	}
 }
 
+// Upstream's version started from no snapshot at all and expected the score
+// refresh to create one. In this fork the refresh only updates rows a sweep
+// published (RefreshUsageStatusSnapshotFromWindows): the sweep row comes
+// first here, and TestUsageStatusWindowRefreshNeverStandsInForASweep pins
+// the no-snapshot case.
 func TestRefreshUsageStatusSnapshotFromWindowsPublishesResetWindows(t *testing.T) {
 	ref := cacheTestAccountRef(t, &usageRoundTripper{})
 	ref.accounts = []accounts.Account{{
@@ -516,6 +521,11 @@ func TestRefreshUsageStatusSnapshotFromWindowsPublishesResetWindows(t *testing.T
 		AuthMode: accounts.AuthModeOAuth, Email: "claude@example.com",
 	}}
 	observedAt := time.Now().Add(-time.Minute).UTC()
+	ref.usageStatusCache = []AccountUsageStatus{{
+		AccountStatus: AccountStatus{ID: "claude@example.com", Provider: accounts.ProviderClaude,
+			AuthMode: accounts.AuthModeOAuth, AuthChecked: true, AuthValid: true},
+		UsageFetchedAt: observedAt.Add(-time.Hour),
+	}}
 	ref.usageWindows = map[string]usageWindowsEntry{
 		"claude@example.com\x00claude": {
 			windows: []accounts.UsageWindow{{

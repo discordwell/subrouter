@@ -38,9 +38,24 @@ func emptyStore(t *testing.T) accounts.CodexStore {
 	return accounts.CodexStore{Dir: t.TempDir()}
 }
 
+// isolateCloudConfig keeps a test that runs `sr doctor` off this host's cloud
+// config. It also keeps it off what the doctor's Claude settings check reads
+// (isolateDoctorClaudeSettings), since every caller runs the doctor or its
+// neighbours.
 func isolateCloudConfig(t *testing.T) {
 	t.Helper()
 	t.Setenv("SUBROUTER_CLOUD_CONFIG", filepath.Join(t.TempDir(), "cloud.json"))
+	isolateDoctorClaudeSettings(t)
+}
+
+// isolateDoctorClaudeSettings points the doctor's Claude settings check at an
+// empty config dir and a Tailscale CLI that does not exist. Without it a bare
+// `go test` reads this host's ~/.claude/settings.json and, for a tailnet URL
+// in it, asks this host's DNS and runs its `tailscale status --json` (§36.4).
+func isolateDoctorClaudeSettings(t *testing.T) {
+	t.Helper()
+	t.Setenv("CLAUDE_CONFIG_DIR", t.TempDir())
+	t.Setenv(tailscaleBinaryEnv, filepath.Join(t.TempDir(), "no-tailscale"))
 }
 
 func TestCleanupWithoutYesOnlyPrintsPlan(t *testing.T) {
@@ -219,6 +234,7 @@ func TestDoctorFailsProviderEgressWhenLocalDaemonIsDown(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	isolateDoctorClaudeSettings(t)
 	dead := healthServer(t, http.StatusServiceUnavailable)
 	t.Setenv("SUBROUTER_LOCAL_BASE_URL", dead.URL+"/v1")
 

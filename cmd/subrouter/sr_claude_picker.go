@@ -125,6 +125,12 @@ func claudeRowBrokenReason(row srUsageRow) string {
 		}
 		return "restricted by Anthropic (account_on_hold)"
 	}
+	if usageProvider(row) == accounts.ProviderClaude && row.err != nil {
+		// The fork's repair hint names the profile and the verb that fits
+		// its login (sr claude addr / add <name>, PATCHES §36.2), not the
+		// provider-wide `sr add`.
+		return "needs re-login (refresh token invalid or expired); " + claudeUsageRowRepair(row)
+	}
 	return "needs re-login (refresh token invalid or expired); re-add with: " + providerReaddCommand(usageProvider(row))
 }
 

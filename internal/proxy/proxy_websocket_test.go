@@ -86,7 +86,7 @@ func TestHandlerProxiesWebSocketWithSelectedAccountAuth(t *testing.T) {
 		MaxBodyBytes: 1024,
 	}.Handler()
 	done := make(chan struct{})
-	subrouter := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	subrouter := newProxyTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer close(done)
 		handler.ServeHTTP(w, r)
 	}))
@@ -163,7 +163,7 @@ func TestWebSocketTracksInflightUntilConnectionCloses(t *testing.T) {
 		SchedulerRef: ref,
 		MaxBodyBytes: 1024,
 	}.Handler()
-	proxy := httptest.NewServer(handler)
+	proxy := newProxyTestServer(t, handler)
 	defer proxy.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(proxy.URL, "http") + "/v1/responses"
@@ -252,13 +252,16 @@ func TestWebSocketCommitsSchedulerRerouteOnlyAfterBothUpgradesSucceed(t *testing
 					{ID: "fresh@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "fresh-token"},
 				},
 				Sessions: store,
+				// Cold: the reroute is a below-floor move, not an eviction, and a
+				// warm session keeps its account until that account is evicted.
+				ActiveSessions: coldActiveSessions(),
 				SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
 					{AccountID: "spent@example.com", Provider: accounts.ProviderCodex, Headroom: 0.01, ShortHeadroom: 0.01},
 					{AccountID: "fresh@example.com", Provider: accounts.ProviderCodex, Headroom: 1, ShortHeadroom: 1},
 				})),
 				MaxBodyBytes: 1024,
 			}.Handler()
-			proxy := httptest.NewServer(handler)
+			proxy := newProxyTestServer(t, handler)
 			defer proxy.Close()
 
 			wsURL := "ws" + strings.TrimPrefix(proxy.URL, "http") + "/v1/responses"
@@ -324,7 +327,7 @@ func TestHandlerRejectsCrossOriginBrowserWebSocketBeforeUpstreamDial(t *testing.
 		Sessions:  store,
 		Scheduler: selectacct.NewScheduler(nil),
 	}.Handler()
-	subrouter := httptest.NewServer(handler)
+	subrouter := newProxyTestServer(t, handler)
 	defer subrouter.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(subrouter.URL, "http") + "/v1/responses"
@@ -384,7 +387,7 @@ func TestHandlerRejectsOversizedWebSocketMessage(t *testing.T) {
 		Sessions:  store,
 		Scheduler: selectacct.NewScheduler(nil),
 	}.Handler()
-	subrouter := httptest.NewServer(handler)
+	subrouter := newProxyTestServer(t, handler)
 	defer subrouter.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(subrouter.URL, "http") + "/v1/responses"
@@ -444,7 +447,7 @@ func TestHandlerForwardsLargeWebSocketMessage(t *testing.T) {
 		Sessions:  store,
 		Scheduler: selectacct.NewScheduler(nil),
 	}.Handler()
-	subrouter := httptest.NewServer(handler)
+	subrouter := newProxyTestServer(t, handler)
 	defer subrouter.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(subrouter.URL, "http") + "/v1/responses"
@@ -773,7 +776,7 @@ func TestHandlerDoesNotNegotiateWebSocketCompression(t *testing.T) {
 		Sessions:  store,
 		Scheduler: selectacct.NewScheduler(nil),
 	}.Handler()
-	subrouter := httptest.NewServer(handler)
+	subrouter := newProxyTestServer(t, handler)
 	defer subrouter.Close()
 
 	dialer := *websocket.DefaultDialer
@@ -830,7 +833,7 @@ func TestHandlerForwardsUpstreamWebSocketCloseHandshake(t *testing.T) {
 		Scheduler:    selectacct.NewScheduler(nil),
 		MaxBodyBytes: 1024,
 	}.Handler()
-	subrouter := httptest.NewServer(handler)
+	subrouter := newProxyTestServer(t, handler)
 	defer subrouter.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(subrouter.URL, "http") + "/v1/responses"
@@ -922,7 +925,7 @@ func TestHandlerProxiesWebSocketWhenAllOAuthAccountsBelowProtectedHeadroom(t *te
 		}),
 		MaxBodyBytes: 1024,
 	}.Handler()
-	subrouter := httptest.NewServer(handler)
+	subrouter := newProxyTestServer(t, handler)
 	defer subrouter.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(subrouter.URL, "http") + "/v1/responses"
@@ -980,7 +983,7 @@ func TestHandlerMapsV1RequestsToCodexBackendPaths(t *testing.T) {
 		Scheduler:    selectacct.NewScheduler(nil),
 		MaxBodyBytes: 1024,
 	}.Handler()
-	subrouter := httptest.NewServer(handler)
+	subrouter := newProxyTestServer(t, handler)
 	defer subrouter.Close()
 
 	response, err := http.Post(subrouter.URL+"/v1/responses", "application/json", strings.NewReader(`{}`))
@@ -1074,7 +1077,7 @@ func TestHandlerProxiesClaudeOAuthSubscriptionRequest(t *testing.T) {
 		Scheduler:    selectacct.NewScheduler(nil),
 		MaxBodyBytes: 1024,
 	}.Handler()
-	subrouter := httptest.NewServer(handler)
+	subrouter := newProxyTestServer(t, handler)
 	defer subrouter.Close()
 
 	req, err := http.NewRequest(http.MethodPost, subrouter.URL+"/v1/messages?beta=true", bytes.NewReader(requestBody))
@@ -1134,7 +1137,7 @@ func TestHandlerKeepsClaudeConversationOnSameAccount(t *testing.T) {
 		Scheduler:    selectacct.NewScheduler(nil),
 		MaxBodyBytes: 1024,
 	}.Handler()
-	subrouter := httptest.NewServer(handler)
+	subrouter := newProxyTestServer(t, handler)
 	defer subrouter.Close()
 
 	postClaudeMessage := func(sessionID string) {
@@ -1246,7 +1249,7 @@ func TestHandlerReroutesClaudeWhenStickyAccountRefreshFails(t *testing.T) {
 		SchedulerRef:   schedulerRef,
 		MaxBodyBytes:   1024,
 	}.Handler()
-	subrouter := httptest.NewServer(handler)
+	subrouter := newProxyTestServer(t, handler)
 	defer subrouter.Close()
 
 	req, err := http.NewRequest(http.MethodPost, subrouter.URL+"/v1/messages", strings.NewReader(`{}`))
@@ -1322,7 +1325,7 @@ func TestHandlerRoutesCodexAndClaudeProvidersSeparately(t *testing.T) {
 		Scheduler:    selectacct.NewScheduler(nil),
 		MaxBodyBytes: 1024,
 	}.Handler()
-	subrouter := httptest.NewServer(handler)
+	subrouter := newProxyTestServer(t, handler)
 	defer subrouter.Close()
 
 	codexReq, err := http.NewRequest(http.MethodPost, subrouter.URL+"/v1/responses", strings.NewReader(`{}`))
@@ -1402,7 +1405,7 @@ func TestHandlerHandlesBaseURLHeadProbeLocally(t *testing.T) {
 		Scheduler:    selectacct.NewScheduler(nil),
 		MaxBodyBytes: 1024,
 	}.Handler()
-	subrouter := httptest.NewServer(handler)
+	subrouter := newProxyTestServer(t, handler)
 	defer subrouter.Close()
 
 	req, err := http.NewRequest(http.MethodHead, subrouter.URL+"/", nil)
@@ -1497,7 +1500,7 @@ func TestHandlerMapsDesktopCodexBackendPathsWithoutDuplicatingPrefix(t *testing.
 		Scheduler:    selectacct.NewScheduler(nil),
 		MaxBodyBytes: 1024,
 	}.Handler()
-	subrouter := httptest.NewServer(handler)
+	subrouter := newProxyTestServer(t, handler)
 	defer subrouter.Close()
 
 	response, err := http.Post(subrouter.URL+"/backend-api/codex/remote/control/client/enroll/start", "application/json", strings.NewReader(`{}`))
@@ -1548,7 +1551,7 @@ func TestHandlerMapsChatGPTBackendUsagePathsWithoutDuplicatingPrefix(t *testing.
 		Scheduler:    selectacct.NewScheduler(nil),
 		MaxBodyBytes: 1024,
 	}.Handler()
-	subrouter := httptest.NewServer(handler)
+	subrouter := newProxyTestServer(t, handler)
 	defer subrouter.Close()
 
 	response, err := http.Get(subrouter.URL + "/backend-api/wham/usage")
@@ -1591,7 +1594,7 @@ func TestHandlerDoesNotUseAPIKeyAccountsForDesktopCodexBackendPaths(t *testing.T
 		Scheduler:    selectacct.NewScheduler(nil),
 		MaxBodyBytes: 1024,
 	}.Handler()
-	subrouter := httptest.NewServer(handler)
+	subrouter := newProxyTestServer(t, handler)
 	defer subrouter.Close()
 
 	response, err := http.Post(subrouter.URL+"/backend-api/codex/remote/control/client/enroll/start", "application/json", strings.NewReader(`{}`))
@@ -1637,7 +1640,7 @@ func TestHandlerDoesNotUseAPIKeyAccountsForChatGPTBackendUsagePaths(t *testing.T
 		Scheduler:    selectacct.NewScheduler(nil),
 		MaxBodyBytes: 1024,
 	}.Handler()
-	subrouter := httptest.NewServer(handler)
+	subrouter := newProxyTestServer(t, handler)
 	defer subrouter.Close()
 
 	response, err := http.Get(subrouter.URL + "/backend-api/wham/usage")
@@ -1751,7 +1754,7 @@ func TestHandlerRefreshesExpiredOAuthBeforeProxying(t *testing.T) {
 		Scheduler:     selectacct.NewScheduler(nil),
 		MaxBodyBytes:  1024,
 	}.Handler()
-	subrouter := httptest.NewServer(handler)
+	subrouter := newProxyTestServer(t, handler)
 	defer subrouter.Close()
 
 	response, err := http.Post(subrouter.URL+"/v1/responses", "application/json", strings.NewReader(`{}`))
@@ -1812,7 +1815,7 @@ func TestAccountStatusEndpointValidatesRefreshToken(t *testing.T) {
 	}.Handler()
 
 	recorder := httptest.NewRecorder()
-	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/_subrouter/account-status", nil))
+	handler.ServeHTTP(recorder, loopbackAdminRequest(http.MethodPost, "/_subrouter/account-status", nil))
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
 	}
@@ -1878,7 +1881,7 @@ func TestUsageStatusEndpointFetchesUsageWithoutForcingFreshRefresh(t *testing.T)
 	}.Handler()
 
 	recorder := httptest.NewRecorder()
-	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/_subrouter/usage-status", nil))
+	handler.ServeHTTP(recorder, loopbackAdminRequest(http.MethodGet, "/_subrouter/usage-status", nil))
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
 	}
@@ -1909,7 +1912,7 @@ func TestUsageStatusEndpointIncludesClaudeRequestTimeExhaustion(t *testing.T) {
 	}.Handler()
 
 	recorder := httptest.NewRecorder()
-	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/_subrouter/usage-status", nil))
+	handler.ServeHTTP(recorder, loopbackAdminRequest(http.MethodGet, "/_subrouter/usage-status", nil))
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
 	}
@@ -1971,7 +1974,7 @@ func TestReloadAccountsHotLoadsNewAccountWithoutRestart(t *testing.T) {
 		SchedulerRef:  schedulerRef,
 		MaxBodyBytes:  1024,
 	}.Handler()
-	subrouter := httptest.NewServer(handler)
+	subrouter := newProxyTestServer(t, handler)
 	defer subrouter.Close()
 
 	if err := accountStore.SaveStored(added); err != nil {
@@ -2065,7 +2068,7 @@ func TestHandlerMapsV1WebSocketRequestsToCodexBackendPaths(t *testing.T) {
 		Scheduler:    selectacct.NewScheduler(nil),
 		MaxBodyBytes: 1024,
 	}.Handler()
-	subrouter := httptest.NewServer(handler)
+	subrouter := newProxyTestServer(t, handler)
 	defer subrouter.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(subrouter.URL, "http") + "/v1/responses"
@@ -2129,7 +2132,7 @@ func TestHandlerMapsRealtimeWebSocketRequestsToCodexBackendPaths(t *testing.T) {
 		Scheduler:    selectacct.NewScheduler(nil),
 		MaxBodyBytes: 1024,
 	}.Handler()
-	subrouter := httptest.NewServer(handler)
+	subrouter := newProxyTestServer(t, handler)
 	defer subrouter.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(subrouter.URL, "http") + "/v1/realtime?intent=quicksilver&model=snapshot"
@@ -2186,7 +2189,7 @@ func TestHandlerMapsAPIShapedRealtimeCallToChatGPTOAuthBackend(t *testing.T) {
 		Scheduler:    selectacct.NewScheduler(nil),
 		MaxBodyBytes: 1024 * 1024,
 	}.Handler()
-	subrouter := httptest.NewServer(handler)
+	subrouter := newProxyTestServer(t, handler)
 	defer subrouter.Close()
 
 	const boundary = "codex-realtime-call-boundary"
@@ -2288,7 +2291,7 @@ func TestHandlerMapsAPIShapedRealtimeCallAndSidebandToSameOAuthAccount(t *testin
 	}
 	primary := accounts.Account{ID: "oauth", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "oauth-token", AccountID: "acct-oauth"}
 	handler := Server{CodexUpstream: backendURL, APIUpstream: apiURL, Accounts: []accounts.Account{primary}, Sessions: store, Scheduler: selectacct.NewScheduler(nil), MaxBodyBytes: 1024 * 1024}.Handler()
-	subrouter := httptest.NewServer(handler)
+	subrouter := newProxyTestServer(t, handler)
 	defer subrouter.Close()
 	const boundary = "codex-realtime-call-boundary"
 	body := "--" + boundary + "\r\nContent-Disposition: form-data; name=\"sdp\"\r\n\r\nv=offer\r\n--" + boundary + "\r\nContent-Disposition: form-data; name=\"session\"\r\nContent-Type: application/json\r\n\r\n{\"type\":\"realtime\"}\r\n--" + boundary + "--\r\n"
@@ -2343,7 +2346,7 @@ func TestHandlerRejectsUnknownOrInvalidRealtimeSidebandBeforeUpstream(t *testing
 		t.Fatal(err)
 	}
 	handler := Server{APIUpstream: apiURL, Accounts: []accounts.Account{{ID: "oauth", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "token"}}, Sessions: store, Scheduler: selectacct.NewScheduler(nil), MaxBodyBytes: 1024}.Handler()
-	subrouter := httptest.NewServer(handler)
+	subrouter := newProxyTestServer(t, handler)
 	defer subrouter.Close()
 	for _, path := range []string{"/v1/live/missing", "/v1/live/a/b"} {
 		resp, err := http.Get(subrouter.URL + path)
@@ -2399,7 +2402,7 @@ func TestHandlerMapsDesktopCodexBackendWebSocketPathsWithoutDuplicatingPrefix(t 
 		Scheduler:    selectacct.NewScheduler(nil),
 		MaxBodyBytes: 1024,
 	}.Handler()
-	subrouter := httptest.NewServer(handler)
+	subrouter := newProxyTestServer(t, handler)
 	defer subrouter.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(subrouter.URL, "http") + "/backend-api/codex/realtime"
@@ -2494,7 +2497,7 @@ func TestHandlerMapsBareRequestsToOpenAIV1Paths(t *testing.T) {
 		Scheduler:    selectacct.NewScheduler(nil),
 		MaxBodyBytes: 1024,
 	}.Handler()
-	subrouter := httptest.NewServer(handler)
+	subrouter := newProxyTestServer(t, handler)
 	defer subrouter.Close()
 
 	response, err := http.Post(subrouter.URL+"/responses", "application/json", strings.NewReader(`{}`))
@@ -2546,7 +2549,7 @@ func TestHandlerUsesExplicitSubrouterAccountID(t *testing.T) {
 		}),
 		MaxBodyBytes: 1024,
 	}.Handler()
-	subrouter := httptest.NewServer(handler)
+	subrouter := newProxyTestServer(t, handler)
 	defer subrouter.Close()
 
 	req, err := http.NewRequest(http.MethodPost, subrouter.URL+"/responses", strings.NewReader(`{}`))
@@ -2614,7 +2617,7 @@ func TestHandlerUsesClaudeAPIKeyHeaders(t *testing.T) {
 		Scheduler:    selectacct.NewScheduler(nil),
 		MaxBodyBytes: 1024,
 	}.Handler()
-	subrouter := httptest.NewServer(handler)
+	subrouter := newProxyTestServer(t, handler)
 	defer subrouter.Close()
 
 	req, err := http.NewRequest(http.MethodPost, subrouter.URL+"/v1/messages", strings.NewReader(`{}`))
@@ -2675,7 +2678,7 @@ func TestHandlerPreservesRequestBodyBytesAfterJSONSessionExtraction(t *testing.T
 		Scheduler:    selectacct.NewScheduler(nil),
 		MaxBodyBytes: 1024,
 	}.Handler()
-	subrouter := httptest.NewServer(handler)
+	subrouter := newProxyTestServer(t, handler)
 	defer subrouter.Close()
 
 	req, err := http.NewRequest(http.MethodPost, subrouter.URL+"/v1/responses", bytes.NewReader(body))
@@ -2735,7 +2738,7 @@ func TestHandlerPreservesResponseBodyBytes(t *testing.T) {
 		Scheduler:    selectacct.NewScheduler(nil),
 		MaxBodyBytes: 1024,
 	}.Handler()
-	subrouter := httptest.NewServer(handler)
+	subrouter := newProxyTestServer(t, handler)
 	defer subrouter.Close()
 
 	req, err := http.NewRequest(http.MethodPost, subrouter.URL+"/v1/responses", strings.NewReader(`{}`))
@@ -2857,7 +2860,7 @@ func TestHandlerRetriesReplayableResponsesPostOnTransientTransportError(t *testi
 				Transport:    transport,
 				MaxBodyBytes: 1024,
 			}.Handler()
-			subrouter := httptest.NewServer(handler)
+			subrouter := newProxyTestServer(t, handler)
 			defer subrouter.Close()
 
 			body := `{"model":"gpt-5.5","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}]}`
@@ -2937,7 +2940,7 @@ func TestHandlerRetriesReplayableResponsesPostOnUpstreamRequestTimeout(t *testin
 				Transport:    transport,
 				MaxBodyBytes: 1024,
 			}.Handler()
-			subrouter := httptest.NewServer(handler)
+			subrouter := newProxyTestServer(t, handler)
 			defer subrouter.Close()
 
 			body := `{"model":"gpt-5.5","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}]}`
@@ -3017,7 +3020,7 @@ func TestHandlerLogsUpstreamResponseStreamReadErrors(t *testing.T) {
 		Logger:       slog.New(slog.NewTextHandler(logs, nil)),
 		MaxBodyBytes: 1024,
 	}.Handler()
-	subrouter := httptest.NewServer(handler)
+	subrouter := newProxyTestServer(t, handler)
 	defer subrouter.Close()
 
 	req, err := http.NewRequest(http.MethodPost, subrouter.URL+"/v1/responses/compact", strings.NewReader(`{}`))
@@ -3096,7 +3099,7 @@ func TestHandlerPreservesWebSocketMessageBytes(t *testing.T) {
 		Scheduler:    selectacct.NewScheduler(nil),
 		MaxBodyBytes: 1024,
 	}.Handler()
-	subrouter := httptest.NewServer(handler)
+	subrouter := newProxyTestServer(t, handler)
 	defer subrouter.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(subrouter.URL, "http") + "/v1/responses"
@@ -3158,7 +3161,7 @@ func TestHandlerRecordsHTTPTranscriptBodies(t *testing.T) {
 		MaxBodyBytes: 1024,
 		Transcripts:  transcripts,
 	}.Handler()
-	subrouter := httptest.NewServer(handler)
+	subrouter := newProxyTestServer(t, handler)
 	defer subrouter.Close()
 
 	req, err := http.NewRequest(http.MethodPost, subrouter.URL+"/v1/responses", bytes.NewReader(requestBody))
@@ -3244,7 +3247,7 @@ func TestHandlerRecordsWebSocketTranscriptMessages(t *testing.T) {
 		MaxBodyBytes: 1024,
 		Transcripts:  transcripts,
 	}.Handler()
-	subrouter := httptest.NewServer(handler)
+	subrouter := newProxyTestServer(t, handler)
 	defer subrouter.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(subrouter.URL, "http") + "/v1/responses"
@@ -3312,10 +3315,12 @@ func TestHandlerStoresUserEmailAndStripsSubrouterHeaders(t *testing.T) {
 		Scheduler:    selectacct.NewScheduler(nil),
 		MaxBodyBytes: 1024,
 	}.Handler()
-	subrouter := httptest.NewServer(handler)
+	subrouter := newProxyTestServer(t, handler)
 	defer subrouter.Close()
 
-	req, err := http.NewRequest(http.MethodPost, subrouter.URL+"/v1/responses", strings.NewReader(`{}`))
+	// A Claude model turn: a Claude request on any other path is a side
+	// request (sideChannelRequest) and pins nothing.
+	req, err := http.NewRequest(http.MethodPost, subrouter.URL+"/v1/messages", strings.NewReader(`{}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3399,7 +3404,7 @@ func TestHandlerReroutesStickySessionWhenAssignedAccountExhausted(t *testing.T) 
 		}),
 		MaxBodyBytes: 1024,
 	}.Handler()
-	subrouter := httptest.NewServer(handler)
+	subrouter := newProxyTestServer(t, handler)
 	defer subrouter.Close()
 
 	req, err := http.NewRequest(http.MethodPost, subrouter.URL+"/v1/responses", strings.NewReader(`{}`))
@@ -3450,20 +3455,33 @@ func TestHandlerReroutesColdStickySessionWhenAssignedAccountBelowRetentionHeadro
 	if _, err := store.Put("codex", "session-1", "low@example.com", ""); err != nil {
 		t.Fatal(err)
 	}
+	// Explicitly COLD: this process has run for a full idle bound without
+	// seeing a turn from session-1. A fresh tracker would read the unseen
+	// session as possibly-warm, and a warm session keeps its account.
+	active := NewActiveSessions()
+	active.startedAt = time.Now().Add(-(warmSessionIdleTTL + time.Minute))
 	handler := Server{
 		Upstream: upstreamURL,
 		Accounts: []accounts.Account{
 			{ID: "low@example.com", AuthMode: accounts.AuthModeOAuth, Token: "low-token"},
 			{ID: "healthy@example.com", AuthMode: accounts.AuthModeOAuth, Token: "healthy-token"},
 		},
-		Sessions: store,
+		Sessions:       store,
+		ActiveSessions: active,
 		Scheduler: selectacct.NewScheduler([]selectacct.Score{
-			{AccountID: "low@example.com", Headroom: 0.02, ShortHeadroom: 0.02},
-			{AccountID: "healthy@example.com", Headroom: 0.90, ShortHeadroom: 0.90},
+			// "Constrained" is a burn RATE, not a level: 80% of the 5h window
+			// spent with four hours still to run. A bare 0.10 headroom no
+			// longer refuses anything -- eligibility stopped being a flat
+			// floor -- so stating it as a level would make this test pass
+			// vacuously against the rule it exists to check.
+			{AccountID: "low@example.com", Headroom: 0.20, ShortHeadroom: 0.20,
+				ShortWindowSeconds: 5 * 60 * 60, ShortResetAfterSeconds: 4 * 60 * 60},
+			{AccountID: "healthy@example.com", Headroom: 0.90, ShortHeadroom: 0.90,
+				ShortWindowSeconds: 5 * 60 * 60, ShortResetAfterSeconds: 4 * 60 * 60},
 		}),
 		MaxBodyBytes: 1024,
 	}.Handler()
-	subrouter := httptest.NewServer(handler)
+	subrouter := newProxyTestServer(t, handler)
 	defer subrouter.Close()
 
 	req, err := http.NewRequest(http.MethodPost, subrouter.URL+"/v1/responses", strings.NewReader(`{}`))
@@ -3534,7 +3552,7 @@ func TestHandlerRoutesSparkModelUsingSparkQuota(t *testing.T) {
 		}),
 		MaxBodyBytes: 1024,
 	}.Handler()
-	subrouter := httptest.NewServer(handler)
+	subrouter := newProxyTestServer(t, handler)
 	defer subrouter.Close()
 
 	req, err := http.NewRequest(http.MethodPost, subrouter.URL+"/v1/responses", strings.NewReader(`{}`))
@@ -3599,17 +3617,19 @@ func TestHandlerKeepsActiveStickySessionWhenAssignedAccountBelowRetentionHeadroo
 		{AccountID: "low@example.com", Headroom: 0.90, ShortHeadroom: 0.90},
 		{AccountID: "healthy@example.com", Headroom: 0.80, ShortHeadroom: 0.80},
 	}))
+	active := NewActiveSessions()
 	handler := Server{
 		Upstream: upstreamURL,
 		Accounts: []accounts.Account{
 			{ID: "low@example.com", AuthMode: accounts.AuthModeOAuth, Token: "low-token"},
 			{ID: "healthy@example.com", AuthMode: accounts.AuthModeOAuth, Token: "healthy-token"},
 		},
-		Sessions:     store,
-		SchedulerRef: schedulerRef,
-		MaxBodyBytes: 1024,
+		Sessions:       store,
+		ActiveSessions: active,
+		SchedulerRef:   schedulerRef,
+		MaxBodyBytes:   1024,
 	}.Handler()
-	subrouter := httptest.NewServer(handler)
+	subrouter := newProxyTestServer(t, handler)
 	defer subrouter.Close()
 
 	firstReq, err := http.NewRequest(http.MethodPost, subrouter.URL+"/v1/responses", strings.NewReader(`{}`))
@@ -3644,9 +3664,15 @@ func TestHandlerKeepsActiveStickySessionWhenAssignedAccountBelowRetentionHeadroo
 		t.Fatal("timed out waiting for first request to become active")
 	}
 
+	// Degrade the assigned account mid-session. Stated as a burn rate -- 80% of
+	// the 5h window gone with four hours left -- because a bare level no longer
+	// makes an account unroutable, so the old 0.10 fixture would leave it
+	// perfectly usable and this test would assert nothing.
 	schedulerRef.Set(selectacct.NewScheduler([]selectacct.Score{
-		{AccountID: "low@example.com", Headroom: 0.02, ShortHeadroom: 0.02},
-		{AccountID: "healthy@example.com", Headroom: 0.90, ShortHeadroom: 0.90},
+		{AccountID: "low@example.com", Headroom: 0.20, ShortHeadroom: 0.20,
+			ShortWindowSeconds: 5 * 60 * 60, ShortResetAfterSeconds: 4 * 60 * 60},
+		{AccountID: "healthy@example.com", Headroom: 0.90, ShortHeadroom: 0.90,
+			ShortWindowSeconds: 5 * 60 * 60, ShortResetAfterSeconds: 4 * 60 * 60},
 	}))
 
 	secondReq, err := http.NewRequest(http.MethodGet, subrouter.URL+"/backend-api/codex/analytics-events/events", nil)
@@ -3673,29 +3699,52 @@ func TestHandlerKeepsActiveStickySessionWhenAssignedAccountBelowRetentionHeadroo
 		t.Fatal(err)
 	}
 
-	thirdReq, err := http.NewRequest(http.MethodPost, subrouter.URL+"/v1/responses/compact", strings.NewReader(`{}`))
-	if err != nil {
-		t.Fatal(err)
+	compact := func(name string) {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodPost, subrouter.URL+"/v1/responses/compact", strings.NewReader(`{}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("X-Subrouter-Session", "session-1")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+			t.Fatal(err)
+		}
+		if err := resp.Body.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if resp.StatusCode != http.StatusNoContent {
+			t.Fatalf("%s status = %d, want 204", name, resp.StatusCode)
+		}
 	}
-	thirdReq.Header.Set("X-Subrouter-Session", "session-1")
-	thirdResp, err := http.DefaultClient.Do(thirdReq)
-	if err != nil {
-		t.Fatal(err)
+	// The turn just ended, so the session is WARM: it keeps its below-floor
+	// account (the owner's warm rule, PATCHES §21), where it used to move the
+	// moment its in-flight count reached zero.
+	compact("third")
+
+	// Once it has gone cold -- no turn for a full idle bound -- nothing is
+	// left to protect and the below-floor account sheds it. Wait for the
+	// third turn's release (it stamps lastSeen after the response) first.
+	key := session.ScopedSessionKey("codex", "session-1")
+	deadline := time.Now().Add(2 * time.Second)
+	for active.Active("codex", "session-1") {
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for the third turn to release")
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
-	if _, err := io.Copy(io.Discard, thirdResp.Body); err != nil {
-		t.Fatal(err)
-	}
-	if err := thirdResp.Body.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if thirdResp.StatusCode != http.StatusNoContent {
-		t.Fatalf("third status = %d, want 204", thirdResp.StatusCode)
-	}
+	active.mu.Lock()
+	active.lastSeen[key] = time.Now().Add(-(warmSessionIdleTTL + time.Minute))
+	active.mu.Unlock()
+	compact("fourth")
 
 	mu.Lock()
 	got := append([]string(nil), auths...)
 	mu.Unlock()
-	want := []string{"Bearer low-token", "Bearer low-token", "Bearer healthy-token"}
+	want := []string{"Bearer low-token", "Bearer low-token", "Bearer low-token", "Bearer healthy-token"}
 	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
 		t.Fatalf("auths = %#v, want %#v", got, want)
 	}
@@ -3758,7 +3807,7 @@ func TestHandlerReroutesActiveStickySessionWhenAssignedAccountExhausted(t *testi
 		SchedulerRef: schedulerRef,
 		MaxBodyBytes: 1024,
 	}.Handler()
-	subrouter := httptest.NewServer(handler)
+	subrouter := newProxyTestServer(t, handler)
 	defer subrouter.Close()
 
 	firstReq, err := http.NewRequest(http.MethodPost, subrouter.URL+"/v1/responses", strings.NewReader(`{}`))
@@ -3795,7 +3844,10 @@ func TestHandlerReroutesActiveStickySessionWhenAssignedAccountExhausted(t *testi
 
 	schedulerRef.MarkExhausted(accounts.ProviderCodex, "empty@example.com", "")
 
-	secondReq, err := http.NewRequest(http.MethodGet, subrouter.URL+"/backend-api/codex/analytics-events/events", nil)
+	// A model turn: only a turn moves the pin. A side request on the same key
+	// (analytics-events) is served off the exhausted account too, but leaves
+	// the pin for the next turn to move.
+	secondReq, err := http.NewRequest(http.MethodPost, subrouter.URL+"/v1/responses", strings.NewReader(`{}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3835,11 +3887,11 @@ func TestHandlerReroutesActiveStickySessionWhenAssignedAccountExhausted(t *testi
 	}
 }
 
-// On a true cold start (the scheduler has never been scored) the request that
-// notices it still refreshes before selection. Stale-but-present scores
-// refresh off the request path instead; see
-// TestStaleUsageScoresRefreshOffRequestPath.
-func TestHandlerRefreshesColdStartUsageScoresBeforeReusingStickySession(t *testing.T) {
+// On a scheduler that has never been scored, the request that notices still
+// refreshes before selection: there is nothing to route on yet. Scores that
+// exist but are stale refresh off the request path instead; see
+// TestStaleUsageScoresRefreshOffTheRequestPath.
+func TestHandlerRefreshesNeverScoredUsageScoresBeforeReusingStickySession(t *testing.T) {
 	var auths []string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		auths = append(auths, r.Header.Get("Authorization"))
@@ -3885,7 +3937,7 @@ func TestHandlerRefreshesColdStartUsageScoresBeforeReusingStickySession(t *testi
 		},
 		MaxBodyBytes: 1024,
 	}.Handler()
-	subrouter := httptest.NewServer(handler)
+	subrouter := newProxyTestServer(t, handler)
 	defer subrouter.Close()
 
 	req, err := http.NewRequest(http.MethodPost, subrouter.URL+"/v1/responses", strings.NewReader(`{}`))
@@ -3920,6 +3972,18 @@ func TestHandlerRefreshesColdStartUsageScoresBeforeReusingStickySession(t *testi
 }
 
 func TestHandlerMarksWebSocketUsageLimitAccountExhausted(t *testing.T) {
+	testWebSocketQuotaReconnect(t, `{"type":"error","error":{"type":"usage_limit_reached","message":"The usage limit has been reached"}}`, true)
+}
+
+func TestHandlerReconnectsWebSocketSpendCapOnHealthyAccount(t *testing.T) {
+	testWebSocketQuotaReconnect(t, `{"type":"error","error":{"code":"workspace_usage_limit_reached","message":"You hit your spend cap set by the owner of your workspace. Ask an owner to increase your spend cap to continue."}}`, true)
+}
+
+func TestHandlerPreservesSpendCapWithoutAlternate(t *testing.T) {
+	testWebSocketQuotaReconnect(t, `{"type":"error","error":{"message":"You hit your spend cap set by the owner of your workspace."}}`, false)
+}
+
+func testWebSocketQuotaReconnect(t *testing.T, payload string, expectReconnect bool) {
 	upgrader := websocket.Upgrader{CheckOrigin: func(_ *http.Request) bool { return true }}
 	var auths []string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -3936,7 +4000,7 @@ func TestHandlerMarksWebSocketUsageLimitAccountExhausted(t *testing.T) {
 		if _, _, err := conn.ReadMessage(); err != nil {
 			t.Fatalf("read client message: %v", err)
 		}
-		if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"error","error":{"type":"usage_limit_reached","message":"The usage limit has been reached"}}`)); err != nil {
+		if err := conn.WriteMessage(websocket.TextMessage, []byte(payload)); err != nil {
 			t.Fatalf("write usage error: %v", err)
 		}
 	}))
@@ -3957,7 +4021,7 @@ func TestHandlerMarksWebSocketUsageLimitAccountExhausted(t *testing.T) {
 		{AccountID: "empty@example.com", Headroom: 0.80, ShortHeadroom: 0.80},
 		{AccountID: "healthy@example.com", Headroom: 0.80, ShortHeadroom: 0.80},
 	}))
-	handler := Server{
+	server := Server{
 		Upstream: upstreamURL,
 		Accounts: []accounts.Account{
 			{ID: "empty@example.com", AuthMode: accounts.AuthModeOAuth, Token: "empty-token"},
@@ -3966,8 +4030,11 @@ func TestHandlerMarksWebSocketUsageLimitAccountExhausted(t *testing.T) {
 		Sessions:     store,
 		SchedulerRef: schedulerRef,
 		MaxBodyBytes: 1024,
-	}.Handler()
-	subrouter := httptest.NewServer(handler)
+	}
+	if !expectReconnect {
+		server.Accounts = server.Accounts[:1]
+	}
+	subrouter := newProxyTestServer(t, server.Handler())
 	defer subrouter.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(subrouter.URL, "http") + "/v1/responses"
@@ -3981,15 +4048,17 @@ func TestHandlerMarksWebSocketUsageLimitAccountExhausted(t *testing.T) {
 	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create"}`)); err != nil {
 		t.Fatalf("write create: %v", err)
 	}
-	// The event is terminal for Codex, so the relay absorbs it and closes
-	// 1012: the reconnect is what reaches a usable account.
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	_, body, err := conn.ReadMessage()
-	if err == nil {
-		t.Fatalf("client received %q, want the usage limit event absorbed and the socket closed", body)
+	if !expectReconnect {
+		defer conn.Close()
+		if err != nil || string(body) != payload {
+			t.Fatalf("without alternate: body=%q err=%v", body, err)
+		}
+		return
 	}
-	var closeErr *websocket.CloseError
-	if !errors.As(err, &closeErr) || closeErr.Code != websocket.CloseServiceRestart {
-		t.Fatalf("close = %v, want 1012 so the client reconnects", err)
+	if !websocket.IsCloseError(err, websocket.CloseTryAgainLater) {
+		t.Fatalf("got body %q, error %v; want retryable reconnect without a terminal quota error", body, err)
 	}
 	_ = conn.Close()
 	if _, accountMarked := schedulerRef.ExhaustedUntilFor(accounts.ProviderCodex, "empty@example.com", ""); !accountMarked {
@@ -4029,13 +4098,19 @@ func TestHandlerMarksWebSocketUsageLimitAccountExhausted(t *testing.T) {
 }
 
 func TestHandlerRetriesHTTPUsageLimitOnAlternateOAuthAccount(t *testing.T) {
+	testHTTPQuotaFailover(t, `{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached"}}`)
+}
+func TestHandlerRetriesHTTPSpendCapOnAlternateOAuthAccount(t *testing.T) {
+	testHTTPQuotaFailover(t, `{"error":{"message":"You hit your spend cap set by the owner of your workspace. Ask an owner to increase your spend cap to continue."}}`)
+}
+func testHTTPQuotaFailover(t *testing.T, payload string) {
 	var auths []string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		auth := r.Header.Get("Authorization")
 		auths = append(auths, auth)
 		if auth == "Bearer empty-token" {
 			w.WriteHeader(http.StatusTooManyRequests)
-			_, _ = w.Write([]byte(`{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached"}}`))
+			_, _ = w.Write([]byte(payload))
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
@@ -4067,7 +4142,7 @@ func TestHandlerRetriesHTTPUsageLimitOnAlternateOAuthAccount(t *testing.T) {
 		SchedulerRef: schedulerRef,
 		MaxBodyBytes: 1024,
 	}.Handler()
-	subrouter := httptest.NewServer(handler)
+	subrouter := newProxyTestServer(t, handler)
 	defer subrouter.Close()
 
 	firstReq, err := http.NewRequest(http.MethodPost, subrouter.URL+"/v1/responses/compact", strings.NewReader(`{}`))
@@ -4140,7 +4215,7 @@ func TestHandlerRetriesCodexModelCompatibilityErrorOnAlternateOAuthAccount(t *te
 		SchedulerRef: schedulerRef,
 		MaxBodyBytes: 1024,
 	}.Handler()
-	subrouter := httptest.NewServer(handler)
+	subrouter := newProxyTestServer(t, handler)
 	defer subrouter.Close()
 
 	req, err := http.NewRequest(http.MethodPost, subrouter.URL+"/v1/responses", strings.NewReader(`{"model":"gpt-5.6-sol","input":"hello"}`))
@@ -4216,7 +4291,7 @@ func TestFailedCodexModelCompatibilityAlternateKeepsOriginalStickyAssignment(t *
 		})),
 		MaxBodyBytes: 1024,
 		// The 503 is a capacity failure, so the default capacity retry
-		// replays it; fast gaps keep the test quick.
+		// (upstream #389) replays it; fast gaps keep the test quick.
 		CodexOverloadFailover: &CodexOverloadFailoverConfig{sameAccountGap: func() time.Duration { return time.Millisecond }, stayRetryLimit: codexTestStayRetries},
 	}.Handler()
 	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-5.6-sol","input":"hello"}`))
@@ -4228,7 +4303,8 @@ func TestFailedCodexModelCompatibilityAlternateKeepsOriginalStickyAssignment(t *
 		t.Fatalf("status = %d, want failed alternate 503", response.Code)
 	}
 	// The capacity retries go to the account that answered, never back
-	// through the incompatible one.
+	// through the incompatible one (upstream #389's targetID, on #371's
+	// routedResponseAccount crediting).
 	if len(auths) != 2+codexTestStayRetries || auths[0] != "Bearer incompatible-token" {
 		t.Fatalf("auths = %#v, want incompatible then %d compatible attempts", auths, 1+codexTestStayRetries)
 	}
@@ -4276,7 +4352,7 @@ func TestHandlerDoesNotRetryCodexModelCompatibilityErrorOnAPIKeyAccount(t *testi
 		})),
 		MaxBodyBytes: 1024,
 	}.Handler()
-	subrouter := httptest.NewServer(handler)
+	subrouter := newProxyTestServer(t, handler)
 	defer subrouter.Close()
 
 	req, err := http.NewRequest(http.MethodPost, subrouter.URL+"/v1/responses", strings.NewReader(`{"model":"gpt-5.6-sol","input":"hello"}`))
@@ -4339,7 +4415,7 @@ func TestHandlerDoesNotMarkCodexAccountWideWhenCompatibilityModelIsUnknown(t *te
 		SchedulerRef: schedulerRef,
 		MaxBodyBytes: 1024,
 	}.Handler()
-	subrouter := httptest.NewServer(handler)
+	subrouter := newProxyTestServer(t, handler)
 	defer subrouter.Close()
 
 	requestBody := `{"input":"` + strings.Repeat("x", (8<<20)+1) + `","model":"gpt-5.6-sol"}`
@@ -4460,7 +4536,7 @@ func TestHandlerMarksWebSocketModelCompatibilityAndReroutesReconnect(t *testing.
 		SchedulerRef: schedulerRef,
 		MaxBodyBytes: 1024,
 	}.Handler()
-	subrouter := httptest.NewServer(handler)
+	subrouter := newProxyTestServer(t, handler)
 	defer subrouter.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(subrouter.URL, "http") + "/v1/responses"
@@ -4533,8 +4609,8 @@ func TestCodexWebSocketResponseFinished(t *testing.T) {
 
 func TestWebSocketModelStateTracksSequentialResponses(t *testing.T) {
 	state := &webSocketModelState{model: "default-model"}
-	state.observe([]byte(`{"type":"response.create","model":"model-a"}`))
-	state.observe([]byte(`{"type":"response.create","model":"model-b"}`))
+	state.admitTurn([]byte(`{"type":"response.create","model":"model-a"}`), nil)
+	state.admitTurn([]byte(`{"type":"response.create","model":"model-b"}`), nil)
 
 	if got := state.current(); got != "model-a" {
 		t.Fatalf("first current model = %q, want model-a", got)
@@ -4584,7 +4660,7 @@ func TestHandlerRetriesHTTPUsageLimitToBelowThresholdFallback(t *testing.T) {
 		SchedulerRef: schedulerRef,
 		MaxBodyBytes: 1024,
 	}.Handler()
-	subrouter := httptest.NewServer(handler)
+	subrouter := newProxyTestServer(t, handler)
 	defer subrouter.Close()
 
 	req, err := http.NewRequest(http.MethodPost, subrouter.URL+"/v1/responses", strings.NewReader(`{}`))
@@ -4651,7 +4727,7 @@ func TestHandlerRoutesOptimisticallyWhenAllOAuthScoredExhausted(t *testing.T) {
 		}),
 		MaxBodyBytes: 1024,
 	}.Handler()
-	subrouter := httptest.NewServer(handler)
+	subrouter := newProxyTestServer(t, handler)
 	defer subrouter.Close()
 
 	req, err := http.NewRequest(http.MethodPost, subrouter.URL+"/v1/responses", strings.NewReader(`{}`))
@@ -4710,7 +4786,7 @@ func TestHandlerUsesConstrainedOAuthInsteadOfExhaustedOAuth(t *testing.T) {
 		}),
 		MaxBodyBytes: 1024,
 	}.Handler()
-	subrouter := httptest.NewServer(handler)
+	subrouter := newProxyTestServer(t, handler)
 	defer subrouter.Close()
 
 	req, err := http.NewRequest(http.MethodPost, subrouter.URL+"/v1/responses", strings.NewReader(`{}`))
@@ -4770,16 +4846,21 @@ func TestHandlerScopesStickySessionsByAgentType(t *testing.T) {
 		}),
 		MaxBodyBytes: 1024,
 	}.Handler()
-	subrouter := httptest.NewServer(handler)
+	subrouter := newProxyTestServer(t, handler)
 	defer subrouter.Close()
 
-	for _, agentType := range []string{"codex", "claude"} {
-		req, err := http.NewRequest(http.MethodPost, subrouter.URL+"/v1/responses", strings.NewReader(`{}`))
+	// Each agent's model-turn path: anything else is a side request and pins
+	// nothing (sideChannelRequest).
+	for _, turn := range []struct{ agentType, path string }{
+		{"codex", "/v1/responses"},
+		{"claude", "/v1/messages"},
+	} {
+		req, err := http.NewRequest(http.MethodPost, subrouter.URL+turn.path, strings.NewReader(`{}`))
 		if err != nil {
 			t.Fatal(err)
 		}
 		req.Header.Set("X-Subrouter-Session", "same-session")
-		req.Header.Set("X-Subrouter-Agent", agentType)
+		req.Header.Set("X-Subrouter-Agent", turn.agentType)
 		response, err := http.DefaultClient.Do(req)
 		if err != nil {
 			t.Fatal(err)
@@ -4835,7 +4916,7 @@ func TestHandlerKeepsCodexTurnIDsOnSameAccount(t *testing.T) {
 		}),
 		MaxBodyBytes: 1024,
 	}.Handler()
-	subrouter := httptest.NewServer(handler)
+	subrouter := newProxyTestServer(t, handler)
 	defer subrouter.Close()
 
 	for _, sessionID := range []string{"codex-session:4", "codex-session:7"} {
@@ -5037,7 +5118,7 @@ func TestHandlerBalancesEquivalentNewSessionsByStoredCounts(t *testing.T) {
 		}),
 		MaxBodyBytes: 1024,
 	}.Handler()
-	subrouter := httptest.NewServer(handler)
+	subrouter := newProxyTestServer(t, handler)
 	defer subrouter.Close()
 
 	const sessions = 16
@@ -5087,7 +5168,7 @@ func TestHandlerForcedCodexWebSocketSelectionErrorDoesNotOfferAzure(t *testing.T
 		t.Fatal(err)
 	}
 	server := azureCodexFallbackServer(t, azureURL, azureURL, 0)
-	proxy := httptest.NewServer(server.Handler())
+	proxy := newProxyTestServer(t, server.Handler())
 	defer proxy.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(proxy.URL, "http") + "/backend-api/codex/responses"
@@ -5120,7 +5201,7 @@ func TestHandlerInvalidForcedCodexWebSocketSelectorDoesNotOfferAzure(t *testing.
 		t.Fatal(err)
 	}
 	server := azureCodexFallbackServer(t, azureURL, azureURL, 0)
-	proxy := httptest.NewServer(server.Handler())
+	proxy := newProxyTestServer(t, server.Handler())
 	defer proxy.Close()
 
 	for _, headerName := range []string{"X-Subrouter-Account-ID", "X-Subrouter-Account"} {
@@ -5213,7 +5294,7 @@ func TestHandlerDivertsOverloadedCodexWebSocketToAzure(t *testing.T) {
 			}},
 		},
 	}
-	proxy := httptest.NewServer(server.Handler())
+	proxy := newProxyTestServer(t, server.Handler())
 	defer proxy.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(proxy.URL, "http") + "/backend-api/codex/responses"
@@ -5339,7 +5420,7 @@ func TestHandlerForcedCodexWebSocketServerErrorDoesNotDivertToAzure(t *testing.T
 			}},
 		},
 	}
-	proxy := httptest.NewServer(server.Handler())
+	proxy := newProxyTestServer(t, server.Handler())
 	defer proxy.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(proxy.URL, "http") + "/backend-api/codex/responses"
@@ -5437,7 +5518,7 @@ func TestHandlerForwardsOverloadedEventWhenModelNotServed(t *testing.T) {
 			}},
 		},
 	}
-	proxy := httptest.NewServer(server.Handler())
+	proxy := newProxyTestServer(t, server.Handler())
 	defer proxy.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(proxy.URL, "http") + "/backend-api/codex/responses"
@@ -5510,7 +5591,7 @@ func TestHandlerDivertsUnknownCodexWebSocketFailureToAzure(t *testing.T) {
 			}},
 		},
 	}
-	proxy := httptest.NewServer(server.Handler())
+	proxy := newProxyTestServer(t, server.Handler())
 	defer proxy.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(proxy.URL, "http") + "/backend-api/codex/responses"
@@ -5599,7 +5680,7 @@ func TestCodexWebSocketQuotaRerouteDoesNotPinToAzure(t *testing.T) {
 			}},
 		},
 	}
-	proxy := httptest.NewServer(server.Handler())
+	proxy := newProxyTestServer(t, server.Handler())
 	defer proxy.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(proxy.URL, "http") + "/backend-api/codex/responses"
@@ -5647,6 +5728,12 @@ func TestCodexWebSocketQuotaRerouteDoesNotPinToAzure(t *testing.T) {
 // make Codex replay response.create on another account and duplicate the
 // partial answer. The failure must pass through instead. Before any visible
 // output (only an output_item.added), the reroute still applies.
+//
+// Upstream #373's test, adapted in one place: before any output the fork's
+// quota filter (rotate, then close) closes 1013 where upstream's
+// usage-limit case closes 1012, so quota/after_delta=false wants 1013. The
+// after-output subtests are upstream's as written; the quota one pins that
+// the fork's filter now honours the same rule.
 func TestCodexWebSocketFailureAfterOutputPassesThrough(t *testing.T) {
 	failures := map[string]string{
 		"capacity": `{"type":"response.failed","response":{"error":{"code":"server_is_overloaded","message":"Selected model is at capacity."}}}`,
@@ -5683,7 +5770,7 @@ func TestCodexWebSocketFailureAfterOutputPassesThrough(t *testing.T) {
 				upstreamURL, _ := url.Parse(upstream.URL)
 				server := codexEgressServer(t, upstreamURL, nil, 2)
 				server.CodexOverloadFailover = &CodexOverloadFailoverConfig{Enabled: true}
-				proxy := httptest.NewServer(server.Handler())
+				proxy := newProxyTestServer(t, server.Handler())
 				defer proxy.Close()
 
 				wsURL := "ws" + strings.TrimPrefix(proxy.URL, "http") + "/backend-api/codex/responses"
@@ -5716,9 +5803,13 @@ func TestCodexWebSocketFailureAfterOutputPassesThrough(t *testing.T) {
 					}
 					return
 				}
+				wantClose := websocket.CloseServiceRestart
+				if name == "quota" {
+					wantClose = websocket.CloseTryAgainLater
+				}
 				var closeErr *websocket.CloseError
-				if !errors.As(readErr, &closeErr) || closeErr.Code != websocket.CloseServiceRestart {
-					t.Fatalf("received %q, err %v; want 1012 before any visible output", received, readErr)
+				if !errors.As(readErr, &closeErr) || closeErr.Code != wantClose {
+					t.Fatalf("received %q, err %v; want close %d before any visible output", received, readErr, wantClose)
 				}
 			})
 		}

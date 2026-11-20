@@ -111,6 +111,7 @@ func TestCloudCodexAlwaysUsesLocalProxy(t *testing.T) {
 func TestTeamServerKeepsDedicatedProxyAuthenticationForRemoteOverride(t *testing.T) {
 	saveReadyCloudConfig(t)
 	t.Setenv("SUBROUTER_CODEX_BASE_URL", "https://remote.example/v1")
+	unlockRemoteGateForTest(t)
 
 	store := srServerStore{Path: filepath.Join(t.TempDir(), "servers.json")}
 	if _, err := codexBaseURLWithFallback(store, nil); err == nil ||
@@ -127,6 +128,9 @@ func TestTeamServerKeepsDedicatedProxyAuthenticationForRemoteOverride(t *testing
 }
 
 func TestTeamServerRejectsNamedLoopbackRemoteOverride(t *testing.T) {
+	// A box path: on a keyless machine the PATCHES 17 gate ignores servers.json
+	// and the remote selection entirely, so this upstream test states the unlock.
+	unlockRemoteGateForTest(t)
 	saveReadyCloudConfig(t)
 	local := healthServer(t, 200)
 	t.Setenv("SUBROUTER_LOCAL_BASE_URL", local.URL+"/v1")
@@ -166,6 +170,11 @@ func TestTeamProxyUsesDedicatedLocalSecret(t *testing.T) {
 		RefreshToken: "stack-refresh",
 		TeamID:       "team-a",
 	}); err != nil {
+		t.Fatal(err)
+	}
+	// SaveConfig never mints; the key ceremony is what equips a machine with
+	// its dedicated secret before team mode enforces it.
+	if _, err := broker.EnsureLocalProxyToken(path); err != nil {
 		t.Fatal(err)
 	}
 	config, err := broker.LoadConfig(path)
@@ -257,6 +266,7 @@ func TestBareSRUsesSelectedTeamInsteadOfLegacyRemote(t *testing.T) {
 
 	path := filepath.Join(t.TempDir(), "cloud.json")
 	t.Setenv("SUBROUTER_CLOUD_CONFIG", path)
+	unlockRemoteGateForTest(t)
 	if err := broker.SaveConfig(path, broker.Config{
 		BaseURL:      cloud.URL,
 		AccessToken:  "stack-access",
@@ -326,6 +336,7 @@ func TestBareSRUsesSelectedTeamInsteadOfLegacyRemote(t *testing.T) {
 
 func TestStorageLocalUsesLocalAccountsInsteadOfCloudOrLegacyRemote(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
+	unlockRemoteGateForTest(t)
 	path := filepath.Join(t.TempDir(), "cloud.json")
 	t.Setenv("SUBROUTER_CLOUD_CONFIG", path)
 	if err := broker.SaveConfig(path, broker.Config{
@@ -386,6 +397,7 @@ func TestStorageLocalUsesLocalAccountsInsteadOfCloudOrLegacyRemote(t *testing.T)
 
 func TestRecoveryCommandsSurviveMalformedCloudConfig(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
+	unlockRemoteGateForTest(t)
 	configPath := filepath.Join(t.TempDir(), "cloud.json")
 	if err := os.WriteFile(configPath, []byte("{"), 0o600); err != nil {
 		t.Fatal(err)
@@ -649,6 +661,10 @@ func TestUserSystemdUnitQuotesPathsWithSystemdSpecialCharacters(t *testing.T) {
 func TestLocalAccountUploadsPreserveSupportedAPIKeyProviders(t *testing.T) {
 	// localAccountUploads also reads ~/.claude; a real login there would count.
 	t.Setenv("HOME", t.TempDir())
+	// On macOS that read also asks the login keychain through `security`. With
+	// nothing on PATH it cannot, and localAccountUploads skips a login it could
+	// not read just as it skips a missing one.
+	t.Setenv("PATH", t.TempDir())
 	stateDir := t.TempDir()
 	t.Setenv("SUBROUTER_STATE_DIR", stateDir)
 	store := accounts.CodexStore{Dir: filepath.Join(stateDir, "codex", "accounts")}

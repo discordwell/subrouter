@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -203,26 +202,29 @@ func serverHasAccountImportCredential(server srServerConfig) bool {
 }
 
 func (r srRunner) doServerAccountImportRequest(ctx context.Context, server srServerConfig, method string, body []byte) (*http.Response, error) {
-	baseURL, err := protectedServerControlBaseURL(server)
-	if err != nil {
-		return nil, err
-	}
-	endpoint := baseURL + serverAccountImportPath
-	req, err := http.NewRequestWithContext(ctx, method, endpoint, bytes.NewReader(body))
-	if err != nil {
-		return nil, redactServerRequestError(err, server)
-	}
-	addServerAccountImportAuth(req, server)
+	header := http.Header{}
 	if method == http.MethodPost {
-		req.Header.Set("Content-Type", "application/json")
+		header.Set("Content-Type", "application/json")
 	}
-	secured, err := r.securedRequestClientForServer(server, endpoint, 30*time.Second)
-	if err != nil {
-		return nil, err
+	if body == nil {
+		body = []byte{}
 	}
-	res, err := secured.Do(req)
+	res, _, err := r.doServerAdmin(ctx, server, serverAdminCall{
+		method:      method,
+		path:        serverAccountImportPath,
+		body:        body,
+		header:      header,
+		timeout:     30 * time.Second,
+		protected:   true,
+		privateAuth: addServerAccountImportAuth,
+		publicOnly:  r.credentialUploadPublicOnly,
+	})
 	if err != nil {
-		return nil, redactServerRequestError(err, server)
+		// Redacted, and still saying whether the request certainly did
+		// nothing (requestDidNothing): a Codex login's failure line asks
+		// (serverLoginOne, PATCHES §51.5).
+		nothing, _ := requestDidNothing(err)
+		return nil, &serverAdminError{message: redactServerRequestError(err, server).Error(), nothingDone: nothing}
 	}
 	return res, nil
 }
@@ -235,6 +237,8 @@ func redactServerRequestError(err error, server srServerConfig) error {
 		strings.TrimSpace(server.TenantKey),
 		strings.TrimSpace(server.AccountImportToken),
 		strings.TrimSpace(server.AdminToken),
+		strings.TrimSpace(server.PublicAdminToken),
+		strings.TrimSpace(server.ProxyToken),
 	}
 	if parsed, parseErr := url.Parse(strings.TrimSpace(server.URL)); parseErr == nil {
 		secrets = append(secrets, tenantKeyFromURL(parsed))

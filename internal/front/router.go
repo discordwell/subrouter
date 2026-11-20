@@ -323,17 +323,30 @@ func (r *Router) release(state *backendState, client net.Conn) {
 	r.mu.Unlock()
 }
 
+// A client that never reads while idle, like Python's http.client, never
+// closes, and its connection would hold the worker's generation open for
+// good. Nothing the client sends afterwards could matter: a worker reads
+// nothing once it has ended its side (net/http closes the connection, and a
+// websocket closes it outright).
+const clientCloseGrace = time.Second
+
 func proxyBidirectional(client, upstream net.Conn) {
-	done := make(chan struct{}, 2)
-	copyOneWay := func(dst, src net.Conn) {
-		_, _ = io.Copy(dst, src)
-		if closer, ok := dst.(interface{ CloseWrite() error }); ok {
-			_ = closer.CloseWrite()
-		}
-		done <- struct{}{}
+	toUpstream := make(chan struct{})
+	go func() {
+		_, _ = io.Copy(upstream, client)
+		closeWrite(upstream)
+		close(toUpstream)
+	}()
+	_, _ = io.Copy(client, upstream)
+	closeWrite(client)
+	grace := time.Now().Add(clientCloseGrace)
+	_ = client.SetReadDeadline(grace)
+	_ = upstream.SetWriteDeadline(grace)
+	<-toUpstream
+}
+
+func closeWrite(conn net.Conn) {
+	if closer, ok := conn.(interface{ CloseWrite() error }); ok {
+		_ = closer.CloseWrite()
 	}
-	go copyOneWay(upstream, client)
-	go copyOneWay(client, upstream)
-	<-done
-	<-done
 }

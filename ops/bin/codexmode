@@ -1,0 +1,336 @@
+#!/usr/bin/env python3
+"""codexmode -- launch the ChatGPT/Codex desktop app against the subrouter pool.
+
+  codexmode              pick a pool automatically and launch
+  codexmode status       show where it would point and which bundle; change nothing
+  codexmode local        force the local daemon
+  codexmode <server>     force a named server from servers.json
+  codexmode off          launch with no override (straight to chatgpt.com)
+
+Why this exists: the `codex` CLI can be pointed at subrouter through
+~/.codex/config.toml, but the desktop app cannot -- it reads exactly one
+environment variable, CODEX_API_BASE_URL, and nothing else. Its usage therefore
+never touched the pool: the daemon log holds zero requests from it.
+
+  let t = process.env.CODEX_API_BASE_URL;
+  return t && t.trim().length > 0 ? t.replace(/\\/+$/,``) : ... prodApiBaseUrl
+
+That check sits ahead of the production default in the app's main process, in
+both the current build and the previous one, so setting the variable is the whole
+mechanism. Everything else here is about setting it against the right pool, for
+the right bundle, without lying to you when it cannot.
+
+*** The variable is read at process start. *** A running app cannot be moved, so
+this refuses to do anything while one is up rather than launching a second copy
+and leaving you to wonder which one you are typing into.
+
+THE BUNDLE IS RESOLVED BY ID, NEVER BY NAME. OpenAI renamed this app from Codex
+to ChatGPT while keeping `com.openai.codex` and the Codex branding internally,
+and both bundles can sit in /Applications at once sharing one support directory.
+Hardcoding either name is how this breaks at the next rename, and picking the
+wrong one looks exactly like subrouter being broken.
+"""
+
+from __future__ import annotations
+
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import os
+import plistlib
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+
+BUNDLE_ID = "com.openai.codex"
+# Spotlight is the rename-proof lookup; these are only a fallback for a machine
+# with indexing off, and are deliberately NOT the primary path.
+FALLBACK_BUNDLES = ["/Applications/ChatGPT.app", "/Applications/Codex.app"]
+
+
+def load_sibling(name):
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), name)
+    if not os.path.exists(path):
+        raise SystemExit(f"codexmode: cannot find {name} next to me at {path}")
+    spec = importlib.util.spec_from_loader(
+        name, importlib.machinery.SourceFileLoader(name, path)
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+# srdash owns pool discovery and reading. Not reimplemented here: this file must
+# not carry its own copy of "which accounts are usable" -- that rule has been
+# duplicated four times in this codebase and every copy eventually disagreed
+# with the router. We read the daemon's published verdict via srdash and stop.
+DASH = load_sibling("srdash")
+
+
+# --------------------------------------------------------------------------
+# the app bundle
+# --------------------------------------------------------------------------
+
+def bundle_candidates():
+    """Every installed copy of the app, newest version first."""
+    found = []
+    try:
+        out = subprocess.run(
+            ["mdfind", f"kMDItemCFBundleIdentifier == '{BUNDLE_ID}'"],
+            capture_output=True, text=True, timeout=10,
+        )
+        found = [line.strip() for line in out.stdout.splitlines() if line.strip()]
+    except (OSError, subprocess.SubprocessError):
+        found = []
+    for path in FALLBACK_BUNDLES:
+        if path not in found and os.path.isdir(path):
+            found.append(path)
+
+    described = []
+    for path in found:
+        info = bundle_info(path)
+        if info:
+            described.append(info)
+    described.sort(key=lambda b: b["version_key"], reverse=True)
+    return described
+
+
+def bundle_info(path):
+    """Read Info.plist. Returns None for anything that is not our app."""
+    plist_path = os.path.join(path, "Contents", "Info.plist")
+    try:
+        with open(plist_path, "rb") as fh:
+            plist = plistlib.load(fh)
+    except (OSError, ValueError):
+        return None
+    if plist.get("CFBundleIdentifier") != BUNDLE_ID:
+        return None
+    version = str(plist.get("CFBundleShortVersionString") or "0")
+    # The executable name is read, not assumed: it happens to be "ChatGPT" in
+    # both current bundles, but that is exactly the sort of thing a rename moves.
+    executable = plist.get("CFBundleExecutable") or "ChatGPT"
+    binary = os.path.join(path, "Contents", "MacOS", executable)
+    if not os.path.exists(binary):
+        return None
+    return {
+        "path": path,
+        "version": version,
+        "version_key": version_key(version),
+        "binary": binary,
+    }
+
+
+def version_key(version):
+    parts = []
+    for chunk in str(version).split("."):
+        digits = "".join(c for c in chunk if c.isdigit())
+        parts.append(int(digits) if digits else 0)
+    return tuple(parts)
+
+
+def running_bundles(bundles):
+    """Which of these bundles currently has a process up."""
+    running = []
+    for bundle in bundles:
+        try:
+            out = subprocess.run(["pgrep", "-f", bundle["binary"]],
+                                 capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if out.returncode == 0 and out.stdout.strip():
+            running.append(bundle)
+    return running
+
+
+# --------------------------------------------------------------------------
+# the pool
+# --------------------------------------------------------------------------
+
+def codex_accounts(pool):
+    return [a for a in pool["accounts"] if a.get("provider") == "codex"]
+
+
+def capacity(pool):
+    """Best known codex headroom in a pool, as a fraction. -1 when unknown."""
+    known = [a["headroom_percent"] for a in codex_accounts(pool)
+             if a.get("known") and a.get("headroom_percent") is not None]
+    return (max(known) / 100) if known else -1.0
+
+
+def choose(pools):
+    """(target_pool, reason). Mirrors claudemode, including its unknown rule."""
+    local = next((p for p in pools if p["is_local"]), None)
+    servers = [p for p in pools if not p["is_local"] and p["online"]]
+
+    if not local or not local["online"]:
+        if servers:
+            best = max(servers, key=capacity)
+            return best, "local daemon is not reachable"
+        return None, "no pool is reachable"
+
+    rows = codex_accounts(local)
+    if not rows:
+        if servers:
+            best = max(servers, key=capacity)
+            return best, "no codex accounts on the local daemon"
+        return local, "no codex accounts anywhere — staying local"
+
+    clears = [a["clears_floor"] for a in rows]
+    if any(c is None for c in clears):
+        # Absent normalized data means unknown, and the router deliberately
+        # stays local rather than assuming capacity elsewhere. Same here.
+        return local, "local capacity is unknown — staying local, as the router would"
+    if any(clears):
+        best = max((a["headroom_percent"] or 0) for a in rows if a["clears_floor"])
+        return local, f"local is routable (best {best}% left)"
+    if not servers:
+        return local, ("no local codex account takes new sessions, but no server "
+                       "is reachable — staying local")
+    best = max(servers, key=capacity)
+    if capacity(best) < 0:
+        return local, f"{best['name']} reports no known capacity — staying local"
+    return best, (f"no local codex account takes new sessions; "
+                  f"{best['name']} has {round(capacity(best) * 100)}%")
+
+
+def reachable(base):
+    """Ask the daemon, rather than assume.
+
+    /_subrouter/health is the route. A bare /health or /healthz is NOT -- it
+    falls through to the catch-all proxy and comes back as an upstream HTML
+    page, which reads exactly like a dead daemon and is not one.
+    """
+    url = base.rstrip("/") + "/_subrouter/health"
+    try:
+        with urllib.request.urlopen(url, timeout=5) as response:
+            return response.status == 200
+    except (urllib.error.URLError, OSError, ValueError):
+        return False
+
+
+def api_base(pool):
+    """The app appends its own path, so hand it the /backend-api root."""
+    return pool["base"].rstrip("/") + "/backend-api"
+
+
+# --------------------------------------------------------------------------
+
+def describe_pools(pools):
+    for pool in pools:
+        if not pool["online"]:
+            print(f"  {pool['name']:<10} offline — {pool['error']}")
+            continue
+        rows = codex_accounts(pool)
+        ok = sum(1 for a in rows if a.get("clears_floor") is True)
+        best = max((a["headroom_percent"] for a in rows
+                    if a.get("headroom_percent") is not None), default=None)
+        best_txt = "unknown" if best is None else f"best {best}% left"
+        print(f"  {pool['name']:<10} codex {ok}/{len(rows)} take new sessions, {best_txt}")
+
+
+def main(argv):
+    parser = argparse.ArgumentParser(
+        prog="codexmode", description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("target", nargs="?", default=None,
+                        help="'status', 'off', 'local', or a server name")
+    parser.add_argument("--app", default=None,
+                        help="explicit .app bundle, overriding bundle-id lookup")
+    args = parser.parse_args(argv)
+
+    if args.app:
+        chosen = bundle_info(args.app)
+        if not chosen:
+            print(f"codexmode: {args.app} is not a {BUNDLE_ID} bundle", file=sys.stderr)
+            return 2
+        bundles = [chosen]
+    else:
+        bundles = bundle_candidates()
+        if not bundles:
+            print(f"codexmode: no {BUNDLE_ID} bundle found", file=sys.stderr)
+            return 2
+        chosen = bundles[0]
+
+    payload = DASH.build_payload()
+    pools = payload["pools"]
+
+    if args.target == "status":
+        print(f"app:     {chosen['path']}  ({chosen['version']})")
+        for other in bundles[1:]:
+            print(f"         (also installed, older: {other['path']} {other['version']})")
+        up = running_bundles(bundles)
+        print(f"running: {up[0]['path'] if up else 'no'}")
+        describe_pools(pools)
+        target, reason = choose(pools)
+        if target:
+            print(f"would use: {target['name']}  {api_base(target)}\n           {reason}")
+        return 0
+
+    # A running app cannot be repointed: the variable is read once at startup.
+    # Quitting it is the user's call, not this script's.
+    up = running_bundles(bundles)
+    if up:
+        print(f"codexmode: {up[0]['path']} is already running.\n"
+              "CODEX_API_BASE_URL is read at process start, so a running app "
+              "cannot be moved onto the pool. Quit it, then run this again.",
+              file=sys.stderr)
+        return 2
+
+    if args.target == "off":
+        print(f"-> {chosen['path']}  ({chosen['version']})\n   no override — straight to chatgpt.com")
+        os.execve(chosen["binary"], [chosen["binary"]], clean_env())
+        return 0
+
+    if args.target in (None, "auto"):
+        target, reason = choose(pools)
+        if not target:
+            print(f"codexmode: {reason}", file=sys.stderr)
+            return 2
+    else:
+        name = "local" if args.target == "local" else args.target
+        target = next((p for p in pools if p["name"] == name), None)
+        if not target:
+            names = ", ".join(p["name"] for p in pools)
+            print(f"codexmode: no pool named {name!r}; have: {names}", file=sys.stderr)
+            return 2
+        if not target["online"]:
+            print(f"codexmode: {target['name']} is offline — {target['error']}",
+                  file=sys.stderr)
+            return 2
+        reason = "forced"
+
+    # Verified against the daemon, not inferred from the payload: launching the
+    # app at a dead endpoint produces a failure that looks like the app's fault.
+    if not reachable(target["base"]):
+        print(f"codexmode: {target['name']} did not answer /_subrouter/health at "
+              f"{target['base']} — refusing to launch the app at an endpoint that "
+              "is not serving.", file=sys.stderr)
+        return 2
+
+    base = api_base(target)
+    describe_pools(pools)
+    print(f"\n-> {chosen['path']}  ({chosen['version']})")
+    print(f"   {target['name']}  {base}\n   {reason}")
+
+    env = clean_env()
+    env["CODEX_API_BASE_URL"] = base
+    os.execve(chosen["binary"], [chosen["binary"]], env)
+    return 0
+
+
+def clean_env():
+    """Start from the current environment minus any stale override.
+
+    Without the pop, `codexmode off` inherits a CODEX_API_BASE_URL exported by
+    the shell (or by a login agent) and silently keeps proxying -- the one case
+    where this tool would report the opposite of what it did.
+    """
+    env = dict(os.environ)
+    env.pop("CODEX_API_BASE_URL", None)
+    return env
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

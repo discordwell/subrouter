@@ -21,6 +21,13 @@ import (
 	"github.com/manaflow-ai/subrouter/selectacct"
 )
 
+// The overload failover's size cap (PATCHES section 27). Upstream
+// manaflow-ai/subrouter's codex_overload_size_test.go (c9303d3, #454/#457),
+// as written since the 389/373 port: a kept conversation takes the
+// failover-off same-account ladder (#389). Fix-up 2's interim -- one budgeted
+// quick retry, then the failure handed up -- and its attempt-budget test are
+// gone with it. Plus the fork's Azure regression test from fix-up 2.
+
 // codexSizedBody is a Codex turn whose conversation is about tokens input
 // tokens long by the proxy's 4-bytes-per-token estimate.
 func codexSizedBody(sessionID string, tokens int) string {
@@ -46,8 +53,6 @@ func codexSizedPost(t *testing.T, proxyURL, body, encoding string) (int, string)
 		t.Fatal(err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set(CodexCapacityRetryableHeader, "1")
-	req.Header.Set(AgentRetryPolicyHeader, "bounded")
 	if encoding != "" {
 		req.Header.Set("Content-Encoding", encoding)
 	}
@@ -64,7 +69,7 @@ func codexSizedPost(t *testing.T, proxyURL, body, encoding string) (int, string)
 // first failures requests and whose account 1 always serves.
 func codexSizeServer(t *testing.T, failures int, configure func(*CodexOverloadFailoverConfig)) (Server, *httptest.Server, func() []codexCapacityAttempt) {
 	t.Helper()
-	poolURL, seen := codexCapacityPool(t, func(token string, index int) bool {
+	poolURL, seen := codexCapacityPool(t, func(token, _ string, index int) bool {
 		return token == "oauth-token-0" && index < failures
 	})
 	server := codexOverloadServer(t, poolURL, 2, true)
@@ -81,8 +86,8 @@ func codexSizeServer(t *testing.T, failures int, configure func(*CodexOverloadFa
 	return server, proxy, seen
 }
 
-// A short conversation keeps today's failover: one quick retry on its
-// account, then another account, and the session moves with it.
+// A short conversation keeps the failover: one quick retry on its account,
+// then another account, and the session moves with it. Upstream's test.
 func TestCodexOverloadFailoverSmallConversationSwitches(t *testing.T) {
 	server, proxy, seen := codexSizeServer(t, 100, nil)
 	status, body := codexSizedPost(t, proxy.URL, codexSizedBody("session-size", 2_000), "")
@@ -97,34 +102,53 @@ func TestCodexOverloadFailoverSmallConversationSwitches(t *testing.T) {
 	}
 }
 
-// A long conversation that hits capacity itself switches like a short one:
-// one quick retry on its account, then another account, and the shedding
-// account is marked for the model. Moving re-bills the conversation's cache,
-// but waiting minutes on an account that keeps shedding costs more (the pool
-// has plenty of accounts). The size cap still keeps it from being evicted by
-// marks other sessions left (TestCodexCapacityEvictionSkipsLargeStickyConversation).
-func TestCodexOverloadFailoverLargeConversationSwitchesOnItsOwnCapacityFailure(t *testing.T) {
+// A long conversation stays on its account through capacity failures even
+// with the failover on: the same-account ladder waits the shedding out, and
+// the account is not marked, so the next turn does not evict it either.
+func TestCodexOverloadFailoverLargeConversationStaysOnAccount(t *testing.T) {
 	for _, encoding := range []string{"", "zstd"} {
 		t.Run("encoding="+encoding, func(t *testing.T) {
-			server, proxy, seen := codexSizeServer(t, 1000, nil)
+			server, proxy, seen := codexSizeServer(t, 4, nil)
 			status, body := codexSizedPost(t, proxy.URL, codexSizedBody("session-size", 50_000), encoding)
-			if status != http.StatusOK || !strings.Contains(body, "served-from-oauth-token-1") {
-				t.Fatalf("status=%d body=%s, want the failover to serve from account 1", status, body)
+			if status != http.StatusOK || !strings.Contains(body, "served-from-oauth-token-0") {
+				t.Fatalf("status=%d body=%s, want the session's own account to serve after the wait", status, body)
 			}
-			if got := strings.Join(tokens(seen()), ","); got != "oauth-token-0,oauth-token-0,oauth-token-1" {
-				t.Fatalf("pool saw %s, want account 0 twice then account 1", got)
+			if got := strings.Join(tokens(seen()), ","); got != "oauth-token-0,oauth-token-0,oauth-token-0,oauth-token-0,oauth-token-0" {
+				t.Fatalf("pool saw %s, want every attempt on account 0", got)
 			}
-			if assignment, ok := server.Sessions.Get("codex", "session-size"); !ok || assignment.AccountID != "codex-account-1" {
-				t.Fatalf("session = %+v, want it moved to account 1", assignment)
+			if assignment, ok := server.Sessions.Get("codex", "session-size"); !ok || assignment.AccountID != "codex-account-0" {
+				t.Fatalf("session = %+v, want it kept on account 0", assignment)
 			}
-			if _, _, ok := server.SchedulerRef.CapacityMarkFor(accounts.ProviderCodex, "codex-account-0", "gpt-6-astra", ""); !ok {
-				t.Fatal("the shedding account was not marked at capacity for the model")
+			if _, _, ok := server.SchedulerRef.CapacityMarkFor(accounts.ProviderCodex, "codex-account-0", "gpt-6-astra", ""); ok {
+				t.Fatal("a kept conversation marked its account at capacity")
 			}
 		})
 	}
 }
 
-// A long conversation whose account recovers on the quick retry stays put.
+// The ladder a kept conversation takes is the failover-off one, bounded by
+// its own limits rather than the failover's two-attempt shape.
+func TestCodexOverloadFailoverLargeConversationExhaustsSameAccountLadder(t *testing.T) {
+	_, proxy, seen := codexSizeServer(t, 1000, nil)
+	status, body := codexSizedPost(t, proxy.URL, codexSizedBody("session-size", 50_000), "")
+	if status != http.StatusOK || !strings.Contains(body, "server_is_overloaded") {
+		t.Fatalf("status=%d body=%s, want the capacity failure once the ladder is spent", status, body)
+	}
+	got := tokens(seen())
+	if len(got) != codexTestStayRetries+1 {
+		t.Fatalf("pool saw %d attempts, want %d (the same-account ladder)", len(got), codexTestStayRetries+1)
+	}
+	for _, token := range got {
+		if token != "oauth-token-0" {
+			t.Fatalf("pool saw %v, want only account 0", got)
+		}
+	}
+}
+
+// A long conversation whose account recovers on its first retry stays put.
+// Upstream's test (#622, d549972), where that retry is the failover's quick
+// one; in the fork a kept conversation's first retry is the stay ladder's,
+// on the same account all the same.
 func TestCodexOverloadFailoverLargeConversationStaysWhenTheQuickRetryServes(t *testing.T) {
 	server, proxy, seen := codexSizeServer(t, 1, nil)
 	status, body := codexSizedPost(t, proxy.URL, codexSizedBody("session-size", 50_000), "")
@@ -139,8 +163,72 @@ func TestCodexOverloadFailoverLargeConversationStaysWhenTheQuickRetryServes(t *t
 	}
 }
 
-// SUBROUTER_CODEX_OVERLOAD_FAILOVER_MAX_INPUT=0 is today's behavior: a long
-// conversation switches like a short one. A raised cap does too.
+// Fix-up 2's finding, end to end with an Azure fallback configured: a >32k
+// conversation whose account sheds ONE request must be served by that
+// account's next attempt, not handed to Azure -- which is paid, re-bills the
+// whole prefix, and pins the session for azureCodexStickyTTL, so the NEXT
+// turn went to Azure too. The small conversation is the control: it takes
+// the failover's quick retry. The large one now takes the stay ladder, which
+// a configured fallback caps at ~10s (codexStayBudget) -- still ahead of
+// Azure. The fork has no Azure configured; this pins the order for the day
+// it does.
+func TestCodexOverloadFailoverLargeConversationRetriesBeforeAzure(t *testing.T) {
+	for _, size := range []struct {
+		name   string
+		tokens int
+	}{{"small", 2_000}, {"large", 50_000}} {
+		t.Run(size.name, func(t *testing.T) {
+			poolURL, seen := codexCapacityPool(t, func(_, _ string, index int) bool { return index == 0 })
+			azureHits := 0
+			var azureMu sync.Mutex
+			_, azureURL := azureCodexTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+				azureMu.Lock()
+				azureHits++
+				azureMu.Unlock()
+				_, _ = io.ReadAll(r.Body)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"id":"resp_azure"}`)
+			})
+			server := azureCodexFallbackServer(t, azureURL, poolURL, 2)
+			server.CodexOverloadFailover = &CodexOverloadFailoverConfig{Enabled: true}
+			fastCapacityGaps(server.CodexOverloadFailover, 5*time.Millisecond)
+			server.SchedulerRef = selectacct.NewSchedulerRef(server.Scheduler)
+			if _, err := server.Sessions.Put("codex", "session-azure", "codex-account-0", ""); err != nil {
+				t.Fatal(err)
+			}
+			proxy := httptest.NewServer(server.Handler())
+			defer proxy.Close()
+			body := `{"model":"gpt-5.6-codex","session_id":"session-azure","input":[{"type":"message","role":"user","content":"` +
+				strings.Repeat("abcd", size.tokens) + `"}]}`
+			for turn := 1; turn <= 2; turn++ {
+				before := len(seen())
+				status, out := codexSizedPost(t, proxy.URL, body, "")
+				if status != http.StatusOK || !strings.Contains(out, "served-from-oauth-token-0") {
+					azureMu.Lock()
+					hits := azureHits
+					azureMu.Unlock()
+					t.Fatalf("turn %d: status=%d azure=%d pool saw %v body=%.200s, want account 0 to serve",
+						turn, status, hits, tokens(seen()[before:]), out)
+				}
+			}
+			if got := strings.Join(tokens(seen()), ","); got != "oauth-token-0,oauth-token-0,oauth-token-0" {
+				t.Fatalf("pool saw %s, want turn 1 shed once and retried on account 0, turn 2 on account 0", got)
+			}
+			azureMu.Lock()
+			defer azureMu.Unlock()
+			if azureHits != 0 {
+				t.Fatalf("azure served %d requests, want none", azureHits)
+			}
+			if assignment, ok := server.Sessions.Get("codex", "session-azure"); !ok || assignment.AccountID != "codex-account-0" {
+				t.Fatalf("session = %+v, want it kept on account 0", assignment)
+			}
+		})
+	}
+}
+
+// SUBROUTER_CODEX_OVERLOAD_FAILOVER_MAX_INPUT=0 is the uncapped behaviour: a
+// long conversation switches like a short one. A raised cap does too.
+// Upstream's test.
 func TestCodexOverloadFailoverMaxInputKnob(t *testing.T) {
 	for name, configure := range map[string]func(*CodexOverloadFailoverConfig){
 		"unlimited": func(c *CodexOverloadFailoverConfig) { c.FailoverMaxInputUnlimited = true },
@@ -176,12 +264,16 @@ func TestCodexOverloadFailoverKeepsAccount(t *testing.T) {
 	}
 }
 
-// The websocket reroute switches a conversation that hits capacity itself
-// whatever its size, like the HTTP failover: the connection's size (from the
-// input tokens its finished turns report, or a large response.create) no
-// longer keeps it on a shedding account. Without the failover the failure
-// passes through on the same account, unmarked.
-func TestCodexWebSocketOverloadRerouteIgnoresConversationSize(t *testing.T) {
+// The websocket reroute follows the same cap. The connection learns the
+// conversation's size from the input tokens its finished turns report (a
+// chained turn's response.create carries only its new input) or from a
+// large response.create: past the cap a capacity failure passes through on
+// the same account, unmarked, instead of closing 1012. Without the failover
+// any conversation's failure passes through that way (upstream #479's
+// "default capacity stays live" case). Upstream's test as at c9303d3, plus
+// that case; upstream #622 later made the size not matter here, which the
+// fork does not take (PATCHES section 27: the owner kept the 32k cap).
+func TestCodexWebSocketOverloadRerouteRespectsConversationSize(t *testing.T) {
 	failed := `{"type":"response.failed","response":{"error":{"code":"server_is_overloaded","message":"Selected model is at capacity."}}}`
 	completed := func(inputTokens int) string {
 		return `{"type":"response.completed","response":{"id":"r","usage":{"input_tokens":` + strconv.Itoa(inputTokens) + `,"output_tokens":5}}}`
@@ -196,8 +288,8 @@ func TestCodexWebSocketOverloadRerouteIgnoresConversationSize(t *testing.T) {
 		failover    bool
 	}{
 		{name: "small conversation reroutes", firstUsage: 1_000, wantReroute: true, failover: true},
-		{name: "reported usage past the cap reroutes", firstUsage: 200_000, wantReroute: true, failover: true},
-		{name: "large response.create reroutes", createBytes: 200_000, wantReroute: true, failover: true},
+		{name: "reported usage past the cap stays", firstUsage: 200_000, wantReroute: false, failover: true},
+		{name: "large response.create stays", createBytes: 200_000, wantReroute: false, failover: true},
 		{name: "default capacity stays live", wantReroute: false, failover: false},
 	}
 	for _, tc := range cases {
@@ -276,7 +368,7 @@ func TestCodexWebSocketOverloadRerouteIgnoresConversationSize(t *testing.T) {
 				t.Fatalf("body=%q err=%v, want the capacity failure passed through on the same connection", body, err)
 			}
 			if marked {
-				t.Fatal("a failure without the failover marked its account at capacity")
+				t.Fatal("a kept conversation, or a failure without the failover, marked its account at capacity")
 			}
 			if assignment, ok := server.Sessions.Get("codex", "ws-size"); !ok || assignment.AccountID != "codex-account-0" {
 				t.Fatalf("session = %+v, want it kept on account 0", assignment)
@@ -290,12 +382,10 @@ func TestCodexWebSocketOverloadRerouteIgnoresConversationSize(t *testing.T) {
 	}
 }
 
-// The default path passes a capacity event through the existing websocket so the
-// Codex process remains alive; account failover is an explicit opt-in.
-
 // Capacity marks left on an account by other sessions evict its sticky
 // sessions at placement, but not one too large for the failover to move: it
 // keeps its account (and its prompt cache) while a small session moves.
+// Upstream's test.
 func TestCodexCapacityEvictionSkipsLargeStickyConversation(t *testing.T) {
 	server, proxy, seen := codexSizeServer(t, 0, nil)
 	if _, err := server.Sessions.Put("codex", "session-small", "codex-account-0", ""); err != nil {
@@ -329,6 +419,7 @@ func TestCodexCapacityEvictionSkipsLargeStickyConversation(t *testing.T) {
 }
 
 // Knob at 0: a large sticky session is evicted by marks like before.
+// Upstream's test.
 func TestCodexCapacityEvictionUnlimitedMovesLargeConversation(t *testing.T) {
 	server, proxy, _ := codexSizeServer(t, 0, func(c *CodexOverloadFailoverConfig) { c.FailoverMaxInputUnlimited = true })
 	until := time.Now().Add(time.Minute)

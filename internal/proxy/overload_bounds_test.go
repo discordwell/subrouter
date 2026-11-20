@@ -3,20 +3,19 @@ package proxy
 import (
 	"bytes"
 	"context"
-	"errors"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 )
 
-// Bounds on the stay-on-account overload retries: the fallback cap, operator
-// gating of the persist header, wall-clock budgets, prompt cancellation and
-// the one-reroute-per-request limit.
+// Bounds on the Codex stay-on-account capacity ladder: the fallback cap,
+// wall-clock budgets and prompt cancellation. Upstream manaflow-ai/subrouter
+// #389 (overload_bounds_test.go as at c9303d3), Codex tests only; the persist
+// and header opt-in tests are not ported with those features (PATCHES
+// section 27).
 
 // An egress or Azure fallback is the operator's deliberate next step for a
 // shedding pool, so with the failover off the same-account ladder gives way
@@ -50,67 +49,6 @@ func TestCodexCapacityStayBudgetCappedWhenFallbackConfigured(t *testing.T) {
 	}
 	if codexCapacityFallbackStayRetryBudget != 10*time.Second {
 		t.Fatalf("fallback stay budget = %v, want 10s", codexCapacityFallbackStayRetryBudget)
-	}
-}
-
-// The persist header lets a client hold an upstream slot for up to 10m, so
-// it counts only when the operator allows it: with the failover or with
-// SUBROUTER_CODEX_CAPACITY_RETRY_HEADER=1. The operator's own persist setting
-// works without either.
-func TestCodexCapacityRetryHeaderNeedsOperatorOptIn(t *testing.T) {
-	request := httptest.NewRequest(http.MethodPost, "/responses", nil)
-	request.Header.Set(CodexCapacityRetryHeader, "persist")
-	request.Header.Set(CodexCapacityRetryBudgetHeader, "9m")
-	cases := []struct {
-		name        string
-		config      *CodexOverloadFailoverConfig
-		wantPersist bool
-		wantBudget  time.Duration
-	}{
-		{"unconfigured", nil, false, codexCapacityDefaultPersistBudget},
-		{"failover off", &CodexOverloadFailoverConfig{}, false, codexCapacityDefaultPersistBudget},
-		{"header opt-in", &CodexOverloadFailoverConfig{CapacityRetryHeader: true}, true, 9 * time.Minute},
-		{"failover on", &CodexOverloadFailoverConfig{Enabled: true}, true, 9 * time.Minute},
-	}
-	for _, test := range cases {
-		t.Run(test.name, func(t *testing.T) {
-			policy := test.config.codexCapacityRetryPolicyFor(request, nil)
-			if policy.persist != test.wantPersist || policy.persistBudget != test.wantBudget {
-				t.Fatalf("policy = %+v, want persist=%t budget=%v", policy, test.wantPersist, test.wantBudget)
-			}
-		})
-	}
-
-	// The operator's persist setting needs no failover and no header opt-in.
-	operator := &CodexOverloadFailoverConfig{CapacityRetryPersist: true, CapacityRetryBudget: 90 * time.Second}
-	if policy := operator.codexCapacityRetryPolicyFor(httptest.NewRequest(http.MethodPost, "/responses", nil), nil); !policy.persist || policy.persistBudget != 90*time.Second {
-		t.Fatalf("operator persist policy = %+v, want persist with 90s", policy)
-	}
-	// Without the header opt-in a client can neither opt out of it nor
-	// stretch its budget.
-	ignored := httptest.NewRequest(http.MethodPost, "/responses", nil)
-	ignored.Header.Set(CodexCapacityRetryHeader, "default")
-	ignored.Header.Set(CodexCapacityRetryBudgetHeader, "9m")
-	if policy := operator.codexCapacityRetryPolicyFor(ignored, nil); !policy.persist || policy.persistBudget != 90*time.Second {
-		t.Fatalf("operator persist policy with ignored headers = %+v, want persist with 90s", policy)
-	}
-}
-
-// End to end: without an opt-in the persist header is ignored and the request
-// gets the bounded same-account ladder.
-func TestCodexCapacityPersistHeaderIgnoredByDefault(t *testing.T) {
-	server, seen := codexStayServer(t, func(_ string, index int) bool { return index < 15 }, 3)
-	proxy := httptest.NewServer(server.Handler())
-	defer proxy.Close()
-
-	status, body, err := codexCapacityPost(context.Background(), t, proxy.URL, "session-header-ignored", "a", map[string]string{
-		CodexCapacityRetryHeader: "persist",
-	})
-	if err != nil || status != http.StatusServiceUnavailable || !strings.Contains(body, "subrouter_capacity_retry") || strings.Contains(body, "server_is_overloaded") {
-		t.Fatalf("status=%d body=%s err=%v, want a retryable capacity failure after the default ladder", status, body, err)
-	}
-	if got := seen(); len(got) != 1+codexTestStayRetries {
-		t.Fatalf("pool saw %d attempts, want %d: the header must not turn on persist", len(got), 1+codexTestStayRetries)
 	}
 }
 
@@ -175,190 +113,37 @@ func TestCodexCapacityStaySleepHonorsCancel(t *testing.T) {
 	}
 }
 
-// A client cancel during a Claude ladder wait ends the request at once.
-func TestClaudeOverloadSleepHonorsCancel(t *testing.T) {
-	server, _ := claudeFailoverServer(t)
-	stub := &stubRoundTripper{responses: func(*http.Request) *http.Response { return claudeOverloaded529(nil) }}
-	var waits []time.Duration
-	transport := claudeOverloadTransport(&server, "s", "cooked@example.com", stub, &waits)
-	transport.sleep = nil // the real timer: the first wait is 1s
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	request := claudeOverloadRequest("tok-cooked").WithContext(ctx)
-	time.AfterFunc(50*time.Millisecond, cancel)
-	started := time.Now()
-	response, err := transport.RoundTrip(request)
-	if response != nil && response.Body != nil {
-		response.Body.Close()
+// The fork's: the stay ladder's own budget (codexStayBudget), which upstream
+// pins only inside its X-Subrouter-Retry header test (not ported). A
+// configured fallback caps the operator's wait at ~10s, an unbounded one
+// included; RetryBudget overrides everything; without a fallback the
+// operator's wait and its unboundedness stand. The fork has no Azure or egress
+// configured today, so in production this is the first row.
+func TestCodexStayBudgetCappedOnlyByAFallback(t *testing.T) {
+	egress := &CodexEgressConfig{Proxies: []*url.URL{mustParseURL(t, "http://egress.example:3128")}}
+	azure := &AzureCodexConfig{Endpoints: []AzureCodexEndpoint{{BaseURL: mustParseURL(t, "https://azure.example/openai/v1"), APIKey: "key"}}}
+	cases := []struct {
+		name          string
+		server        Server
+		want          time.Duration
+		wantUnbounded bool
+	}{
+		{"no fallback", Server{}, codexCapacityDefaultStayMaxWait, false},
+		{"no fallback, operator wait", Server{CodexOverloadFailover: &CodexOverloadFailoverConfig{StayMaxWait: 90 * time.Second}}, 90 * time.Second, false},
+		{"no fallback, unbounded", Server{CodexOverloadFailover: &CodexOverloadFailoverConfig{StayUnbounded: true}}, codexCapacityDefaultStayMaxWait, true},
+		{"egress", Server{CodexEgress: egress}, codexCapacityFallbackStayRetryBudget, false},
+		{"azure", Server{AzureCodex: azure}, codexCapacityFallbackStayRetryBudget, false},
+		{"azure, unbounded", Server{AzureCodex: azure, CodexOverloadFailover: &CodexOverloadFailoverConfig{StayUnbounded: true}}, codexCapacityFallbackStayRetryBudget, false},
+		{"egress, shorter operator wait", Server{CodexEgress: egress, CodexOverloadFailover: &CodexOverloadFailoverConfig{StayMaxWait: 5 * time.Second}}, 5 * time.Second, false},
+		{"failover on, kept conversation, egress", Server{CodexEgress: egress, CodexOverloadFailover: &CodexOverloadFailoverConfig{Enabled: true}}, codexCapacityFallbackStayRetryBudget, false},
+		{"retry budget wins", Server{CodexEgress: egress, CodexOverloadFailover: &CodexOverloadFailoverConfig{RetryBudget: time.Minute, StayUnbounded: true}}, time.Minute, false},
 	}
-	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
-		t.Fatalf("RoundTrip returned after %v, want it to stop promptly on cancel instead of sleeping the 1s wait", elapsed)
-	}
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("err = %v, want context.Canceled", err)
-	}
-	if stub.calls != 1 {
-		t.Fatalf("upstream calls = %d, want no retry after the cancel", stub.calls)
-	}
-}
-
-// The Claude hold is wall clock from the first attempt: slow upstream
-// attempts count, and no retry starts whose wait would end past the cap
-// (35s here, the short test ladder).
-func TestClaudeOverloadHoldIsWallClock(t *testing.T) {
-	server, _ := claudeFailoverServer(t)
-	clock := time.Unix(1_800_000_000, 0)
-	started := clock
-	var retryStarts []time.Duration
-	var calls int
-	stub := &stubRoundTripper{responses: func(*http.Request) *http.Response {
-		calls++
-		if calls > 1 {
-			retryStarts = append(retryStarts, clock.Sub(started))
-		}
-		clock = clock.Add(5 * time.Second) // each upstream attempt takes 5s
-		return claudeOverloaded529(nil)
-	}}
-	var waits []time.Duration
-	transport := claudeOverloadTransport(&server, "s", "cooked@example.com", stub, &waits)
-	transport.overloadPolicy = claudeShortLadder
-	transport.now = func() time.Time { return clock }
-	transport.sleep = func(ctx context.Context, d time.Duration) error {
-		waits = append(waits, d)
-		clock = clock.Add(d)
-		return ctx.Err()
-	}
-	response, err := transport.RoundTrip(claudeOverloadRequest("tok-cooked"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer response.Body.Close()
-	if response.StatusCode != 529 {
-		t.Fatalf("status = %d, want 529", response.StatusCode)
-	}
-	// Attempts end at 5s, 11s, 18s, 27s and 40s; the waits before the
-	// retries are 1s, 2s, 4s, 8s (the last ends exactly at 35s). The next
-	// 10s wait would end at 50s, past the cap, so the ladder stops two steps
-	// early even though its backoff total is only 15s.
-	want := []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second}
-	if len(waits) != len(want) || calls != 1+len(want) {
-		t.Fatalf("waits = %v calls = %d, want %v and %d calls", waits, calls, want, 1+len(want))
-	}
-	for i := range want {
-		if waits[i] != want[i] {
-			t.Fatalf("waits = %v, want %v", waits, want)
-		}
-	}
-	for _, start := range retryStarts {
-		if start > claudeShortLadder.maxWait {
-			t.Fatalf("retry started %v after the first attempt (all: %v), past %v", start, retryStarts, claudeShortLadder.maxWait)
-		}
-	}
-}
-
-// Opt-in reroute: an outer replay (after a transport error on the rerouted
-// account) continues the request-wide ladder on the session's account and
-// cannot reroute a second time.
-func TestClaudeOverloadRerouteAtMostOncePerRequest(t *testing.T) {
-	server, _ := claudeFailoverServer(t)
-	server.ClaudeOverloadReroute = true
-	var cookedCalls, freshCalls int
-	base := roundTripFunc(func(req *http.Request) (*http.Response, error) {
-		if strings.Contains(req.Header.Get("Authorization"), "tok-cooked") {
-			cookedCalls++
-			return claudeOverloaded529(nil), nil
-		}
-		freshCalls++
-		return nil, io.ErrUnexpectedEOF
-	})
-	var waits []time.Duration
-	transport := claudeOverloadTransport(&server, "s", "cooked@example.com", base, &waits)
-	transport.overloadPolicy = claudeShortLadder
-	// First pass: two same-account retries, the reroute, a transport error.
-	if _, err := transport.RoundTrip(claudeOverloadRequest("tok-cooked")); err == nil {
-		t.Fatal("first pass succeeded, want the rerouted attempt's transport error")
-	}
-	if cookedCalls != 1+providerOverloadMaxRetries || freshCalls != 1 {
-		t.Fatalf("first pass: cooked=%d fresh=%d, want %d and 1", cookedCalls, freshCalls, 1+providerOverloadMaxRetries)
-	}
-	// The outer replay reuses the transport, so the request's budget and its
-	// overload ladder.
-	response, err := transport.RoundTrip(claudeOverloadRequest("tok-cooked"))
-	if err != nil {
-		t.Fatalf("replay err = %v (fresh calls %d), want the 529 once the ladder is spent", err, freshCalls)
-	}
-	defer response.Body.Close()
-	if response.StatusCode != 529 {
-		t.Fatalf("replay status = %d, want the 529 once the ladder is spent", response.StatusCode)
-	}
-	if freshCalls != 1 {
-		t.Fatalf("fresh calls = %d, want the reroute to run once per request", freshCalls)
-	}
-	// The replay's first attempt plus the rest of the ladder.
-	if want := 1 + providerOverloadMaxRetries + 1 + (claudeShortLadderRetries - providerOverloadMaxRetries); cookedCalls != want {
-		t.Fatalf("cooked calls = %d, want %d", cookedCalls, want)
-	}
-}
-
-// With fast upstream attempts the whole ladder runs: the last step is
-// shortened to end at the cap (35s here, the short test ladder) rather than
-// refused.
-func TestClaudeOverloadLastStepShortenedToCap(t *testing.T) {
-	server, _ := claudeFailoverServer(t)
-	clock := time.Unix(1_800_000_000, 0)
-	var calls int
-	stub := &stubRoundTripper{responses: func(*http.Request) *http.Response {
-		calls++
-		clock = clock.Add(500 * time.Millisecond)
-		return claudeOverloaded529(nil)
-	}}
-	var waits []time.Duration
-	transport := claudeOverloadTransport(&server, "s", "cooked@example.com", stub, &waits)
-	transport.overloadPolicy = claudeShortLadder
-	transport.now = func() time.Time { return clock }
-	transport.sleep = func(ctx context.Context, d time.Duration) error {
-		waits = append(waits, d)
-		clock = clock.Add(d)
-		return ctx.Err()
-	}
-	response, err := transport.RoundTrip(claudeOverloadRequest("tok-cooked"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer response.Body.Close()
-	// Attempts take 0.5s: the fifth retry starts at 27.5s and ends at 28s,
-	// leaving 7s of the 35s hold for the sixth step instead of its 10s.
-	want := []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 10 * time.Second, 7 * time.Second}
-	if len(waits) != len(want) || calls != 1+len(want) {
-		t.Fatalf("waits = %v calls = %d, want %v and %d calls", waits, calls, want, 1+len(want))
-	}
-	for i := range want {
-		if waits[i] != want[i] {
-			t.Fatalf("waits = %v, want %v", waits, want)
-		}
-	}
-}
-
-// Retry-After can lengthen a ladder step but never shorten it, so a 0 value
-// does not fire the retries back to back.
-func TestClaudeOverloadRetryAfterNeverShortensStep(t *testing.T) {
-	hold := &claudeOverloadHold{}
-	now := time.Unix(1_800_000_000, 0)
-	hold.begin(now)
-	header := http.Header{}
-	header.Set("Retry-After", "0")
-	step, ok := hold.claim(header, now, overloadRetryPolicy{})
-	if !ok || step.wait != time.Second {
-		t.Fatalf("Retry-After: 0 wait = %v ok = %t, want the 1s ladder step", step.wait, ok)
-	}
-	header.Set("Retry-After", "5")
-	step, ok = hold.claim(header, now.Add(2*time.Second), overloadRetryPolicy{})
-	if !ok || step.wait != 5*time.Second {
-		t.Fatalf("Retry-After: 5 wait = %v ok = %t, want 5s over the 2s step", step.wait, ok)
-	}
-	header.Set("Retry-After", "60")
-	step, ok = hold.claim(header, now.Add(8*time.Second), overloadRetryPolicy{})
-	if !ok || step.wait != claudeOverloadMaxRetryAfter {
-		t.Fatalf("Retry-After: 60 wait = %v ok = %t, want the %v cap", step.wait, ok, claudeOverloadMaxRetryAfter)
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			budget, unbounded := test.server.codexStayBudget(test.server.CodexOverloadFailover.stayPolicy())
+			if budget != test.want || unbounded != test.wantUnbounded {
+				t.Fatalf("stay budget = %v unbounded=%t, want %v unbounded=%t", budget, unbounded, test.want, test.wantUnbounded)
+			}
+		})
 	}
 }

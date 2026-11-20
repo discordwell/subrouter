@@ -148,6 +148,12 @@ func TestHostedClientUsesTenantScopedUsageStatus(t *testing.T) {
 			http.Error(w, "unexpected path", http.StatusBadRequest)
 			return
 		}
+		// Fork: the plain cached read. ?refresh=1 forces a live sweep, which
+		// refreshes every account's token (PATCHES §44).
+		if r.URL.RawQuery != "" {
+			http.Error(w, "unexpected query "+r.URL.RawQuery, http.StatusBadRequest)
+			return
+		}
 		_ = json.NewEncoder(w).Encode([]map[string]any{{
 			"id":                "user@example.com",
 			"provider":          "codex",

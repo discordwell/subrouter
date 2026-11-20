@@ -15,6 +15,52 @@ type serverIPLookup func(context.Context, string) ([]net.IPAddr, error)
 
 const secureTenantTransportRequirement = "tenant-scoped server URL must use HTTPS, loopback HTTP, or verified Tailscale HTTP"
 
+// errPlaintextDestinationNotTailscaleNode is the policy's refusal of a
+// destination whose addresses are all in Tailscale's ranges while Tailscale
+// answered and no online node of this tailnet owns them under that name.
+// 100.64.0.0/10 is also carrier-grade NAT space, so the range alone proves
+// nothing.
+var errPlaintextDestinationNotTailscaleNode = errors.New("plaintext tenant destination is not an authenticated Tailscale node")
+
+// tailscaleUnverifiedError is the policy's refusal when a plaintext
+// destination could be trusted only through Tailscale and Tailscale itself
+// could not be checked: no status source, a `tailscale status --json` that
+// failed or did not parse, or this machine offline in it (Tailscale stopped or
+// logged out). Its text is the refusal every caller already prints; cause
+// says which of those it was, for a caller that has to say why rather than
+// refuse (`sr doctor`, PATCHES §36.4).
+type tailscaleUnverifiedError struct {
+	message string
+	cause   error
+}
+
+func (e tailscaleUnverifiedError) Error() string { return e.message }
+
+func (e tailscaleUnverifiedError) Unwrap() error { return e.cause }
+
+// loadOnlineTailscaleStatus reads Tailscale's status for the transport policy
+// and requires this machine to be online in it. Every failure is a
+// tailscaleUnverifiedError.
+func loadOnlineTailscaleStatus(ctx context.Context, load tailscaleStatusLoader) ([]byte, tailscaleStatusDocument, error) {
+	const couldNotVerify = "could not verify Tailscale for plaintext tenant routing"
+	const offline = "Tailscale is offline; plaintext tenant routing is disabled"
+	if load == nil {
+		return nil, tailscaleStatusDocument{}, tailscaleUnverifiedError{couldNotVerify, errors.New("no Tailscale status source")}
+	}
+	data, err := load(ctx)
+	if err != nil {
+		return nil, tailscaleStatusDocument{}, tailscaleUnverifiedError{couldNotVerify, err}
+	}
+	var status tailscaleStatusDocument
+	if err := json.Unmarshal(data, &status); err != nil {
+		return nil, tailscaleStatusDocument{}, tailscaleUnverifiedError{offline, fmt.Errorf("decode tailscale status: %w", err)}
+	}
+	if !status.Self.Online {
+		return nil, tailscaleStatusDocument{}, tailscaleUnverifiedError{offline, errors.New("this machine is offline in tailscale status: Tailscale is stopped or logged out")}
+	}
+	return data, status, nil
+}
+
 func secureTenantProxyURL(ctx context.Context, rawURL, tenantKey string) (string, error) {
 	server := srServerConfig{URL: rawURL, TenantKey: tenantKey}
 	return secureTenantServerURL(ctx, rawURL, server)
@@ -59,16 +105,9 @@ func secureTenantServerURLWithResolvers(
 }
 
 func pinTenantURLToTailscaleNode(ctx context.Context, parsed *url.URL, server srServerConfig, load tailscaleStatusLoader) (string, error) {
-	if load == nil {
-		return "", errors.New("could not verify Tailscale for plaintext tenant routing")
-	}
-	data, err := load(ctx)
+	data, _, err := loadOnlineTailscaleStatus(ctx, load)
 	if err != nil {
-		return "", errors.New("could not verify Tailscale for plaintext tenant routing")
-	}
-	var status tailscaleStatusDocument
-	if err := json.Unmarshal(data, &status); err != nil || !status.Self.Online {
-		return "", errors.New("Tailscale is offline; plaintext tenant routing is disabled")
+		return "", err
 	}
 	node, ok, err := tailscaleNodeByID(data, server.TailscaleNodeID)
 	if err != nil || !ok || !node.Online || !serverURLBelongsToTailscaleNode(server.URL, node) {
@@ -108,19 +147,12 @@ func pinTenantURLToVerifiedAddresses(ctx context.Context, parsed *url.URL, looku
 		}
 		return pinParsedURL(parsed, selected), nil
 	}
-	if load == nil {
-		return "", errors.New("could not verify Tailscale for plaintext tenant routing")
-	}
-	data, err := load(ctx)
+	_, status, err := loadOnlineTailscaleStatus(ctx, load)
 	if err != nil {
-		return "", errors.New("could not verify Tailscale for plaintext tenant routing")
-	}
-	var status tailscaleStatusDocument
-	if err := json.Unmarshal(data, &status); err != nil || !status.Self.Online {
-		return "", errors.New("Tailscale is offline; plaintext tenant routing is disabled")
+		return "", err
 	}
 	if !tenantURLAddressesBelongToOnlineTailscaleNode(parsed, addresses, status) {
-		return "", errors.New("plaintext tenant destination is not an authenticated Tailscale node")
+		return "", errPlaintextDestinationNotTailscaleNode
 	}
 	return pinParsedURL(parsed, addresses[0].IP), nil
 }

@@ -235,6 +235,15 @@ func (s Server) handleTranscriptStats(w http.ResponseWriter, _ *http.Request) {
 // client receives. Nothing is recorded when the route declines and writes
 // nothing, because the pool path that follows records the request itself.
 func (s Server) serveRecorded(w http.ResponseWriter, r *http.Request, agentType, sessionID, route string, serve func(http.ResponseWriter, *http.Request) bool) bool {
+	if clientExchangeFrom(r.Context()) != nil {
+		// The client-boundary transcript records the bytes (PATCHES §71);
+		// it only learns which route answered.
+		served := serve(w, r)
+		if served {
+			noteExchangeServed(r.Context(), exchangeServed{route: route})
+		}
+		return served
+	}
 	if !s.Transcripts.SegmentMode() || !transcriptWorthRecording(sessionID) || r.Body == nil {
 		return serve(w, r)
 	}

@@ -14,7 +14,7 @@ import (
 func TestAdmissionRecoveryLimitsAndDeadlines(t *testing.T) {
 	control := testAdmissionControl(6, 64)
 	start := time.Now().Add(time.Minute)
-	bucket := &admissionBucket{pausedTil: start, recoverSlowly: true}
+	bucket := &admissionBucket{limit: 6, pausedTil: start, recoverSlowly: true}
 	for _, tc := range []struct {
 		elapsed time.Duration
 		limit   int
@@ -42,7 +42,7 @@ func TestAdmissionRecoveryLimitsAndDeadlines(t *testing.T) {
 	}
 	// Small configured limits must never be raised by the recovery ramp.
 	for _, configured := range []int{1, 2, 3, 4, 6} {
-		control.limit = configured
+		bucket.limit = configured
 		limit, _ := control.admissionLimitLocked(bucket, start.Add(3*time.Second))
 		if limit != configured {
 			t.Errorf("configured=%d: recovered limit=%d", configured, limit)
@@ -79,7 +79,7 @@ func TestAdmissionRecoveryConcurrentReservationsAndIsolation(t *testing.T) {
 		admissionKeyFor(accounts.ProviderClaude, "recovering", "claude-sonnet"),
 		admissionKeyFor(accounts.ProviderCodex, "recovering", "claude-opus"),
 	} {
-		for range control.limit {
+		for range control.limits.Limit {
 			lease, ok := control.tryAcquire(other, admissionSessionKey{})
 			if !ok {
 				t.Fatalf("recovery leaked to independent bucket %+v", other)
@@ -169,7 +169,7 @@ func TestAdmissionRecoveryReThrottlesAndKeepsQuotaPolicy(t *testing.T) {
 	control.mu.Lock()
 	limit, next = control.admissionLimitLocked(bucket, bucket.pausedTil)
 	control.mu.Unlock()
-	if limit != control.limit || !next.IsZero() {
+	if limit != control.limits.Limit || !next.IsZero() {
 		t.Fatalf("quota rejection inherited transient recovery: limit=%d next=%v", limit, next)
 	}
 	// Concurrent in-flight requests can return a transient hint after a
@@ -178,7 +178,7 @@ func TestAdmissionRecoveryReThrottlesAndKeepsQuotaPolicy(t *testing.T) {
 	control.mu.Lock()
 	limit, next = control.admissionLimitLocked(bucket, bucket.pausedTil)
 	control.mu.Unlock()
-	if limit != control.limit || !next.IsZero() {
+	if limit != control.limits.Limit || !next.IsZero() {
 		t.Fatalf("late transient hint changed quota recovery: limit=%d next=%v", limit, next)
 	}
 }

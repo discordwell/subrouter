@@ -30,7 +30,7 @@ func upstreamStackTestServer(t *testing.T, poolURL *url.URL, proxies []*url.URL,
 	server.SchedulerRef = selectacct.NewSchedulerRef(server.Scheduler)
 	noGap := func() time.Duration { return 0 }
 	server.CodexOverloadFailover = &CodexOverloadFailoverConfig{
-		Enabled: true, sameAccountGap: noGap, switchGap: noGap, persistGap: noGap,
+		Enabled: true, sameAccountGap: noGap, switchGap: noGap,
 	}
 	return server
 }

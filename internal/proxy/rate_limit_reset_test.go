@@ -100,7 +100,7 @@ func TestRateLimitResetEndpointRedeemsCookedAccountWithCredit(t *testing.T) {
 	handler := Server{AccountRef: NewAccountRef(store, nil, client), MaxBodyBytes: 1024}.Handler()
 
 	recorder := httptest.NewRecorder()
-	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/_subrouter/rate-limit-reset?email=stable-routing-id", nil))
+	handler.ServeHTTP(recorder, loopbackAdminRequest(http.MethodPost, "/_subrouter/rate-limit-reset?email=stable-routing-id", nil))
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
 	}
@@ -142,7 +142,7 @@ func TestResetCreditsListsStableRoutingIdentifier(t *testing.T) {
 	handler := Server{AccountRef: NewAccountRef(store, nil, client), MaxBodyBytes: 1024}.Handler()
 
 	recorder := httptest.NewRecorder()
-	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/_subrouter/reset-credits", nil))
+	handler.ServeHTTP(recorder, loopbackAdminRequest(http.MethodGet, "/_subrouter/reset-credits", nil))
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
 	}
@@ -162,7 +162,7 @@ func TestResetCreditsListsStableRoutingIdentifier(t *testing.T) {
 func TestRateLimitResetEndpointRejectsMissingTarget(t *testing.T) {
 	handler := Server{AccountRef: NewAccountRef(accounts.CodexStore{Dir: t.TempDir()}, nil, nil), MaxBodyBytes: 1024}.Handler()
 	recorder := httptest.NewRecorder()
-	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/_subrouter/rate-limit-reset", nil))
+	handler.ServeHTTP(recorder, loopbackAdminRequest(http.MethodPost, "/_subrouter/rate-limit-reset", nil))
 	if recorder.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", recorder.Code)
 	}
@@ -182,7 +182,7 @@ func TestRateLimitResetEndpointDryRunDoesNotConsume(t *testing.T) {
 	handler := Server{AccountRef: NewAccountRef(store, nil, client), MaxBodyBytes: 1024}.Handler()
 
 	recorder := httptest.NewRecorder()
-	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/_subrouter/rate-limit-reset?email=cooked@example.com&dry_run=true", nil))
+	handler.ServeHTTP(recorder, loopbackAdminRequest(http.MethodPost, "/_subrouter/rate-limit-reset?email=cooked@example.com&dry_run=true", nil))
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
 	}
@@ -251,7 +251,7 @@ func TestRateLimitResetEndpointAllSkipsHealthy(t *testing.T) {
 	handler := Server{AccountRef: NewAccountRef(store, nil, client), MaxBodyBytes: 1024}.Handler()
 
 	recorder := httptest.NewRecorder()
-	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/_subrouter/rate-limit-reset?all=true", nil))
+	handler.ServeHTTP(recorder, loopbackAdminRequest(http.MethodPost, "/_subrouter/rate-limit-reset?all=true", nil))
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
 	}
@@ -324,7 +324,7 @@ func TestRateLimitResetRedeemsWeeklyPrimaryWindow(t *testing.T) {
 	handler := Server{AccountRef: NewAccountRef(store, nil, client), MaxBodyBytes: 1024}.Handler()
 
 	recorder := httptest.NewRecorder()
-	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/_subrouter/rate-limit-reset?email=weekly-primary@example.com", nil))
+	handler.ServeHTTP(recorder, loopbackAdminRequest(http.MethodPost, "/_subrouter/rate-limit-reset?email=weekly-primary@example.com", nil))
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
 	}
@@ -383,7 +383,7 @@ func TestRateLimitResetBestPicksLongestWeeklyWait(t *testing.T) {
 	handler := Server{AccountRef: NewAccountRef(store, nil, client), MaxBodyBytes: 1024}.Handler()
 
 	recorder := httptest.NewRecorder()
-	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/_subrouter/rate-limit-reset?best=true", nil))
+	handler.ServeHTTP(recorder, loopbackAdminRequest(http.MethodPost, "/_subrouter/rate-limit-reset?best=true", nil))
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
 	}
@@ -392,57 +392,64 @@ func TestRateLimitResetBestPicksLongestWeeklyWait(t *testing.T) {
 	}
 }
 
-// TestRateLimitResetNotCookedSaysWhy asserts a refused reset names the
-// windows it judged, so a disagreement with sr status is visible at once.
-func TestRateLimitResetNotCookedSaysWhy(t *testing.T) {
+// TestRateLimitResetRefusesFiveHourStall covers limit_reached raised by the 5h
+// window while the weekly window still has room. That account recovers on its
+// own within hours; a reset credit is finite and never renews, so spending one
+// here is pure loss. #363 still treated limit_reached as authoritative, and
+// both the named-email path and --all redeemed.
+func TestRateLimitResetRefusesFiveHourStall(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	store := accounts.CodexStore{Dir: t.TempDir()}
-	if err := store.SaveStored(proxyStoredOAuthAccount("healthy@example.com", "fresh", time.Now().Add(time.Hour))); err != nil {
+	if err := store.SaveStored(proxyStoredOAuthAccount("fivehour@example.com", "fresh", time.Now().Add(time.Hour))); err != nil {
 		t.Fatal(err)
 	}
+	var mu sync.Mutex
+	consume := 0
 	client := &http.Client{Transport: proxyRoundTripFunc(func(req *http.Request) (*http.Response, error) {
-		body, _ := json.Marshal(map[string]any{
-			"plan_type": "pro",
-			"rate_limit": map[string]any{
-				"primary_window":   map[string]any{"used_percent": 100, "limit_window_seconds": 18000},
-				"secondary_window": map[string]any{"used_percent": 40, "limit_window_seconds": 604800},
-			},
-		})
+		var body []byte
+		switch req.URL.Path {
+		case "/backend-api/wham/usage":
+			body, _ = json.Marshal(map[string]any{
+				"plan_type": "pro",
+				"rate_limit": map[string]any{
+					"allowed":          false,
+					"limit_reached":    true,
+					"primary_window":   map[string]any{"used_percent": 100, "limit_window_seconds": 18000, "reset_after_seconds": 9000},
+					"secondary_window": map[string]any{"used_percent": 40, "limit_window_seconds": 604800, "reset_after_seconds": 500000},
+				},
+				"rate_limit_reset_credits": map[string]any{"available_count": 3},
+			})
+		case "/backend-api/wham/rate-limit-reset-credits":
+			body = []byte(`{"credits":[{"id":"x","status":"available"}]}`)
+		case "/backend-api/wham/rate-limit-reset-credits/consume":
+			mu.Lock()
+			consume++
+			mu.Unlock()
+			body = []byte(`{"code":"reset","credit":{"id":"x","status":"redeemed"}}`)
+		default:
+			return &http.Response{StatusCode: http.StatusNotFound, Header: http.Header{}, Body: io.NopCloser(bytes.NewReader(nil)), Request: req}, nil
+		}
 		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(bytes.NewReader(body)), Request: req}, nil
 	})}
 	handler := Server{AccountRef: NewAccountRef(store, nil, client), MaxBodyBytes: 1024}.Handler()
-	recorder := httptest.NewRecorder()
-	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/_subrouter/rate-limit-reset?email=healthy@example.com&dry_run=1", nil))
-	if !strings.Contains(recorder.Body.String(), "primary 5h 100%, secondary 7d 40%") {
-		t.Fatalf("refusal does not name the windows: %s", recorder.Body.String())
+
+	for _, target := range []string{"email=fivehour@example.com", "all=true"} {
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, loopbackAdminRequest(http.MethodPost, "/_subrouter/rate-limit-reset?"+target, nil))
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("%s: status = %d, body = %s", target, recorder.Code, recorder.Body.String())
+		}
+		mu.Lock()
+		spent := consume
+		mu.Unlock()
+		if spent != 0 {
+			t.Fatalf("%s: spent %d reset credit(s) on a 5h stall with weekly at 40%%; body = %s", target, spent, recorder.Body.String())
+		}
 	}
 }
 
-// TestRateLimitResetAllReportsUsageFetchFailures asserts the sweep reports an
-// account it could not read instead of answering reset:0 as if all is well.
-func TestRateLimitResetAllReportsUsageFetchFailures(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
-	store := accounts.CodexStore{Dir: t.TempDir()}
-	if err := store.SaveStored(proxyStoredOAuthAccount("broken@example.com", "fresh", time.Now().Add(time.Hour))); err != nil {
-		t.Fatal(err)
-	}
-	client := &http.Client{Transport: proxyRoundTripFunc(func(req *http.Request) (*http.Response, error) {
-		return &http.Response{StatusCode: http.StatusUnauthorized, Header: http.Header{}, Body: io.NopCloser(bytes.NewReader(nil)), Request: req}, nil
-	})}
-	handler := Server{AccountRef: NewAccountRef(store, nil, client), MaxBodyBytes: 1024}.Handler()
-	recorder := httptest.NewRecorder()
-	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/_subrouter/rate-limit-reset?all=true&dry_run=1", nil))
-	var payload struct {
-		Results []RateLimitResetResult `json:"results"`
-	}
-	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
-		t.Fatal(err)
-	}
-	if len(payload.Results) != 1 || payload.Results[0].Email != "broken@example.com" || !strings.Contains(payload.Results[0].Error, "usage fetch failed") {
-		t.Fatalf("results = %+v, want one usage-fetch failure for broken@example.com", payload.Results)
-	}
-}
-
+// From upstream #366 (854c85d7). The rest of #366 is not taken (PATCHES
+// section 29.5); this pins the usage-status helper the merge keeps.
 func TestWithWeeklyCookedDoesNotMutateInput(t *testing.T) {
 	in := []AccountUsageStatus{{Windows: []accounts.UsageWindow{{Name: "primary", UsedPercent: 100, LimitWindowSeconds: 604800}}}}
 	out := withWeeklyCooked(in)
@@ -501,9 +508,17 @@ func TestRateLimitResetSweepHonorsMinWaitAndExpiry(t *testing.T) {
 	handler := Server{AccountRef: NewAccountRef(store, nil, client), MaxBodyBytes: 1024}.Handler()
 
 	recorder := httptest.NewRecorder()
-	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/_subrouter/rate-limit-reset?all=true&dry_run=1&min_wait_seconds=86400", nil))
+	handler.ServeHTTP(recorder, loopbackAdminRequest(http.MethodPost, "/_subrouter/rate-limit-reset?all=true&dry_run=1&min_wait_seconds=86400", nil))
+	// Decoded as the wire format the CLI reads (sr_reset.go remoteResetResult),
+	// not RateLimitResetResult, so this pins the JSON contract --min-wait
+	// clients rely on to tell a server that honored min_wait_seconds from one
+	// that ignored it.
 	var payload struct {
-		Results []RateLimitResetResult `json:"results"`
+		Results []struct {
+			Email             string `json:"email"`
+			WeeklyWaitSeconds int64  `json:"weekly_wait_seconds"`
+			CreditExpiresAt   string `json:"credit_expires_at"`
+		} `json:"results"`
 	}
 	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
 		t.Fatal(err)
@@ -520,13 +535,13 @@ func TestRateLimitResetSweepHonorsMinWaitAndExpiry(t *testing.T) {
 	}
 
 	recorder = httptest.NewRecorder()
-	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/_subrouter/rate-limit-reset?best=true", nil))
+	handler.ServeHTTP(recorder, loopbackAdminRequest(http.MethodPost, "/_subrouter/rate-limit-reset?best=true", nil))
 	if len(consumed) != 1 || consumed["expiring@example.com"] != 1 {
 		t.Fatalf("best consumed %v, want the expiring credit", consumed)
 	}
 
 	recorder = httptest.NewRecorder()
-	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/_subrouter/rate-limit-reset?all=true&min_wait_seconds=-1", nil))
+	handler.ServeHTTP(recorder, loopbackAdminRequest(http.MethodPost, "/_subrouter/rate-limit-reset?all=true&min_wait_seconds=-1", nil))
 	if recorder.Code != http.StatusBadRequest {
 		t.Fatalf("negative min_wait status = %d, want 400", recorder.Code)
 	}

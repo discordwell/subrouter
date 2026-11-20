@@ -82,31 +82,6 @@ func TestWithSessionCountsUsesLiveAssignments(t *testing.T) {
 	}
 }
 
-func TestInflightPenaltyReordersPlacementWithoutExhaustingOrEvicting(t *testing.T) {
-	accountA := account.Account{ID: "a", Provider: account.ProviderCodex, AuthMode: account.AuthModeOAuth}
-	accountB := account.Account{ID: "b", Provider: account.ProviderCodex, AuthMode: account.AuthModeOAuth}
-	base := NewScheduler([]Score{
-		{AccountID: "a", Provider: account.ProviderCodex, Headroom: 0.80, ShortHeadroom: 0.80},
-		{AccountID: "b", Provider: account.ProviderCodex, Headroom: 0.75, ShortHeadroom: 0.75},
-	})
-	picked, err := base.PickBest([]account.Account{accountA, accountB})
-	if err != nil || picked.ID != "a" {
-		t.Fatalf("baseline pick = %q %v, want a", picked.ID, err)
-	}
-
-	busy := base.WithInflightCounts(map[string]int{ScoreKey(account.ProviderCodex, "a"): 1})
-	picked, err = busy.PickBest([]account.Account{accountA, accountB})
-	if err != nil || picked.ID != "b" {
-		t.Fatalf("inflight pick = %q %v, want b", picked.ID, err)
-	}
-	if busy.Exhausted(account.ProviderCodex, "a") {
-		t.Fatal("inflight penalty marked a healthy account exhausted")
-	}
-	if !busy.UsableForStickySession(account.ProviderCodex, "a") {
-		t.Fatal("inflight penalty evicted a sticky session")
-	}
-}
-
 func TestWithSessionCountsSeparatesProvidersSharingAnAccountID(t *testing.T) {
 	scheduler := NewScheduler([]Score{
 		{AccountID: "same@example.com", Provider: account.ProviderCodex, Headroom: 0.75},
@@ -288,17 +263,15 @@ func TestLiveDebitsReorderPickWithoutExhausting(t *testing.T) {
 		{AccountID: "b", Provider: account.ProviderClaude, Headroom: 1, ShortHeadroom: 1},
 	})
 
-	// Equal scores: the deterministic ordering (PickBest) ties to "a".
-	// Pick itself spreads within equal-pressure bands, so the ordering
-	// contract is asserted through PickBest.
-	picked, err := scheduler.PickBest([]account.Account{accountA, accountB})
+	// Equal scores: deterministic tie falls to "a".
+	picked, err := scheduler.Pick([]account.Account{accountA, accountB})
 	if err != nil || picked.ID != "a" {
 		t.Fatalf("baseline pick = %v %v, want a", picked.ID, err)
 	}
 
-	// Five requests routed to "a" since the snapshot: the debit flips the order.
+	// Five requests routed to "a" since the snapshot: the debit flips the pick.
 	debited := scheduler.WithLiveDebits(map[string]int{ScoreKey(account.ProviderClaude, "a"): 5})
-	picked, err = debited.PickBest([]account.Account{accountA, accountB})
+	picked, err = debited.Pick([]account.Account{accountA, accountB})
 	if err != nil || picked.ID != "b" {
 		t.Fatalf("debited pick = %v %v, want b", picked.ID, err)
 	}
@@ -316,28 +289,16 @@ func TestLiveDebitsReorderPickWithoutExhausting(t *testing.T) {
 }
 
 func TestLiveDebitsSurviveForModelAndSessionCounts(t *testing.T) {
-	// Live debits reweight within the plan tier but never change the tier
-	// (it reads the measured score), so a keeps the spread floor weight and
-	// an unseeded Pick still lands on it about 2% of the time. Pin the draw.
-	previous := spreadRandFloat
-	spreadRandFloat = func() float64 { return 0.5 }
-	defer func() { spreadRandFloat = previous }()
 	scheduler := NewScheduler([]Score{
 		{AccountID: "a", Provider: account.ProviderClaude, Headroom: 1, ShortHeadroom: 1,
 			ModelScores: map[string]Score{"claudefable": {AccountID: "a", Provider: account.ProviderClaude, Headroom: 1, ShortHeadroom: 1}}},
 		{AccountID: "b", Provider: account.ProviderClaude, Headroom: 1, ShortHeadroom: 1,
 			ModelScores: map[string]Score{"claudefable": {AccountID: "b", Provider: account.ProviderClaude, Headroom: 1, ShortHeadroom: 1}}},
-		// 35 debited requests push a's headroom to 0.30, below the
-		// new-session threshold, which drops a to the spread floor weight.
-	}).WithLiveDebits(map[string]int{ScoreKey(account.ProviderClaude, "a"): 35}).
+	}).WithLiveDebits(map[string]int{ScoreKey(account.ProviderClaude, "a"): 5}).
 		WithSessionCounts(map[string]int{})
-	model := scheduler.ForModel("claude-fable")
-	if model.UsableForNewSession(account.ProviderClaude, "a") || !model.UsableForNewSession(account.ProviderClaude, "b") {
-		t.Fatal("live debits were dropped by ForModel or WithSessionCounts")
-	}
 	accountA := account.Account{ID: "a", Provider: account.ProviderClaude, AuthMode: account.AuthModeOAuth, Token: "x"}
 	accountB := account.Account{ID: "b", Provider: account.ProviderClaude, AuthMode: account.AuthModeOAuth, Token: "x"}
-	picked, err := model.Pick([]account.Account{accountA, accountB})
+	picked, err := scheduler.ForModel("claude-fable").Pick([]account.Account{accountA, accountB})
 	if err != nil || picked.ID != "b" {
 		t.Fatalf("pool pick = %v %v, want b (debits must survive ForModel and WithSessionCounts)", picked.ID, err)
 	}
@@ -356,51 +317,22 @@ func TestFablePickPrefersSoonerWeeklyReset(t *testing.T) {
 	})
 	later.Provider = account.ProviderClaude
 	scheduler := NewScheduler([]Score{later, soon}).ForModel(fable)
-	candidates := []account.Account{
+	picked, err := scheduler.Pick([]account.Account{
 		{ID: "later@example.com", Provider: account.ProviderClaude, AuthMode: account.AuthModeOAuth, Token: "x"},
 		{ID: "soon@example.com", Provider: account.ProviderClaude, AuthMode: account.AuthModeOAuth, Token: "x"},
-	}
-	// PickBest: the sooner weekly reset must lead the order. Pick spreads
-	// new sessions across both, so it must lean toward the same account.
-	picked, err := scheduler.PickBest(candidates)
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if picked.ID != "soon@example.com" {
 		t.Fatalf("picked %q, want sooner-resetting fable account", picked.ID)
 	}
-	counts := pickCounts(t, scheduler, candidates, 2000)
-	if counts["soon@example.com"] <= counts["later@example.com"] {
-		t.Fatalf("spread placements %v, want most new sessions on the sooner-resetting fable account", counts)
-	}
 }
 
-func TestOpusPickIgnoresWeeklyDrainPressure(t *testing.T) {
-	const opus = "claudeopus"
-	soon := ScoreFromLimitWindows("soon@example.com", 0, []LimitWindow{
-		{Name: "5h", Feature: opus, UsedPercent: 10, LimitWindowSeconds: 5 * 60 * 60, ResetAfterSeconds: 5 * 60 * 60},
-		{Name: "opus-weekly", Feature: opus, UsedPercent: 10, LimitWindowSeconds: 7 * 24 * 60 * 60, ResetAfterSeconds: 2 * 60 * 60},
-	})
-	soon.Provider = account.ProviderClaude
-	later := ScoreFromLimitWindows("later@example.com", 0, []LimitWindow{
-		{Name: "5h", Feature: opus, UsedPercent: 10, LimitWindowSeconds: 5 * 60 * 60, ResetAfterSeconds: 5 * 60 * 60},
-		{Name: "opus-weekly", Feature: opus, UsedPercent: 10, LimitWindowSeconds: 7 * 24 * 60 * 60, ResetAfterSeconds: 5 * 24 * 60 * 60},
-	})
-	later.Provider = account.ProviderClaude
-	scheduler := NewScheduler([]Score{later, soon}).ForModel(opus)
-	// PickBest: the assertion is about ordering (weekly drain pressure must
-	// not reorder opus picks), not about placement spreading.
-	picked, err := scheduler.PickBest([]account.Account{
-		{ID: "later@example.com", Provider: account.ProviderClaude, AuthMode: account.AuthModeOAuth, Token: "x"},
-		{ID: "soon@example.com", Provider: account.ProviderClaude, AuthMode: account.AuthModeOAuth, Token: "x"},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if picked.ID != "later@example.com" {
-		t.Fatalf("picked %q, want ordinary headroom/tie ordering unchanged for opus", picked.ID)
-	}
-}
+// Opus routing's weekly behavior is pinned in claude_pace_test.go
+// (TestOpusTrafficPrefersFableConsumedAccount and friends): opus now follows
+// weekly pace (with a fable reservation while PATCHES §57's switch is on)
+// rather than ignoring weekly drain.
 
 func TestSchedulerRefLiveDebitLifecycle(t *testing.T) {
 	ref := NewSchedulerRef(NewScheduler(nil))
@@ -412,129 +344,173 @@ func TestSchedulerRefLiveDebitLifecycle(t *testing.T) {
 		t.Fatalf("debits = %v", debits)
 	}
 	// A failed refresh keeps the debits (the stale snapshot still applies)...
-	publishRefresh(t, ref, Scheduler{}, false)
+	ref.FinishRefresh(Scheduler{}, false)
 	if ref.LiveDebits() == nil {
 		t.Fatal("failed refresh must keep live debits")
 	}
 	// ...a successful one supersedes them.
-	publishRefresh(t, ref, NewScheduler(nil), true)
+	ref.FinishRefresh(NewScheduler(nil), true)
 	if ref.LiveDebits() != nil {
 		t.Fatal("fresh refresh must clear live debits")
 	}
 }
 
-func TestWeeklyHeadroomTracksOnlyLongWindows(t *testing.T) {
-	weekly := int64(7 * 24 * 60 * 60)
-	session := int64(5 * 60 * 60)
-
-	// Session cooked, weekly healthy: not weekly-cooked — paid fallback must
-	// stay out; this is a temporary wait.
-	sessionCooked := ScoreFromLimitWindows("acct", 0, []LimitWindow{
-		{Name: "5h", UsedPercent: 100, LimitWindowSeconds: session},
-		{Name: "7d", UsedPercent: 40, LimitWindowSeconds: weekly},
-	})
-	if sessionCooked.WeeklyCooked() {
-		t.Fatalf("session-only exhaustion cooked the weekly window: %+v", sessionCooked)
-	}
-	if !sessionCooked.exhausted() {
-		t.Fatalf("cooked 5h window should still exhaust the account: %+v", sessionCooked)
-	}
-
-	// Weekly cooked, session fine: weekly-cooked.
-	weeklyCooked := ScoreFromLimitWindows("acct", 0, []LimitWindow{
-		{Name: "5h", UsedPercent: 10, LimitWindowSeconds: session},
-		{Name: "7d", UsedPercent: 100, LimitWindowSeconds: weekly},
-	})
-	if !weeklyCooked.WeeklyCooked() {
-		t.Fatalf("100%% weekly window must read as weekly-cooked: %+v", weeklyCooked)
-	}
-
-	// No weekly window evidence: fail closed to "not cooked" so paid spend
-	// never fires on missing data.
-	unknown := ScoreFromLimitWindows("acct", 0, []LimitWindow{
-		{Name: "5h", UsedPercent: 100, LimitWindowSeconds: session},
-	})
-	if unknown.WeeklyCooked() {
-		t.Fatalf("missing weekly window must not read as cooked: %+v", unknown)
-	}
-	if NewScheduler(nil).ScoreFor(account.ProviderClaude, "ghost").WeeklyCooked() {
-		t.Fatal("default score for an unknown account must not read as weekly-cooked")
-	}
-}
-
+// A usage reading served after its window's absolute reset describes a
+// period that is over (upstream 4e80ede7, adapted: this fork has no
+// WeeklyCooked). The stale 100% must neither exhaust the account nor bind
+// its week.
 func TestScoreFromLimitWindowsClearsExpiredAbsoluteReset(t *testing.T) {
 	weekly := int64(7 * 24 * 60 * 60)
-	score := ScoreFromLimitWindows("acct", 0, []LimitWindow{{
-		Name: "7d", UsedPercent: 100, LimitWindowSeconds: weekly,
-		ResetAt: time.Now().Add(-time.Minute),
-	}})
-	if score.exhausted() || score.WeeklyCooked() {
+	now := time.Now()
+	score := ScoreFromLimitWindowsAt("acct", 0, []LimitWindow{{
+		Name: "7d", UsedPercent: 100, LimitWindowSeconds: weekly, ResetAfterSeconds: 60,
+		ResetAt: now.Add(-time.Minute),
+	}}, now)
+	if score.exhausted() {
 		t.Fatalf("expired weekly window stayed cooked: %+v", score)
 	}
+	if !score.WeeklyResetAt.IsZero() || score.WeeklyRemaining != 0 {
+		t.Fatalf("expired weekly window still binds the week: %+v", score)
+	}
+	// Control: the same window before its reset is spent.
+	live := ScoreFromLimitWindowsAt("acct", 0, []LimitWindow{{
+		Name: "7d", UsedPercent: 100, LimitWindowSeconds: weekly, ResetAfterSeconds: 60,
+		ResetAt: now.Add(time.Minute),
+	}}, now)
+	if !live.exhausted() {
+		t.Fatalf("a live 100%% weekly window must exhaust the account: %+v", live)
+	}
 }
 
-func TestWeeklyHeadroomUsesSixDayLongWindowThreshold(t *testing.T) {
+// An elapsed reading leaves the window set's shape alone: an account whose
+// 5h reading is past its reset still publishes a 5h window, so it is not
+// WeeklyOnly, and that window reads as refilled rather than aliased to the
+// week.
+func TestScoreFromLimitWindowsKeepsWindowShapePastAnElapsedReading(t *testing.T) {
+	now := time.Now()
+	score := ScoreFromLimitWindowsAt("acct", 0, []LimitWindow{
+		{Name: "5h", UsedPercent: 100, LimitWindowSeconds: 5 * 60 * 60, ResetAfterSeconds: 60, ResetAt: now.Add(-time.Minute)},
+		{Name: "7d", UsedPercent: 50, LimitWindowSeconds: 7 * 24 * 60 * 60, ResetAfterSeconds: 3 * 24 * 60 * 60},
+	}, now)
+	if score.exhausted() || score.ShortHeadroom != 1 {
+		t.Fatalf("an elapsed 5h reading still holds the short window: %+v", score)
+	}
+	if score.WeeklyOnly {
+		t.Fatalf("an elapsed 5h reading made the account weekly-only: %+v", score)
+	}
+	if score.Headroom != 0.5 || score.WeeklyRemaining != 0.5 {
+		t.Fatalf("the live weekly reading was lost: %+v", score)
+	}
+}
+
+// ExhaustionClearsAt (upstream #530) names when the measured windows stop
+// holding a score exhausted: the latest reset among its exhausted windows,
+// unknown when one of them reported none.
+func TestExhaustionClearsAtFollowsTheLatestExhaustedWindowReset(t *testing.T) {
+	now := time.Now()
+	shortReset := now.Add(2 * time.Hour)
+	weeklyReset := now.Add(3 * 24 * time.Hour)
+	both := ScoreFromLimitWindowsAt("acct", 0, []LimitWindow{
+		{Name: "5h", UsedPercent: 100, LimitWindowSeconds: 5 * 60 * 60, ResetAfterSeconds: 7200, ResetAt: shortReset},
+		{Name: "7d", UsedPercent: 100, LimitWindowSeconds: 7 * 24 * 60 * 60, ResetAfterSeconds: 3 * 24 * 60 * 60, ResetAt: weeklyReset},
+	}, now)
+	if at, known := both.ExhaustionClearsAt(); !known || !at.Equal(weeklyReset) {
+		t.Fatalf("ExhaustionClearsAt = %v, %v; want the weekly reset %v", at, known, weeklyReset)
+	}
+	unknown := ScoreFromLimitWindowsAt("acct", 0, []LimitWindow{
+		{Name: "5h", UsedPercent: 100, LimitWindowSeconds: 5 * 60 * 60, ResetAfterSeconds: 7200},
+	}, now)
+	if _, known := unknown.ExhaustionClearsAt(); known {
+		t.Fatalf("an exhausted window with no reset time must read unknown: %+v", unknown)
+	}
+	healthy := ScoreFromLimitWindowsAt("acct", 0, []LimitWindow{
+		{Name: "5h", UsedPercent: 10, LimitWindowSeconds: 5 * 60 * 60, ResetAfterSeconds: 7200},
+	}, now)
+	if at, known := healthy.ExhaustionClearsAt(); !known || !at.IsZero() {
+		t.Fatalf("a score that is not exhausted must clear now: %v, %v", at, known)
+	}
+}
+
+// A long window is at least six days (upstream #379, adapted), the rule
+// internal/accounts and sr status share. A mid-length cap (OpenRouter
+// "daily", Kimi "1d") still blocks routing when it is spent, but it is not
+// the week: read as one it would earn weekly pace and, rolling within a day,
+// a permanent seat in the endgame drain.
+func TestWeeklyWindowUsesSixDayLongWindowThreshold(t *testing.T) {
 	day := int64(24 * 60 * 60)
 	session := int64(5 * 60 * 60)
+	now := time.Now()
 
-	// A cooked daily window (OpenRouter "daily", Kimi "1d") is a mid-length
-	// cap: it blocks routing through Headroom but is not weekly evidence, so
-	// it neither cooks the weekly window nor hides a healthy one.
-	dailyCooked := ScoreFromLimitWindows("acct", 0, []LimitWindow{
-		{Name: "5h", UsedPercent: 10, LimitWindowSeconds: session},
-		{Name: "1d", UsedPercent: 100, LimitWindowSeconds: day},
-		{Name: "7d", UsedPercent: 50, LimitWindowSeconds: 7 * day},
-	})
-	if dailyCooked.WeeklyCooked() || dailyCooked.WeeklyHeadroom != 0.5 {
-		t.Fatalf("daily window counted as weekly: %+v", dailyCooked)
+	dailyCooked := ScoreFromLimitWindowsAt("acct", 0, []LimitWindow{
+		{Name: "5h", UsedPercent: 10, LimitWindowSeconds: session, ResetAfterSeconds: 3600},
+		{Name: "1d", UsedPercent: 100, LimitWindowSeconds: day, ResetAfterSeconds: 3600},
+		{Name: "7d", UsedPercent: 50, LimitWindowSeconds: 7 * day, ResetAfterSeconds: 3 * day},
+	}, now)
+	if dailyCooked.WeeklyRemaining != 0.5 || !dailyCooked.WeeklyResetAt.Equal(now.Add(3*24*time.Hour)) {
+		t.Fatalf("the daily window bound the week: %+v", dailyCooked)
 	}
 	if !dailyCooked.exhausted() {
-		t.Fatalf("cooked daily window must still exhaust the account: %+v", dailyCooked)
+		t.Fatalf("a spent daily window must still exhaust the account: %+v", dailyCooked)
 	}
 
-	dailyOnly := ScoreFromLimitWindows("acct", 0, []LimitWindow{
-		{Name: "daily", UsedPercent: 100, LimitWindowSeconds: day},
-	})
-	if dailyOnly.WeeklyHeadroomKnown || dailyOnly.WeeklyCooked() {
-		t.Fatalf("daily-only account must have no weekly evidence: %+v", dailyOnly)
-	}
-	if dailyOnly.ShortHeadroom != 0 {
-		t.Fatalf("daily-only exhaustion must still read as exhausted headroom: %+v", dailyOnly)
+	dailyOnly := ScoreFromLimitWindowsAt("acct", 0, []LimitWindow{
+		{Name: "daily", UsedPercent: 40, LimitWindowSeconds: day, ResetAfterSeconds: 3600},
+	}, now)
+	if !dailyOnly.WeeklyResetAt.IsZero() || dailyOnly.InEndgameWindow(now) {
+		t.Fatalf("a daily-only account was paced as a week rolling within the day: %+v", dailyOnly)
 	}
 
-	// Six days is the shared long-window floor (accounts / sr status).
-	sixDay := ScoreFromLimitWindows("acct", 0, []LimitWindow{
-		{Name: "6d", UsedPercent: 100, LimitWindowSeconds: 6 * day},
-	})
-	if !sixDay.WeeklyCooked() {
-		t.Fatalf("6d window must count as weekly: %+v", sixDay)
-	}
-	justUnder := ScoreFromLimitWindows("acct", 0, []LimitWindow{
-		{Name: "long", UsedPercent: 100, LimitWindowSeconds: 6*day - 1},
-	})
-	if justUnder.WeeklyHeadroomKnown {
-		t.Fatalf("window just under 6d must not count as weekly: %+v", justUnder)
-	}
-	monthly := ScoreFromLimitWindows("acct", 0, []LimitWindow{
-		{Name: "monthly", UsedPercent: 100, LimitWindowSeconds: 30 * day},
-	})
-	if !monthly.WeeklyCooked() {
-		t.Fatalf("monthly window must count as long: %+v", monthly)
+	for _, tc := range []struct {
+		name   string
+		length int64
+		weekly bool
+	}{
+		{"6d", 6 * day, true},
+		{"just under 6d", 6*day - 1, false},
+		{"monthly", 30 * day, true},
+	} {
+		score := ScoreFromLimitWindowsAt("acct", 0, []LimitWindow{
+			{Name: tc.name, UsedPercent: 50, LimitWindowSeconds: tc.length, ResetAfterSeconds: day},
+		}, now)
+		if got := !score.WeeklyResetAt.IsZero(); got != tc.weekly {
+			t.Fatalf("%s window: weekly = %v, want %v (%+v)", tc.name, got, tc.weekly, score)
+		}
 	}
 }
 
-func TestWeeklyExhaustionMarkCooksWeeklyUntilExpiry(t *testing.T) {
-	ref := NewSchedulerRef(NewScheduler([]Score{
-		{AccountID: "acct", Provider: account.ProviderClaude, Headroom: 1, ShortHeadroom: 1, WeeklyHeadroom: 1},
-	}))
-	until := time.Now().Add(time.Hour)
-	ref.MarkWeeklyExhaustedUntil(account.ProviderClaude, "acct", "", until)
-	if !ref.Get().ScoreFor(account.ProviderClaude, "acct").WeeklyCooked() {
-		t.Fatal("weekly mark did not cook the weekly window")
+// Missing model buckets follow the score's declaration and, with none, this
+// fork's provider table (upstream #467, adapted): Claude and Antigravity
+// absence is unknown -- Opus and Sonnet route on the account-wide budget
+// (PATCHES §24) -- and any other provider's absence is unsupported. An
+// explicit declaration overrides the table either way.
+func TestForModelMissingBucketsFollowDeclarationAndForkProviderTable(t *testing.T) {
+	const model = "provider-model"
+	measured := func(provider account.Provider) Score {
+		return Score{AccountID: "measured", Provider: provider, Headroom: 0.8, ShortHeadroom: 0.8,
+			ModelScores: map[string]Score{ModelKey(model): {AccountID: "measured", Provider: provider, Headroom: 0.2, ShortHeadroom: 0.2}}}
 	}
-	// A plain (session-evidence) mark never touches weekly headroom.
-	ref.MarkExhaustedUntil(account.ProviderClaude, "other", "", until)
-	if got := ref.Get().ScoreFor(account.ProviderClaude, "other"); got.WeeklyCooked() {
-		t.Fatalf("session-level mark cooked the weekly window: %+v", got)
+	for _, tc := range []struct {
+		name     string
+		provider account.Provider
+		declared ModelSupport
+		eligible bool
+	}{
+		{"claude default", account.ProviderClaude, ModelSupportProviderDefault, true},
+		{"claude declared unsupported", account.ProviderClaude, ModelSupportUnsupported, false},
+		{"antigravity default", account.ProviderAntigravity, ModelSupportProviderDefault, true},
+		{"codex default", account.ProviderCodex, ModelSupportProviderDefault, false},
+		{"codex declared unknown", account.ProviderCodex, ModelSupportUnknown, true},
+	} {
+		absent := Score{AccountID: "absent", Provider: tc.provider, Headroom: 0.8, ShortHeadroom: 0.8, MissingModelSupport: tc.declared}
+		scheduler := NewScheduler([]Score{absent, measured(tc.provider)}).ForModel(model)
+		if got := !scheduler.Exhausted(tc.provider, "absent"); got != tc.eligible {
+			t.Fatalf("%s: eligible = %v, want %v", tc.name, got, tc.eligible)
+		}
+		if got := scheduler.score(tc.provider, "measured").Headroom; got != 0.2 {
+			t.Fatalf("%s: measured model bucket was not selected: headroom %v", tc.name, got)
+		}
+	}
+	if DefaultMissingModelSupport(account.ProviderClaude) != ModelSupportUnknown {
+		t.Fatal("Claude's missing buckets must default to unknown (PATCHES §24)")
 	}
 }

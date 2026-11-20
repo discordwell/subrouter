@@ -401,7 +401,7 @@ func TestMultiTenantKeyRevocationAndRotation(t *testing.T) {
 	}
 
 	// Mint a second key through the admin API, then revoke the first.
-	keysReq := httptest.NewRequest(http.MethodPost, "/_subrouter/tenants/"+created.ID+"/keys", nil)
+	keysReq := loopbackAdminRequest(http.MethodPost, "/_subrouter/tenants/"+created.ID+"/keys", nil)
 	keysResp := httptest.NewRecorder()
 	handler.ServeHTTP(keysResp, keysReq)
 	if keysResp.Code != http.StatusOK {
@@ -414,7 +414,7 @@ func TestMultiTenantKeyRevocationAndRotation(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	revokeReq := httptest.NewRequest(http.MethodDelete, "/_subrouter/tenants/"+created.ID+"/keys/"+created.Keys[0].Prefix, nil)
+	revokeReq := loopbackAdminRequest(http.MethodDelete, "/_subrouter/tenants/"+created.ID+"/keys/"+created.Keys[0].Prefix, nil)
 	revokeResp := httptest.NewRecorder()
 	handler.ServeHTTP(revokeResp, revokeReq)
 	if revokeResp.Code != http.StatusOK {
@@ -527,6 +527,17 @@ func TestTenantSessionsRequireManageAccountsCapability(t *testing.T) {
 	if _, err := registry.EnsureExternalRestricted(tenantID, "privacy", manageKey, []tenant.Capability{tenant.CapabilityManageAccounts}); err != nil {
 		t.Fatal(err)
 	}
+	// Two sessions in the tenant's own store, written before the tenant's
+	// handler (and its store) is first built.
+	seeded, err := session.NewStore(filepath.Join(registry.Dir(tenantID), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"sess-1", "sess-2"} {
+		if _, err := seeded.Put("claude", id, "acct-"+id, id+"@example.com"); err != nil {
+			t.Fatal(err)
+		}
+	}
 	for _, test := range []struct {
 		key  string
 		want int
@@ -551,6 +562,21 @@ func TestTenantSessionsRequireManageAccountsCapability(t *testing.T) {
 		handler.ServeHTTP(resp, httptest.NewRequest(test.method, "/t/"+useKey+"/_subrouter/sessions"+test.query, nil))
 		if resp.Code != test.want {
 			t.Fatalf("use key %s %s status = %d, want %d", test.method, test.query, resp.Code, test.want)
+		}
+		// The use-key grant (#429, tenantCredentialAllowsRequest) trusts
+		// handleSessions to filter by session_id; without that filter the
+		// lookup answers 200 with every session of the tenant (account IDs,
+		// session IDs, user emails), which the status check above misses.
+		if test.method == http.MethodGet && resp.Code == http.StatusOK {
+			var views []struct {
+				SessionID string `json:"session_id"`
+			}
+			if err := json.Unmarshal(resp.Body.Bytes(), &views); err != nil {
+				t.Fatalf("use key lookup body: %v\n%s", err, resp.Body.String())
+			}
+			if len(views) != 1 || views[0].SessionID != "sess-1" {
+				t.Fatalf("use key lookup for sess-1 answered %s", resp.Body.String())
+			}
 		}
 	}
 }
@@ -3692,7 +3718,7 @@ func TestAccountListDoesNotRefreshOrRewriteOAuthCredentials(t *testing.T) {
 	response := httptest.NewRecorder()
 	server.Handler().ServeHTTP(
 		response,
-		httptest.NewRequest(http.MethodGet, "/_subrouter/accounts", nil),
+		loopbackAdminRequest(http.MethodGet, "/_subrouter/accounts", nil),
 	)
 	if response.Code != http.StatusOK {
 		t.Fatalf("response = %d: %s", response.Code, response.Body.String())

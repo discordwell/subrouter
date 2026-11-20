@@ -221,6 +221,76 @@ func TestSchedulerRefAccountGenerationInvalidatesOlderRefresh(t *testing.T) {
 	}
 }
 
+// The fork keeps the tokenless FinishRefresh upstream #379 dropped (PATCHES
+// 29.3b). Upstream's rewrite moved the tests above onto the generation-aware
+// finish, which turns an old generation away by itself; these tokenless twins
+// are the fork's originals, so the guards only the tokenless path has --
+// legacyFinishInvalidated, set when an account generation advances under a
+// refresh, and refreshInvalidated after a newer Set -- keep a red test.
+
+func TestSchedulerRefAccountGenerationInvalidatesLegacyRefresh(t *testing.T) {
+	ref := NewSchedulerRef(NewScheduler([]Score{{
+		AccountID: "old@example.com", Provider: account.ProviderCodex, Headroom: 0.9, ShortHeadroom: 0.9,
+	}}))
+	ref.SetUpdatedAt(time.Time{})
+	if !ref.BeginRefreshIfStale(time.Minute) {
+		t.Fatal("legacy refresh did not begin")
+	}
+
+	ref.AdvanceAccountGeneration(2)
+	if !ref.SetForAccountGeneration(NewScheduler([]Score{{
+		AccountID: "new@example.com", Provider: account.ProviderCodex, Headroom: 0.8, ShortHeadroom: 0.8,
+	}}), 2) {
+		t.Fatal("new account generation was not published")
+	}
+	ref.FinishRefresh(NewScheduler([]Score{{
+		AccountID: "old@example.com", Provider: account.ProviderCodex, Headroom: 0.1, ShortHeadroom: 0.1,
+	}}), true)
+
+	if got := ref.Get().ScoreFor(account.ProviderCodex, "new@example.com").Headroom; got != 0.8 {
+		t.Fatalf("legacy refresh overwrote a newer account generation: headroom = %v, want 0.8", got)
+	}
+}
+
+func TestSchedulerRefNewerSetInvalidatesOlderLegacyRefresh(t *testing.T) {
+	ref := NewSchedulerRef(NewScheduler([]Score{{
+		AccountID: "old@example.com", Provider: account.ProviderCodex, Headroom: 0.9, ShortHeadroom: 0.9,
+	}}))
+	ref.SetUpdatedAt(time.Time{})
+	if !ref.BeginRefreshIfStale(time.Minute) {
+		t.Fatal("stale refresh should begin")
+	}
+
+	ref.Set(NewScheduler([]Score{{
+		AccountID: "new@example.com", Provider: account.ProviderCodex, Headroom: 0.8, ShortHeadroom: 0.8,
+	}}))
+	ref.FinishRefresh(NewScheduler([]Score{{
+		AccountID: "old@example.com", Provider: account.ProviderCodex, Headroom: 0.1, ShortHeadroom: 0.1,
+	}}), true)
+
+	if got := ref.Get().ScoreFor(account.ProviderCodex, "new@example.com").Headroom; got != 0.8 {
+		t.Fatalf("older legacy refresh overwrote newer scheduler: headroom = %v, want 0.8", got)
+	}
+}
+
+func TestSchedulerRefRetryAfterSkippedLegacyRefreshWaitsForTTL(t *testing.T) {
+	ref := NewSchedulerRef(NewScheduler(nil))
+	ref.SetUpdatedAt(time.Now().Add(-time.Hour))
+
+	if !ref.BeginRefreshIfStale(time.Minute) {
+		t.Fatal("stale refresh should begin")
+	}
+	ref.FinishRefresh(Scheduler{}, false)
+
+	if ref.BeginRefreshIfStale(time.Minute) {
+		t.Fatal("skipped legacy refresh should still touch updatedAt")
+	}
+	ref.SetUpdatedAt(time.Now().Add(-time.Hour))
+	if !ref.BeginRefreshIfStale(time.Minute) {
+		t.Fatal("refresh should be allowed after TTL passes")
+	}
+}
+
 func TestSchedulerRefInterleavedRefreshesAcrossGenerationBumpPublishNewest(t *testing.T) {
 	ref := NewSchedulerRef(NewScheduler(nil))
 	ref.SetUpdatedAt(time.Time{})
@@ -559,7 +629,8 @@ func TestAccountGenerationPrunesRemovedAccountExhaustionMarks(t *testing.T) {
 	ref.AdvanceAccountGenerationWithAccounts(1, 1, []account.Account{removed, kept})
 	removedUntil := time.Now().Add(time.Hour)
 	keptUntil := time.Now().Add(2 * time.Hour)
-	ref.MarkWeeklyExhaustedUntil(removed.Provider, removed.ID, "", removedUntil)
+	// The fork's plain mark: upstream's weekly mark (T3) is not ported.
+	ref.MarkExhaustedUntil(removed.Provider, removed.ID, "", removedUntil)
 	ref.MarkExhaustedUntil(kept.Provider, kept.ID, "", keptUntil)
 
 	ref.AdvanceAccountGenerationWithAccounts(2, 2, []account.Account{kept})
@@ -567,11 +638,10 @@ func TestAccountGenerationPrunesRemovedAccountExhaustionMarks(t *testing.T) {
 		t.Fatal("removed account retained an exhaustion mark")
 	}
 	ref.mu.RLock()
-	_, weeklyMarked := ref.weeklyExhaustedUntil[poolScopedExhaustionKey(removed.Provider, removed.ID, "")]
 	_, seqMarked := ref.exhaustedMarkSeq[poolScopedExhaustionKey(removed.Provider, removed.ID, "")]
 	ref.mu.RUnlock()
-	if weeklyMarked || seqMarked {
-		t.Fatal("removed account retained weekly or sequence exhaustion state")
+	if seqMarked {
+		t.Fatal("removed account retained sequence exhaustion state")
 	}
 	if got, ok := ref.ExhaustedUntilFor(kept.Provider, kept.ID, ""); !ok || !got.Equal(keptUntil) {
 		t.Fatalf("kept account mark = %v, %t; want %v, true", got, ok, keptUntil)
@@ -663,7 +733,7 @@ func TestSchedulerRefScoreMergeReturnsActiveExhaustionOverlay(t *testing.T) {
 	if !merged.Exhausted(account.ProviderCodex, "blocked") {
 		t.Fatal("partial merge return omitted the active exhaustion overlay")
 	}
-	picked, err := merged.PickBest([]account.Account{
+	picked, err := merged.Pick([]account.Account{
 		{ID: "healthy", Provider: account.ProviderCodex},
 		{ID: "blocked", Provider: account.ProviderCodex},
 	})
@@ -700,7 +770,7 @@ func TestSchedulerRefScoreMergeReturnsActiveCredentialExclusion(t *testing.T) {
 	if !merged.Exhausted(credential.Provider, credential.ID) {
 		t.Fatal("partial merge return omitted the active credential exclusion")
 	}
-	picked, err := merged.PickBest([]account.Account{
+	picked, err := merged.Pick([]account.Account{
 		{ID: "healthy", Provider: account.ProviderCodex},
 		credential,
 	})
@@ -1045,5 +1115,110 @@ func TestPoolScopedRetainLeavesOtherPoolMark(t *testing.T) {
 	}
 	if !ref.Get().ForModel(opus).Exhausted(account.ProviderClaude, "a@example.com") {
 		t.Fatal("opus mark should still apply after fable refresh")
+	}
+}
+
+// A republication of the cached usage sweep (every usage-status and pool-board
+// read) is not the scheduled refresh, and must not act like one in either
+// direction: it may not make the snapshot look fresh -- that postponed the one
+// event that clears the live debits for as long as a peer kept reading -- and
+// it may not cancel a refresh already in flight, which discarded that event
+// whenever a read landed inside the sweep. Set keeps both behaviors (see
+// "newer direct publication invalidates older full refresh"); this is the
+// publication the usage-status path uses instead. PATCHES.md §26.
+func TestSchedulerRefRepublicationNeitherPostponesNorCancelsTheRefresh(t *testing.T) {
+	scores := func(headroom float64) Scheduler {
+		return NewScheduler([]Score{{AccountID: "claude", Provider: account.ProviderClaude, Headroom: headroom, ShortHeadroom: headroom}})
+	}
+	debits := func(ref *SchedulerRef) int {
+		return ref.LiveDebits()[ScoreKey(account.ProviderClaude, "claude")]
+	}
+	ref := NewSchedulerRef(scores(0.9))
+	ref.AdvanceAccountGeneration(1)
+	stale := time.Now().Add(-time.Hour)
+	ref.SetUpdatedAt(stale)
+	ref.NoteRouted(account.ProviderClaude, "claude")
+
+	if !ref.PublishWithoutRefreshForAccountGenerationAtScoreRevision(scores(0.8), 1, ref.ScoreRevision()) {
+		t.Fatal("republication at the current generation and score revision was rejected")
+	}
+	if got := ref.Get().ScoreFor(account.ProviderClaude, "claude").Headroom; got != 0.8 {
+		t.Fatalf("republished headroom = %v, want 0.8", got)
+	}
+	if !ref.Stale(time.Minute) {
+		t.Fatal("a republication made the snapshot look fresh, postponing the refresh that clears the debits")
+	}
+	if got := debits(ref); got != 1 {
+		t.Fatalf("live debits = %d after a republication, want 1: it republishes the same measurement, so it must not erase them", got)
+	}
+
+	if !ref.BeginRefreshIfStaleForAccountGeneration(time.Minute, 1) {
+		t.Fatal("the scheduled refresh did not begin after a republication")
+	}
+	ref.NoteRouted(account.ProviderClaude, "claude")
+	if !ref.PublishWithoutRefreshForAccountGenerationAtScoreRevision(scores(0.7), 1, ref.ScoreRevision()) {
+		t.Fatal("republication during a refresh was rejected")
+	}
+	if !ref.FinishRefreshForAccountGeneration(scores(0.85), true, 1) {
+		t.Fatal("a republication landing mid-sweep cancelled the scheduled refresh")
+	}
+	if got := debits(ref); got != 0 {
+		t.Fatalf("live debits = %d after the scheduled refresh landed, want 0", got)
+	}
+	if got := ref.Get().ScoreFor(account.ProviderClaude, "claude").Headroom; got != 0.85 {
+		t.Fatalf("headroom = %v after the refresh, want its 0.85", got)
+	}
+	if ref.Stale(time.Minute) {
+		t.Fatal("the scheduled refresh did not restart the refresh clock")
+	}
+
+	// The guards are Set's: a publication computed before a newer score or
+	// account generation landed is still refused.
+	old := ref.ScoreRevision()
+	if _, ok := ref.MergeScoresForAccountGeneration([]Score{{AccountID: "claude", Provider: account.ProviderClaude, Headroom: 0.6, ShortHeadroom: 0.6}}, 1); !ok {
+		t.Fatal("score merge was rejected")
+	}
+	if ref.PublishWithoutRefreshForAccountGenerationAtScoreRevision(scores(0.1), 1, old) {
+		t.Fatal("a republication overwrote a newer score merge")
+	}
+	if ref.PublishWithoutRefreshForAccountGenerationAtScoreRevision(scores(0.1), 0, ref.ScoreRevision()) {
+		t.Fatal("a republication from an older account generation was accepted")
+	}
+}
+
+// Scored is "there are scores to route on while a refresh runs", not "the
+// refresh clock is set": an account reload makes the scores stale and keeps
+// them, so only an explicit SetUpdatedAt(time.Time{}) or a ref that never held
+// a scheduler reads unscored (PATCHES section 44).
+func TestSchedulerRefScoredSurvivesAnAccountReload(t *testing.T) {
+	if (&SchedulerRef{}).Scored() {
+		t.Fatal("a zero SchedulerRef reads scored")
+	}
+	ref := NewSchedulerRef(NewScheduler([]Score{{AccountID: "a", Headroom: 0.9, ShortHeadroom: 0.9}}))
+	if !ref.Scored() {
+		t.Fatal("a ref built with scores reads unscored")
+	}
+	ref.AdvanceAccountGeneration(1)
+	if !ref.Stale(time.Minute) {
+		t.Fatal("precondition: an account reload leaves the scores stale")
+	}
+	if !ref.Scored() {
+		t.Fatal("an account reload made the ref read unscored; its scores are stale, not absent")
+	}
+	ref.SetUpdatedAt(time.Time{})
+	if ref.Scored() {
+		t.Fatal("SetUpdatedAt(time.Time{}) must ask for a re-score before routing")
+	}
+	if !ref.BeginRefreshIfStaleForAccountGeneration(time.Minute, 1) {
+		t.Fatal("could not claim the refresh")
+	}
+	ref.FinishRefreshForAccountGeneration(Scheduler{}, false, 1)
+	if !ref.Scored() {
+		t.Fatal("a finished refresh, even one with no fresh scores, leaves the ref unscored")
+	}
+	fresh := &SchedulerRef{}
+	fresh.Set(NewScheduler(nil))
+	if !fresh.Scored() {
+		t.Fatal("a publish leaves the ref unscored")
 	}
 }

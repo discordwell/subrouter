@@ -140,11 +140,13 @@ func (r srRunner) errorsServer(ctx context.Context) (srServerConfig, error) {
 		if server, ok, err := r.defaultRemoteServer(); err != nil || ok {
 			return server, err
 		}
-		if r.useServingAPI {
-			return r.readyLocalServingServer(ctx, defaultDaemonStarter())
-		}
+		// Upstream reaches the local daemon here only when its CLI routes
+		// through the serving API (useServingAPI); this fork's srRunner has
+		// no such switch (sr.go), and the daemon on this machine is what
+		// keeps this machine's error log, so it is asked directly.
+		return r.readyLocalServingServer(ctx, defaultDaemonStarter())
 	case broker.CredentialSourceLocal:
-		if !explicitLocalStateAuthority() && r.useServingAPI {
+		if !explicitLocalStateAuthority() {
 			return r.readyLocalServingServer(ctx, defaultDaemonStarter())
 		}
 	}

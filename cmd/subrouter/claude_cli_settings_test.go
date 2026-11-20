@@ -147,6 +147,48 @@ func TestManagedClaudeLaunchKeepsCLISettingsHooks(t *testing.T) {
 	}
 }
 
+// The fork's socket launcher (PATCHES §30) keeps the caller's --settings too:
+// managedClaudeLaunchArgs drops them from argv on every pooled launcher, and
+// a healthy socket used to lose their hooks, permissions and env while the
+// TCP fallback for the same command kept them. The route stays the socket's.
+func TestSocketClaudeLaunchKeepsCLISettingsHooks(t *testing.T) {
+	for name, args := range cliSettingsArgVariants(t, t.TempDir()) {
+		t.Run(name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			tempRoot := filepath.Join(home, "tmp")
+			if err := os.MkdirAll(tempRoot, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("TMPDIR", tempRoot)
+			capturePath, argsPath := installSettingsCapturingClaude(t, home)
+			configDir := filepath.Join(home, "proxy-config")
+			if err := os.MkdirAll(configDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			runner := srRunner{
+				store: accounts.CodexStore{Dir: filepath.Join(home, "hermetic-store", "accounts")},
+				in:    strings.NewReader(""), out: io.Discard, errOut: io.Discard,
+			}
+			socket := filepath.Join(home, "claude.sock")
+			if err := runner.launchSocketClaude(t.Context(), args, socket, configDir); err != nil {
+				t.Fatal(err)
+			}
+			settings := readLaunchedClaudeSettings(t, capturePath, argsPath)
+			requireCLIPreToolUseHook(t, settings)
+			if settings.Env["CLI_SETTINGS_ONLY"] != "kept" {
+				t.Fatalf("--settings env did not reach the socket-launched claude: %v", settings.Env)
+			}
+			if got := settings.Env["ANTHROPIC_UNIX_SOCKET"]; got != socket {
+				t.Fatalf("--settings replaced the socket route: ANTHROPIC_UNIX_SOCKET=%q, want %q", got, socket)
+			}
+			if got := settings.Env["ANTHROPIC_BASE_URL"]; got == "http://cli-settings.invalid" {
+				t.Fatalf("--settings replaced the socket route: ANTHROPIC_BASE_URL=%q", got)
+			}
+		})
+	}
+}
+
 func TestPooledClaudeLaunchKeepsCLISettingsHooks(t *testing.T) {
 	for name, args := range cliSettingsArgVariants(t, t.TempDir()) {
 		t.Run(name, func(t *testing.T) {

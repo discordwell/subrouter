@@ -152,7 +152,7 @@ func pickClaudeForSession(t *testing.T, server Server, sessionID string) (accoun
 	}
 	req.Header.Set("X-Subrouter-Agent", "claude")
 	req.Header.Set("X-Subrouter-Session", sessionID)
-	account, _, _, err := server.accountForSessionProvider(accounts.ProviderClaude, "claude", sessionID, req)
+	account, _, _, _, err := server.accountForSessionProvider(accounts.ProviderClaude, "claude", sessionID, req)
 	return account, err
 }
 
@@ -185,9 +185,12 @@ func TestClaudeNewSessionKeepsSubscriptionAheadOfPromotedKey(t *testing.T) {
 	statuses := server.withClaudeCostTiers([]AccountUsageStatus{
 		{AccountStatus: AccountStatus{ID: "claude:behind", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeAPIKey}},
 	})
+	// The pace still reads behind, but the status never says promoted:
+	// this fork's routing does not promote a key (upstream #570; see
+	// claude_cost_tiers.go).
 	credit := statuses[0].Credit
-	if credit == nil || !credit.Promoted || credit.RemainingUSD != 195 || credit.Pace != claudeCreditPaceBehind {
-		t.Fatalf("status credit = %+v, want $195 left, behind, promoted", credit)
+	if credit == nil || credit.Promoted || credit.RemainingUSD != 195 || credit.Pace != claudeCreditPaceBehind {
+		t.Fatalf("status credit = %+v, want $195 left, behind, not promoted", credit)
 	}
 }
 
@@ -206,21 +209,9 @@ func TestClaudeFinal48hKeyStaysBehindSubscriptionAndSoonestExpiryFirst(t *testin
 	if got.ID != "plan" {
 		t.Fatalf("picked %q, want subscription quota ahead of a key expiring within 48h", got.ID)
 	}
-
-	// Two ordinary (unpromoted) keys: the one expiring first is spent first.
-	soon := creditState(now.Add(-time.Hour), 0)
-	soon.ExpiresAt = now.Add(10 * 24 * time.Hour)
-	far := creditState(now.Add(-time.Hour), 0)
-	server, _ = claudeCreditServer(t,
-		[]selectacct.Score{{AccountID: "plan", Headroom: 0, ShortHeadroom: 0, WeeklyHeadroom: 0, WeeklyHeadroomKnown: true}},
-		map[string]claudeCreditKeyState{"claude:far": far, "claude:soon": soon})
-	got, err = pickClaudeForSession(t, server, "s-soon")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got.ID != "claude:soon" {
-		t.Fatalf("picked %q, want the soonest-expiring grant", got.ID)
-	}
+	// Upstream also ranks two unpromoted keys by grant expiry
+	// (Score.CreditExpiresAt, #570); this fork's selectacct does not carry
+	// it, so that half is not here.
 }
 
 // Moving a running session re-bills its whole prompt prefix, so a promoted
@@ -242,10 +233,12 @@ func TestClaudePromotedKeyDoesNotMoveRunningSession(t *testing.T) {
 	}
 }
 
-func TestClaudeSpentKeyHeldUntilPeriodEndThenExtraUsageThen503(t *testing.T) {
+// Upstream reaches a subscription's paid extra usage between the spent key
+// and the 503 (#569); this fork never spends extra usage (PATCHES §23), so a
+// spent key with every plan cooked goes straight to the pool-exhausted error.
+func TestClaudeSpentKeyHeldUntilPeriodEndThen503(t *testing.T) {
 	now := time.Now().UTC()
-	cooked := selectacct.Score{AccountID: "plan", Headroom: 0, ShortHeadroom: 0, WeeklyHeadroom: 0, WeeklyHeadroomKnown: true,
-		ClaudeExtraUsageEnabled: true, ClaudeExtraUsageKnown: true, ClaudeExtraUsageRemaining: 500}
+	cooked := selectacct.Score{AccountID: "plan", Headroom: 0, ShortHeadroom: 0, WeeklyHeadroom: 0}
 	server, _ := claudeCreditServer(t, []selectacct.Score{cooked},
 		map[string]claudeCreditKeyState{"claude:only": creditState(now.AddDate(0, 0, -5), 0)})
 	got, err := pickClaudeForSession(t, server, "s-1")
@@ -259,12 +252,6 @@ func TestClaudeSpentKeyHeldUntilPeriodEndThenExtraUsageThen503(t *testing.T) {
 	if view.HeldUntil.Before(now.Add(23 * time.Hour)) {
 		t.Fatalf("hold until %v, want the day-long re-probe hold, not one hour", view.HeldUntil)
 	}
-	got, err = pickClaudeForSession(t, server, "s-2")
-	if err != nil || got.ID != "plan" {
-		t.Fatalf("picked %q, %v; want extra usage once free credit is spent", got.ID, err)
-	}
-
-	cooked.ClaudeExtraUsageEnabled = false
 	cooked.Provider = accounts.ProviderClaude
 	server.SchedulerRef.Set(selectacct.NewScheduler([]selectacct.Score{cooked,
 		{AccountID: "claude:only", Provider: accounts.ProviderClaude, Headroom: 0.01, ShortHeadroom: 0.01, MissingModelSupport: selectacct.ModelSupportUnknown}}))

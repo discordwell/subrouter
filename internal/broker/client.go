@@ -306,10 +306,14 @@ func (c *Client) UsageStatuses(ctx context.Context) ([]UsageStatus, error) {
 		return nil, errors.New("hosted usage status requires a hosted tenant")
 	}
 	var statuses []UsageStatus
+	// The plain cached read, not upstream #497's ?refresh=1: against a
+	// subrouter tenant that forces a live sweep, and every sweep refreshes
+	// every account's token (ops/PATCHES.md §44). The CLI sends
+	// it nowhere in this fork.
 	if err := c.doHostedJSON(
 		ctx,
 		http.MethodGet,
-		"/_subrouter/usage-status?refresh=1",
+		"/_subrouter/usage-status",
 		nil,
 		&statuses,
 	); err != nil {

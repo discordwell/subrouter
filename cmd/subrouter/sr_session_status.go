@@ -98,16 +98,6 @@ func (r srRunner) ledgerServer(ctx context.Context, name string) (srServerConfig
 	return r.namedRemoteServer(ctx, defaultSRServerStore(r.store), name)
 }
 
-// launchServerName is the name recorded for a launch: the selected remote,
-// or "local".
-func (r srRunner) launchServerName() string {
-	server, remote, err := r.selectedRemoteServer()
-	if err != nil || !remote {
-		return "local"
-	}
-	return server.Name
-}
-
 func (r srRunner) fetchServerSessionAssignments(ctx context.Context, server srServerConfig, agent, sessionID string) ([]serverSessionAssignment, error) {
 	baseURL, err := serverControlBaseURL(server)
 	if err != nil {
@@ -634,7 +624,10 @@ type sessionHookArgs struct {
 	shared   bool
 	launchID string
 	storeDir string
-	rest     []string
+	// settingSources is the launch's --setting-sources value, nil when the
+	// launch chose none: the user status line is chained only from those.
+	settingSources *string
+	rest           []string
 }
 
 func parseSessionHookArgs(args []string, name string) (sessionHookArgs, error) {
@@ -643,10 +636,16 @@ func parseSessionHookArgs(args []string, name string) (sessionHookArgs, error) {
 	launch := flags.String("launch", "", "launch id")
 	storeDir := flags.String("store-dir", "", "subrouter store directory")
 	shared := flags.Bool("shared", false, "match the launch by working directory")
+	var settingSources *string
+	flags.Func("setting-sources", "the launch's Claude setting sources", func(value string) error {
+		settingSources = &value
+		return nil
+	})
 	if err := flags.Parse(args); err != nil {
 		return sessionHookArgs{}, err
 	}
-	return sessionHookArgs{shared: *shared, launchID: strings.TrimSpace(*launch), storeDir: strings.TrimSpace(*storeDir), rest: flags.Args()}, nil
+	return sessionHookArgs{shared: *shared, launchID: strings.TrimSpace(*launch), storeDir: strings.TrimSpace(*storeDir),
+		settingSources: settingSources, rest: flags.Args()}, nil
 }
 
 // hookRunner builds the runner a hook uses: the launch's store, and the
@@ -660,7 +659,7 @@ func (h sessionHookArgs) runner(program string, out io.Writer) (srRunner, sessio
 	if launch, ok, _ := ledger.loadLaunch(h.launchID); ok && launch.LocalBaseURL != "" {
 		_ = os.Setenv("SUBROUTER_LOCAL_BASE_URL", launch.LocalBaseURL)
 	}
-	return srRunner{program: program, store: store, useServingAPI: true, in: os.Stdin, out: out, errOut: io.Discard}, ledger
+	return srRunner{program: program, store: store, in: os.Stdin, out: out, errOut: io.Discard}, ledger
 }
 
 // runHiddenSessionCommand dispatches the hook entry points. It runs before
@@ -690,7 +689,7 @@ func runSessionStatusLine(program string, args []string, in io.Reader, out io.Wr
 	body, _ := io.ReadAll(io.LimitReader(in, 1<<20))
 	// The user's own status line runs alongside sr's render.
 	userLine := make(chan string, 1)
-	go func() { userLine <- runUserClaudeStatusLine(body) }()
+	go func() { userLine <- runUserClaudeStatusLine(body, hook.settingSources) }()
 	line, sessionID, due := r.sessionStatusLine(ledger, hook.launchID, body)
 	if due {
 		startSessionRefreshOnce(ledger, hook, sessionID)
@@ -791,7 +790,22 @@ func hookLaunch(ledger sessionLedger, launchID string) sessionLaunchRecord {
 // userClaudeStatusLineSettings lists the settings files that can define the
 // status line sr's injected hook would otherwise hide, highest precedence
 // first: project local, project, then the launch's config directory.
-func userClaudeStatusLineSettings(input []byte) []string {
+//
+// settingSources is the launch's --setting-sources (nil: none chosen). A
+// launch that chose its sources gets a status line only from those -- local
+// (settings.local.json), project (settings.json), user (the config
+// directory's) -- and never from ~/.claude/settings.json, which sr carries
+// into no such launch (PATCHES 29.9.2: "a caller who left 'user' out gets
+// nothing from sr").
+func userClaudeStatusLineSettings(input []byte, settingSources *string) []string {
+	allowed := func(string) bool { return true }
+	if settingSources != nil {
+		chosen := map[string]bool{}
+		for _, source := range strings.Split(*settingSources, ",") {
+			chosen[strings.ToLower(strings.TrimSpace(source))] = true
+		}
+		allowed = func(source string) bool { return chosen[source] }
+	}
 	var workspace struct {
 		Cwd       string `json:"cwd"`
 		Workspace struct {
@@ -803,7 +817,12 @@ func userClaudeStatusLineSettings(input []byte) []string {
 	var paths []string
 	for _, dir := range []string{workspace.Workspace.ProjectDir, workspace.Workspace.CurrentDir, workspace.Cwd} {
 		if dir = strings.TrimSpace(dir); dir != "" && filepath.IsAbs(dir) {
-			paths = append(paths, filepath.Join(dir, ".claude", "settings.local.json"), filepath.Join(dir, ".claude", "settings.json"))
+			if allowed("local") {
+				paths = append(paths, filepath.Join(dir, ".claude", "settings.local.json"))
+			}
+			if allowed("project") {
+				paths = append(paths, filepath.Join(dir, ".claude", "settings.json"))
+			}
 			break
 		}
 	}
@@ -813,8 +832,11 @@ func userClaudeStatusLineSettings(input []byte) []string {
 			configDir = filepath.Join(home, ".claude")
 		}
 	}
-	if configDir != "" {
+	if configDir != "" && allowed("user") {
 		paths = append(paths, filepath.Join(configDir, "settings.json"))
+	}
+	if settingSources != nil {
+		return paths
 	}
 	// A pooled launch runs with CLAUDE_CONFIG_DIR set to its proxy directory,
 	// whose settings never hold the user's status line. Fall back to the
@@ -827,10 +849,11 @@ func userClaudeStatusLineSettings(input []byte) []string {
 	return paths
 }
 
-// runUserClaudeStatusLine chains the user's own status line command.
-func runUserClaudeStatusLine(input []byte) string {
+// runUserClaudeStatusLine chains the user's own status line command, from the
+// sources the launch loads (userClaudeStatusLineSettings).
+func runUserClaudeStatusLine(input []byte, settingSources *string) string {
 	command := ""
-	for _, path := range userClaudeStatusLineSettings(input) {
+	for _, path := range userClaudeStatusLineSettings(input, settingSources) {
 		if command = userClaudeStatusLineCommand(path); command != "" {
 			break
 		}
@@ -896,8 +919,10 @@ func hookCommandQuote(value string) string {
 }
 
 // claudeStatusLineSetting is the statusLine block sr adds to a pooled
-// launch's private settings, or nil when disabled.
-func claudeStatusLineSetting(launchID, storeDir string) map[string]any {
+// launch's private settings, or nil when disabled. settingSources, when the
+// launch chose them, rides along so the hook chains no status line from a
+// source the caller left out.
+func claudeStatusLineSetting(launchID, storeDir string, settingSources *string) map[string]any {
 	if disabled := strings.TrimSpace(os.Getenv(sessionStatusDisableEnv)); disabled == "0" || strings.EqualFold(disabled, "false") || strings.EqualFold(disabled, "off") {
 		return nil
 	}
@@ -905,9 +930,13 @@ func claudeStatusLineSetting(launchID, storeDir string) map[string]any {
 	if err != nil || !validSessionLaunchID(launchID) {
 		return nil
 	}
+	command := hookCommandQuote(executable) + " " + sessionStatusLineCommand + " --launch " + launchID + " --store-dir " + hookCommandQuote(storeDir)
+	if settingSources != nil {
+		command += " --setting-sources " + hookCommandQuote(*settingSources)
+	}
 	return map[string]any{
 		"type":    "command",
-		"command": hookCommandQuote(executable) + " " + sessionStatusLineCommand + " --launch " + launchID + " --store-dir " + hookCommandQuote(storeDir),
+		"command": command,
 		"padding": 0,
 	}
 }

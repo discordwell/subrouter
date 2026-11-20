@@ -55,7 +55,9 @@ func TestLiveDebitsNeverMoveSubscriptionBehindAPIKey(t *testing.T) {
 		{AccountID: sub.ID, Provider: sub.Provider, Headroom: 0.50, ShortHeadroom: 0.50},
 		{AccountID: other.ID, Provider: other.Provider, Headroom: 0.45, ShortHeadroom: 0.45},
 	}).WithLiveDebits(map[string]int{ScoreKey(sub.Provider, sub.ID): 6})
-	if picked, _ := scheduler.PickBest([]account.Account{key, sub, other}); picked.ID != other.ID {
-		t.Fatalf("PickBest = %q, want the undebited subscription account", picked.ID)
+	// Pick: the fork's deterministic pick (PATCHES §10); upstream's
+	// PickBest belongs to its spread placement (§23).
+	if picked, _ := scheduler.Pick([]account.Account{key, sub, other}); picked.ID != other.ID {
+		t.Fatalf("Pick = %q, want the undebited subscription account", picked.ID)
 	}
 }

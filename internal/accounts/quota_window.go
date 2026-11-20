@@ -1,7 +1,6 @@
 package accounts
 
 import (
-	"fmt"
 	"strings"
 	"time"
 )
@@ -14,6 +13,13 @@ const longQuotaWindowMinSeconds = 6 * 24 * 60 * 60
 // per-model limit rather than the account-wide quota.
 func IsModelScopedWindow(window UsageWindow) bool {
 	return strings.TrimSpace(window.Feature) != ""
+}
+
+// IsSpendWindow reports a window that carries a usage-based Codex seat's
+// workspace spend cap (spend_control) rather than a rate limit. A rate-limit
+// reset credit resets rate limits, so it never lifts one of these.
+func IsSpendWindow(window UsageWindow) bool {
+	return window.Name == CodexSpendWindowName || window.Name == CodexSpendReachedWindowName
 }
 
 // IsLongQuotaWindow reports whether a window is the weekly quota. A reported
@@ -32,6 +38,9 @@ func IsLongQuotaWindow(window UsageWindow) bool {
 // fully consumed. When no account-wide weekly window is reported at all, the
 // synthetic "reached" window (upstream limit_reached) stands in for it,
 // unless a full shorter window already explains the limit.
+// A usage-based seat's "spend/reached" is cooked on its own: it is the
+// upstream's hard stop on the seat's only quota, which no shorter window
+// explains and no reset credit lifts (PATCHES.md §42).
 // This is the single definition of "cooked" shared by sr status, sr switch,
 // sr reset, and the server's reset handler.
 func WeeklyCookedWindow(windows []UsageWindow) (UsageWindow, bool) {
@@ -45,8 +54,21 @@ func WeeklyCookedWindow(windows []UsageWindow) (UsageWindow, bool) {
 		// Cached status can outlive the provider's quota window when the
 		// usage endpoint is throttled. An absolute reset is authoritative:
 		// once it has passed, the old 100% reading no longer means cooked.
+		// The window was still reported, though: the same reading's
+		// synthetic "reached" (limit_reached, no reset of its own) must not
+		// stand in for a weekly window whose reset passed, nor for a full
+		// short window that explained it, or the stale cook the skip exists
+		// to clear came back through "reached".
 		if !window.ResetAt.IsZero() && !window.ResetAt.After(time.Now()) {
+			if IsLongQuotaWindow(window) {
+				sawLong = true
+			} else if window.LimitWindowSeconds > 0 && window.UsedPercent >= 100 {
+				shortFull = true
+			}
 			continue
+		}
+		if window.Name == CodexSpendReachedWindowName {
+			return window, true
 		}
 		if window.Name == "reached" {
 			reached = &windows[i]
@@ -81,32 +103,4 @@ func WeeklyResetWait(windows []UsageWindow) int64 {
 		return 0
 	}
 	return window.ResetAfterSeconds
-}
-
-// DescribeAccountWindows summarizes the account-wide windows a cooked
-// decision was made from, e.g. "primary 7d 100%, secondary 5h 40%". Model
-// scoped windows are left out because they never decide eligibility.
-func DescribeAccountWindows(windows []UsageWindow) string {
-	var parts []string
-	for _, window := range windows {
-		if IsModelScopedWindow(window) {
-			continue
-		}
-		if window.Name == "reached" {
-			parts = append(parts, "limit_reached")
-			continue
-		}
-		length := "unknown length"
-		switch {
-		case window.LimitWindowSeconds >= 24*60*60:
-			length = fmt.Sprintf("%dd", window.LimitWindowSeconds/(24*60*60))
-		case window.LimitWindowSeconds > 0:
-			length = fmt.Sprintf("%dh", (window.LimitWindowSeconds+1800)/3600)
-		}
-		parts = append(parts, fmt.Sprintf("%s %s %.0f%%", window.Name, length, window.UsedPercent))
-	}
-	if len(parts) == 0 {
-		return "no account-wide windows reported"
-	}
-	return strings.Join(parts, ", ")
 }

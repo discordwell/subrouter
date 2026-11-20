@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -26,8 +26,31 @@ const MaxRetainedAssignments = 512
 const UserEmailRetention = 30 * 24 * time.Hour
 
 // sessionActivityWriteInterval keeps active-session retention accurate without
-// rewriting the shared store for every proxied request.
-const sessionActivityWriteInterval = 24 * time.Hour
+// rewriting the shared store for every proxied request. It bounds how far a
+// persisted UpdatedAt can lag real use, so it must stay well inside the warm
+// window: upstream's 24h let a session in active use carry an UpdatedAt from
+// yesterday, which the 512-entry prune then read as the oldest in the store.
+const sessionActivityWriteInterval = 10 * time.Minute
+
+// warmSessionWindow is how long after its last turn a session is still warm:
+// the upstream prompt-cache lifetime, the same 60 minutes as the proxy's
+// warmSessionIdleTTL (PATCHES.md sections 20, 21 and 67), which covers Codex
+// and Claude sessions alike. Keep the two in step.
+const warmSessionWindow = 60 * time.Minute
+
+// WarmAssignmentRetention is the age below which the MaxRetainedAssignments
+// prune never drops an assignment. A warm session moves only when its account
+// is evicted; losing its assignment to a size cap would re-pick it cold, which
+// is a move that is not an eviction. The write interval is added because a
+// persisted UpdatedAt lags the last turn by up to that much. If more than
+// MaxRetainedAssignments assignments are warm at once, the store keeps them
+// all: the bound yields to the warm rule, never the other way round.
+const WarmAssignmentRetention = warmSessionWindow + sessionActivityWriteInterval
+
+// answeredWriteInterval coalesces NoteAnswered's writes, as
+// sessionActivityWriteInterval does Touch's: a session answered every few
+// seconds rewrites the store once a minute, not once a turn.
+const answeredWriteInterval = time.Minute
 
 type Assignment struct {
 	AgentType string    `json:"agent_type"`
@@ -36,23 +59,43 @@ type Assignment struct {
 	UserEmail string    `json:"user_email,omitempty"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
+	// Refugee is set when the session was placed on this account because the
+	// box its cache was on could not be reached (PATCHES §67). It stays while
+	// the assignment keeps the account.
+	Refugee *Refugee `json:"refugee,omitempty"`
+	// AnsweredAt is when one of the session's model turns was last answered:
+	// the clock a stranded chat gives up on (PATCHES §67), kept here so a
+	// chain of holds that moves to another process keeps it. It lags the
+	// last answer by less than answeredWriteInterval.
+	AnsweredAt time.Time `json:"answered_at,omitzero"`
+}
+
+// Refugee marks a chat placed on an account because the box its prompt
+// cache was on was found down (PATCHES §67): where it came from and when it
+// was placed. An account takes a bounded number of warm refugees.
+type Refugee struct {
+	Origin   string    `json:"origin"`
+	PlacedAt time.Time `json:"placed_at"`
 }
 
 type Store struct {
 	path string
 	mu   sync.Mutex
 	data map[string]Assignment
-	// seen is this process's last use of each assignment key. UpdatedAt is
-	// written at most once per sessionActivityWriteInterval, so it cannot
-	// tell a session that ran a minute ago from one idle for a day; seen can.
-	// It is memory only: the routing process is the one that touches. After
-	// a restart a running session older than the window counts as idle until
-	// its next request.
-	seen map[string]time.Time
+	// lastUsed records, in memory only, when this process last looked a
+	// session up (Get) or touched it. The prune reads it alongside UpdatedAt so
+	// a session in active use through this daemon is never pruned even when
+	// its persisted UpdatedAt is older (Touch coalesces writes, and a proxy
+	// that does not call Touch leaves UpdatedAt at the last assignment).
+	lastUsed map[string]time.Time
+	// writeFile durably replaces s.path; nil means fsutil.WriteFileAtomic.
+	// Tests set it to make a rewrite fail, which a root-run container cannot
+	// otherwise arrange with file permissions.
+	writeFile func(path string, body []byte, mode os.FileMode) error
 }
 
 func NewStore(path string) (*Store, error) {
-	store := &Store{path: path, data: map[string]Assignment{}, seen: map[string]time.Time{}}
+	store := &Store{path: path, data: map[string]Assignment{}}
 	lock, err := lockSessionStore(path)
 	if err != nil {
 		return nil, err
@@ -67,9 +110,21 @@ func NewStore(path string) (*Store, error) {
 func (s *Store) Get(agentType, sessionID string) (Assignment, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	key := ScopedSessionKey(agentType, sessionID)
+	// Recorded before the reload, whose prune must already see this lookup:
+	// a request for a session is use of it, and the reload is where a store
+	// over the cap drops its oldest entries.
+	s.noteUsedLocked(key, time.Now().UTC())
 	s.reloadBestEffortLocked()
-	assignment, ok := s.data[ScopedSessionKey(agentType, sessionID)]
+	assignment, ok := s.data[key]
 	return assignment, ok
+}
+
+func (s *Store) noteUsedLocked(key string, at time.Time) {
+	if s.lastUsed == nil {
+		s.lastUsed = map[string]time.Time{}
+	}
+	s.lastUsed[key] = at
 }
 
 func (s *Store) Put(agentType, sessionID, accountID, userEmail string) (Assignment, error) {
@@ -100,49 +155,63 @@ func (s *Store) Put(agentType, sessionID, accountID, userEmail string) (Assignme
 		UpdatedAt: now,
 	}
 	if existing, ok := s.data[key]; ok {
-		assignment.CreatedAt = existing.CreatedAt
+		assignment.CreatedAt, assignment.AnsweredAt = existing.CreatedAt, existing.AnsweredAt
 		if assignment.UserEmail == "" {
 			assignment.UserEmail = existing.UserEmail
 		}
+		if existing.AccountID == accountID {
+			assignment.Refugee = existing.Refugee
+		}
 	}
 	s.data[key] = assignment
-	s.noteSeenLocked(key, now)
 	s.pruneLocked()
 	return assignment, s.saveLocked()
 }
 
-func (s *Store) noteSeenLocked(key string, now time.Time) {
-	if s.seen == nil {
-		s.seen = map[string]time.Time{}
-	}
-	s.seen[key] = now
-}
-
-// ActiveSince returns the assignments used at or after cutoff: by this
-// process (Put, Touch, CompareAndPut) or, failing that, by their stored
-// UpdatedAt. Placement counts these instead of every retained assignment, so
-// sessions that ended hours ago stop damping their account's share of new
-// sessions.
-func (s *Store) ActiveSince(cutoff time.Time) []Assignment {
+// PutRefugee places a session on accountID as a refugee from origin, unless
+// accountID already holds slots refugees that count (counts): the count and
+// the write happen under one lock, so two placements cannot both take the
+// last slot. held is the account's refugees with this one.
+func (s *Store) PutRefugee(agentType, sessionID, accountID string, mark Refugee, slots int, counts func(Assignment) bool) (held int, placed bool, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.reloadBestEffortLocked()
-	active := make([]Assignment, 0, len(s.data))
-	for key, assignment := range s.data {
-		last := assignment.UpdatedAt
-		if seen, ok := s.seen[key]; ok && seen.After(last) {
-			last = seen
-		}
-		if !last.Before(cutoff) {
-			active = append(active, assignment)
+	lock, err := lockSessionStore(s.path)
+	if err != nil {
+		return 0, false, err
+	}
+	defer lock.Close()
+	if err := s.loadLocked(); err != nil {
+		return 0, false, err
+	}
+	normalizedAgent := NormalizeAgentType(agentType)
+	if normalizedAgent == "" {
+		normalizedAgent = "codex"
+	}
+	stickySessionID := StickySessionID(normalizedAgent, sessionID)
+	key := ScopedSessionKey(normalizedAgent, stickySessionID)
+	for other, assignment := range s.data {
+		if other != key && assignment.Refugee != nil && assignment.AccountID == accountID && counts(assignment) {
+			held++
 		}
 	}
-	for key := range s.seen {
-		if _, ok := s.data[key]; !ok {
-			delete(s.seen, key)
-		}
+	if held >= slots {
+		return held, false, nil
 	}
-	return active
+	now := time.Now().UTC()
+	assignment := Assignment{
+		AgentType: normalizedAgent,
+		SessionID: stickySessionID,
+		AccountID: accountID,
+		CreatedAt: now,
+		UpdatedAt: now,
+		Refugee:   &mark,
+	}
+	if existing, ok := s.data[key]; ok {
+		assignment.CreatedAt, assignment.UserEmail, assignment.AnsweredAt = existing.CreatedAt, existing.UserEmail, existing.AnsweredAt
+	}
+	s.data[key] = assignment
+	s.pruneLocked()
+	return held + 1, true, s.saveLocked()
 }
 
 // Touch records recent use of an existing sticky assignment. Updates are
@@ -166,7 +235,7 @@ func (s *Store) Touch(agentType, sessionID string) (Assignment, bool, error) {
 		return Assignment{}, false, nil
 	}
 	now := time.Now().UTC()
-	s.noteSeenLocked(key, now)
+	s.noteUsedLocked(key, now)
 	if now.Sub(assignment.UpdatedAt) < sessionActivityWriteInterval {
 		return assignment, true, nil
 	}
@@ -176,6 +245,34 @@ func (s *Store) Touch(agentType, sessionID string) (Assignment, bool, error) {
 		return Assignment{}, false, err
 	}
 	return assignment, true, nil
+}
+
+// NoteAnswered records that one of an existing assignment's model turns was
+// answered at at. The write is skipped while the stored AnsweredAt is less
+// than answeredWriteInterval older, or later (another process answered one
+// since).
+func (s *Store) NoteAnswered(agentType, sessionID string, at time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key := ScopedSessionKey(agentType, sessionID)
+	if assignment, ok := s.data[key]; ok && at.Sub(assignment.AnsweredAt) < answeredWriteInterval {
+		return nil
+	}
+	lock, err := lockSessionStore(s.path)
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+	if err := s.loadLocked(); err != nil {
+		return err
+	}
+	assignment, ok := s.data[key]
+	if !ok || at.Sub(assignment.AnsweredAt) < answeredWriteInterval {
+		return nil
+	}
+	assignment.AnsweredAt = at.UTC()
+	s.data[key] = assignment
+	return s.saveLocked()
 }
 
 // CompareAndPut replaces one sticky assignment only while it still points at
@@ -213,20 +310,35 @@ func (s *Store) CompareAndPut(agentType, sessionID, expectedAccountID, accountID
 		CreatedAt: existing.CreatedAt,
 		UpdatedAt: now,
 	}
+	assignment.AnsweredAt = existing.AnsweredAt
 	if assignment.UserEmail == "" {
 		assignment.UserEmail = existing.UserEmail
+	}
+	if existing.AccountID == accountID {
+		assignment.Refugee = existing.Refugee
 	}
 	s.data[key] = assignment
 	if err := s.saveLocked(); err != nil {
 		s.data[key] = existing
 		return Assignment{}, false, err
 	}
-	s.noteSeenLocked(key, now)
 	return assignment, true, nil
 }
 
-// Delete removes one scoped sticky assignment and its self-reported identity
-// metadata. It is used by the admin-only sessions endpoint.
+// Delete removes one sticky assignment, returning whether one was there. It
+// backs the admin-only sessions endpoint's DELETE and the pool board.
+//
+// The store had no removal at all, which is why assignments are immortal and
+// why CountByAccount grows without bound (see the warning on
+// activeSessionCountsByAccount in internal/proxy). Every other route to
+// changing an assignment is a Put, so "stop pinning this session" could only be
+// expressed as "pin it somewhere else" -- which is not the same thing, and
+// leaves the account it pointed at still counted in the spread signal.
+//
+// Deliberately reuses Put's exact path -- mutex, lockSessionStore, loadLocked,
+// mutate, saveLocked -- rather than a second locking scheme. Two writers with
+// different lock orders interleave, and the file this rewrites is re-read by the
+// daemon on every proxied request.
 func (s *Store) Delete(agentType, sessionID string) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -244,6 +356,49 @@ func (s *Store) Delete(agentType, sessionID string) (bool, error) {
 	}
 	delete(s.data, key)
 	return true, s.saveLocked()
+}
+
+// DeleteMany removes several assignments under ONE lock and ONE rewrite, and
+// reports how many existed. Looping Delete would take the flock and rewrite the
+// file once per key, so a prune of a hundred orphans would be a hundred
+// tmp+rename cycles on a file the daemon reads on every request.
+func (s *Store) DeleteMany(refs []Ref) (int, error) {
+	if len(refs) == 0 {
+		return 0, nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	lock, err := lockSessionStore(s.path)
+	if err != nil {
+		return 0, err
+	}
+	defer lock.Close()
+	if err := s.loadLocked(); err != nil {
+		return 0, err
+	}
+	removed := 0
+	for _, ref := range refs {
+		key := ScopedSessionKey(ref.AgentType, ref.SessionID)
+		if _, ok := s.data[key]; !ok {
+			continue
+		}
+		delete(s.data, key)
+		removed++
+	}
+	if removed == 0 {
+		// Nothing changed, so do not rewrite the file. A no-op prune must not
+		// churn a file every proxied request re-reads.
+		return 0, nil
+	}
+	return removed, s.saveLocked()
+}
+
+// Ref names one assignment. Callers pass the raw agent type and session ID and
+// let ScopedSessionKey normalize -- notably the codex truncate-at-first-colon
+// rule, which a caller assembling keys by hand gets wrong.
+type Ref struct {
+	AgentType string `json:"agent_type"`
+	SessionID string `json:"session_id"`
 }
 
 func (s *Store) All() []Assignment {
@@ -297,15 +452,12 @@ func (s *Store) loadLocked() error {
 	}
 	data := map[string]Assignment{}
 	if err := json.Unmarshal(body, &data); err != nil {
-		// Assignments are routing stickiness only: losing them sends the
-		// next request of each session through normal account selection.
-		// Refusing to load would instead fail every Put/Touch/CompareAndPut
-		// forever, so keep the bytes for inspection and start empty.
-		if quarantineErr := s.quarantineCorruptLocked(err); quarantineErr != nil {
-			return quarantineErr
-		}
-		s.data = map[string]Assignment{}
-		return nil
+		// Refusing to load fails NewStore -- fatal to `serve` and to loading
+		// a tenant, so launchd/systemd restart the daemon into the same parse
+		// error forever -- and fails every later Put/Touch/CompareAndPut. So
+		// keep the bytes for inspection and carry on; s.data is untouched,
+		// because the failed parse went into a separate map.
+		return s.recoverCorruptLocked(body, err)
 	}
 	s.data = data
 	s.migrateLoadedAssignments()
@@ -321,28 +473,53 @@ func (s *Store) loadLocked() error {
 	return nil
 }
 
+// pruneLocked bounds the store to MaxRetainedAssignments, dropping the least
+// recently used first, and reports whether it removed anything. It never drops
+// an assignment used within WarmAssignmentRetention -- by its persisted
+// UpdatedAt or by this process's in-memory lastUsed -- even when that leaves the
+// store over the cap (see WarmAssignmentRetention). A store over the cap only
+// because of warm entries removes nothing, so a read-path reload does not
+// rewrite the file on every request.
 func (s *Store) pruneLocked() bool {
+	now := time.Now().UTC()
+	for key, used := range s.lastUsed {
+		if now.Sub(used) >= WarmAssignmentRetention {
+			delete(s.lastUsed, key)
+		}
+	}
 	if len(s.data) <= MaxRetainedAssignments {
 		return false
 	}
 	type entry struct {
-		key       string
-		updatedAt time.Time
+		key      string
+		lastUsed time.Time
 	}
 	entries := make([]entry, 0, len(s.data))
 	for key, assignment := range s.data {
-		entries = append(entries, entry{key: key, updatedAt: assignment.UpdatedAt})
+		used := assignment.UpdatedAt
+		if seen := s.lastUsed[key]; seen.After(used) {
+			used = seen
+		}
+		entries = append(entries, entry{key: key, lastUsed: used})
 	}
 	sort.Slice(entries, func(i, j int) bool {
-		if entries[i].updatedAt.Equal(entries[j].updatedAt) {
+		if entries[i].lastUsed.Equal(entries[j].lastUsed) {
 			return entries[i].key < entries[j].key
 		}
-		return entries[i].updatedAt.After(entries[j].updatedAt)
+		return entries[i].lastUsed.After(entries[j].lastUsed)
 	})
+	removed := false
 	for _, stale := range entries[MaxRetainedAssignments:] {
+		if now.Sub(stale.lastUsed) < WarmAssignmentRetention {
+			// Warm. Everything ranked above it is at least as recent, so the
+			// warm set alone exceeds the cap; keep it rather than move a warm
+			// session cold.
+			continue
+		}
 		delete(s.data, stale.key)
+		removed = true
 	}
-	return true
+	return removed
 }
 
 func (s *Store) expireUserEmailsLocked(now time.Time) bool {
@@ -366,20 +543,80 @@ func (s *Store) saveLocked() error {
 	if err != nil {
 		return err
 	}
-	return fsutil.WriteFileAtomic(s.path, body, 0o600)
+	// A unique temp file, fsynced before its rename, then a directory sync.
+	// The old fixed-name "sessions.json.tmp" written without a sync could leave
+	// a zero-length sessions.json after a power loss (APFS may commit the
+	// rename before the data), and a stale directory at that fixed name failed
+	// every write. The two syncs (file, then directory) run under s.mu, which
+	// every Get also takes. On macOS each is an F_FULLFSYNC -- the port
+	// assessment measured 15 ms median and 208 ms worst on the laptop -- and
+	// only writes pay it: a new or moved assignment, and Touch at most once
+	// per sessionActivityWriteInterval per session. A proxied request that
+	// lands behind one waits that long before routing; nothing is retried.
+	write := s.writeFile
+	if write == nil {
+		write = fsutil.WriteFileAtomic
+	}
+	return write(s.path, body, 0o600)
 }
 
-// quarantineCorruptLocked moves an unparseable store aside. The caller holds
-// the session store lock, so no other process is writing s.path meanwhile.
-func (s *Store) quarantineCorruptLocked(parseErr error) error {
+// recoverCorruptLocked replaces an unparseable sessions.json. The caller holds
+// the session store lock, so no other process reads or writes s.path meanwhile.
+//
+// Upstream (#369) always starts EMPTY here. That is the only choice for a
+// process with nothing in memory -- a daemon starting after the crash that
+// left the file torn -- but loadLocked also runs on every Get (the reload each
+// proxied request does), Put, Touch and CompareAndPut of a running daemon.
+// Starting empty there would drop every warm session's assignment, so each
+// one's next turn would be re-picked cold: a move that is not an eviction,
+// which the 70-minute warm rule (PATCHES.md sections 20, 21 and 28) forbids.
+// A running daemon's in-memory assignments are the newest state anyone still
+// has, so it keeps them and writes them over the torn file instead.
+//
+// The two paths differ in how the file is replaced, on purpose:
+//
+//   - Nothing to keep: upstream's rename aside. A rename writes no file data,
+//     so a daemon starting on a torn file does not also need room for a
+//     rewrite, and the next Put creates the file.
+//   - Assignments to keep: copy the torn bytes aside, then atomically replace
+//     the live file with memory. The live file is never absent, and if the
+//     rewrite fails the torn file stays where it was, so the next access
+//     retries and memory survives. Renaming it away first would instead let
+//     that next access read "no file", which loadLocked (rightly, for an
+//     operator's `rm`) treats as "no assignments" -- wiping memory on exactly
+//     the failing disk where the re-picks' own writes then fail as well.
+//
+// Residual, accepted: another process with nothing in memory (`sr` reading
+// SUBROUTER_SESSIONS) that reaches the torn file before the running daemon
+// does still starts it empty, and the daemon then reloads that. Our own
+// writers cannot tear the file while running (every one holds the flock and
+// renames a synced temp file), so reaching that needs an out-of-band writer.
+func (s *Store) recoverCorruptLocked(body []byte, parseErr error) error {
 	aside := fmt.Sprintf("%s.corrupt-%d", s.path, time.Now().UnixNano())
-	if err := os.Rename(s.path, aside); err != nil {
+	if len(s.data) == 0 {
+		if err := os.Rename(s.path, aside); err != nil {
+			return fmt.Errorf("parse %s: %w (quarantine failed: %v)", s.path, parseErr, err)
+		}
+		if err := fsutil.SyncDir(filepath.Dir(s.path)); err != nil {
+			return fmt.Errorf("sync %s after quarantine: %w", filepath.Dir(s.path), err)
+		}
+		slog.Warn("session store is corrupt; moved it aside and starting with no sticky assignments",
+			"path", s.path, "error", parseErr, "moved_to", aside)
+		return nil
+	}
+	if err := os.WriteFile(aside, body, 0o600); err != nil {
+		_ = os.Remove(aside)
 		return fmt.Errorf("parse %s: %w (quarantine failed: %v)", s.path, parseErr, err)
 	}
-	if err := fsutil.SyncDir(filepath.Dir(s.path)); err != nil {
-		return fmt.Errorf("sync %s after quarantine: %w", filepath.Dir(s.path), err)
+	if err := s.saveLocked(); err != nil {
+		// The torn file is still live and memory is intact; the next access
+		// retries. Drop this copy so a failing disk does not collect one per
+		// proxied request.
+		_ = os.Remove(aside)
+		return fmt.Errorf("parse %s: %w (rewrite from memory failed: %v)", s.path, parseErr, err)
 	}
-	log.Printf("session store: %s is corrupt (%v); moved it to %s and starting with no sticky assignments", s.path, parseErr, aside)
+	slog.Warn("session store is corrupt; kept this process's assignments and rewrote the store from them",
+		"path", s.path, "error", parseErr, "copied_to", aside, "assignments", len(s.data))
 	return nil
 }
 

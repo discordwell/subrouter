@@ -1,0 +1,1904 @@
+#!/bin/bash
+# claude-route -- route switch for NEW Claude Code (and Codex) launches on this machine:
+# your own login, or the local subrouter daemon's pool in socket ("first-party") mode.
+#
+#   off    the real Claude Code, untouched: your own login
+#   pool   ANTHROPIC_UNIX_SOCKET -> the daemon's Claude socket: every request goes
+#          through the pool, and Claude Code keeps its first-party features
+#
+# Route words: one-launch exceptions typed FIRST. The default (the mode file) never changes.
+#   claude local ...       safety mode: your own login, subrouter dropped completely
+#   claude <account> ...   through subrouter, pinned to that account (name, id, email, or an
+#                          alias in ~/.claude-route/aliases.tsv). Never falls back to your login.
+#   codex local / codex <account>   the same for the Codex CLI (codex shim, codex-mode file)
+# A word that can't be honoured exactly launches nothing (exit 2; 75 when the daemon is down).
+#
+# Why this shape: switching a machine onto subrouter used to strand sessions,
+# because the switch rewrote state that RUNNING sessions read (settings.json env,
+# auth files). Here nothing a running session reads is touched. A `claude` shim
+# sits on PATH ahead of the real binary (and behind Paradev's wrapper, which execs
+# the first non-Paradev `claude`), and picks the route once, at launch. Flipping
+# the mode changes only what the NEXT launch does, so a switch cannot strand one.
+# A pool launch whose socket is dead falls back to the daemon's TCP port (pool-tcp),
+# then to off, so a launch never hangs on a dead route (a socket-mode Claude whose
+# socket is dead retries silently for minutes instead of failing over).
+#
+# pool must look like a signed-in Claude Code. `test` checks that (same tools as
+# off), with one accepted gap: claude.ai connectors, which Claude Code itself turns
+# off for a socket-mode token (it lacks the user:mcp_servers scope, and connector
+# traffic bypasses the socket). `pool` refuses until the test passes.
+#
+# settings.json, the keychain, ~/.claude and ~/.codex are never written. CLAUDE_CONFIG_DIR is
+# left alone (sr claude would point it at the pool's active profile), except that `off`
+# drops one pointing into ~/.subrouter: off means your own login, never a pool profile's.
+#
+#   claude-route status           where things stand
+#   claude-route install          shims (each tested before it goes live) + PATH line in ~/.zshrc and ~/.zprofile
+#   claude-route accounts         refresh and print the account directory route words read
+#   claude-route socket-on        daemon serves ~/.subrouter/claude.sock (deploy-laptop.sh edits the plist under
+#                                 its lock, verifies, puts it back if anything fails; a supervised daemon needs
+#                                 --restart-supervisor)
+#   claude-route test             wet test: decisions, real launches checked against the daemon, parity
+#   claude-route check            one real launch the way a new Paradev session makes it (mode file decides)
+#   claude-route check codex      one real pooled Codex launch through Paradev's wrapper (your CODEX_HOME)
+#   claude-route pool [--force]   cut over NEW launches to the pool (refuses without a passing test today)
+#   claude-route off              roll back NEW launches to your own login (instant)
+#   claude-route codex pool [--force] | codex off   the same switch for NEW Codex launches (ships off)
+#   claude-route uninstall        remove the shims and the PATH lines (the socket stays: socket-off)
+#   claude-route socket-off [--force] [--restart-supervisor]
+#                                 stop serving the socket (refuses while pool sessions use it)
+#
+# One launch, either way, whatever the mode:  CLAUDE_ROUTE=off claude ...  /  CLAUDE_ROUTE=pool claude ...
+#
+# Paths: ops/deploy/macos/deploy-laptop.sh from this script's real path in ops/bin (CLAUDE_ROUTE_DEPLOY),
+# and `srq serving <session-id>` beside it, which prints the pool account that served a session
+# (CLAUDE_ROUTE_SRQ), for check and test. A copy outside the checkout finds neither.
+# CLAUDE_ROUTE_SOCKET, CLAUDE_ROUTE_TCP and CLAUDE_ROUTE_PLIST move the daemon, as they do for the shim.
+
+ROUTE_HOME="${CLAUDE_ROUTE_HOME:-$HOME/.claude-route}"
+SHIM_DIR="$ROUTE_HOME/bin"
+SHIM="$SHIM_DIR/claude"
+CODEX_SHIM="$SHIM_DIR/codex"
+MODE_FILE="$ROUTE_HOME/mode"
+CODEX_MODE_FILE="$ROUTE_HOME/codex-mode"
+LAST_TEST="$ROUTE_HOME/last-test"
+LAST_CODEX_TEST="$ROUTE_HOME/last-codex-test"
+LAST_CODEX_CHECK="$ROUTE_HOME/last-codex-check"
+ACCOUNTS="$ROUTE_HOME/accounts.tsv"
+ALIASES="$ROUTE_HOME/aliases.tsv"
+SOCK="${CLAUDE_ROUTE_SOCKET:-$HOME/.subrouter/claude.sock}"
+TCP="${CLAUDE_ROUTE_TCP:-http://127.0.0.1:31415}"
+PLIST="${CLAUDE_ROUTE_PLIST:-$HOME/Library/LaunchAgents/ai.manaflow.subrouter.plist}"
+HERE="$(dirname "$(/usr/bin/python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$0")")"
+DEPLOY="${CLAUDE_ROUTE_DEPLOY:-$HERE/../deploy/macos/deploy-laptop.sh}"
+SRQ="${CLAUDE_ROUTE_SRQ:-$HERE/srq}"
+PY=/usr/bin/python3
+GREP=/usr/bin/grep
+RC_FILES=("$HOME/.zshrc" "$HOME/.zprofile")
+MARK_BEGIN='# >>> claude-route >>>'
+MARK_END='# <<< claude-route <<<'
+
+die() { echo "claude-route: $*" >&2; exit 1; }
+health_ok() { [[ "$1" =~ \"ok\"[[:space:]]*:[[:space:]]*true ]]; }
+probe() { curl -q -s --noproxy '*' -m 2 "$@" 2>/dev/null; }
+socket_ok() { [ -S "$SOCK" ] && health_ok "$(probe --unix-socket "$SOCK" http://api.anthropic.com/_subrouter/health)"; }
+tcp_ok() { health_ok "$(probe "$TCP/_subrouter/health")"; }
+plist_get() { # <Key[:Sub]>
+    "$PY" -I - "$PLIST" "$1" <<'PY'
+import plistlib, sys
+path, key = sys.argv[1:3]
+with open(path, "rb") as f:
+    v = plistlib.load(f)
+for k in key.split(":"):
+    v = v.get(k) if isinstance(v, dict) else None
+if v is None:
+    sys.exit(1)
+print(v)
+PY
+}
+plist_sock() { plist_get EnvironmentVariables:SUBROUTER_CLAUDE_SOCKET 2>/dev/null; }
+plist_identity() { plist_get EnvironmentVariables:SUBROUTER_IDENTITY_ACCOUNT 2>/dev/null; }
+read_mode() { local m=""; [ -f "$1" ] && [ -r "$1" ] && read -r m < "$1"; m="${m%$'\r'}"; case "$m" in pool|off) echo "$m" ;; *) echo off ;; esac; }
+mode_now() { read_mode "$MODE_FILE"; }
+codex_mode_now() { read_mode "$CODEX_MODE_FILE"; }
+write_mode() { mkdir -p "$ROUTE_HOME" && printf '%s\n' "$2" > "$1.tmp.$$" && mv -f "$1.tmp.$$" "$1"; }
+set_mode() { write_mode "$MODE_FILE" "$1"; }
+set_codex_mode() { write_mode "$CODEX_MODE_FILE" "$1"; }
+passed_today() { case "$(cat "$1" 2>/dev/null)" in "PASS $(date +%Y-%m-%d)"*) return 0 ;; esac; return 1; }
+rc_has_block() { [ -f "$1" ] && $GREP -qF "$MARK_BEGIN" "$1"; }
+real_codex() { # the first codex on PATH that is neither a shim nor Paradev's wrapper
+    local d IFS=:
+    for d in $PATH; do
+        d="${d%/}"
+        case "$d" in ""|"$SHIM_DIR"|"$HOME"/.paradev/bin|"$HOME"/.paradev-*/bin|"$HOME"/.superset/bin|"$HOME"/.superset-*/bin) continue ;; esac
+        [ -x "$d/codex" ] && [ ! -d "$d/codex" ] || continue
+        head -c 512 "$d/codex" 2>/dev/null | $GREP -aq 'claude-route codex shim' && continue
+        echo "$d/codex"; return 0
+    done
+    return 1
+}
+
+# Remove exactly one well-formed block (and the blank line install put before it).
+# Anything else -- no end marker, two blocks, a block that grew -- leaves the file alone.
+rc_remove_block() {
+    python3 -I - "$1" "$MARK_BEGIN" "$MARK_END" <<'PY'
+import os, shutil, sys
+path, begin, end = sys.argv[1:4]
+text = open(path).read()
+lines = text.split('\n')
+b = [i for i, l in enumerate(lines) if l.startswith(begin)]
+e = [i for i, l in enumerate(lines) if l.startswith(end)]
+if len(b) != 1 or len(e) != 1 or not 0 < e[0] - b[0] <= 3:
+    print(f"left {path} alone: expected one block from '{begin}' to '{end}', found {len(b)} begin and {len(e)} end marker(s)")
+    sys.exit(2)
+start = b[0] - 1 if b[0] > 0 and lines[b[0] - 1] == '' else b[0]
+tmp = path + '.claude-route.tmp'
+with open(tmp, 'w') as f:
+    f.write('\n'.join(lines[:start] + lines[e[0] + 1:]))
+shutil.copymode(path, tmp)
+os.replace(tmp, path)
+PY
+}
+
+# ---------------------------------------------------------------------------
+# The account resolver both shims embed (one copy, here). It reads only the daemon's
+# account listings, which hold no credential, and caches the peers' in accounts.tsv.
+resolver_py() {
+    cat <<'RESOLVER_PY'
+# claude-route account resolver: is WORD an account of PROVIDER, and where does it live?
+# argv: provider word route_home tcp [--refresh]
+# Prints one line of fields joined by \x1f: kind id where note flags label
+#   local        a laptop account (id = canonical id)
+#   peer         an account a peer box holds (where = peer name, comma-joined if several)
+#   ambiguous    the word names several accounts (id = comma-joined id@where)
+#   gone         an alias whose account no daemon lists
+#   email        an unknown word with @ (where = the other provider, when it names one of its accounts)
+#   other        an account of the other provider (where = provider)
+#   near         a near miss (id = the closest account word, or 'local')
+#   unavailable  no live directory and no cached one
+#   none         not an account: the word is prompt text
+# flags (local/peer): ineligible (the daemon's new-session verdict is no; note = its reason),
+# paid (the account can bill past its plan: Codex credits, Claude extra usage),
+# unverified (no usage verdict could be read).
+# Sources: /_subrouter/accounts and /_subrouter/usage-status (live, laptop), and
+# /_subrouter/peers/usage-status (cached in accounts.tsv). None of them holds a credential.
+# Laptop membership is always live when the daemon answers, so an account that moved to a
+# peer is never pinned here from a stale cache. When the daemon does not answer, nothing
+# else is asked: the cache decides, and a pin is refused later anyway.
+import difflib, json, os, sys, tempfile, threading, time, urllib.request
+
+provider, word, home, tcp = sys.argv[1:5]
+refresh = "--refresh" in sys.argv[5:]
+other_provider = "codex" if provider == "claude" else "claude"
+CACHE = os.path.join(home, "accounts.tsv")
+ALIASES = os.path.join(home, "aliases.tsv")
+TTL, MISS_TTL = 600, 60
+COLS = ("provider", "id", "label", "email", "where", "eligible", "paid")
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def get(path, timeout):
+    try:
+        with opener.open(tcp.rstrip("/") + path, timeout=timeout) as r:
+            return json.loads(r.read(8 << 20)) if r.status == 200 else None
+    except Exception:
+        return None
+
+
+def clean(v):
+    return " ".join(str(v or "").replace("\x1f", " ").split())  # one cache cell, one output field
+
+
+def verdict(a):
+    ns = (a.get("normalized") or {}).get("new_session") or {}
+    if "eligible" not in ns:
+        return "?"
+    return "yes" if ns.get("eligible") else "no:" + clean(ns.get("reason") or "not eligible")
+
+
+def paid(a):  # "paid": it can bill past its plan (Codex credits, Claude extra usage); "?": not reported
+    known = on = False
+    cr, eu = a.get("credits"), a.get("extra_usage")
+    if isinstance(cr, dict):
+        known, on = True, on or bool(cr.get("HasCredits") or cr.get("has_credits") or cr.get("Unlimited") or cr.get("unlimited"))
+    if isinstance(eu, dict):
+        known, on = True, on or bool(eu.get("is_enabled"))
+    for w in a.get("windows") or []:
+        if isinstance(w, dict) and isinstance(w.get("extra_usage"), dict):
+            known, on = True, on or bool(w["extra_usage"].get("is_enabled"))
+    return "paid" if on else ("no" if known else "?")
+
+
+def row(prov, a, where, elig="?", pay="?"):
+    email = clean(a.get("email"))
+    return {"provider": clean(prov or "codex"), "id": clean(a.get("id")), "label": clean(a.get("label")),
+            "email": email if "@" in email else "", "where": where, "eligible": elig, "paid": pay}
+
+
+def read_local():
+    got = {}
+    def fetch(key, path, timeout):
+        got[key] = get(path, timeout)
+    ts = [threading.Thread(target=fetch, args=a) for a in (("accounts", "/_subrouter/accounts", 1.0), ("usage", "/_subrouter/usage-status", 1.5))]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    data = got.get("accounts")
+    if not isinstance(data, list):
+        return None
+    usage = got.get("usage")
+    urows = usage if isinstance(usage, list) else (usage.get("accounts") if isinstance(usage, dict) else None)
+    by = {}
+    for u in urows or []:
+        if isinstance(u, dict) and u.get("id"):
+            by[(u.get("provider") or "codex", u.get("id"))] = u
+    out = []
+    for a in data:
+        if not isinstance(a, dict) or not a.get("id"):
+            continue
+        prov = a.get("provider") or "codex"
+        u = by.get((prov, a.get("id")))
+        r = row(prov, a, "local", verdict(u) if u else "?", paid(u) if u else "?")
+        if not r["email"] and u and "@" in clean(u.get("email")):
+            r["email"] = clean(u.get("email"))  # a Claude account's email is only in usage-status
+        out.append(r)
+    return out
+
+
+def peer_rows():
+    data = get("/_subrouter/peers/usage-status", 4.0)
+    if not isinstance(data, dict) or not isinstance(data.get("peers"), list):
+        return None
+    out = []
+    for p in data["peers"]:
+        name = clean(p.get("name")) or "peer"
+        for a in p.get("accounts") or []:
+            if isinstance(a, dict) and a.get("id"):
+                out.append(row(a.get("provider"), a, name, verdict(a), paid(a)))
+    return out
+
+
+def read_cache():
+    try:
+        st = os.stat(CACHE)
+        with open(CACHE) as f:
+            rows = [dict(zip(COLS, l.rstrip("\n").split("\t"))) for l in f if l.strip() and not l.startswith("#")]
+        return [r for r in rows if r.get("id") and r.get("where")], time.time() - st.st_mtime
+    except Exception:
+        return None, None
+
+
+def write_cache(rows):
+    try:
+        os.makedirs(home, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=home, prefix=".accounts.tsv.")
+        with os.fdopen(fd, "w") as f:
+            f.write("# claude-route account directory (no credentials): " + " ".join(COLS) + "\n")
+            for r in rows:
+                f.write("\t".join(clean(r.get(c, "")) for c in COLS) + "\n")
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, CACHE)
+    except Exception:
+        pass
+
+
+def aliases():
+    out = {}
+    try:
+        with open(ALIASES) as f:
+            for l in f:
+                parts = [p.strip() for p in l.rstrip("\n").split("\t")]
+                if l.startswith("#") or len(parts) < 3 or not parts[1] or not parts[2]:
+                    continue
+                out[(parts[0].lower(), parts[1].lower())] = parts[2]
+    except Exception:
+        pass
+    return out
+
+
+def words_of(r):
+    """(strong, weak): strong = id, label, email, a Codex label without its plan; weak = an email's local part."""
+    strong, weak = set(), set()
+    for k in ("id", "label", "email"):
+        v = r.get(k, "").strip().lower()
+        if not v:
+            continue
+        strong.add(v)
+        if k == "label" and v.endswith("]") and " [" in v:  # Codex label "<email> [<plan>]"
+            v = v[: v.rindex(" [")].strip()
+            strong.add(v)
+        if "@" in v and not v.startswith("@"):
+            weak.add(v.split("@", 1)[0])
+    return strong, weak - strong
+
+
+def find(rows, prov, w):
+    hits = [r for r in rows if r["provider"] == prov and w in words_of(r)[0]]
+    return hits or [r for r in rows if r["provider"] == prov and w in words_of(r)[1]]
+
+
+def emit(kind, id_="", where="", note="", flags="", label=""):
+    print("\x1f".join(clean(x) for x in (kind, id_, where, note, flags, label)))
+    sys.exit(0)
+
+
+def near_local(w):  # Damerau-Levenshtein distance to 'local' is at most 1
+    t = "local"
+    if abs(len(w) - len(t)) > 1:
+        return False
+    d = [[i + j if i * j == 0 else 0 for j in range(len(t) + 1)] for i in range(len(w) + 1)]
+    for i in range(1, len(w) + 1):
+        for j in range(1, len(t) + 1):
+            d[i][j] = min(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + (w[i - 1] != t[j - 1]))
+            if i > 1 and j > 1 and w[i - 1] == t[j - 2] and w[i - 2] == t[j - 1]:
+                d[i][j] = min(d[i][j], d[i - 2][j - 2] + 1)
+    return d[len(w)][len(t)] <= 1
+
+
+local = read_local()
+daemon_up = local is not None
+cached, age = read_cache()
+peers = [r for r in cached if r["where"] != "local"] if cached is not None else None
+asked_peers = fresh = False
+if daemon_up and (refresh or peers is None or age > TTL):
+    asked_peers = True  # at most one live peer read per run, so a stalled daemon costs one timeout
+    fresh = peer_rows()
+    if fresh is not None:
+        peers = fresh
+        write_cache(local + peers)
+if refresh:
+    if not daemon_up:
+        emit("unavailable", note="subrouter is not answering")
+    if fresh is None:
+        emit("refreshed", note="%d local rows; the peer listing did not answer, so the cache was left as it was" % len(local))
+    emit("refreshed", note="%d local, %d peer rows" % (len(local), len(peers)))
+if not daemon_up and cached is not None:
+    local = [r for r in cached if r["where"] == "local"]  # recognition only: a pin needs the daemon anyway
+
+w = word.strip().lower()
+target = aliases().get((provider, w))
+if target:
+    w = target.strip().lower()
+
+
+def lookup():
+    return find((local or []) + (peers or []), provider, w)
+
+
+hits = lookup()
+if not hits and daemon_up and not asked_peers and age is not None and age > MISS_TTL:
+    fresh = peer_rows()  # a miss on a cache older than a minute: one live look before calling it prompt text
+    if fresh is not None:
+        peers = fresh
+        write_cache(local + peers)
+        hits = lookup()
+
+if hits:
+    ids = sorted({r["id"] for r in hits})
+    if len(ids) > 1:  # the same word for two accounts, wherever they live: never guess
+        emit("ambiguous", ",".join(sorted({"%s@%s" % (r["id"], r["where"]) for r in hits})))
+    mine = [r for r in hits if r["id"] == ids[0]]
+    here = [r for r in mine if r["where"] == "local"]
+    r = here[0] if here else mine[0]
+    flags = []
+    elig, pay = r.get("eligible") or "?", r.get("paid") or "?"
+    if elig.startswith("no"):
+        flags.append("ineligible")
+    if pay == "paid":
+        flags.append("paid")
+    if elig == "?" or (elig.startswith("no") and pay == "?"):  # paid overflow can't be ruled out
+        flags.append("unverified")
+    note = r["eligible"][3:] if r.get("eligible", "").startswith("no:") else ""
+    if here:
+        emit("local", r["id"], "local", note, ",".join(flags), r.get("label", ""))
+    emit("peer", r["id"], ",".join(sorted({x["where"] for x in mine})), note, ",".join(flags), r.get("label", ""))
+if target:
+    emit("gone", target)
+directory = (local or []) + (peers or [])
+elsewhere = find(directory, other_provider, w)
+if "@" in w:
+    emit("email", "", other_provider if elsewhere else "")
+if elsewhere:
+    emit("other", sorted({r["id"] for r in elsewhere})[0], other_provider)
+if any(c in w for c in "-@._+") or any(c.isdigit() for c in w):  # account-shaped: a typo of an account
+    pool = sorted({x for r in directory if r["provider"] == provider for x in words_of(r)[0]} | {"local"})
+    near = difflib.get_close_matches(w, pool, n=1, cutoff=0.8)
+    if near:
+        emit("near", near[0])
+elif near_local(w):  # a plain word one keystroke from 'local' (locl, lcoal): safety mode must not land on the pool
+    emit("near", "local")
+if not directory:
+    emit("unavailable")
+emit("none")
+RESOLVER_PY
+}
+resolver_run() { # provider word [--refresh] -> the resolver's one line, fields joined by \x1f
+    /usr/bin/perl -e 'alarm 12; exec @ARGV' "$PY" -I -c "$(resolver_py)" "$1" "$2" "$ROUTE_HOME" "$TCP" "${@:3}" 2>/dev/null
+}
+
+# Shell code both shims share, written into each of them.
+shim_common() {
+    cat <<'COMMON'
+# ---- shared by the claude and codex shims (claude-route writes both from one copy) ----
+us=$'\037'
+lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+under_subrouter() { # is directory $1 inside ~/.subrouter, where the pool's account stores live?
+    local d="$1" r h
+    [ -n "$d" ] || return 1
+    case "$d" in "$HOME"/.subrouter|"$HOME"/.subrouter/*|*/.subrouter|*/.subrouter/*) return 0 ;; esac
+    r="$(cd "$d" 2>/dev/null && pwd -P)" || return 1
+    h="$(cd "$HOME/.subrouter" 2>/dev/null && pwd -P)" || return 1
+    case "$r" in "$h"|"$h"/*) return 0 ;; esac
+    return 1
+}
+# A route word is one bare token: letters, digits and @._+- only, starting with a letter or
+# digit. So a flag (every Paradev launch starts with one), a prompt with spaces, a path or
+# /command, or an @-mention is never one. At most 200 characters.
+word_re='^[A-Za-z0-9][A-Za-z0-9@._+-]*$'
+peer_pins_re='"account_pins"[[:space:]]*:[[:space:]]*"local\+peers"'
+# The account directory: /_subrouter/accounts and usage-status (live) and the peers' listing
+# (cached in accounts.tsv). None of them holds a credential. Run only for a candidate word,
+# never for `local`, and capped at 7 s (then: timeout).
+IFS= read -r -d '' RESOLVER <<'PY' || true
+COMMON
+    resolver_py
+    cat <<'COMMON'
+PY
+resolve() { # provider word -> kind id where note flags label, joined by \x1f
+    local out rc
+    out="$(/usr/bin/perl -e 'alarm 7; exec @ARGV' /usr/bin/python3 -I -c "$RESOLVER" "$1" "$2" "$route_home" "$tcp" 2>/dev/null)"; rc=$?
+    if [ -n "$out" ]; then printf '%s\n' "$out"
+    elif [ "$rc" -ge 128 ]; then printf 'timeout\n'
+    else printf 'unavailable\n'; fi
+}
+# ---- end of the shared part ----
+COMMON
+}
+
+# ---------------------------------------------------------------------------
+# The shims. `install` writes each beside the live one, tests it, then moves it in.
+write_shim() { # $1 = destination
+    mkdir -p "$SHIM_DIR" || return 1
+    {
+    cat <<'SHIM'
+#!/bin/bash
+# claude-route shim (installed by ~/bin/claude-route; `claude-route status` explains).
+# Chooses the route for a NEW Claude Code launch, then execs the real binary.
+#   off    the real Claude Code, untouched (your own login)
+#   pool   the local subrouter daemon's Claude socket (first-party mode); if it does
+#          not answer, the daemon's TCP port (pool-tcp); if that does not either, off
+# Route words: an exception typed FIRST, before any flag. The default never changes.
+#   claude local ...       safety mode: your own login, with everything that points at
+#                          subrouter dropped. Decided with no daemon I/O at all.
+#   claude <account> ...   through subrouter, pinned to that account: profile name, id,
+#                          email, or an alias in ~/.claude-route/aliases.tsv, any case. A
+#                          pinned launch never falls back to your own login.
+#   claude -- <word> ...   the word as a prompt. CLAUDE_ROUTE_WORDS=0 turns words off.
+# A word that can't be honoured exactly launches nothing: exit 2 (75 when the daemon is
+# down). That includes a pin this daemon build can't hold to the letter (a peer's account,
+# or a laptop account other than the daemon's identity) and a pin to an account that is
+# out of plan quota but can bill paid overflow (CLAUDE_ROUTE_ALLOW_PAID=1 accepts that).
+# Precedence: a route word; then a --settings/--managed-settings naming a route (sr claude)
+# is kept; then CLAUDE_ROUTE=pool|off; then a route already in the environment (a claude
+# started inside a pool session, an API key, Bedrock/Vertex); then ~/.claude-route/mode.
+# An unknown CLAUDE_ROUTE value is reported and ignored (the mode file decides).
+# CLAUDE_ROUTE_DRYRUN=1 prints the decision instead of launching.
+route_home="${CLAUDE_ROUTE_HOME:-$HOME/.claude-route}"
+native="$HOME/.local/bin/claude"
+self_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd -P)"
+
+# exec keeps the PID, so meeting our own PID again means a wrapper handed this launch
+# back to us. Go straight to the native binary instead of looping.
+if [ "${CLAUDE_ROUTE_SHIM_PID:-}" = "$$" ]; then
+    if [ -n "${CLAUDE_ROUTE_DRYRUN:-}" ]; then echo "route=loop-guard"; echo "real=$native"; exit 0; fi
+    echo "claude-route: a claude wrapper sent this launch back to the shim; running $native directly" >&2
+    exec "$native" "$@"
+fi
+export CLAUDE_ROUTE_SHIM_PID=$$
+
+# The real binary: the first `claude` on PATH after this shim's own entry (next in
+# line, as a wrapper should take it), never a shim copy or Paradev's wrapper. If the
+# shim's dir is not on PATH, the first acceptable one; else the native install.
+real=""; first=""; past_self=0
+IFS=: read -r -a path_dirs <<< "$PATH"
+for d in "${path_dirs[@]}"; do
+    [ -n "$d" ] && [ -x "$d/claude" ] && [ ! -d "$d/claude" ] || continue
+    c="$(cd "$d" 2>/dev/null && pwd -P)" || continue
+    if [ "$c" = "$self_dir" ]; then past_self=1; continue; fi
+    case "$c" in */.paradev/bin|*/.paradev-*/bin|*/.superset/bin|*/.superset-*/bin) continue ;; esac
+    head -c 512 "$d/claude" 2>/dev/null | /usr/bin/grep -aq 'claude-route shim' && continue
+    [ -n "$first" ] || first="$d/claude"
+    if [ "$past_self" = 1 ]; then real="$d/claude"; break; fi
+done
+[ -n "$real" ] || real="$first"
+[ -n "$real" ] || { [ -x "$native" ] && real="$native"; }
+if [ -z "$real" ]; then
+    echo "claude-route: no Claude Code binary found besides this shim" >&2
+    exit 127
+fi
+
+explicit="${CLAUDE_ROUTE:-}"
+bad_route=""
+case "$explicit" in pool|off) mode="$explicit" ;; "") mode="" ;; *) bad_route="$explicit"; explicit=""; mode="" ;; esac
+[ -z "$mode" ] && [ -f "$route_home/mode" ] && [ -r "$route_home/mode" ] && read -r mode < "$route_home/mode"
+mode="${mode%$'\r'}"
+case "$mode" in pool|off) ;; *) mode=off ;; esac
+sock="${CLAUDE_ROUTE_SOCKET:-$HOME/.subrouter/claude.sock}"
+tcp="${CLAUDE_ROUTE_TCP:-http://127.0.0.1:31415}"
+plist="${CLAUDE_ROUTE_PLIST:-$HOME/Library/LaunchAgents/ai.manaflow.subrouter.plist}"
+nl=$'\n'
+
+SHIM
+    shim_common
+    cat <<'SHIM'
+
+# Route word: $1 only. `local` is decided with no I/O at all: safety mode never waits on
+# subrouter. A Claude Code command (doctor, mcp, ...) is never a word.
+word=""; typed=""; pin=""; pin_at=""; pin_note=""; pin_flags=""; pin_label=""; refuse=""; refuse_kind=""; refuse_rc=2
+reserved=" agents attach auth auto-mode config doctor gateway help import install login logout logs mcp migrate-installer plugin plugins purge respawn rm setup-token stop kill ultrareview update upgrade "
+if [ $# -gt 0 ] && [ "${CLAUDE_ROUTE_WORDS:-1}" != 0 ] && [ "${#1}" -le 200 ] && [[ "$1" =~ $word_re ]]; then
+    lc="$(lower "$1")"
+    if [ "$lc" = local ]; then
+        word=local
+    elif [[ "$reserved" != *" $lc "* ]]; then
+        IFS="$us" read -r kind rid rwhere rnote rflags rlabel <<< "$(resolve claude "$1")"
+        case "$kind" in
+            local|peer) word=account; pin="$rid"; pin_at="$rwhere"; pin_note="$rnote"; pin_flags="$rflags"; pin_label="$rlabel" ;;
+            none) ;;
+            other) refuse="'$1' is a $rwhere account, not a Claude one ($rwhere $1)" ;;
+            ambiguous) refuse="'$1' names more than one account ($rid); type its exact profile name or id" ;;
+            gone) refuse="'$1' is an alias for '$rid', which no subrouter lists now ($route_home/aliases.tsv)" ;;
+            email) refuse="'$1' is not a Claude account subrouter knows${rwhere:+ (it is a $rwhere account: $rwhere $1)}. Accounts on the boxes carry no email: type the profile name, or add an alias to $route_home/aliases.tsv" ;;
+            near) if [ "$rid" = local ]; then refuse="'$1' is not a route word (did you mean 'local'?)"; else refuse="'$1' is not an account (did you mean '$rid'?)"; fi ;;
+            timeout) refuse="subrouter took too long to say whether '$1' is an account" ;;
+            *) kind=unavailable; refuse="can't tell whether '$1' is an account: subrouter is not answering and there is no account list ($route_home/accounts.tsv)" ;;
+        esac
+        [ -n "$refuse" ] && { refuse_kind="$kind"; refuse="$refuse. Nothing was launched. As a prompt: claude -- $1   Your own login: claude local"; }
+    fi
+    if [ -n "$word" ]; then typed="$1"; shift; fi
+fi
+
+# A settings file Claude Code applies over this launch's environment (the user's, and the
+# project's in this directory or above): if one names a route (env or apiKeyHelper), it would
+# quietly undo a word. Checked for a word only.
+settings_file_route=""
+if [ -n "$word" ]; then
+    route_key_re='"(ANTHROPIC_[A-Z_]*(BASE_URL|UNIX_SOCKET|AUTH_TOKEN|API_KEY|CUSTOM_HEADERS)|CLAUDE_CODE_USE_(BEDROCK|VERTEX|FOUNDRY)|CLAUDE_CODE_OAUTH_TOKEN|CLAUDE_CONFIG_DIR|apiKeyHelper)"[[:space:]]*:'
+    files=("$HOME/.claude/settings.json" "$HOME/.claude/settings.local.json")
+    [ -n "${CLAUDE_CONFIG_DIR:-}" ] && files+=("$CLAUDE_CONFIG_DIR/settings.json" "$CLAUDE_CONFIG_DIR/settings.local.json")
+    d="$PWD"; n=0
+    while [ -n "$d" ] && [ "$n" -lt 64 ]; do
+        files+=("$d/.claude/settings.json" "$d/.claude/settings.local.json")
+        [ "$d" = / ] && break
+        d="${d%/*}"; [ -n "$d" ] || d=/; n=$((n+1))
+    done
+    for f in "${files[@]}"; do
+        [ -f "$f" ] && [[ "$(head -c 262144 "$f" 2>/dev/null)" =~ $route_key_re ]] && { settings_file_route="$f"; break; }
+    done
+fi
+
+# One pass over the arguments: a --settings that names a route, and the session id (for the log).
+settings_route=0; sid=""; prev=""
+for a in "$@"; do
+    [ "$a" = "--" ] && break
+    v=""
+    case "$prev" in --settings|--managed-settings) v="$a" ;; --session-id|--resume|-r) sid="$a" ;; esac
+    case "$a" in --settings=*|--managed-settings=*) v="${a#*=}" ;; --session-id=*|--resume=*) sid="${a#*=}" ;; esac
+    if [ -n "$v" ]; then
+        if [ "${v:0:1}" = "{" ]; then s="$v"; else s="$(head -c 65536 "$v" 2>/dev/null)"; fi
+        case "$s" in *ANTHROPIC_BASE_URL*|*ANTHROPIC_UNIX_SOCKET*|*ANTHROPIC_AUTH_TOKEN*|*ANTHROPIC_API_KEY*|*CLAUDE_CODE_USE_*) settings_route=1 ;; esac
+    fi
+    prev="$a"
+done
+env_route=0
+[ -n "${ANTHROPIC_BASE_URL:-}${ANTHROPIC_UNIX_SOCKET:-}${CLAUDE_CODE_OAUTH_TOKEN:-}${ANTHROPIC_AUTH_TOKEN:-}${ANTHROPIC_API_KEY:-}" ] && env_route=1
+for v in $(compgen -e); do
+    case "$v" in CLAUDE_CODE_USE_*|ANTHROPIC_*BASE_URL) [ -n "${!v}" ] && env_route=1 ;; esac
+done
+
+ok() { [[ "$1" =~ \"ok\"[[:space:]]*:[[:space:]]*true ]]; }
+probe() { curl -q -s --noproxy '*' -m 2 "$@" 2>/dev/null; }
+route=""; note=""; want=""
+if [ -n "$refuse" ]; then
+    route=refused
+elif [ -n "$word" ] && [ "$settings_route" = 1 ]; then
+    route=refused; refuse_kind=settings; refuse="'$typed' can't be honoured: this launch's --settings names a route of its own. Nothing was launched"
+elif [ -n "$word" ] && [ -n "$settings_file_route" ]; then
+    route=refused; refuse_kind=settings-file; refuse="'$typed' can't be honoured: $settings_file_route sets a route (env or apiKeyHelper) that Claude Code applies over this launch's. Nothing was launched"
+elif [ -n "$word" ]; then
+    # A word is explicit, like CLAUDE_ROUTE: undo only what a parent shim set.
+    for k in ${CLAUDE_ROUTE_SET:-}; do unset "$k"; done
+    unset CLAUDE_ROUTE_SET
+    if [ "$word" = local ]; then want=off; else want=pinned; fi
+    [ -n "${CLAUDE_ROUTE:-}" ] && note="the route word overrides CLAUDE_ROUTE=$CLAUDE_ROUTE"
+elif [ "$settings_route" = 1 ]; then
+    route=inherited; note="this launch's --settings names a route; kept it"
+elif [ -n "$explicit" ]; then
+    # Undo only what a parent shim set (it listed the keys); a user's own values stay.
+    for k in ${CLAUDE_ROUTE_SET:-}; do unset "$k"; done
+    unset CLAUDE_ROUTE_SET
+    want="$explicit"
+elif [ "$env_route" = 1 ]; then
+    route=inherited
+else
+    want="$mode"
+fi
+if [ -z "$route" ]; then
+    if [ "$want" = pool ] || [ "$want" = pinned ]; then
+        hb=""
+        if [ -S "$sock" ] && hb="$(probe --unix-socket "$sock" http://api.anthropic.com/_subrouter/health)" && ok "$hb"; then
+            route=pool
+        elif hb="$(probe "$tcp/_subrouter/health")" && ok "$hb"; then
+            route=pool-tcp; note="${note:+$note; }subrouter's Claude socket ($sock) is not answering; routing over the daemon's TCP port"
+        elif [ "$want" = pinned ]; then
+            route=refused; refuse_kind=daemon-down; refuse_rc=75
+            refuse="subrouter is not answering, so '$pin' can't be pinned (a pinned launch never falls back to your own login). Nothing was launched. Plain claude falls back on its own; claude local is your own login"
+        else
+            route=off; note="the subrouter daemon is not answering; launching on your own login (off)"
+        fi
+        if [ "$want" = pinned ] && [ "$route" != refused ]; then
+            # Hold the pin to the letter, or launch nothing. This build pins only the daemon's
+            # own accounts: a peer pin would get a 503 that Claude Code retries for minutes.
+            # And it answers a pinned session's account calls (/api/*: profile, org, policy)
+            # on the pinned account too, so a pin to any laptop account but the identity one
+            # would cache another org in the ~/.claude.json every route shares.
+            if [ "$pin_at" != local ]; then
+                if [[ "$pin_at" == *,* ]] || ! [[ "$hb" =~ $peer_pins_re ]]; then
+                    route=refused; refuse_kind=peer-pins-unsupported
+                    refuse="'$pin' lives on $pin_at, and this subrouter build pins only this laptop's own accounts. Nothing was launched. Plain claude may still be placed there; claude local is your own login"
+                fi
+            elif ! [[ "$hb" =~ \"pin_control_plane\"[[:space:]]*:[[:space:]]*\"identity\" ]]; then
+                idn="$(/usr/libexec/PlistBuddy -c 'Print :EnvironmentVariables:SUBROUTER_IDENTITY_ACCOUNT' "$plist" 2>/dev/null)"
+                lidn="$(lower "$idn")"
+                if [ -z "$idn" ] || { [ "$lidn" != "$(lower "$pin")" ] && [ "$lidn" != "$(lower "$pin_label")" ]; }; then
+                    route=refused; refuse_kind=not-identity
+                    refuse="'$pin' is not the daemon's identity account (${idn:-none set}). On this subrouter build a pinned session's account calls (profile, org, policy limits) go to the pinned account too, and Claude Code would cache that org in ~/.claude.json for every route. Nothing was launched"
+                fi
+            fi
+            if [ "$route" != refused ] && [ "${CLAUDE_ROUTE_ALLOW_PAID:-}" != 1 ]; then
+                if [[ ",$pin_flags," == *,ineligible,* && ",$pin_flags," == *,paid,* ]]; then
+                    route=refused; refuse_kind=paid-overflow
+                    refuse="subrouter reports '$pin' as ${pin_note:-not eligible}, and it can bill past its plan (extra usage). A pinned session never moves to another account, so it could run on paid overflow. Nothing was launched. To accept that: CLAUDE_ROUTE_ALLOW_PAID=1 claude $typed ..."
+                elif [[ ",$pin_flags," == *,unverified,* ]]; then
+                    route=refused; refuse_kind=unverified
+                    refuse="subrouter gave no usage verdict for '$pin', so the pin can't rule out paid overflow. Nothing was launched. To pin anyway: CLAUDE_ROUTE_ALLOW_PAID=1 claude $typed ..."
+                fi
+            fi
+            if [ "$route" != refused ]; then
+                case ",$pin_flags," in *,ineligible,*) note="${note:+$note; }pinned to $pin, which subrouter reports as ${pin_note:-not eligible}: a pinned session gets the provider's limit error, never another account" ;; esac
+                case ",$pin_flags," in *,paid,*) note="${note:+$note; }$pin can bill past its plan (extra usage) once its plan limit is reached, and a pinned session never moves" ;; esac
+            fi
+        fi
+    else
+        route=off
+    fi
+fi
+[ -n "$bad_route" ] && [ -z "$word" ] && note="unknown CLAUDE_ROUTE=$bad_route (use pool or off); the mode file decided${note:+; $note}"
+
+set_keys=""
+put() { export "$1=$2"; set_keys="$set_keys $1"; }
+keep() { [ -n "${!1+x}" ] || put "$1" "$2"; }   # only when absent: the user's own value wins
+scrub() { # every alternate route, and ambient proxies (the base URL is plain http)
+    unset ANTHROPIC_AUTH_TOKEN ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_UNIX_SOCKET \
+          CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY \
+          ANTHROPIC_BEDROCK_BASE_URL ANTHROPIC_VERTEX_BASE_URL ANTHROPIC_FOUNDRY_BASE_URL \
+          HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy
+}
+own_headers() { # the caller's header lines minus every subrouter selector (any case)
+    local out="" line
+    shopt -s nocasematch
+    while IFS= read -r line; do
+        line="${line%$'\r'}"
+        [[ "$line" =~ ^[[:space:]]*x-subrouter-(agent|account|account-id|preferred-account-id|target-account)[[:space:]]*: ]] && continue
+        [ -n "${line//[[:space:]]/}" ] && out="$out$line$nl"
+    done <<< "${ANTHROPIC_CUSTOM_HEADERS:-}"
+    shopt -u nocasematch
+    printf '%s' "$out"
+}
+pin_headers() { local h; h="$(own_headers)"; printf '%s%sX-Subrouter-Agent: claude%sX-Subrouter-Account-ID: %s' "$h" "${h:+$nl}" "$nl" "$pin"; }
+drop_subrouter() { # off means off: nothing pointing at subrouter survives, whoever set it
+    local via_sock="" k
+    case "${ANTHROPIC_UNIX_SOCKET:-}" in "") ;; "$sock"|*/.subrouter/*) unset ANTHROPIC_UNIX_SOCKET; via_sock=1 ;; esac
+    case "${ANTHROPIC_BASE_URL:-}" in
+        "$tcp"|"$tcp"/*|http://127.0.0.1:31415|http://127.0.0.1:31415/*|http://localhost:31415|http://localhost:31415/*)
+            unset ANTHROPIC_BASE_URL ANTHROPIC_AUTH_TOKEN ;;   # the token went with the subrouter URL
+        http://api.anthropic.com|http://api.anthropic.com/) [ -n "$via_sock" ] && unset ANTHROPIC_BASE_URL ;;
+    esac
+    [ "${CLAUDE_CODE_OAUTH_TOKEN:-}" = ssh-placeholder ] && unset CLAUDE_CODE_OAUTH_TOKEN
+    [ "${ANTHROPIC_AUTH_TOKEN:-}" = subrouter ] && unset ANTHROPIC_AUTH_TOKEN
+    [ "${CLAUDE_SECURESTORAGE_CONFIG_DIR:-}" = "$route_home/securestorage" ] && unset CLAUDE_SECURESTORAGE_CONFIG_DIR ENABLE_CLAUDEAI_MCP_SERVERS
+    if [ -n "${ANTHROPIC_CUSTOM_HEADERS+x}" ]; then
+        local h; h="$(own_headers)"; h="${h%$nl}"
+        if [ -n "$h" ]; then export ANTHROPIC_CUSTOM_HEADERS="$h"; else unset ANTHROPIC_CUSTOM_HEADERS; fi
+    fi
+    # A config dir inside ~/.subrouter is a pool profile (sr claude sets one): running there
+    # would use and refresh that account's login outside the daemon. Off is your own login.
+    for k in CLAUDE_CONFIG_DIR CLAUDE_CODE_CONFIG_DIR; do
+        if [ -n "${!k:-}" ] && under_subrouter "${!k}"; then
+            unset "$k"; note="${note:+$note; }$k pointed into ~/.subrouter (a pool profile); dropped it, so this runs on your own login"
+        fi
+    done
+}
+case "$route" in
+    pool)
+        scrub
+        put ANTHROPIC_BASE_URL http://api.anthropic.com
+        put ANTHROPIC_UNIX_SOCKET "$sock"
+        put CLAUDE_CODE_OAUTH_TOKEN ssh-placeholder      # Claude Code's own socket placeholder; the daemon swaps in the pooled account
+        # A socket session that meets a 401 copies
+        # the access token of whatever login its credential store holds into its own environment.
+        # With the default store that is the owner's own login. A dedicated, login-less store leaves
+        # nothing to adopt; the connector scope is never claimed on the pool route.
+        unset CLAUDE_CODE_OAUTH_SCOPES
+        mkdir -p "$route_home/securestorage" 2>/dev/null && chmod 700 "$route_home/securestorage" 2>/dev/null
+        put CLAUDE_SECURESTORAGE_CONFIG_DIR "$route_home/securestorage"
+        put ENABLE_CLAUDEAI_MCP_SERVERS 0
+        if [ -n "$pin" ]; then put ANTHROPIC_CUSTOM_HEADERS "$(pin_headers)"; else keep ANTHROPIC_CUSTOM_HEADERS "X-Subrouter-Agent: claude"; fi
+        keep CLAUDE_CODE_PROMPT_CACHE_TTL 1h
+        export CLAUDE_ROUTE_SET="${set_keys# }"
+        ;;
+    pool-tcp)
+        scrub
+        put ANTHROPIC_BASE_URL "$tcp"
+        put ANTHROPIC_AUTH_TOKEN subrouter                # subrouter's no-token placeholder
+        if [ -n "$pin" ]; then put ANTHROPIC_CUSTOM_HEADERS "$(pin_headers)"; else keep ANTHROPIC_CUSTOM_HEADERS "X-Subrouter-Agent: claude"; fi
+        keep ENABLE_TOOL_SEARCH true
+        keep CLAUDE_CODE_PROMPT_CACHE_TTL 1h
+        keep CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY 1
+        export CLAUDE_ROUTE_SET="${set_keys# }"
+        ;;
+    off)
+        drop_subrouter
+        ;;
+esac
+export CLAUDE_ROUTE_ACTIVE="$route"
+
+if [ -n "${CLAUDE_ROUTE_DRYRUN:-}" ]; then
+    echo "route=$route"
+    echo "mode=$mode"
+    echo "real=$real"
+    echo "word=${word:-<none>}"
+    echo "pin=${pin:-<none>}${pin_at:+ at=$pin_at}${pin_flags:+ flags=$pin_flags}"
+    printf 'args='; [ $# -gt 0 ] && printf '[%s]' "$@"; echo
+    for k in ANTHROPIC_BASE_URL ANTHROPIC_UNIX_SOCKET CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_AUTH_TOKEN ANTHROPIC_API_KEY CLAUDE_CODE_USE_BEDROCK ANTHROPIC_CUSTOM_HEADERS ENABLE_TOOL_SEARCH CLAUDE_CODE_PROMPT_CACHE_TTL CLAUDE_CONFIG_DIR CLAUDE_SECURESTORAGE_CONFIG_DIR CLAUDE_CODE_OAUTH_SCOPES ENABLE_CLAUDEAI_MCP_SERVERS CLAUDE_ROUTE_SET; do
+        v="${!k-<unset>}"
+        case "$k:$v" in *TOKEN:ssh-placeholder|*TOKEN:subrouter|*:"<unset>") ;; *TOKEN:*|*API_KEY:*) v="<set>" ;; esac
+        echo "$k=${v//$nl/\\n}"
+    done
+    [ -n "$note" ] && echo "note=$note"
+    if [ "$route" = refused ]; then echo "refused=$refuse_kind exit=$refuse_rc"; echo "message=$refuse"; exit "$refuse_rc"; fi
+    exit 0
+fi
+
+[ -n "$note" ] && echo "claude-route: $note" >&2
+[ "$route" = refused ] && echo "claude-route: $refuse" >&2
+if [ -d "$route_home" ] && [ -w "$route_home" ]; then
+    log="$route_home/launch.log"
+    {
+        [ "$(stat -f %z "$log" 2>/dev/null || echo 0)" -gt 1048576 ] && mv -f "$log" "$log.1"
+        printf '%s pid=%s mode=%s route=%s%s%s%s%s%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$$" "$mode" "$route" "${word:+ word=$word}" "${pin:+ pin=$pin at=$pin_at}" "${refuse_kind:+ reason=$refuse_kind exit=$refuse_rc}" "${sid:+ sid=$sid}" "${note:+ note=$note}" >> "$log"
+    } 2>/dev/null
+fi
+[ "$route" = refused ] && exit "$refuse_rc"
+exec "$real" "$@"
+SHIM
+    } > "$1" || return 1
+    chmod 755 "$1"
+}
+
+write_codex_shim() { # $1 = destination
+    mkdir -p "$SHIM_DIR" || return 1
+    {
+    cat <<'SHIM'
+#!/bin/bash
+# claude-route codex shim (installed by ~/bin/claude-route; `claude-route status` explains).
+# Chooses the route for a NEW Codex CLI launch, then execs the real binary.
+#   off    the real Codex, untouched: your own login (whatever CODEX_HOME says, ~/.codex by default)
+#   pool   the local subrouter daemon, by the -c provider block `sr codex` passes (no relay,
+#          no sr argument parsing). Daemon down, or no Codex account anywhere: off.
+# ~/.claude-route/codex-mode chooses between them; it is off until `claude-route codex pool`.
+# Route words: an exception typed FIRST (Paradev's wrapper prefix in front is skipped).
+#   codex local ...        safety mode: your own login (~/.codex), subrouter dropped
+#   codex <account> ...    through subrouter, pinned to that Codex account: id, email, label
+#                          or an alias, any case. Never falls back to your own login.
+#   codex -- <word>        the word as a prompt. CODEX_ROUTE_WORDS=0 turns words off.
+# A word that can't be honoured exactly launches nothing: exit 2 (75 when the daemon is
+# down). That includes a peer's account on this daemon build, and an account out of plan
+# quota that can bill credits (CODEX_ROUTE_ALLOW_PAID=1 accepts that).
+# Only session commands are routed: interactive, exec/e, review, resume, fork. login, logout,
+# mcp, app-server, --help, --version and every other command run the real binary untouched,
+# except that login/logout are refused while CODEX_HOME points into ~/.subrouter (a pool store).
+# Precedence: a route word; then provider settings already on the command line (sr codex,
+# cx, --oss, --profile, --remote) are kept; then CODEX_ROUTE=pool|off; then codex-mode.
+# CODEX_ROUTE_DRYRUN=1 prints the decision instead of launching. No credential is read here.
+route_home="${CLAUDE_ROUTE_HOME:-$HOME/.claude-route}"
+self_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd -P)"
+tcp="${CLAUDE_ROUTE_TCP:-http://127.0.0.1:31415}"
+nl=$'\n'
+
+# The real binary: the first `codex` on PATH after this shim's own entry, never a shim
+# copy or Paradev's wrapper (which runs the first non-Paradev `codex`: this shim).
+real=""; first=""; past_self=0
+IFS=: read -r -a path_dirs <<< "$PATH"
+for d in "${path_dirs[@]}"; do
+    [ -n "$d" ] && [ -x "$d/codex" ] && [ ! -d "$d/codex" ] || continue
+    c="$(cd "$d" 2>/dev/null && pwd -P)" || continue
+    if [ "$c" = "$self_dir" ]; then past_self=1; continue; fi
+    case "$c" in */.paradev/bin|*/.paradev-*/bin|*/.superset/bin|*/.superset-*/bin) continue ;; esac
+    head -c 512 "$d/codex" 2>/dev/null | /usr/bin/grep -aq 'claude-route codex shim' && continue
+    [ -n "$first" ] || first="$d/codex"
+    if [ "$past_self" = 1 ]; then real="$d/codex"; break; fi
+done
+[ -n "$real" ] || real="$first"
+if [ -z "$real" ]; then
+    echo "claude-route: no Codex binary found besides this shim" >&2
+    exit 127
+fi
+# exec keeps the PID: meeting our own PID again means a wrapper handed the launch back.
+if [ "${CODEX_ROUTE_SHIM_PID:-}" = "$$" ]; then
+    if [ -n "${CODEX_ROUTE_DRYRUN:-}" ]; then echo "route=loop-guard"; echo "real=$real"; exit 0; fi
+    echo "claude-route: a codex wrapper sent this launch back to the shim; running $real directly" >&2
+    exec "$real" "$@"
+fi
+export CODEX_ROUTE_SHIM_PID=$$
+
+explicit="${CODEX_ROUTE:-}"; bad_route=""
+case "$explicit" in pool|off) mode="$explicit" ;; "") mode="" ;; *) bad_route="$explicit"; explicit=""; mode="" ;; esac
+[ -z "$mode" ] && [ -f "$route_home/codex-mode" ] && [ -r "$route_home/codex-mode" ] && read -r mode < "$route_home/codex-mode"
+mode="${mode%$'\r'}"
+case "$mode" in pool|off) ;; *) mode=off ;; esac
+
+SHIM
+    shim_common
+    cat <<'SHIM'
+
+codex_cmds=" agents exec e review login logout mcp mcp-server plugin app-server remote-control app completion update doctor sandbox debug apply a resume queue archive delete migrate-rollouts migrate-nfs-db unarchive fork cloud exec-server features help "
+args=("$@")
+
+# Route word: the first argument after Paradev's prefix ([-c projects=...] --enable hooks
+# [--dangerously-bypass-hook-trust]), and only a bare token that is not a Codex command.
+word=""; typed=""; pin=""; pin_at=""; pin_note=""; pin_flags=""; refuse=""; refuse_kind=""; refuse_rc=2
+i=0
+if [ "${args[0]:-}" = -c ] && [[ "${args[1]:-}" == projects=* ]]; then i=2; fi
+if [ "${args[i]:-}" = --enable ] && [ "${args[i+1]:-}" = hooks ]; then i=$((i+2)); fi
+if [ "${args[i]:-}" = --dangerously-bypass-hook-trust ]; then i=$((i+1)); fi
+cand="${args[i]:-}"
+if [ $# -gt "$i" ] && [ "${CODEX_ROUTE_WORDS:-1}" != 0 ] && [ "${#cand}" -le 200 ] && [[ "$cand" =~ $word_re ]]; then
+    lc="$(lower "$cand")"
+    if [ "$lc" = local ]; then
+        word=local
+    elif [[ "$codex_cmds" != *" $lc "* ]]; then
+        IFS="$us" read -r kind rid rwhere rnote rflags rlabel <<< "$(resolve codex "$cand")"
+        case "$kind" in
+            local|peer) word=account; pin="$rid"; pin_at="$rwhere"; pin_note="$rnote"; pin_flags="$rflags" ;;
+            none) ;;
+            other) refuse="'$cand' is a $rwhere account, not a Codex one ($rwhere $cand)" ;;
+            ambiguous) refuse="'$cand' names more than one account ($rid); type its exact id or email" ;;
+            gone) refuse="'$cand' is an alias for '$rid', which no subrouter lists now ($route_home/aliases.tsv)" ;;
+            email) refuse="'$cand' is not a Codex account subrouter knows${rwhere:+ (it is a $rwhere account: $rwhere $cand)}" ;;
+            near) if [ "$rid" = local ]; then refuse="'$cand' is not a route word (did you mean 'local'?)"; else refuse="'$cand' is not an account (did you mean '$rid'?)"; fi ;;
+            timeout) refuse="subrouter took too long to say whether '$cand' is an account" ;;
+            *) kind=unavailable; refuse="can't tell whether '$cand' is an account: subrouter is not answering and there is no account list ($route_home/accounts.tsv)" ;;
+        esac
+        [ -n "$refuse" ] && { refuse_kind="$kind"; refuse="$refuse. Nothing was launched. As a prompt: codex -- $cand   Your own login: codex local"; }
+    fi
+    if [ -n "$word" ]; then typed="$cand"; args=("${args[@]:0:i}" "${args[@]:i+1}"); fi
+fi
+
+# What the remaining command is: Codex's own grammar (global options, then a command or the prompt).
+utility=0; sub=""; inherit=0; n=${#args[@]}; j=0; prev=""
+while [ "$j" -lt "$n" ]; do
+    a="${args[j]}"
+    [ "$a" = -- ] && break
+    case "$a" in
+        --help|-h|--version|-V) utility=1 ;;
+        -i|--image) while [ $((j+1)) -lt "$n" ] && [[ "${args[j+1]}" != -* ]]; do j=$((j+1)); done ;;
+        -c|--config|--enable|--disable|--remote|--remote-auth-token-env|-m|--model|--local-provider|-p|--profile|-s|--sandbox|-C|--cd|--add-dir|-a|--ask-for-approval) j=$((j+1)) ;;
+        -*) ;;
+        *) [ -z "$sub" ] && [[ "$codex_cmds" == *" $a "* ]] && sub="$a"; break ;;
+    esac
+    j=$((j+1))
+done
+for a in "${args[@]}"; do   # a provider already chosen on the command line (sr codex, cx, --oss, a profile, a remote server)
+    [ "$a" = -- ] && break
+    v=""
+    case "$prev" in -c|--config) v="$a" ;; esac
+    case "$a" in
+        --config=*) v="${a#--config=}" ;;
+        -c?*) v="${a#-c}"; v="${v#=}" ;;
+        --oss|--local-provider|--local-provider=*|-p|--profile|--profile=*|--remote|--remote=*) inherit=1 ;;
+    esac
+    if [ -n "$v" ]; then
+        key="${v%%=*}"; key="${key//[[:space:]]/}"
+        case "$key" in model_provider|model_providers|model_providers.*|openai_base_url|chatgpt_base_url) inherit=1 ;; esac
+    fi
+    prev="$a"
+done
+session=0
+case "$sub" in ""|exec|e|review|resume|fork) [ "$utility" = 0 ] && session=1 ;; esac
+
+# CODEX_HOME inside ~/.subrouter is a pool account's store. `local` means ~/.codex, so it is
+# dropped there; a login/logout, or a pooled or pinned session, is refused while it is set.
+note=""
+pool_home=0
+if [ -n "${CODEX_HOME:-}" ] && under_subrouter "$CODEX_HOME"; then
+    if [ "$word" = local ]; then
+        unset CODEX_HOME; note="CODEX_HOME pointed into ~/.subrouter (a pool account's store); dropped it, so this runs on your own login"
+    else
+        pool_home=1
+    fi
+fi
+
+route=""; want=""
+if [ -n "$refuse" ]; then
+    route=refused
+elif [ "$session" = 0 ]; then
+    if [ "$word" = account ]; then route=refused; refuse_kind=not-a-session; refuse="a pin applies to Codex sessions only, not '${sub:-$cand}'. Nothing was launched"
+    elif [ "$pool_home" = 1 ] && { [ "$sub" = login ] || [ "$sub" = logout ]; }; then
+        route=refused; refuse_kind=pool-store-home; refuse="CODEX_HOME=$CODEX_HOME is inside ~/.subrouter, a pool account's store: codex $sub there would replace or end that account's login. Nothing was launched. Your own login: codex local $sub"
+    else route=passthrough; fi
+elif [ "$inherit" = 1 ]; then
+    if [ -n "$word" ]; then route=refused; refuse_kind=settings; refuse="'$typed' can't be honoured: this command line already chooses a provider. Nothing was launched"
+    else route=inherited; fi
+elif [ "$word" = local ]; then
+    want=off
+elif [ "$word" = account ]; then
+    want=pinned
+    [ -n "${CODEX_ROUTE:-}" ] && note="${note:+$note; }the route word overrides CODEX_ROUTE=$CODEX_ROUTE"
+else
+    want="$mode"
+fi
+if [ -z "$route" ] && [ "$pool_home" = 1 ] && { [ "$want" = pool ] || [ "$want" = pinned ]; }; then
+    route=refused; refuse_kind=pool-store-home
+    refuse="CODEX_HOME=$CODEX_HOME is inside ~/.subrouter, a pool account's store: a pooled or pinned Codex there could refresh that account's login outside the daemon. Nothing was launched. Your own login: codex local"
+fi
+probe() { curl -q -s --noproxy '*' -m "$1" "$2" 2>/dev/null; }
+if [ -z "$route" ]; then
+    if [ "$want" = pool ] || [ "$want" = pinned ]; then
+        hb="$(probe 2 "$tcp/_subrouter/health")"
+        if ! [[ "$hb" =~ \"ok\"[[:space:]]*:[[:space:]]*true ]]; then
+            if [ "$want" = pinned ]; then
+                route=refused; refuse_kind=daemon-down; refuse_rc=75
+                refuse="subrouter is not answering, so '$pin' can't be pinned (a pinned launch never falls back to your own login). Nothing was launched. codex local is your own login"
+            else
+                route=off; note="${note:+$note; }the subrouter daemon is not answering; launching on your own login (off)"
+            fi
+        elif [ "$want" = pinned ]; then
+            if [ "$pin_at" != local ] && { [[ "$pin_at" == *,* ]] || ! [[ "$hb" =~ $peer_pins_re ]]; }; then
+                route=refused; refuse_kind=peer-pins-unsupported
+                refuse="'$pin' lives on $pin_at, and this subrouter build pins only this laptop's own accounts. Nothing was launched. codex local is your own login"
+            elif ! [[ "$pin" =~ ^[A-Za-z0-9@._+-]+$ ]]; then
+                route=refused; refuse_kind=bad-id; refuse="account id '$pin' can't be passed safely. Nothing was launched"
+            elif [ "${CODEX_ROUTE_ALLOW_PAID:-}" != 1 ] && [[ ",$pin_flags," == *,ineligible,* && ",$pin_flags," == *,paid,* ]]; then
+                route=refused; refuse_kind=paid-overflow
+                refuse="subrouter reports '$pin' as ${pin_note:-not eligible}, and it holds credits it can bill past its plan. A pinned session never moves to another account, so it could run on credits. Nothing was launched. To accept that: CODEX_ROUTE_ALLOW_PAID=1 codex $typed ..."
+            elif [ "${CODEX_ROUTE_ALLOW_PAID:-}" != 1 ] && [[ ",$pin_flags," == *,unverified,* ]]; then
+                route=refused; refuse_kind=unverified
+                refuse="subrouter gave no usage verdict for '$pin', so the pin can't rule out credits. Nothing was launched. To pin anyway: CODEX_ROUTE_ALLOW_PAID=1 codex $typed ..."
+            else
+                route=pool
+                case ",$pin_flags," in *,ineligible,*) note="${note:+$note; }pinned to $pin, which subrouter reports as ${pin_note:-not eligible}: a pinned session gets the provider's limit error, never another account" ;; esac
+                case ",$pin_flags," in *,paid,*) note="${note:+$note; }$pin holds credits it can bill once its plan limit is reached, and a pinned session never moves" ;; esac
+            fi
+        else
+            acc="$(probe 1 "$tcp/_subrouter/accounts")"
+            if [[ "$acc" =~ \"provider\"[[:space:]]*:[[:space:]]*\"codex\" ]] || /usr/bin/awk -F'\t' '$1 == "codex" && $5 != "local" && $6 == "yes" { f = 1 } END { exit !f }' "$route_home/accounts.tsv" 2>/dev/null; then
+                route=pool
+            else
+                route=off; note="${note:+$note; }subrouter has no Codex account here or on a peer; launching on your own login (off)"
+            fi
+        fi
+    else
+        route=off
+    fi
+fi
+[ -n "$bad_route" ] && [ -z "$word" ] && note="unknown CODEX_ROUTE=$bad_route (use pool or off); the codex-mode file decided${note:+; $note}"
+
+if [ "$word" = local ]; then   # safety mode: nothing pointing at subrouter survives
+    case "${OPENAI_BASE_URL:-}" in "$tcp"|"$tcp"/*|http://127.0.0.1:31415*|http://localhost:31415*) unset OPENAI_BASE_URL ;; esac
+fi
+case "$route" in
+    pool)
+        unset HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY http_proxy https_proxy all_proxy no_proxy   # the base URL is plain http
+        hdr='"X-Subrouter-Agent"="codex"'
+        [ -n "$pin" ] && hdr="$hdr,\"X-Subrouter-Account-ID\"=\"$pin\""
+        block=(-c 'model_provider="subrouter"'
+               -c "model_providers.subrouter={name=\"Subrouter\",base_url=\"$tcp/v1\",experimental_bearer_token=\"subrouter\",wire_api=\"responses\",supports_websockets=true,http_headers={$hdr}}")
+        out=(); done_block=0
+        for a in "${args[@]}"; do   # before the first --: everything after it is prompt text
+            if [ "$done_block" = 0 ] && [ "$a" = -- ]; then out+=("${block[@]}"); done_block=1; fi
+            out+=("$a")
+        done
+        [ "$done_block" = 0 ] && out+=("${block[@]}")
+        args=("${out[@]}")
+        ;;
+esac
+export CODEX_ROUTE_ACTIVE="$route"
+
+if [ -n "${CODEX_ROUTE_DRYRUN:-}" ]; then
+    echo "route=$route"
+    echo "mode=$mode"
+    echo "real=$real"
+    echo "word=${word:-<none>}"
+    echo "pin=${pin:-<none>}${pin_at:+ at=$pin_at}${pin_flags:+ flags=$pin_flags}"
+    printf 'args='; [ ${#args[@]} -gt 0 ] && printf '[%s]' "${args[@]}"; echo
+    echo "CODEX_HOME=${CODEX_HOME-<unset>}"
+    echo "OPENAI_BASE_URL=${OPENAI_BASE_URL-<unset>}"
+    [ -n "$note" ] && echo "note=$note"
+    if [ "$route" = refused ]; then echo "refused=$refuse_kind exit=$refuse_rc"; echo "message=$refuse"; exit "$refuse_rc"; fi
+    exit 0
+fi
+
+[ -n "$note" ] && echo "claude-route: $note" >&2
+[ "$route" = refused ] && echo "claude-route: $refuse" >&2
+if [ -d "$route_home" ] && [ -w "$route_home" ]; then
+    log="$route_home/launch.log"
+    {
+        [ "$(stat -f %z "$log" 2>/dev/null || echo 0)" -gt 1048576 ] && mv -f "$log" "$log.1"
+        printf '%s pid=%s cli=codex mode=%s route=%s%s%s%s%s%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$$" "$mode" "$route" "${sub:+ cmd=$sub}" "${word:+ word=$word}" "${pin:+ pin=$pin at=$pin_at}" "${refuse_kind:+ reason=$refuse_kind exit=$refuse_rc}" "${note:+ note=$note}" >> "$log"
+    } 2>/dev/null
+fi
+[ "$route" = refused ] && exit "$refuse_rc"
+exec "$real" "${args[@]}"
+SHIM
+    } > "$1" || return 1
+    chmod 755 "$1"
+}
+
+# ---------------------------------------------------------------------------
+seed_aliases() {
+    [ -f "$ALIASES" ] && return 0
+    mkdir -p "$ROUTE_HOME" || return 1
+    printf '%s\n' "# claude-route aliases, yours to edit: provider<TAB>word<TAB>account (its id, profile name, label or email)." \
+        "# Then 'claude <word>' / 'codex <word>' pins that account. A word may be a full email address." \
+        > "$ALIASES.tmp.$$" && mv -f "$ALIASES.tmp.$$" "$ALIASES"
+}
+
+cmd_install() {
+    local new="$SHIM_DIR/claude.new" cnew="$SHIM_DIR/codex.new" rcodex
+    write_shim "$new" || die "could not write $new"
+    [ -f "$MODE_FILE" ] || set_mode off
+    # Prove the NEW shim launches the real binary before it replaces the live one or
+    # any shell can find it: a shim that cannot would break every new launch.
+    local probe_out real_v shim_v cprobe creal_v cshim_v
+    probe_out=$(env -u ANTHROPIC_BASE_URL -u ANTHROPIC_UNIX_SOCKET -u CLAUDE_CODE_OAUTH_TOKEN -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_API_KEY \
+        CLAUDE_ROUTE=off CLAUDE_ROUTE_DRYRUN=1 PATH="$SHIM_DIR:$PATH" "$new")
+    case "$probe_out" in
+        *"route=off"*"real=$SHIM_DIR/"*) rm -f "$new"; die "new shim resolves to a shim; nothing installed" ;;
+        *"route=off"*"real=/"*) ;;
+        *) rm -f "$new"; die "new shim dry run failed: $probe_out; nothing installed" ;;
+    esac
+    real_v=$("$HOME/.local/bin/claude" --version 2>&1)
+    shim_v=$(env -u ANTHROPIC_BASE_URL -u ANTHROPIC_UNIX_SOCKET -u CLAUDE_CODE_OAUTH_TOKEN CLAUDE_ROUTE=off PATH="$SHIM_DIR:$PATH" "$new" --version 2>&1)
+    if [ -z "$real_v" ] || [ "$real_v" != "$shim_v" ]; then rm -f "$new"; die "new shim --version ($shim_v) differs from the real binary ($real_v); nothing installed"; fi
+    # The codex shim, proved the same way (its own off dry run and --version).
+    rcodex=$(real_codex)
+    if [ -n "$rcodex" ]; then
+        write_codex_shim "$cnew" || { rm -f "$new"; die "could not write $cnew; nothing installed"; }
+        cprobe=$(env -u CODEX_ROUTE -u CODEX_ROUTE_DRYRUN CODEX_ROUTE=off CODEX_ROUTE_DRYRUN=1 PATH="$SHIM_DIR:$PATH" "$cnew" exec x)
+        case "$cprobe" in
+            *"route=off"*"real=$SHIM_DIR/"*|*"route=off"*"real="*"/.paradev"*) rm -f "$new" "$cnew"; die "new codex shim resolves to a shim or a wrapper; nothing installed" ;;
+            *"route=off"*"real=/"*"args=[exec][x]"*) ;;
+            *) rm -f "$new" "$cnew"; die "new codex shim dry run failed: $cprobe; nothing installed" ;;
+        esac
+        creal_v=$("$rcodex" --version 2>&1)
+        cshim_v=$(env -u CODEX_ROUTE CODEX_ROUTE=off PATH="$SHIM_DIR:$PATH" "$cnew" --version 2>&1)
+        if [ -z "$creal_v" ] || [ "$creal_v" != "$cshim_v" ]; then rm -f "$new" "$cnew"; die "new codex shim --version ($cshim_v) differs from the real binary ($creal_v); nothing installed"; fi
+    fi
+    mv -f "$new" "$SHIM" || die "could not move the tested shim into place"
+    echo "shim: tested and installed ($(printf '%s\n' "$probe_out" | $GREP '^real='), $shim_v)"
+    if [ -n "$rcodex" ]; then
+        mv -f "$cnew" "$CODEX_SHIM" || die "could not move the tested codex shim into place"
+        echo "codex shim: tested and installed ($(printf '%s\n' "$cprobe" | $GREP '^real='), $cshim_v)"
+    else
+        echo "codex shim: not installed (no codex binary on PATH)"
+    fi
+    [ -f "$CODEX_MODE_FILE" ] || set_codex_mode off
+    seed_aliases && echo "aliases: $ALIASES"
+    local refreshed; refreshed=$(resolver_run claude x --refresh | tr '\037' '\t' | cut -f4)
+    echo "account directory: ${refreshed:-not refreshed (subrouter not answering); words use it once it is}"
+    local f
+    for f in "${RC_FILES[@]}"; do
+        [ -f "$f" ] || continue
+        if rc_has_block "$f"; then echo "PATH line: already in $f"; continue; fi
+        [ -f "$f.bak-claude-route" ] || cp -p "$f" "$f.bak-claude-route"
+        # Appended LAST so it lands ahead of ~/.local/bin, which ~/.zshrc prepends earlier;
+        # Paradev prepends its wrapper after the rc files, and the wrapper execs this shim.
+        printf '\n%s (subrouter route switch; remove with: claude-route uninstall)\nexport PATH="$HOME/.claude-route/bin:$PATH"\n%s\n' "$MARK_BEGIN" "$MARK_END" >> "$f"
+        echo "PATH line: added to $f (backup $f.bak-claude-route)"
+    done
+    echo "mode: $(mode_now)  (off = your own login; nothing routes through subrouter until 'claude-route pool')"
+    echo "codex mode: $(codex_mode_now)  (off = your own login; 'claude-route codex pool' after its checks pass)"
+}
+
+cmd_uninstall() {
+    local f
+    for f in "${RC_FILES[@]}"; do
+        rc_has_block "$f" || continue
+        rc_remove_block "$f" && echo "PATH line: removed from $f"
+    done
+    rm -rf "$SHIM_DIR" "$MODE_FILE" "$CODEX_MODE_FILE" "$ACCOUNTS"
+    echo "shims removed. New launches use the real claude and codex; shells opened earlier still list the (now empty) dir, which PATH lookup skips."
+    echo "Kept: $ALIASES (yours). The daemon still serves the socket; 'claude-route socket-off' stops that."
+}
+
+read_job() {
+    local lib="$HERE/../deploy/macos/laptop-deploy-lib.sh"
+    [ -f "$lib" ] || lib="$(dirname "$("$PY" -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$DEPLOY")")/laptop-deploy-lib.sh"
+    if [ ! -x "$DEPLOY" ] || [ ! -f "$lib" ]; then
+        die "$1 refused: no deploy-laptop.sh and laptop-deploy-lib.sh at $DEPLOY. claude-route finds them from its own real path in ops/bin, so a copy of it elsewhere cannot. Remove the copy so PATH finds ops/bin/claude-route, link it (ln -sfn <checkout>/ops/bin/claude-route <the copy>), or set CLAUDE_ROUTE_DEPLOY=<checkout>/ops/deploy/macos/deploy-laptop.sh. Nothing was changed."
+    fi
+    # shellcheck source=../deploy/macos/laptop-deploy-lib.sh
+    . "$lib" || die "$1 refused: cannot load $lib. Nothing was changed."
+    LABEL="gui/$(id -u)/$(plist_get Label 2>/dev/null)"
+    job_state
+    local conflict
+    conflict=$(shape_conflict) && die "$1 refused: $conflict. Nothing was changed."
+    JOB_SUPERVISED=0
+    case "$LOADED_SHAPE/$PLIST_SHAPE" in supervised/*|none/supervised|unknown/supervised) JOB_SUPERVISED=1 ;; esac
+}
+
+supervisor_restart_allowed() {
+    read_job "$1"
+    [ "$JOB_SUPERVISED" = 1 ] || return 0
+    if [ "$2" != --restart-supervisor ]; then
+        die "$1 refused: $LABEL runs subrouter supervise, and the supervisor reads SUBROUTER_CLAUDE_SOCKET only when it starts. Turning the socket on or off therefore restarts the supervisor: its port and socket close until its first worker is ready, and launchd gives streams in flight at most the plist's ExitTimeOut before cutting them. Nothing was changed. To do it anyway: claude-route $1 --restart-supervisor"
+    fi
+    echo "restarting the supervisor (--restart-supervisor): the port closes until its first worker is ready, and the supervisor binary becomes the worker's build"
+}
+
+reload_daemon() { # PLIST_SET_ENV=<name>=<value> | PLIST_DELETE_ENV=<name>
+    local staged="$ROUTE_HOME/subrouter.reload.$$" rc restart=()
+    [ "$JOB_SUPERVISED" = 1 ] && restart=(--restart-supervisor)
+    mkdir -p "$ROUTE_HOME" && cp -p "$JOB_BINARY" "$staged" || return 1
+    env RELOAD=1 "$1" "$DEPLOY" "$staged" ${restart[@]+"${restart[@]}"} 2>&1 | tee "$ROUTE_HOME/last-reload.log" | sed 's/^/    | /'
+    rc=${PIPESTATUS[0]}
+    rm -f "$staged"
+    return "$rc"
+}
+
+cmd_socket_on() {
+    local cur; cur=$(plist_sock)
+    if [ "$cur" = "$SOCK" ] && socket_ok; then echo "socket: already serving $SOCK"; return 0; fi
+    supervisor_restart_allowed socket-on "${1:-}"
+    echo "restarting the daemon on its own binary with SUBROUTER_CLAUDE_SOCKET=$SOCK (deploy-laptop.sh) ..."
+    local rc=0; reload_daemon PLIST_SET_ENV="SUBROUTER_CLAUDE_SOCKET=$SOCK" || rc=$?
+    if [ "$rc" = 0 ] && socket_ok; then echo "socket: serving $SOCK"; return 0; fi
+    echo "!! socket-on failed (deploy exit $rc, socket $(socket_ok && echo up || echo down)); deploy-laptop.sh's output above says what it changed and what it put back" >&2
+    if tcp_ok; then echo "daemon: healthy" >&2; else echo "!! daemon NOT healthy: tail -50 ~/Library/Logs/subrouter.err.log" >&2; fi
+    return 1
+}
+
+pool_sessions() { # running processes whose environment routes through the socket
+    ps -E -ww -o pid=,command= -U "$(id -u)" 2>/dev/null \
+        | awk -v s="ANTHROPIC_UNIX_SOCKET=$SOCK" 'index($0, s) && $2 !~ /(^|\/)(awk|grep|ps)$/ { print $1 }' | sort -u
+}
+
+cmd_socket_off() {
+    local force="" restart_flag="" a
+    for a in "$@"; do
+        case "$a" in --force) force=1 ;; --restart-supervisor) restart_flag="$a" ;; *) die "socket-off: unknown option '$a'" ;; esac
+    done
+    [ "$(mode_now)" = pool ] && die "mode is pool; run 'claude-route off' first (new launches would fall back to TCP)"
+    [ -n "$(plist_sock)" ] || { echo "socket: not configured"; return 0; }
+    supervisor_restart_allowed socket-off "$restart_flag"
+    local live; live=$(pool_sessions | wc -l | tr -d ' ')
+    if [ "$live" -gt 0 ] && [ -z "$force" ]; then
+        die "$live running process(es) still route through $SOCK; they would hang once it closes (pids: $(pool_sessions | paste -sd' ' -)). Close them, or --force"
+    fi
+    reload_daemon PLIST_DELETE_ENV=SUBROUTER_CLAUDE_SOCKET \
+        || { echo "!! socket-off failed; deploy-laptop.sh's output above says what it changed and what it put back" >&2; return 1; }
+    echo "socket: off"
+}
+
+# The account directory's health, for status and test: words that name two accounts, words
+# that are also a CLI command or 'local', and Claude accounts no email word reaches.
+# Args: accounts.tsv aliases.tsv claude-reserved codex-reserved. Exit 1 when a word collides.
+directory_report() {
+    "$PY" -I - "$@" <<'PY'
+import os, sys, time
+acc, ali, claude_cmds, codex_cmds = sys.argv[1:5]
+cmds = {"claude": set(claude_cmds.split()) | {"local"}, "codex": set(codex_cmds.split()) | {"local"}}
+try:
+    rows = [l.rstrip("\n").split("\t") for l in open(acc) if l.strip() and not l.startswith("#")]
+    age = int(time.time() - os.stat(acc).st_mtime)
+except Exception:
+    print("directory:   none yet (claude-route accounts)"); sys.exit(0)
+rows = [r + [""] * (7 - len(r)) for r in rows]
+count = {}
+for r in rows:
+    k = (r[0], "laptop" if r[4] == "local" else "peers")
+    count[k] = count.get(k, 0) + 1
+print("directory:   %s, %ds old: %s" % (acc, age, ", ".join("%s %s=%d" % (p, w, n) for (p, w), n in sorted(count.items()))))
+words = {}
+for r in rows:
+    prov, id_, label, email = r[0], r[1].lower(), r[2].lower(), r[3].lower()
+    strong = {x for x in (id_, label, email) if x}
+    if label.endswith("]") and " [" in label:
+        strong.add(label[: label.rindex(" [")].strip())
+    for x in list(strong):
+        if "@" in x and not x.startswith("@"):
+            words.setdefault((prov, x.split("@", 1)[0], "weak"), set()).add(r[1] + "@" + r[4])
+    for x in strong:
+        words.setdefault((prov, x, "strong"), set()).add(r[1] + "@" + r[4])
+try:
+    for l in open(ali):
+        p = [x.strip() for x in l.rstrip("\n").split("\t")]
+        if not l.startswith("#") and len(p) >= 3 and p[1]:
+            words.setdefault((p[0].lower(), p[1].lower(), "alias"), set()).add("alias->" + p[2])
+except Exception:
+    pass
+bad = []
+for (prov, w, tier), ids in sorted(words.items()):
+    if w in cmds.get(prov, set()):
+        bad.append("%s %s (also a %s command or 'local')" % (prov, w, prov))
+    plain = {i.split("@", 1)[0] for i in ids if not i.startswith("alias->")}
+    if tier == "strong" and len(plain) > 1:
+        bad.append("%s %s names %s" % (prov, w, ", ".join(sorted(ids))))
+print("collisions:  " + ("; ".join(bad) if bad else "none"))
+noemail = sorted(r[1] for r in rows if r[0] == "claude" and not r[3])
+if noemail:
+    print("by name only: %d Claude accounts carry no email (an alias in aliases.tsv adds one): %s" % (len(noemail), " ".join(noemail)))
+sys.exit(1 if bad else 0)
+PY
+}
+shim_list() { # the command list a shim reserves: $1 = shim, $2 = variable name
+    sed -n "s/^$2=\"\(.*\)\"\$/\1/p" "$1" 2>/dev/null | head -1
+}
+
+cmd_status() {
+    local m; m=$(mode_now)
+    echo "mode:        $m   (new launches: $([ "$m" = pool ] && echo 'subrouter pool over the socket' || echo 'your own login'))"
+    echo "shim:        $([ -x "$SHIM" ] && echo "$SHIM" || echo 'NOT installed')"
+    local f; for f in "${RC_FILES[@]}"; do echo "PATH line:   $f: $(rc_has_block "$f" && echo present || echo absent)"; done
+    echo "plist:       SUBROUTER_CLAUDE_SOCKET=$(plist_sock || true)"
+    echo "socket:      $(socket_ok && echo "serving $SOCK" || echo "NOT answering ($SOCK)")"
+    echo "daemon TCP:  $(tcp_ok && echo healthy || echo DOWN)"
+    echo "pool now:    $(pool_sessions | wc -l | tr -d ' ') running process(es) route through the socket"
+    [ -x "$SHIM" ] && echo "decision:    $(env -u ANTHROPIC_BASE_URL -u ANTHROPIC_UNIX_SOCKET -u CLAUDE_CODE_OAUTH_TOKEN -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_API_KEY -u CLAUDE_ROUTE CLAUDE_ROUTE_DRYRUN=1 "$SHIM" | head -1) (a fresh launch now)"
+    echo "last test:   $(cat "$LAST_TEST" 2>/dev/null || echo never)"
+    echo "-- route words (claude local | claude <account>; codex local | codex <account>) --"
+    local hb; hb=$(probe "$TCP/_subrouter/health")
+    echo "identity:    $(plist_identity || echo 'none set') (on this build a laptop Claude pin must name it)"
+    if [[ "$hb" =~ \"account_pins\"[[:space:]]*:[[:space:]]*\"local\+peers\" ]]; then echo "peer pins:   supported by this daemon build"
+    else echo "peer pins:   not supported by this daemon build (refused before launch, exit 2)"; fi
+    directory_report "$ACCOUNTS" "$ALIASES" "$(shim_list "$SHIM" reserved)" "$(shim_list "$CODEX_SHIM" codex_cmds)"
+    echo "aliases:     $([ -f "$ALIASES" ] && echo "$ALIASES ($($GREP -cv '^#' "$ALIASES" 2>/dev/null) lines)" || echo none)"
+    local d="$PWD" sf="" g re='"(ANTHROPIC_[A-Z_]*(BASE_URL|UNIX_SOCKET|AUTH_TOKEN|API_KEY|CUSTOM_HEADERS)|CLAUDE_CODE_USE_(BEDROCK|VERTEX|FOUNDRY)|CLAUDE_CODE_OAUTH_TOKEN|CLAUDE_CONFIG_DIR|apiKeyHelper)"[[:space:]]*:'
+    for g in "$HOME/.claude/settings.json" "$HOME/.claude/settings.local.json"; do [ -f "$g" ] && $GREP -Eq "$re" "$g" && sf="$sf $g"; done
+    while [ -n "$d" ]; do
+        for g in "$d/.claude/settings.json" "$d/.claude/settings.local.json"; do [ -f "$g" ] && $GREP -Eq "$re" "$g" && sf="$sf $g"; done
+        [ "$d" = / ] && break; d="${d%/*}"; [ -n "$d" ] || d=/
+    done
+    if [ -n "$sf" ]; then echo "settings:    route keys in$sf: a route word launched here is refused"
+    else echo "settings:    no settings file here names a route"; fi
+    echo "-- codex --"
+    echo "codex mode:  $(codex_mode_now)   (new launches: $([ "$(codex_mode_now)" = pool ] && echo 'subrouter pool' || echo 'your own login'))"
+    echo "codex shim:  $([ -x "$CODEX_SHIM" ] && echo "$CODEX_SHIM ($(env -u CODEX_ROUTE CODEX_ROUTE_DRYRUN=1 "$CODEX_SHIM" exec x 2>/dev/null | $GREP '^real='))" || echo 'NOT installed')"
+    echo "codex test:  $(cat "$LAST_CODEX_TEST" 2>/dev/null || echo never)   check: $(cat "$LAST_CODEX_CHECK" 2>/dev/null || echo never)"
+    if [ -f "$ROUTE_HOME/launch.log" ]; then echo "recent launches:"; tail -5 "$ROUTE_HOME/launch.log" | sed 's/^/  /'; fi
+}
+
+cmd_accounts() {
+    local line note
+    line=$(resolver_run claude x --refresh | tr '\037' '\t')
+    note=$(printf '%s' "$line" | cut -f4)
+    case "$line" in refreshed*) echo "refreshed: $note" ;; *) echo "not refreshed: ${note:-subrouter is not answering}; showing the cached list" ;; esac
+    [ -f "$ACCOUNTS" ] || { echo "no account list yet"; return 1; }
+    printf '%-7s %-40s %-16s %-16s %s\n' provider "word (id / email)" where verdict paid
+    awk -F'\t' '!/^#/ && NF >= 5 { w = $2; if ($4 != "" && $4 != $2) w = w " / " $4; printf "%-7s %-40s %-16s %-16s %s\n", $1, w, ($5 == "local" ? "laptop" : $5), $6, $7 }' "$ACCOUNTS" | sort
+    if [ -f "$ALIASES" ]; then echo "aliases ($ALIASES):"; $GREP -v '^#' "$ALIASES" | sed 's/^/  /'; fi
+    case "$line" in refreshed*) return 0 ;; esac
+    return 1
+}
+
+cmd_pool() {
+    if [ "${1:-}" != --force ]; then
+        [ -x "$SHIM" ] || die "not installed: claude-route install"
+        rc_has_block "$HOME/.zshrc" || die "PATH line missing from ~/.zshrc: claude-route install"
+        socket_ok || die "the daemon's Claude socket is not answering: claude-route socket-on"
+        local last; last=$(cat "$LAST_TEST" 2>/dev/null)
+        case "$last" in "PASS $(date +%Y-%m-%d)"*) ;; *) die "no passing 'claude-route test' today (last: ${last:-never}); run it, or --force" ;; esac
+    fi
+    set_mode pool
+    echo "mode: pool. NEW Claude Code launches (Paradev or terminal) route through the pool over the socket."
+    echo "Running sessions keep the route they started with. Roll back: claude-route off"
+}
+
+cmd_off() {
+    set_mode off
+    echo "mode: off. NEW Claude Code launches use your own login. Running pool sessions keep the pool."
+}
+
+cmd_codex() {
+    case "${1:-}" in
+        off)
+            set_codex_mode off
+            echo "codex mode: off. NEW Codex launches use your own login (~/.codex). Running sessions keep their route." ;;
+        pool)
+            if [ "${2:-}" != --force ]; then
+                [ -x "$CODEX_SHIM" ] || die "codex shim not installed: claude-route install"
+                passed_today "$LAST_CODEX_TEST" || die "no passing codex section of 'claude-route test' today (last: $(cat "$LAST_CODEX_TEST" 2>/dev/null || echo never)); or --force"
+                passed_today "$LAST_CODEX_CHECK" && $GREP -qF "CODEX_HOME=$HOME/.codex)" "$LAST_CODEX_CHECK" \
+                    || die "no passing 'claude-route check codex' today on your own ~/.codex config (last: $(cat "$LAST_CODEX_CHECK" 2>/dev/null || echo never)); or --force"
+            fi
+            set_codex_mode pool
+            echo "codex mode: pool. NEW Codex launches (Paradev or terminal) route through subrouter. Roll back: claude-route codex off" ;;
+        *) die "usage: claude-route codex pool [--force] | codex off" ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# A clean launch environment for test/check: nothing from the calling session,
+# Paradev's notifier off, no inherited route -- what a fresh terminal would have.
+# Sets CLEAN (env arguments) and BASE (PATH without the shims or Paradev dirs).
+build_launch_env() {
+    CLEAN=(); BASE=""
+    local v d
+    for v in $(compgen -e); do
+        case "$v" in
+            CLAUDE_CODE_MAX_OUTPUT_TOKENS|CLAUDE_CODE_MAX_RETRIES) ;;
+            SUPERSET_*|CLAUDE_CODE_*|CLAUDECODE|CLAUDE_EFFORT|CLAUDE_PID|ANTHROPIC_*|CLAUDE_ROUTE*|CODEX_ROUTE*) CLEAN+=(-u "$v") ;;
+        esac
+    done
+    # A test of another route home (CLAUDE_ROUTE_HOME) keeps it: its shims, its mode, its log.
+    [ -n "${CLAUDE_ROUTE_HOME:-}" ] && CLEAN+=("CLAUDE_ROUTE_HOME=$ROUTE_HOME")
+    local IFS=:
+    for d in $PATH; do case "$d" in "$SHIM_DIR"|"$HOME"/.claude-route/bin|"$HOME"/.paradev/bin|"$HOME"/.paradev-*/bin) ;; *) BASE="${BASE:+$BASE:}$d" ;; esac; done
+}
+
+# Kills the whole process group at the deadline: Paradev's codex wrapper runs codex as a child.
+run_group() { # seconds command...
+    perl -e 'my $t=shift; my $p=fork; if(!$p){setpgrp(0,0); exec @ARGV; exit 127} $SIG{ALRM}=sub{kill "KILL",-$p; exit 142}; alarm $t; waitpid($p,0); exit($?>>8)' "$@"
+}
+
+# One real launch decided by the mode file alone, made the way a new Paradev
+# session makes it (Paradev's wrapper -> shim -> claude). The post-cutover proof.
+cmd_check() {
+    [ "${1:-}" = codex ] && { cmd_check_codex; return; }
+    [ -x "$SHIM" ] || die "not installed: claude-route install"
+    local cwd="$ROUTE_HOME/test-cwd" sid out route acct
+    mkdir -p "$cwd"; sid=$(uuidgen | tr '[:upper:]' '[:lower:]')
+    build_launch_env
+    out=$(cd "$cwd" && perl -e 'alarm shift; exec @ARGV' 240 env "${CLEAN[@]}" PATH="$HOME/.paradev/bin:$SHIM_DIR:$BASE" \
+        "$HOME/.paradev/bin/claude" -p "Reply with exactly one word, in lowercase: ready" --model haiku --session-id "$sid" 2>&1)
+    route=$($GREP -F "sid=$sid" "$ROUTE_HOME/launch.log" 2>/dev/null | tail -1 | sed -n 's/.* route=\([a-z-]*\).*/\1/p')
+    acct=$("$SRQ" serving "$sid" 2>/dev/null)
+    echo "mode=$(mode_now)  route=${route:-?}  answer=${out:0:80}  pool account=${acct:-none (not through the pool)}"
+    [[ "$out" == *ready* ]] || return 1
+    [ "$(mode_now)" = off ] || [ -n "$acct" ]
+}
+
+# One real pooled Codex launch through Paradev's wrapper, on YOUR Codex config (CODEX_HOME,
+# ~/.codex by default: its hooks, MCP servers and notify run, and the session is saved there),
+# checked against the daemon's own session table. 'codex pool' wants it to pass first.
+cmd_check_codex() {
+    [ -x "$CODEX_SHIM" ] || die "codex shim not installed: claude-route install"
+    local cwd="$ROUTE_HOME/test-cwd" out last sid acct res
+    mkdir -p "$cwd"; rm -f "$cwd/.codex-check-last.txt"
+    build_launch_env
+    out=$(cd "$cwd" && run_group 240 env "${CLEAN[@]}" PATH="$HOME/.paradev/bin:$SHIM_DIR:$BASE" CODEX_ROUTE=pool \
+        "$HOME/.paradev/bin/codex" exec --skip-git-repo-check -o "$cwd/.codex-check-last.txt" "Reply with exactly one word, in lowercase: ready" </dev/null 2>&1)
+    sid=$(printf '%s\n' "$out" | sed -n 's/^session id: //p' | head -1)
+    last=$(cat "$cwd/.codex-check-last.txt" 2>/dev/null); rm -f "$cwd/.codex-check-last.txt"
+    acct=$([ -n "$sid" ] && "$SRQ" serving "$sid" 2>/dev/null)
+    echo "codex: CODEX_HOME=${CODEX_HOME:-$HOME/.codex}  session=${sid:-?}  answer=${last:0:80}  pool account=${acct:-none (not through the pool)}"
+    if [[ "$last" == *ready* ]] && [ -n "$acct" ]; then res=PASS; else res=FAIL; printf '%s\n' "$out" | tail -5 >&2; fi
+    echo "$res $(date +%Y-%m-%d) $(date +%H:%M:%S) (${acct:-no pool account}; CODEX_HOME=${CODEX_HOME:-$HOME/.codex})" > "$LAST_CODEX_CHECK"
+    [ "$res" = PASS ]
+}
+
+# ---------------------------------------------------------------------------
+# Wet test. Decisions (dry runs), real launches through the shim (haiku, a few
+# tokens each) checked against the daemon's own session table, forced fallbacks,
+# and parity: a pool session must offer every tool an off one does (claude.ai
+# connectors excepted: Claude Code turns them off for socket-mode tokens).
+# Claude checks decide last-test (the gate for 'pool'); Codex checks decide
+# last-codex-test (the gate for 'codex pool'), so one never blocks the other.
+cmd_test() {
+    [ -x "$SHIM" ] || die "not installed: claude-route install"
+    local pass=0 fail=0 cpass=0 cfail=0 cwd="$ROUTE_HOME/test-cwd" err="$ROUTE_HOME/test.err" tmp
+    mkdir -p "$cwd"; : > "$err"
+    tmp=$(mktemp -d "${TMPDIR:-/tmp}/claude-route-test.XXXXXX") || die "mktemp failed"
+    build_launch_env
+    local -a clean=("${CLEAN[@]}")
+    local base="$BASE" NL=$'\n'
+    local P_SHIM="$SHIM_DIR:$base" P_PARADEV="$HOME/.paradev/bin:$SHIM_DIR:$base" CSHIM="$CODEX_SHIM"
+    local -a fakes=()
+
+    check() { local name="$1"; shift; if "$@" >>"$err" 2>&1; then echo "  PASS  $name"; pass=$((pass+1)); else echo "  FAIL  $name   (details: $err)"; fail=$((fail+1)); fi; }
+    ccheck() { local name="$1"; shift; if "$@" >>"$err" 2>&1; then echo "  PASS  $name"; cpass=$((cpass+1)); else echo "  FAIL  $name   (details: $err)"; cfail=$((cfail+1)); fi; }
+    dry() { (cd "$cwd" && perl -e 'alarm shift; exec @ARGV' 20 env "${clean[@]}" CLAUDE_ROUTE_DRYRUN=1 "$@"); }
+    cdry() { (cd "$cwd" && perl -e 'alarm shift; exec @ARGV' 20 env "${clean[@]}" CODEX_ROUTE_DRYRUN=1 "$@"); }
+    has() { local out="$1"; shift; local w; for w in "$@"; do [[ "$out" == *"$w"* ]] || { echo "missing [$w] in: $out"; return 1; }; done; }
+    lacks() { local out="$1"; shift; local w; for w in "$@"; do [[ "$out" == *"$w"* ]] && { echo "unexpected [$w] in: $out"; return 1; }; done; return 0; }
+    code_is() { [ "$1" = "$2" ] || { echo "exit $1, want $2"; return 1; }; }
+    quick() { [ "$(( $(date +%s) - $1 ))" -le "$2" ] || { echo "took $(( $(date +%s) - $1 ))s, limit $2s"; return 1; }; }
+    ask() { # sid, word, then env assignments and the command; a hang is a failure, not a wait
+        local sid="$1" word="$2"; shift 2
+        local out; out=$(cd "$cwd" && perl -e 'alarm shift; exec @ARGV' 240 env "${clean[@]}" "$@" -p "Reply with exactly one word, in lowercase: $word" --model haiku --session-id "$sid" 2>>"$err")
+        echo "[$sid] -> ${out:0:200}"
+        [[ "$out" == *"$word"* ]]
+    }
+    resume() {
+        local sid="$1" word="$2"; shift 2
+        local out; out=$(cd "$cwd" && perl -e 'alarm shift; exec @ARGV' 240 env "${clean[@]}" "$@" -p "Reply with exactly one word, in lowercase: $word" --model haiku --resume "$sid" 2>>"$err")
+        echo "[resume $sid] -> ${out:0:200}"
+        [[ "$out" == *"$word"* ]]
+    }
+    served() { local a; a=$("$SRQ" serving "$1" 2>&1) || { echo "daemon has no row for $1: $a"; return 1; }; echo "$1 served by: $a"; SERVED_BY="$a"; }
+    unserved() { local a; if a=$("$SRQ" serving "$1" 2>&1); then echo "daemon has a row for $1: $a"; return 1; fi; return 0; }
+    uuid() { uuidgen | tr '[:upper:]' '[:lower:]'; }
+    surface() { # route -> sorted tool names + mcp server names from the session's init record
+        (cd "$cwd" && perl -e 'alarm shift; exec @ARGV' 180 env "${clean[@]}" PATH="$P_SHIM" CLAUDE_ROUTE="$1" "$SHIM" \
+            -p "Reply with one word: ok" --model haiku --output-format stream-json --verbose 2>>"$err") | python3 -I -c '
+import json, sys
+for line in sys.stdin:
+    try: d = json.loads(line)
+    except Exception: continue
+    if d.get("type") == "system" and d.get("subtype") == "init":
+        names = list(d.get("tools", [])) + ["mcp:" + s.get("name", "?") for s in d.get("mcp_servers", [])]
+        print("\n".join(sorted(names)))
+        break'
+    }
+    parity() {
+        printf '%s\n' "$(surface pool)" > "$tmp/pool.txt"; printf '%s\n' "$(surface off)" > "$tmp/off.txt"
+        [ -s "$tmp/pool.txt" ] && [ -s "$tmp/off.txt" ] && [ "$(wc -l < "$tmp/off.txt")" -gt 5 ] || { echo "no init record from one route"; return 1; }
+        local gap='^(mcp__claude_ai_|mcp:claude\.ai )' all missing known
+        all=$(comm -13 "$tmp/pool.txt" "$tmp/off.txt")
+        missing=$(printf '%s\n' "$all" | $GREP -v -E "$gap" | paste -sd' ' -)
+        known=$(printf '%s\n' "$all" | $GREP -E "$gap" | paste -sd' ' -)
+        echo "pool lacks: ${missing:-nothing}${known:+   (accepted socket-mode gap: $known)}"
+        PARITY_MISSING="$missing"; PARITY_KNOWN="$known"
+        [ -z "$missing" ]
+    }
+    pick() { # provider laptop|peer [column] -> the first matching row's id (or that column) in the live directory
+        awk -F'\t' -v p="$1" -v w="$2" -v c="${3:-2}" '!/^#/ && $1 == p && (w == "laptop") == ($5 == "local") { print $c; exit }' "$ACCOUNTS" 2>/dev/null
+    }
+    fake_daemon() { # mode fixture.json -> sets FAKE_PORT. A tiny stand-in daemon for decisions only (dry runs)
+        local pf="$tmp/fake.$RANDOM.port" i
+        "$PY" -I - "$1" "$2" "$pf" >/dev/null 2>&1 <<'FAKE' &
+import http.server, json, os, socket, sys, threading
+mode, fixture, portfile = sys.argv[1:4]
+threading.Timer(900, os._exit, (0,)).start()   # never outlives a test run
+def ready(port):
+    open(portfile + ".tmp", "w").write(str(port)); os.replace(portfile + ".tmp", portfile)
+if mode == "stall":   # accepts and never answers: a hung daemon
+    s = socket.socket(); s.bind(("127.0.0.1", 0)); s.listen(128); ready(s.getsockname()[1]); held = []
+    while True:
+        held.append(s.accept()[0])
+data = json.load(open(fixture))
+class H(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_GET(self):
+        p, variant = self.path, "default"
+        if p.startswith("/pins/"):
+            p, variant = p[5:], "pins"
+        key = {"/_subrouter/health": "health_" + variant, "/_subrouter/accounts": "accounts",
+               "/_subrouter/usage-status": "usage", "/_subrouter/peers/usage-status": "peers"}.get(p)
+        if key not in data:
+            self.send_response(404); self.end_headers(); return
+        body = json.dumps(data[key], indent=2).encode()
+        self.send_response(200); self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H); ready(srv.server_address[1]); srv.serve_forever()
+FAKE
+        fakes+=($!)
+        for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do [ -s "$pf" ] && break; perl -e 'select(undef,undef,undef,0.1)'; done
+        FAKE_PORT=$(cat "$pf" 2>/dev/null)
+    }
+    mkplist() { # identity -> a plist naming it as the daemon's identity account
+        printf '<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict><key>EnvironmentVariables</key><dict><key>SUBROUTER_IDENTITY_ACCOUNT</key><string>%s</string></dict></dict></plist>\n' "$1" > "$tmp/plist-$1"
+        echo "$tmp/plist-$1"
+    }
+
+    echo "== preflight =="
+    check "daemon answers on TCP"                         tcp_ok
+    check "plist names the socket"                        test "$(plist_sock)" = "$SOCK"
+    check "daemon answers THROUGH the socket"             socket_ok
+
+    echo "== decisions (dry run, no API calls) =="
+    local o
+    o=$(dry PATH="$P_SHIM" "$SHIM"); check "resolves the real binary"  has "$o" "real=/" ; check "  ...which is not a shim" lacks "$o" "real=$SHIM_DIR/"
+    o=$(dry PATH="$P_SHIM" CLAUDE_ROUTE=off "$SHIM");  check "off: untouched"   has "$o" "route=off" "ANTHROPIC_BASE_URL=<unset>" "CLAUDE_CODE_OAUTH_TOKEN=<unset>"
+    o=$(dry PATH="$P_SHIM" CLAUDE_ROUTE=pool "$SHIM"); check "pool: socket route" has "$o" "route=pool" "ANTHROPIC_BASE_URL=http://api.anthropic.com" "ANTHROPIC_UNIX_SOCKET=$SOCK" "CLAUDE_CODE_OAUTH_TOKEN=ssh-placeholder" "ANTHROPIC_AUTH_TOKEN=<unset>"
+    check "  ...with a login-less credential store" has "$o" "CLAUDE_SECURESTORAGE_CONFIG_DIR=$ROUTE_HOME/securestorage" "CLAUDE_CODE_OAUTH_SCOPES=<unset>" "ENABLE_CLAUDEAI_MCP_SERVERS=0"
+    o=$(dry PATH="$P_SHIM" CLAUDE_ROUTE=pool CLAUDE_CODE_OAUTH_SCOPES="user:inference user:mcp_servers" CLAUDE_SECURESTORAGE_CONFIG_DIR="$HOME/.claude" "$SHIM"); check "  ...even when the caller set the scopes or pointed the store at ~/.claude" has "$o" "CLAUDE_SECURESTORAGE_CONFIG_DIR=$ROUTE_HOME/securestorage" "CLAUDE_CODE_OAUTH_SCOPES=<unset>"
+    o=$(dry PATH="$P_SHIM" CLAUDE_ROUTE=off CLAUDE_SECURESTORAGE_CONFIG_DIR="$ROUTE_HOME/securestorage" ENABLE_CLAUDEAI_MCP_SERVERS=0 "$SHIM"); check "off drops the pool's credential store" has "$o" "route=off" "CLAUDE_SECURESTORAGE_CONFIG_DIR=<unset>" "ENABLE_CLAUDEAI_MCP_SERVERS=<unset>"
+    o=$(dry PATH="$P_SHIM" CLAUDE_ROUTE=pool CLAUDE_ROUTE_SOCKET=/nonexistent/claude.sock "$SHIM"); check "pool, dead socket: TCP" has "$o" "route=pool-tcp" "ANTHROPIC_BASE_URL=$TCP" "ANTHROPIC_UNIX_SOCKET=<unset>"
+    o=$(dry PATH="$P_SHIM" CLAUDE_ROUTE=pool CLAUDE_ROUTE_SOCKET=/nonexistent/claude.sock ALL_PROXY=http://127.0.0.1:9 http_proxy=http://127.0.0.1:9 "$SHIM"); check "  ...even with a dead proxy in the env" has "$o" "route=pool-tcp"
+    o=$(dry PATH="$P_SHIM" CLAUDE_ROUTE=pool CLAUDE_ROUTE_SOCKET=/nonexistent/claude.sock CLAUDE_ROUTE_TCP=http://127.0.0.1:9 "$SHIM"); check "pool, daemon dead: off, with a note" has "$o" "route=off" "ANTHROPIC_BASE_URL=<unset>" "note="
+    mkdir -p "$tmp/home-pool"; echo pool > "$tmp/home-pool/mode"
+    o=$(dry PATH="$P_SHIM" CLAUDE_ROUTE_HOME="$tmp/home-pool" ANTHROPIC_BASE_URL=http://example.invalid "$SHIM"); check "mode pool keeps a caller's own route" has "$o" "route=inherited" "ANTHROPIC_BASE_URL=http://example.invalid"
+    o=$(dry PATH="$P_SHIM" CLAUDE_ROUTE_HOME="$tmp/home-pool" CLAUDE_CODE_USE_BEDROCK=1 "$SHIM"); check "  ...including Bedrock (sr claude-aws)" has "$o" "route=inherited" "CLAUDE_CODE_USE_BEDROCK=1"
+    printf '{"env":{"ANTHROPIC_BASE_URL":"","ANTHROPIC_AUTH_TOKEN":""}}\n' > "$tmp/sr-settings.json"
+    o=$(dry PATH="$P_SHIM" CLAUDE_ROUTE=pool "$SHIM" --settings "$tmp/sr-settings.json"); check "a --settings naming a route (sr claude) is kept" has "$o" "route=inherited" "ANTHROPIC_UNIX_SOCKET=<unset>"
+    o=$(dry PATH="$P_SHIM" CLAUDE_ROUTE=pool "$SHIM" --settings '{"model":"opus"}'); check "a --settings with no route does not block pool" has "$o" "route=pool"
+    o=$(dry PATH="$P_SHIM" CLAUDE_ROUTE=pool ANTHROPIC_API_KEY=sk-test "$SHIM"); check "explicit pool beats an API key in the env" has "$o" "route=pool" "ANTHROPIC_API_KEY=<unset>"
+    o=$(dry PATH="$P_SHIM" CLAUDE_ROUTE=off ANTHROPIC_BASE_URL=http://api.anthropic.com ANTHROPIC_UNIX_SOCKET="$SOCK" CLAUDE_CODE_OAUTH_TOKEN=ssh-placeholder CLAUDE_ROUTE_ACTIVE=pool \
+        CLAUDE_ROUTE_SET="ANTHROPIC_BASE_URL ANTHROPIC_UNIX_SOCKET CLAUDE_CODE_OAUTH_TOKEN" "$SHIM"); check "explicit off inside a pool session undoes the parent's route" has "$o" "route=off" "ANTHROPIC_BASE_URL=<unset>" "ANTHROPIC_UNIX_SOCKET=<unset>" "CLAUDE_CODE_OAUTH_TOKEN=<unset>"
+    o=$(dry PATH="$SHIM_DIR:$SHIM_DIR:$base" "$SHIM"); check "no self-recursion with the shim twice on PATH" has "$o" "real=/"; check "  ...(not a shim)" lacks "$o" "real=$SHIM_DIR/"
+    o=$(dry PATH="$P_PARADEV" HOME="$HOME/" "$SHIM"); check "HOME with a trailing slash never picks Paradev's wrapper" lacks "$o" "/.paradev/bin/claude" "real=$SHIM_DIR/"
+    mkdir -p "$tmp/naive"; cat > "$tmp/naive/claude" <<'NAIVE'
+#!/bin/bash
+# a naive wrapper: exec the first other `claude` on PATH
+self="$(cd "$(dirname "$0")" && pwd -P)"
+IFS=: ; for d in $PATH; do [ "$(cd "$d" 2>/dev/null && pwd -P)" = "$self" ] && continue; [ -x "$d/claude" ] && exec "$d/claude" "$@"; done
+exit 127
+NAIVE
+    chmod 755 "$tmp/naive/claude"
+    # Real exec, not a dry run (a dry run never follows the exec): without the guard this spins until the alarm.
+    check "a looping wrapper is caught, not spun" eval '[ "$(cd "$cwd" && perl -e "alarm 20; exec @ARGV" env "${clean[@]}" PATH="$SHIM_DIR:$tmp/naive:$base" CLAUDE_ROUTE=off "$SHIM" --version 2>/dev/null)" = "$(env "${clean[@]}" "$HOME/.local/bin/claude" --version 2>&1)" ]'
+    o=$(dry PATH="$P_PARADEV" CLAUDE_ROUTE=pool "$HOME/.paradev/bin/claude"); check "Paradev's wrapper execs the shim" has "$o" "route=pool"
+    o=$(dry PATH="$P_SHIM" CLAUDE_ROUTE=bogus "$SHIM"); check "an unknown CLAUDE_ROUTE is reported, not obeyed" has "$o" "note=unknown CLAUDE_ROUTE=bogus"
+    mkdir -p "$tmp/ro-home"; echo off > "$tmp/ro-home/mode"; : > "$tmp/ro-home/launch.log"; chmod 444 "$tmp/ro-home/launch.log"
+    check "an unwritable launch log stays quiet" eval '[ -z "$(cd "$cwd" && env "${clean[@]}" PATH="$P_SHIM" CLAUDE_ROUTE_HOME="$tmp/ro-home" "$SHIM" --version 2>&1 >/dev/null)" ]'
+    printf 'a\n\n%s (x)\nexport PATH=y\n%s\nb\n' "$MARK_BEGIN" "$MARK_END" > "$tmp/rc-ok"; printf 'a\nb\n' > "$tmp/rc-ok.want"
+    check "uninstall removes exactly the block" eval 'rc_remove_block "$tmp/rc-ok" && cmp -s "$tmp/rc-ok" "$tmp/rc-ok.want"'
+    printf 'a\n%s (x)\nexport PATH=y\nb\nc\n' "$MARK_BEGIN" > "$tmp/rc-bad"; cp "$tmp/rc-bad" "$tmp/rc-bad.orig"
+    check "uninstall leaves a block with no end marker alone" eval '! rc_remove_block "$tmp/rc-bad" && cmp -s "$tmp/rc-bad" "$tmp/rc-bad.orig"'
+
+    # ---- route words. Live accounts come from the directory, never hardcoded. ----
+    cmd_accounts >/dev/null 2>&1
+    local LC LCE PC LX PX rc t0 UP hbl
+    LC=$(pick claude laptop); LCE=$(pick claude laptop 4); PC=$(pick claude peer); LX=$(pick codex laptop); PX=$(pick codex peer)
+    hbl=$(probe "$TCP/_subrouter/health")
+    echo "   (directory: claude laptop=${LC:-none} peer=${PC:-none}; codex laptop=${LX:-none} peer=${PX:-none}; identity=$(plist_identity || echo none))"
+    mkdir -p "$tmp/rh"; echo pool > "$tmp/rh/mode"; echo pool > "$tmp/rh/codex-mode"
+    cp "$ACCOUNTS" "$tmp/rh/accounts.tsv" 2>/dev/null
+    printf 'claude\tdoctor\t%s\nclaude\tzz-gone-alias\tno-such-account\n' "$LC" > "$tmp/rh/aliases.tsv"
+
+    echo "== route words: claude (dry run) =="
+    for w in local LOCAL Local; do
+        t0=$(date +%s); o=$(dry PATH="$P_SHIM" CLAUDE_ROUTE=pool CLAUDE_ROUTE_SOCKET=/nonexistent/claude.sock CLAUDE_ROUTE_TCP=http://127.0.0.1:9 "$SHIM" "$w" -p hi)
+        check "'$w': own login, word dropped, daemon dead and never asked" eval 'has "$o" "route=off" "word=local" "args=[-p][hi]" "ANTHROPIC_BASE_URL=<unset>" && quick $t0 1'
+    done
+    o=$(dry PATH="$P_SHIM" ANTHROPIC_BASE_URL=http://api.anthropic.com ANTHROPIC_UNIX_SOCKET="$SOCK" CLAUDE_CODE_OAUTH_TOKEN=ssh-placeholder \
+        "ANTHROPIC_CUSTOM_HEADERS=X-Subrouter-Agent: claude${NL}X-Subrouter-Account-ID: ${LC:-x}" CLAUDE_ROUTE_SET="ANTHROPIC_BASE_URL ANTHROPIC_UNIX_SOCKET CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_CUSTOM_HEADERS" "$SHIM" local)
+    check "local inside a pinned pool session drops the route and the pin" has "$o" "route=off" "ANTHROPIC_UNIX_SOCKET=<unset>" "ANTHROPIC_CUSTOM_HEADERS=<unset>" "CLAUDE_CODE_OAUTH_TOKEN=<unset>"
+    o=$(dry PATH="$P_SHIM" ANTHROPIC_BASE_URL="$TCP" ANTHROPIC_AUTH_TOKEN=some-token "$SHIM" local)
+    check "local drops a hand-set subrouter URL and its token" has "$o" "route=off" "ANTHROPIC_BASE_URL=<unset>" "ANTHROPIC_AUTH_TOKEN=<unset>"
+    o=$(dry PATH="$P_SHIM" ANTHROPIC_BASE_URL=http://example.invalid "$SHIM" local)
+    check "local keeps a base URL that is not subrouter" has "$o" "ANTHROPIC_BASE_URL=http://example.invalid"
+    o=$(dry PATH="$P_SHIM" CLAUDE_CONFIG_DIR="$HOME/.subrouter/codex/claude/zz-profile" "$SHIM" local)
+    check "local drops a CLAUDE_CONFIG_DIR inside ~/.subrouter (a pool profile)" has "$o" "route=off" "CLAUDE_CONFIG_DIR=<unset>" "note=CLAUDE_CONFIG_DIR pointed into ~/.subrouter"
+    o=$(dry PATH="$P_SHIM" CLAUDE_CONFIG_DIR="$tmp/own-config" "$SHIM" local)
+    check "  ...and keeps one of your own"                             has "$o" "CLAUDE_CONFIG_DIR=$tmp/own-config"
+    o=$(dry PATH="$P_SHIM" CLAUDE_ROUTE=pool "$SHIM" -- local);          check "'-- local' is a prompt"              has "$o" "word=<none>" "args=[--][local]"
+    o=$(dry PATH="$P_SHIM" CLAUDE_ROUTE=pool "$SHIM" "local please");    check "'local please' is a prompt"          has "$o" "word=<none>" "args=[local please]"
+    o=$(dry PATH="$P_SHIM" CLAUDE_ROUTE=pool "$SHIM" -p local);          check "a word after a flag is a prompt"     has "$o" "word=<none>" "args=[-p][local]"
+    o=$(dry PATH="$P_SHIM" CLAUDE_ROUTE=pool "$SHIM" @README.md);       check "an @-mention is a prompt, never a word" has "$o" "route=pool" "word=<none>" "args=[@README.md]"
+    o=$(dry PATH="$P_PARADEV" CLAUDE_ROUTE=pool "$HOME/.paradev/bin/claude" --dangerously-skip-permissions --model opus --effort xhigh local)
+    check "Paradev's launch shape is never a word"                       has "$o" "route=pool" "word=<none>" "args=[--dangerously-skip-permissions][--model][opus][--effort][xhigh][local]"
+    o=$(dry PATH="$P_PARADEV" CLAUDE_ROUTE=pool "$HOME/.paradev/bin/claude" local -p hi)
+    check "a word through Paradev's wrapper"                             has "$o" "route=off" "word=local" "args=[-p][hi]"
+    o=$(dry PATH="$P_SHIM" CLAUDE_ROUTE_WORDS=0 "$SHIM" local);          check "CLAUDE_ROUTE_WORDS=0 turns words off" has "$o" "word=<none>" "args=[local]"
+    o=$(dry PATH="$P_SHIM" "$SHIM" locl); rc=$?;                       check "a typo of 'local' sends nothing (2)" eval 'code_is $rc 2 && has "$o" "refused=near" "did you mean '"'"'local'"'"'"'
+    mkdir -p "$tmp/proj/.claude"; printf '{"env":{"ANTHROPIC_BASE_URL":"http://example.invalid"}}\n' > "$tmp/proj/.claude/settings.json"
+    o=$(cd "$tmp/proj" && perl -e 'alarm 20; exec @ARGV' env "${clean[@]}" CLAUDE_ROUTE_DRYRUN=1 PATH="$P_SHIM" "$SHIM" local); rc=$?
+    check "a project's settings naming a route: a word is refused (2)"   eval 'code_is $rc 2 && has "$o" "refused=settings-file" "/proj/.claude/settings.json"'
+    o=$(cd "$tmp/proj" && perl -e 'alarm 20; exec @ARGV' env "${clean[@]}" CLAUDE_ROUTE_DRYRUN=1 PATH="$P_SHIM" CLAUDE_ROUTE=pool "$SHIM")
+    check "  ...and a plain launch there is unchanged"                   has "$o" "route=pool" "word=<none>"
+    if [ -n "$LC" ]; then
+        UP=$(printf '%s' "$LC" | tr '[:lower:]' '[:upper:]')
+        o=$(dry PATH="$P_SHIM" "$SHIM" "$UP" -p hi)
+        case "$o" in
+            *route=refused*) check "'$UP': refused before launch ($(printf '%s\n' "$o" | sed -n 's/^refused=//p'))" has "$o" "refused=" "word=account" ;;
+            *) check "'$UP': pinned to the canonical id over the socket" has "$o" "route=pool" "word=account" "pin=$LC at=local" "args=[-p][hi]" "ANTHROPIC_CUSTOM_HEADERS=X-Subrouter-Agent: claude\\nX-Subrouter-Account-ID: $LC"
+               o=$(dry PATH="$P_SHIM" "ANTHROPIC_CUSTOM_HEADERS=X-Keep: 1${NL}x-subrouter-account-id: someone-else" "$SHIM" "$LC")
+               check "  ...a caller's own header kept, a stray selector removed" has "$o" "ANTHROPIC_CUSTOM_HEADERS=X-Keep: 1\\nX-Subrouter-Agent: claude\\nX-Subrouter-Account-ID: $LC"
+               o=$(dry PATH="$P_SHIM" CLAUDE_ROUTE=off "$SHIM" "$LC");          check "  ...the word beats CLAUDE_ROUTE=off" has "$o" "route=pool" "pin=$LC"
+               o=$(dry PATH="$P_SHIM" CLAUDE_ROUTE_SOCKET=/nonexistent/claude.sock "$SHIM" "$LC")
+               check "  ...socket dead: TCP, same pin"                          has "$o" "route=pool-tcp" "X-Subrouter-Account-ID: $LC"
+               [ -n "$LCE" ] && { o=$(dry PATH="$P_SHIM" "$SHIM" "$LCE"); check "  ...its email pins the same account" has "$o" "word=account" "pin=$LC at=local"; } ;;
+        esac
+        o=$(dry PATH="$P_SHIM" CLAUDE_ROUTE_SOCKET=/nonexistent/claude.sock CLAUDE_ROUTE_TCP=http://127.0.0.1:9 "$SHIM" "$LC"); rc=$?
+        check "  ...daemon dead: refused (75), never your own login"     eval 'code_is $rc 75 && has "$o" "route=refused" "refused=daemon-down"'
+        o=$(dry PATH="$P_SHIM" "$SHIM" "$LC" --settings '{"env":{"ANTHROPIC_BASE_URL":"http://x"}}'); rc=$?
+        check "  ...a word plus a route-naming --settings is refused (2)" eval 'code_is $rc 2 && has "$o" "refused="'
+        o=$(dry PATH="$P_SHIM" CLAUDE_ROUTE_HOME="$tmp/rh" "$SHIM" doctor)
+        check "an account alias named like a Claude Code command is never a word" has "$o" "word=<none>" "args=[doctor]"
+    fi
+    if [ -n "$PC" ]; then
+        t0=$(date +%s); o=$(dry PATH="$P_SHIM" "$SHIM" "$PC" -p hi); rc=$?
+        if [[ "$hbl" =~ \"account_pins\"[[:space:]]*:[[:space:]]*\"local\+peers\" ]]; then
+            check "peer account '$PC': pinned through the laptop"        has "$o" "word=account" "X-Subrouter-Account-ID: $PC"
+        else
+            check "peer account '$PC': refused before launch on a build without peer pins (2)" eval 'code_is $rc 2 && has "$o" "refused=peer-pins-unsupported" && quick $t0 8'
+        fi
+        case "$PC" in *-*|*[0-9]*) o=$(dry PATH="$P_SHIM" "$SHIM" "${PC%?}"); rc=$?; check "a near miss of '$PC' sends nothing (2)" eval 'code_is $rc 2 && has "$o" "refused=near" "did you mean"' ;; esac
+    fi
+    o=$(dry PATH="$P_SHIM" "$SHIM" nobody-zz@example.invalid); rc=$?;   check "an unknown email sends nothing (2)"  eval 'code_is $rc 2 && has "$o" "refused=email"'
+    [ -n "$LX" ] && { o=$(dry PATH="$P_SHIM" "$SHIM" "$LX"); rc=$?;    check "a Codex account to claude is refused (2)" eval 'code_is $rc 2 && has "$o" "refused=other"'; }
+    o=$(dry PATH="$P_SHIM" CLAUDE_ROUTE_HOME="$tmp/rh" "$SHIM" zz-gone-alias); rc=$?
+    check "an alias whose account is gone sends nothing (2)"             eval 'code_is $rc 2 && has "$o" "refused=gone"'
+    mkdir -p "$tmp/empty-home"
+    o=$(dry PATH="$P_SHIM" CLAUDE_ROUTE_HOME="$tmp/empty-home" CLAUDE_ROUTE_TCP=http://127.0.0.1:9 CLAUDE_ROUTE_SOCKET=/nonexistent/claude.sock "$SHIM" hello); rc=$?
+    check "no directory at all: a bare word is refused, not guessed (2)"   eval 'code_is $rc 2 && has "$o" "refused=unavailable"'
+    o=$(dry PATH="$P_SHIM" CLAUDE_ROUTE=pool "$SHIM" hello-zz-prompt);  check "an unknown plain word is a prompt"   has "$o" "word=<none>" "args=[hello-zz-prompt]"
+
+    echo "== route words: pin rules against a stand-in daemon (dry run) =="
+    cat > "$tmp/fixture.json" <<'JSON'
+{"health_default": {"ok": true, "auth": "open"},
+ "health_pins": {"ok": true, "account_pins": "local+peers", "pin_control_plane": "identity"},
+ "accounts": [
+  {"id": "fx-ident", "label": "fx-ident", "provider": "claude"},
+  {"id": "fx-other", "label": "fx-other", "provider": "claude"},
+  {"id": "fx-paid", "label": "fx-paid", "provider": "claude"},
+  {"id": "fx-spent", "label": "fx-spent", "provider": "claude"},
+  {"id": "fx-nousage", "label": "fx-nousage", "provider": "claude"},
+  {"id": "fx-dup-1", "label": "fx-dup", "provider": "claude"},
+  {"id": "fxplain", "label": "fxplain", "provider": "claude"},
+  {"id": "fx-spent-unknown", "label": "fx-spent-unknown", "provider": "claude"},
+  {"id": "fx-fresh-unknown", "label": "fx-fresh-unknown", "provider": "claude"},
+  {"id": "codex-owner-fxcx1", "label": "fxcx1@example.invalid [pro]", "email": "fxcx1@example.invalid", "provider": "codex"},
+  {"id": "codex-owner-fxcx2", "label": "fxcx2@example.invalid [pro]", "email": "fxcx2@example.invalid", "provider": "codex"}],
+ "usage": [
+  {"id": "fx-ident", "provider": "claude", "email": "fx-ident@example.invalid", "normalized": {"new_session": {"eligible": true, "reason": "eligible"}}, "extra_usage": {"is_enabled": false}},
+  {"id": "fx-other", "provider": "claude", "normalized": {"new_session": {"eligible": true, "reason": "eligible"}}, "extra_usage": {"is_enabled": false}},
+  {"id": "fx-paid", "provider": "claude", "normalized": {"new_session": {"eligible": false, "reason": "exhausted"}}, "extra_usage": {"is_enabled": true}},
+  {"id": "fx-spent", "provider": "claude", "normalized": {"new_session": {"eligible": false, "reason": "exhausted"}}, "extra_usage": {"is_enabled": false}},
+  {"id": "fx-dup-1", "provider": "claude", "normalized": {"new_session": {"eligible": true, "reason": "eligible"}}, "extra_usage": {"is_enabled": false}},
+  {"id": "fxplain", "provider": "claude", "normalized": {"new_session": {"eligible": true, "reason": "eligible"}}, "extra_usage": {"is_enabled": false}},
+  {"id": "fx-spent-unknown", "provider": "claude", "normalized": {"new_session": {"eligible": false, "reason": "exhausted"}}},
+  {"id": "fx-fresh-unknown", "provider": "claude", "normalized": {"new_session": {"eligible": true, "reason": "eligible"}}},
+  {"id": "codex-owner-fxcx1", "provider": "codex", "normalized": {"new_session": {"eligible": false, "reason": "exhausted"}}, "credits": {"HasCredits": true, "Balance": "10"}},
+  {"id": "codex-owner-fxcx2", "provider": "codex", "normalized": {"new_session": {"eligible": true, "reason": "eligible"}}, "credits": {"HasCredits": true, "Balance": "10"}}],
+ "peers": {"peers": [{"name": "fxbox", "reachable": true, "accounts": [
+  {"id": "fx-peer", "provider": "claude", "normalized": {"new_session": {"eligible": true, "reason": "eligible"}}, "extra_usage": {"is_enabled": false}},
+  {"id": "fx-dup", "provider": "claude", "normalized": {"new_session": {"eligible": true, "reason": "eligible"}}, "extra_usage": {"is_enabled": false}},
+  {"id": "fx-peer-paid", "provider": "claude", "normalized": {"new_session": {"eligible": false, "reason": "exhausted"}}, "extra_usage": {"is_enabled": true}}]}]}}
+JSON
+    fake_daemon serve "$tmp/fixture.json"; local FT="http://127.0.0.1:$FAKE_PORT"
+    mkdir -p "$tmp/fh"
+    fdry() { local tcp="$1"; shift; dry PATH="$P_SHIM" CLAUDE_ROUTE_HOME="$tmp/fh" CLAUDE_ROUTE_TCP="$tcp" CLAUDE_ROUTE_SOCKET=/nonexistent/claude.sock "$@"; }
+    if [ -z "$FAKE_PORT" ]; then check "the stand-in daemon started" false; else
+    o=$(fdry "$FT" CLAUDE_ROUTE_PLIST="$(mkplist fx-ident)" "$SHIM" FX-IDENT -p hi)
+    check "the identity account: pinned"                                has "$o" "route=pool-tcp" "pin=fx-ident at=local" "X-Subrouter-Account-ID: fx-ident" "args=[-p][hi]"
+    o=$(fdry "$FT" CLAUDE_ROUTE_PLIST="$(mkplist fx-ident)" "$SHIM" fx-ident@example.invalid)
+    check "  ...by its email (read from usage-status)"                  has "$o" "route=pool-tcp" "pin=fx-ident at=local"
+    o=$(fdry "$FT" CLAUDE_ROUTE_PLIST="$(mkplist fx-ident)" "$SHIM" fx-other); rc=$?
+    check "another laptop account: refused while /api/* follows the pin (2)" eval 'code_is $rc 2 && has "$o" "refused=not-identity"'
+    o=$(fdry "$FT" CLAUDE_ROUTE_PLIST="$tmp/no-such.plist" "$SHIM" fx-ident); rc=$?
+    check "  ...and every account when no identity is set (2)"          eval 'code_is $rc 2 && has "$o" "refused=not-identity"'
+    o=$(fdry "$FT/pins" CLAUDE_ROUTE_PLIST="$(mkplist fx-ident)" "$SHIM" fx-other)
+    check "  ...allowed once the daemon keeps /api/* on its identity"   has "$o" "route=pool-tcp" "pin=fx-other at=local"
+    o=$(fdry "$FT" CLAUDE_ROUTE_PLIST="$(mkplist fx-paid)" "$SHIM" fx-paid); rc=$?
+    check "spent and able to bill extra usage: refused (2)"             eval 'code_is $rc 2 && has "$o" "refused=paid-overflow" "CLAUDE_ROUTE_ALLOW_PAID=1"'
+    o=$(fdry "$FT" CLAUDE_ROUTE_PLIST="$(mkplist fx-paid)" CLAUDE_ROUTE_ALLOW_PAID=1 "$SHIM" fx-paid)
+    check "  ...CLAUDE_ROUTE_ALLOW_PAID=1 accepts it, with a note"      has "$o" "route=pool-tcp" "pin=fx-paid" "note=" "bill past its plan"
+    o=$(fdry "$FT" CLAUDE_ROUTE_PLIST="$(mkplist fx-spent)" "$SHIM" fx-spent)
+    check "spent, no paid overflow: pinned, with the limit note"        has "$o" "route=pool-tcp" "pin=fx-spent" "note=" "limit error, never another account"
+    o=$(fdry "$FT" CLAUDE_ROUTE_PLIST="$(mkplist fx-nousage)" "$SHIM" fx-nousage); rc=$?
+    check "no usage verdict: refused (2)"                               eval 'code_is $rc 2 && has "$o" "refused=unverified"'
+    o=$(fdry "$FT" CLAUDE_ROUTE_PLIST="$(mkplist fx-spent-unknown)" "$SHIM" fx-spent-unknown); rc=$?
+    check "spent, and whether it can bill extra usage unknown: refused (2)" eval 'code_is $rc 2 && has "$o" "refused=unverified"'
+    o=$(fdry "$FT" CLAUDE_ROUTE_PLIST="$(mkplist fx-fresh-unknown)" "$SHIM" fx-fresh-unknown)
+    check "  ...but an eligible one is pinned"                          has "$o" "route=pool-tcp" "pin=fx-fresh-unknown at=local"
+    o=$(fdry "$FT" CLAUDE_ROUTE_PLIST="$(mkplist fx-ident)" "$SHIM" fx-dup); rc=$?
+    check "one word, a laptop account and a different peer one: refused (2)" eval 'code_is $rc 2 && has "$o" "refused=ambiguous"'
+    o=$(fdry "$FT" CLAUDE_ROUTE_PLIST="$(mkplist fx-ident)" "$SHIM" fx-peer); rc=$?
+    check "a peer account without peer pins: refused (2)"               eval 'code_is $rc 2 && has "$o" "refused=peer-pins-unsupported"'
+    o=$(fdry "$FT/pins" CLAUDE_ROUTE_PLIST="$(mkplist fx-ident)" "$SHIM" fx-peer)
+    check "  ...pinned once the daemon advertises peer pins"            has "$o" "route=pool-tcp" "pin=fx-peer at=fxbox" "X-Subrouter-Account-ID: fx-peer"
+    o=$(fdry "$FT/pins" CLAUDE_ROUTE_PLIST="$(mkplist fx-ident)" "$SHIM" fx-peer-paid); rc=$?
+    check "  ...but never a spent one that can bill extra usage (2)"    eval 'code_is $rc 2 && has "$o" "refused=paid-overflow"'
+    o=$(fdry "$FT" CLAUDE_ROUTE_PLIST="$(mkplist fx-ident)" "$SHIM" fx-identt); rc=$?
+    check "a typo of an account name sends nothing (2)"                 eval 'code_is $rc 2 && has "$o" "refused=near" "fx-ident"'
+    o=$(fdry "$FT" CLAUDE_ROUTE_PLIST="$(mkplist fx-ident)" CLAUDE_ROUTE=pool "$SHIM" fxplan)
+    check "a plain one-word prompt near an account name stays a prompt" has "$o" "word=<none>" "args=[fxplan]"
+    if [ -x "$CSHIM" ]; then
+        o=$(cdry PATH="$P_SHIM" CLAUDE_ROUTE_HOME="$tmp/fh" CLAUDE_ROUTE_TCP="$FT" "$CSHIM" fxcx1@example.invalid exec hi); rc=$?
+        ccheck "codex: spent and holding credits: refused (2)"            eval 'code_is $rc 2 && has "$o" "refused=paid-overflow" "CODEX_ROUTE_ALLOW_PAID=1"'
+        o=$(cdry PATH="$P_SHIM" CLAUDE_ROUTE_HOME="$tmp/fh" CLAUDE_ROUTE_TCP="$FT" CODEX_ROUTE_ALLOW_PAID=1 "$CSHIM" fxcx1@example.invalid exec hi)
+        ccheck "  ...CODEX_ROUTE_ALLOW_PAID=1 accepts it"                 has "$o" "route=pool" "\"X-Subrouter-Account-ID\"=\"codex-owner-fxcx1\""
+        o=$(cdry PATH="$P_SHIM" CLAUDE_ROUTE_HOME="$tmp/fh" CLAUDE_ROUTE_TCP="$FT" "$CSHIM" fxcx2 exec hi)
+        ccheck "codex: eligible with credits, by email name: pinned, with a note" has "$o" "route=pool" "pin=codex-owner-fxcx2 at=local" "note=" "credits"
+    fi
+    fi
+    fake_daemon stall /dev/null; local ST="http://127.0.0.1:$FAKE_PORT"
+    mkdir -p "$tmp/sh"; cp "$tmp/fh/accounts.tsv" "$tmp/sh/accounts.tsv" 2>/dev/null; touch -t 202601010000 "$tmp/sh/accounts.tsv" 2>/dev/null
+    if [ -z "$FAKE_PORT" ]; then check "the hung stand-in daemon started" false; else
+    t0=$(date +%s); o=$(dry PATH="$P_SHIM" CLAUDE_ROUTE_HOME="$tmp/sh" CLAUDE_ROUTE_TCP="$ST" CLAUDE_ROUTE_SOCKET=/nonexistent/claude.sock CLAUDE_ROUTE=pool "$SHIM" hello-zz -p x)
+    check "a hung daemon and an old list: a one-word prompt stays a prompt, fast" eval 'has "$o" "word=<none>" "route=off" "args=[hello-zz][-p][x]" && quick $t0 8'
+    t0=$(date +%s); o=$(dry PATH="$P_SHIM" CLAUDE_ROUTE_HOME="$tmp/sh" CLAUDE_ROUTE_TCP="$ST" CLAUDE_ROUTE_SOCKET=/nonexistent/claude.sock "$SHIM" fx-ident); rc=$?
+    check "  ...and a pin is refused as daemon-down (75), fast"          eval 'code_is $rc 75 && has "$o" "refused=daemon-down" && quick $t0 8'
+    fi
+
+    echo "== route words: the account directory and its neighbours =="
+    check "no account word is a Claude Code or Codex command, or 'local'; none names two accounts" \
+        directory_report "$ACCOUNTS" "$ALIASES" "$(shim_list "$SHIM" reserved)" "$(shim_list "$CSHIM" codex_cmds)"
+    check "every 'claude --help' command is reserved in the shim" eval '"$HOME/.local/bin/claude" --help 2>/dev/null | python3 -I -c "
+import re,sys
+cmds=set()
+for m in re.finditer(r\"^  ([a-z][a-z-]*)((?:\\|[a-z-]+)*)\", sys.stdin.read().split(\"Commands:\")[-1], re.M):
+    cmds.add(m.group(1)); cmds.update(x for x in m.group(2).split(\"|\") if x)
+miss=sorted(cmds-set(sys.argv[1].split())); print(\"claude commands not reserved:\", miss or \"none\"); sys.exit(1 if miss or not cmds else 0)" "$(shim_list "$SHIM" reserved)"'
+    [ -x "$CSHIM" ] && ccheck "every 'codex --help' command is reserved in the codex shim" eval '"$(real_codex)" --help 2>/dev/null | python3 -I -c "
+import re,sys
+text=sys.stdin.read().split(\"Commands:\")[-1].split(\"Arguments:\")[0]
+cmds=set()
+for m in re.finditer(r\"^  ([a-z][a-z-]*)\s.*?(?:\[aliases: ([a-z, -]+)\])?$\", text, re.M):
+    cmds.add(m.group(1)); cmds.update(x.strip() for x in (m.group(2) or \"\").split(\",\") if x.strip())
+miss=sorted(cmds-set(sys.argv[1].split())); print(\"codex commands not reserved:\", miss or \"none\"); sys.exit(1 if miss or not cmds else 0)" "$(shim_list "$CSHIM" codex_cmds)"'
+    check "Paradev's presets still put a flag first (claude) and the prompt after -- (codex)" eval 'perl -e "alarm 30; exec @ARGV" paradev agents list --local --json 2>/dev/null | python3 -I -c "
+import json,sys
+p={a[\"presetId\"]:a for a in json.load(sys.stdin)}
+ok=p[\"claude\"][\"args\"][0].startswith(\"-\") and p[\"codex\"][\"promptArgs\"]==[\"--\"]
+sys.exit(0 if ok else 1)"'
+
+    if [ -x "$CSHIM" ]; then
+    echo "== route words: codex (dry run; recorded in last-codex-test) =="
+    local cbefore; cbefore=$(stat -f '%i %m %z' "$HOME/.codex/auth.json" 2>/dev/null)
+    o=$(cdry PATH="$P_SHIM" CODEX_ROUTE=off "$CSHIM"); ccheck "codex: resolves the real binary, not a shim or Paradev's" eval 'has "$o" "real=/" && lacks "$o" "real=$SHIM_DIR/" "/.paradev/bin/"'
+    o=$(cdry PATH="$P_SHIM" CODEX_ROUTE=off OPENAI_BASE_URL="$TCP/v1" "$CSHIM" exec hi)
+    ccheck "codex off (no word): untouched"                           has "$o" "route=off" "args=[exec][hi]" "OPENAI_BASE_URL=$TCP/v1"
+    o=$(cdry PATH="$P_SHIM" CODEX_ROUTE=pool "$CSHIM" exec --skip-git-repo-check hi)
+    ccheck "codex pool: the subrouter provider block, after the prompt" has "$o" "route=pool" "[-c][model_provider=\"subrouter\"][-c][model_providers.subrouter={name=\"Subrouter\",base_url=\"$TCP/v1\",experimental_bearer_token=\"subrouter\",wire_api=\"responses\",supports_websockets=true,http_headers={\"X-Subrouter-Agent\"=\"codex\"}}]"
+    o=$(cdry PATH="$P_SHIM" CODEX_ROUTE=pool "$CSHIM" --dangerously-bypass-approvals-and-sandbox -- "fix it")
+    ccheck "  ...the block goes before --; the prompt stays last"      has "$o" "}}][--][fix it]"
+    o=$(cdry PATH="$P_PARADEV" CODEX_ROUTE=pool OPENAI_BASE_URL="$TCP/v1" "$HOME/.paradev/bin/codex" local)
+    ccheck "codex local through Paradev's wrapper: prefix kept, word dropped, subrouter URL dropped" has "$o" "route=off" "word=local" "args=[--enable][hooks][--dangerously-bypass-hook-trust]" "OPENAI_BASE_URL=<unset>"
+    o=$(cdry PATH="$P_SHIM" CODEX_ROUTE=pool "$CSHIM" -c 'projects={"/x"={trust_level="trusted"}}' --enable hooks --dangerously-bypass-hook-trust LOCAL)
+    ccheck "  ...and with Paradev's project-trust -c in front"         has "$o" "route=off" "word=local"
+    o=$(cdry PATH="$P_PARADEV" CODEX_ROUTE=pool "$HOME/.paradev/bin/codex" --dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust -- local)
+    ccheck "Paradev's Codex preset shape (-- prompt) is never a word"  has "$o" "route=pool" "word=<none>" "[--][local]"
+    local c
+    for c in login logout "mcp list" app-server --version; do
+        o=$(cdry PATH="$P_SHIM" CODEX_ROUTE=pool "$CSHIM" $c); ccheck "codex $c: the real binary, untouched" has "$o" "route=passthrough" "args=[${c// /][}]"
+    done
+    o=$(cdry PATH="$P_SHIM" CODEX_ROUTE=pool "$CSHIM" local login); ccheck "codex local login: the real binary" has "$o" "route=passthrough" "args=[login]"
+    o=$(cdry PATH="$P_SHIM" CODEX_HOME="$HOME/.subrouter/codex/zz-store" "$CSHIM" login); rc=$?
+    ccheck "codex login with CODEX_HOME in a pool store: refused (2)"  eval 'code_is $rc 2 && has "$o" "refused=pool-store-home"'
+    o=$(cdry PATH="$P_SHIM" CODEX_HOME="$HOME/.subrouter/codex/zz-store" CODEX_ROUTE=pool "$CSHIM" exec hi); rc=$?
+    ccheck "  ...and a pooled session there (2)"                       eval 'code_is $rc 2 && has "$o" "refused=pool-store-home"'
+    o=$(cdry PATH="$P_SHIM" CODEX_HOME="$HOME/.subrouter/codex/zz-store" "$CSHIM" local exec hi)
+    ccheck "  ...codex local drops it: your own ~/.codex"              has "$o" "route=off" "CODEX_HOME=<unset>" "note=CODEX_HOME pointed into ~/.subrouter"
+    o=$(cdry PATH="$P_SHIM" CODEX_ROUTE=pool "$CSHIM" exec -c 'model_provider="subrouter"' hi)
+    ccheck "sr codex / cx arguments are kept as they are"              has "$o" "route=inherited" "args=[exec][-c][model_provider=\"subrouter\"][hi]"
+    local p
+    for p in add reset isolation-check; do
+        o=$(cdry PATH="$P_SHIM" CODEX_ROUTE=pool "$CSHIM" "$p"); ccheck "'codex $p' is a prompt to Codex, never an sr account command" has "$o" "route=pool" "args=[$p][-c]"
+    done
+    o=$(cdry PATH="$P_SHIM" "$CSHIM" locl); rc=$?;                   ccheck "codex: a typo of 'local' sends nothing (2)" eval 'code_is $rc 2 && has "$o" "refused=near"'
+    o=$(cdry PATH="$P_SHIM" CODEX_ROUTE=pool CLAUDE_ROUTE_TCP=http://127.0.0.1:9 "$CSHIM" exec hi)
+    ccheck "codex pool, daemon dead: own login with a note"           has "$o" "route=off" "note=the subrouter daemon is not answering"
+    if [ -n "$LX" ]; then
+        o=$(cdry PATH="$P_SHIM" "$CSHIM" "$LX" exec hi)
+        case "$o" in
+            *route=refused*) ccheck "codex '$LX': refused before launch ($(printf '%s\n' "$o" | sed -n 's/^refused=//p'))" has "$o" "refused=" ;;
+            *) ccheck "codex pinned by id: the pin header in the block" has "$o" "route=pool" "pin=$LX at=local" "\"X-Subrouter-Account-ID\"=\"$LX\"" ;;
+        esac
+        o=$(cdry PATH="$P_SHIM" CLAUDE_ROUTE_TCP=http://127.0.0.1:9 "$CSHIM" "$LX" exec hi); rc=$?
+        ccheck "  ...daemon dead: refused (75)"                         eval 'code_is $rc 75'
+        o=$(cdry PATH="$P_SHIM" "$CSHIM" "$LX" login); rc=$?;          ccheck "  ...a pin on login is refused (2)" eval 'code_is $rc 2'
+        o=$(cdry PATH="$P_SHIM" "$CSHIM" "$LX" -c 'model_provider="x"' exec hi); rc=$?; ccheck "  ...a pin plus a provider -c is refused (2)" eval 'code_is $rc 2'
+    fi
+    if [ -n "$PX" ]; then
+        o=$(cdry PATH="$P_SHIM" "$CSHIM" "$PX" exec hi); rc=$?
+        if [[ "$hbl" =~ \"account_pins\"[[:space:]]*:[[:space:]]*\"local\+peers\" ]]; then ccheck "codex peer account '$PX': pinned through the laptop" has "$o" "pin=$PX"
+        else ccheck "codex peer account '$PX': refused on a build without peer pins (2)" eval 'code_is $rc 2 && has "$o" "refused=peer-pins-unsupported"'; fi
+    fi
+    [ -n "$PC" ] && { o=$(cdry PATH="$P_SHIM" "$CSHIM" "$PC" exec hi); rc=$?; ccheck "a Claude account ('$PC') to codex is refused (2)" eval 'code_is $rc 2 && has "$o" "refused=other"'; }
+    ccheck "codex --version through the shim equals the real binary's" eval '[ "$(cd "$cwd" && env "${clean[@]}" PATH="$P_SHIM" CODEX_ROUTE=off "$CSHIM" --version 2>&1)" = "$("$(real_codex)" --version 2>&1)" ]'
+    ccheck "neither shim names Codex's auth file"                     eval '! $GREP -q "auth\.json" "$SHIM" "$CSHIM"'
+
+    echo "== codex real launches (throwaway CODEX_HOME: ~/.codex is never written) =="
+    mkdir -p "$tmp/codex-home" "$tmp/codex-cwd"; $GREP -E '^(model|model_reasoning_effort) *=' "$HOME/.codex/config.toml" > "$tmp/codex-home/config.toml" 2>/dev/null
+    cx() { # the command; the final message must be exactly $CX_WANT. Sets CX_SID (Codex's session id = the daemon's)
+        local out last; rm -f "$tmp/cx-last.txt"
+        # stdin from /dev/null: `codex exec` waits on an open non-terminal stdin. Paradev's codex wrapper
+        # runs codex as a CHILD, so the timeout kills the whole process group, not just the wrapper.
+        out=$(cd "$tmp/codex-cwd" && run_group 180 env "${clean[@]}" CODEX_HOME="$tmp/codex-home" "$@" -o "$tmp/cx-last.txt" </dev/null 2>&1)
+        CX_SID=$(printf '%s\n' "$out" | sed -n 's/^session id: //p' | head -1); last=$(cat "$tmp/cx-last.txt" 2>/dev/null)
+        echo "[codex $CX_SID] -> ${last:0:200}"
+        [ "$(printf '%s' "$last" | tr -d '[:space:].' | tr '[:upper:]' '[:lower:]')" = "$CX_WANT" ]
+    }
+    CX_WANT=echo; ccheck "codex pool exec answers"                       cx PATH="$P_SHIM" CODEX_ROUTE=pool "$CSHIM" exec --skip-git-repo-check "Reply with exactly one word, in lowercase: echo"
+    ccheck "  ...and the pool served it"                                  eval 'served "$CX_SID"'
+    if [ -n "$LX" ] && [[ "$(cdry PATH="$P_SHIM" "$CSHIM" "$LX" exec hi)" == *route=pool* ]]; then
+        CX_WANT=foxtrot; ccheck "codex pinned through Paradev's wrapper answers" cx PATH="$P_PARADEV" "$HOME/.paradev/bin/codex" "$LX" exec --skip-git-repo-check "Reply with exactly one word, in lowercase: foxtrot"
+        ccheck "  ...on exactly that account"                              eval 'served "$CX_SID" && test "$SERVED_BY" = "$LX"'
+    fi
+    ccheck "~/.codex auth file untouched (inode, mtime, size)"            test "$(stat -f '%i %m %z' "$HOME/.codex/auth.json" 2>/dev/null)" = "$cbefore"
+    else
+        echo "== codex: shim not installed; codex checks skipped =="
+    fi
+
+    echo "== route words: real launches (haiku) =="
+    local w1 w2 w3 w4 w5 w6; w1=$(uuid); w2=$(uuid); w3=$(uuid); w4=$(uuid); w5=$(uuid); w6=$(uuid)
+    escaped() { # claude -p -- local: Claude Code gets the word as the prompt (its transcript's first user message)
+        (cd "$cwd" && perl -e 'alarm 240; exec @ARGV' env "${clean[@]}" PATH="$P_SHIM" CLAUDE_ROUTE=pool "$SHIM" -p --model haiku --session-id "$w1" -- local >/dev/null 2>>"$err") || return 1
+        local f; f=$(ls "$HOME"/.claude/projects/*/"$w1".jsonl 2>/dev/null | head -1)
+        [ -n "$f" ] && python3 -I -c 'import json,sys
+for l in open(sys.argv[1]):
+    d=json.loads(l)
+    if d.get("type")=="user": sys.exit(0 if d.get("message",{}).get("content")=="local" else 1)
+sys.exit(1)' "$f"
+    }
+    check "'claude -p -- local' sends the word as the prompt"           escaped
+    check "'claude local' answers on your own login"                     ask "$w4" juliet PATH="$P_PARADEV" "$HOME/.paradev/bin/claude" local
+    check "  ...logged route=off word=local, and the daemon never saw it" eval '$GREP -F "sid=$w4" "$ROUTE_HOME/launch.log" | $GREP -q "route=off word=local" && unserved "$w4"'
+    if [ -n "$LC" ]; then
+        o=$(dry PATH="$P_SHIM" "$SHIM" "$LC")
+        if [[ "$o" == *route=refused* ]]; then
+            t0=$(date +%s)
+            check "pinned '$LC': refused before launch, nothing sent" eval '(cd "$cwd" && env "${clean[@]}" PATH="$P_SHIM" "$SHIM" "$LC" -p hi --session-id "$w2" >/dev/null 2>&1); code_is $? 2 && quick $t0 10 && unserved "$w2"'
+        elif [[ "$o" == *flags=*ineligible* ]]; then
+            t0=$(date +%s)
+            check "pinned '$LC' (spent) fails fast with the provider's limit, no failover" eval '! ask "$w2" hotel PATH="$P_PARADEV" "$HOME/.paradev/bin/claude" "$LC" && quick $t0 45 && served "$w2" && test "$SERVED_BY" = "$LC"'
+        else
+            check "pinned '$LC' answers"                                  ask "$w2" hotel PATH="$P_PARADEV" "$HOME/.paradev/bin/claude" "$LC"
+            check "  ...on exactly that account"                          eval 'served "$w2" && test "$SERVED_BY" = "$LC"'
+        fi
+    fi
+    if [ -n "$PC" ]; then
+        if [[ "$hbl" =~ \"account_pins\"[[:space:]]*:[[:space:]]*\"local\+peers\" ]]; then
+            check "a peer pin ('$PC') answers through the laptop"        ask "$w3" india PATH="$P_SHIM" "$SHIM" "$PC"
+            check "  ...on exactly that account, on the peer"             eval 'served "$w3" && [[ "$SERVED_BY" == "$PC on "*"[remote]"* ]]'
+        else
+            t0=$(date +%s)
+            check "a peer pin ('$PC') on this build: exit 2 at once, nothing sent" eval '(cd "$cwd" && env "${clean[@]}" PATH="$P_SHIM" "$SHIM" "$PC" -p hi --session-id "$w3" >/dev/null 2>&1); code_is $? 2 && quick $t0 10 && unserved "$w3"'
+        fi
+    fi
+    # Resuming across routes: a pool session's signed thinking on your own login, and back.
+    check "a pool session (with thinking) resumes under 'claude local'"  eval 'ask "$w5" kilo PATH="$P_SHIM" MAX_THINKING_TOKENS=2048 CLAUDE_ROUTE=pool "$SHIM" && served "$w5" && resume "$w5" lima PATH="$P_SHIM" MAX_THINKING_TOKENS=2048 "$SHIM" local'
+    check "an own-login session (with thinking) resumes on the pool"      eval 'ask "$w6" mike PATH="$P_SHIM" MAX_THINKING_TOKENS=2048 "$SHIM" local && unserved "$w6" && resume "$w6" november PATH="$P_SHIM" MAX_THINKING_TOKENS=2048 CLAUDE_ROUTE=pool "$SHIM" && served "$w6"'
+
+    echo "== real launches through the shim (haiku) =="
+    local s1 s2 s3 s4 s5; s1=$(uuid); s2=$(uuid); s3=$(uuid); s4=$(uuid); s5=$(uuid)
+    check "pool -p answers"                                ask "$s1" pong PATH="$P_SHIM" CLAUDE_ROUTE=pool "$SHIM"
+    check "  ...and the pool served it"                    served "$s1"
+    local first_account="$SERVED_BY"
+    check "pool via Paradev's wrapper answers"             ask "$s2" ping PATH="$P_PARADEV" CLAUDE_ROUTE=pool "$HOME/.paradev/bin/claude"
+    check "  ...and the pool served it"                    served "$s2"
+    check "pool --resume answers"                          resume "$s1" again PATH="$P_SHIM" CLAUDE_ROUTE=pool "$SHIM"
+    check "  ...on the same pinned account"                eval 'served "$s1" && test "$SERVED_BY" = "$first_account"'
+    ( ask "$s3" alpha PATH="$P_SHIM" CLAUDE_ROUTE=pool "$SHIM" >>"$err" 2>&1; echo $? > "$tmp/t3" ) &
+    local j3=$!
+    ( ask "$s4" bravo PATH="$P_SHIM" CLAUDE_ROUTE=pool "$SHIM" >>"$err" 2>&1; echo $? > "$tmp/t4" ) &
+    local j4=$!
+    wait "$j3" "$j4"
+    check "two concurrent pool launches both answer"      eval 'test "$(cat "$tmp/t3")" = 0 && test "$(cat "$tmp/t4")" = 0'
+    check "  ...and the pool served both"                  eval 'served "$s3" && served "$s4"'
+    check "dead socket falls back to TCP and answers"      ask "$s5" delta PATH="$P_SHIM" CLAUDE_ROUTE=pool CLAUDE_ROUTE_SOCKET=/nonexistent/claude.sock "$SHIM"
+    check "  ...through the pool"                          served "$s5"
+    check "off execs the real binary"                      eval '[ "$(cd "$cwd" && env "${clean[@]}" PATH="$P_SHIM" CLAUDE_ROUTE=off "$SHIM" --version 2>&1)" = "$(env "${clean[@]}" "$HOME/.local/bin/claude" --version 2>&1)" ]'
+
+    echo "== parity: a pool session must look like a signed-in one =="
+    check "pool offers every tool off does (claude.ai connectors excepted)" parity
+    [ -n "${PARITY_MISSING:-}" ] && echo "        pool lacks: $PARITY_MISSING"
+    [ -n "${PARITY_KNOWN:-}" ] && echo "        accepted gap (claude.ai connectors): $PARITY_KNOWN"
+
+    echo "== a fresh terminal =="
+    check "a new login shell finds the shim first"         eval '[ "$(env -i HOME="$HOME" USER="$USER" TERM=dumb SHELL=/bin/zsh perl -e "alarm 30; exec @ARGV" /bin/zsh -l -i -c "command -v claude" 2>/dev/null | tail -1)" = "$SHIM" ]'
+    [ -x "$CSHIM" ] && ccheck "  ...and the codex shim first"      eval '[ "$(env -i HOME="$HOME" USER="$USER" TERM=dumb SHELL=/bin/zsh perl -e "alarm 30; exec @ARGV" /bin/zsh -l -i -c "command -v codex" 2>/dev/null | tail -1)" = "$CSHIM" ]'
+
+    local f; for f in "${fakes[@]}"; do { kill "$f"; wait "$f"; } 2>/dev/null; done
+    rm -rf "$tmp"
+    echo "== claude: $pass passed, $fail failed;  codex: $cpass passed, $cfail failed =="
+    if [ "$fail" = 0 ]; then echo "PASS $(date +%Y-%m-%d) $(date +%H:%M:%S) ($pass checks)" > "$LAST_TEST"
+    else echo "FAIL $(date +%Y-%m-%d) $(date +%H:%M:%S) ($fail of $((pass+fail)) failed)" > "$LAST_TEST"; fi
+    if [ -x "$CSHIM" ]; then
+        if [ "$cfail" = 0 ]; then echo "PASS $(date +%Y-%m-%d) $(date +%H:%M:%S) ($cpass checks)" > "$LAST_CODEX_TEST"
+        else echo "FAIL $(date +%Y-%m-%d) $(date +%H:%M:%S) ($cfail of $((cpass+cfail)) failed)" > "$LAST_CODEX_TEST"; fi
+    fi
+    [ "$fail" = 0 ] && [ "$cfail" = 0 ]
+}
+
+case "${1:-status}" in
+    status) cmd_status ;;
+    install) cmd_install ;;
+    uninstall) cmd_uninstall ;;
+    accounts) cmd_accounts ;;
+    socket-on) cmd_socket_on "${2:-}" ;;
+    socket-off) shift; cmd_socket_off "$@" ;;
+    test) cmd_test ;;
+    check) cmd_check "${2:-}" ;;
+    pool) cmd_pool "${2:-}" ;;
+    off) cmd_off ;;
+    codex) cmd_codex "${2:-}" "${3:-}" ;;
+    help|-h|--help) awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0" ;;
+    *) die "unknown command '$1' (try: claude-route help)" ;;
+esac

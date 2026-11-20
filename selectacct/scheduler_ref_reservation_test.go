@@ -3,9 +3,7 @@ package selectacct
 import (
 	"context"
 	"fmt"
-	"math"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -13,7 +11,9 @@ import (
 )
 
 // reservationTestScheduler returns two equal accounts so reservation tests
-// can observe the scheduler's spreading behavior.
+// can observe how live debits steer the next pick. Upstream pins its spread
+// draw (spreadRandFloat) in these tests; the fork's Pick is deterministic
+// (PATCHES §10), so only the reservation's debit moves the next pick.
 func reservationTestScheduler() Scheduler {
 	return NewScheduler([]Score{
 		{AccountID: "a@example.com", Provider: account.ProviderCodex, Headroom: 0.90, ShortHeadroom: 0.90, Fresh: true},
@@ -33,10 +33,6 @@ func reservationTestAccounts() []account.Account {
 // when concurrent request handlers call Pick and only update NoteRouted after
 // selection. PickAndReserve must install each live debit before the next pick.
 func TestPickAndReserveUsesLiveStateFromTheRef(t *testing.T) {
-	previous := spreadRandFloat
-	spreadRandFloat = func() float64 { return 0.49 }
-	defer func() { spreadRandFloat = previous }()
-
 	ref := NewSchedulerRef(reservationTestScheduler())
 	snapshot := ref.Get()
 	candidates := reservationTestAccounts()
@@ -63,15 +59,11 @@ func TestPickAndReserveUsesLiveStateFromTheRef(t *testing.T) {
 	}
 }
 
-// The ref lock must cover both selection and reservation. With a fixed draw,
-// an atomic sequence alternates between the two equal accounts; a non-atomic
+// The ref lock must cover both selection and reservation. An atomic sequence
+// alternates between the two equal accounts; a non-atomic
 // Pick followed by NoteRouted would let every goroutine select the same stale
 // headroom winner before any debit landed.
 func TestPickAndReserveConcurrentPlacementsSeeEachOther(t *testing.T) {
-	previous := spreadRandFloat
-	spreadRandFloat = func() float64 { return 0.49 }
-	defer func() { spreadRandFloat = previous }()
-
 	ref := NewSchedulerRef(reservationTestScheduler())
 	snapshot := ref.Get()
 	candidates := reservationTestAccounts()
@@ -175,17 +167,6 @@ func reservationReplayAccounts() []account.Account {
 // reservations spread the burst before any upstream attempt is committed, so
 // a single account reset can move only its bounded share of the sessions.
 func TestPickAndReserveConcurrentResetReplayBoundsConcentration(t *testing.T) {
-	previous := spreadRandFloat
-	var draws uint64
-	spreadRandFloat = func() float64 {
-		// A deterministic low-discrepancy sequence keeps this test reproducible
-		// while still exercising every part of the weighted spread interval.
-		const step = 0.6180339887498949
-		draw := atomic.AddUint64(&draws, 1)
-		return math.Mod(float64(draw)*step, 1)
-	}
-	defer func() { spreadRandFloat = previous }()
-
 	ref := NewSchedulerRef(reservationReplayScheduler())
 	snapshot := ref.Get()
 	candidates := reservationReplayAccounts()

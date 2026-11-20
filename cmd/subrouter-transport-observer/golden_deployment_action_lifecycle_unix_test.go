@@ -83,7 +83,11 @@ cleanup() {
 }
 trap cleanup TERM
 printf 'ready\n' >"${ready_path}"
-while :; do sleep 1; done
+# The group's SIGTERM also kills this sleep. A foreground sleep returned 143
+# under set -e before bash ran the trap, whenever bash reaped it before taking
+# its own signal; a trapped signal interrupts wait at once, and || : keeps a
+# dead sleep from ending the script.
+while :; do sleep 1 & wait "$!" || :; done
 `
 	if err := os.WriteFile(scriptPath, []byte(script), 0o700); err != nil {
 		t.Fatal(err)

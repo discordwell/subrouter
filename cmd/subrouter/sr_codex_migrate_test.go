@@ -1041,6 +1041,10 @@ func snapshotTestTree(t *testing.T, root string) map[string]string {
 
 func TestCodexMigrateIsolationRemainsAvailableWithMalformedRoutingConfig(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
+	// migrate-isolation must find nothing to do here. If it ever finds work, it
+	// must not reach the real `codex login`, which opens a browser sign-in: it did
+	// when a shared SUBROUTER_STATE_DIR leaked other tests' accounts in (PATCHES.md §45).
+	t.Setenv("PATH", t.TempDir())
 	configPath := t.TempDir() + "/cloud.json"
 	t.Setenv("SUBROUTER_CLOUD_CONFIG", configPath)
 	if err := os.WriteFile(configPath, []byte("{"), 0o600); err != nil {
@@ -1202,6 +1206,10 @@ func TestCodexIsolationTargetsIncludesTrustedCredentialSharedWithActiveAuth(t *t
 
 func TestCodexIsolationSummaryIsAggregateAndNoOpWhenClean(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
+	// migrate-isolation must find nothing to do at the end. If it ever finds work, it
+	// must not reach the real `codex login`, which opens a browser sign-in: it did
+	// when a shared SUBROUTER_STATE_DIR leaked other tests' accounts in (PATCHES.md §45).
+	t.Setenv("PATH", t.TempDir())
 	store := accounts.DefaultCodexStore()
 	saveLegacyCodexAccount(t, store, "private@example.com", "acct-private", "secret-refresh")
 	check := codexIsolationDoctorCheck(store)
@@ -1262,6 +1270,9 @@ func TestDoctorReportsAggregateCodexIsolationRemediation(t *testing.T) {
 func TestLocalCodexStoreServingDoesNotAssumeUnconfiguredSelectedRemoteIsLocal(t *testing.T) {
 	isolateCloudConfig(t)
 	t.Setenv("HOME", t.TempDir())
+	// A box path: on a keyless machine the PATCHES 17 gate ignores servers.json
+	// and the remote selection entirely, so this upstream test states the unlock.
+	unlockRemoteGateForTest(t)
 	store := accounts.DefaultCodexStore()
 	serverStore := defaultSRServerStore(store)
 	if err := serverStore.update(func(file *srServerFile) error {

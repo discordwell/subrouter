@@ -126,6 +126,27 @@ func writeClaudeWebJSON(path string, value any) {
 	_ = os.Chmod(path, 0600)
 }
 
+// claudeWebBalanceOptInEnv turns the claude.ai web-balance enrichment on.
+const claudeWebBalanceOptInEnv = "SUBROUTER_CLAUDE_WEB_BALANCE"
+
+// claudeWebBalanceEnabled gates the whole web-balance path, and with it
+// pushClaudeWebBalances, whose only input is what this path freshly fetched.
+//
+// This is upstream's paid-extra-usage display (2269757, T3 in the 2026-09
+// merge), which this fork skipped: on macOS it reads browser cookie stores,
+// asks the Keychain for each browser's "Safe Storage" key (a permission prompt
+// per browser), compiles a Swift probe in the background, and calls claude.ai
+// with the recovered session keys -- all from a read command, `sr status` --
+// and the status path then POSTs what it found to the box. Off by default so
+// none of that happens unless someone sets SUBROUTER_CLAUDE_WEB_BALANCE=1.
+func claudeWebBalanceEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(claudeWebBalanceOptInEnv))) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
+}
+
 // claudeWebBalanceCacheEntry is a disk-cached balance reading so repeated
 // `sr status` runs are instant and claude.ai is not hammered.
 type claudeWebBalanceCacheEntry struct {
@@ -556,7 +577,12 @@ func enrichClaudeRowsWithWebBalances(ctx context.Context, rows []srUsageRow) {
 // enrichClaudeRowsWithWebBalances and additionally returns the balances that
 // were freshly fetched from claude.ai during this call (cache hits excluded),
 // so the caller can fan them out to the server.
+//
+// It is OFF unless claudeWebBalanceEnabled: see that function.
 func enrichClaudeRowsWithWebBalancesFresh(ctx context.Context, rows []srUsageRow) map[string]float64 {
+	if !claudeWebBalanceEnabled() {
+		return nil
+	}
 	resolver := newClaudeProfileEmailResolver()
 	wanted := map[string]bool{}
 	for _, row := range rows {

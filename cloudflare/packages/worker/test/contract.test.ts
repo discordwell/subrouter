@@ -406,7 +406,6 @@ describe("subrouter Durable Object contract", () => {
           five_hour: { utilization: 12, resets_at: "2026-06-02T13:00:00.000Z" },
           seven_day_opus: { utilization: 34, resets_at: "2026-06-03T13:00:00.000Z" },
           seven_day_sonnet: { utilization: 56, resets_at: "2026-06-04T13:00:00.000Z" },
-          extra_usage: { is_enabled: true, monthly_limit: 20, used_credits: 3, utilization: 15 },
         }),
         { status: 200 }
       )
@@ -425,18 +424,11 @@ describe("subrouter Durable Object contract", () => {
       "5h",
       "opus-weekly",
       "sonnet-weekly",
-      "extra",
     ])
     expect(usage.windows?.[1]?.feature).toBe("claude-opus")
     expect(usage.windows?.[2]?.feature).toBe("claude-sonnet")
-    expect(usage.extra_usage).toEqual({
-      is_enabled: true,
-      monthly_limit: 20,
-      used_credits: 3,
-      utilization: 15,
-    })
-    expect(usage.windows?.[3]?.extra_usage).toEqual(usage.extra_usage)
   })
+
   test("claude usage rejects missing quota telemetry", async () => {
     const extra = { is_enabled: true, monthly_limit: 20, used_credits: 3 }
     await expect(
@@ -457,5 +449,4 @@ describe("subrouter Durable Object contract", () => {
       )
     ).rejects.toThrow("Codex usage quota is unknown")
   })
-
 })

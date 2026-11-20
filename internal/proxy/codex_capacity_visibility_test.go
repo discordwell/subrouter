@@ -17,12 +17,18 @@ import (
 // emails, so the tests can assert no email leaks into the payloads.
 func codexVisibilityServer(t *testing.T, failToken func(string) bool, failover bool) (Server, *httptest.Server) {
 	t.Helper()
-	poolURL, _ := codexCapacityPool(t, func(token string, _ int) bool { return failToken(token) })
+	poolURL, _ := codexCapacityPool(t, func(token, _ string, _ int) bool { return failToken(token) })
 	server := codexOverloadServer(t, poolURL, 2, failover)
 	if failover {
 		server.CodexOverloadFailover.MarkTTL = 20 * time.Second
-		fastCapacityGaps(server.CodexOverloadFailover, 5*time.Millisecond)
+	} else {
+		// With the failover off the fork waits a capacity failure out on the
+		// session's account (the stay ladder, PATCHES §27; upstream's tests
+		// opt out with its #505 retry-policy header instead). A disabled
+		// config with fast gaps bounds that wait for the test.
+		server.CodexOverloadFailover = &CodexOverloadFailoverConfig{}
 	}
+	fastCapacityGaps(server.CodexOverloadFailover, 5*time.Millisecond)
 	server.Accounts[0].ID, server.Accounts[0].Email = "alice@example.com", "alice@example.com"
 	server.Accounts[1].ID, server.Accounts[1].Email = "bob@example.com", "bob@example.com"
 	server.SchedulerRef = selectacct.NewSchedulerRef(server.Scheduler)
@@ -43,7 +49,6 @@ func codexVisibilityPost(t *testing.T, proxyURL string) *http.Response {
 		t.Fatal(err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set(AgentRetryPolicyHeader, "bounded")
 	response, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)

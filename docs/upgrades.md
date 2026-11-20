@@ -1,5 +1,22 @@
 # Subrouter upgrades
 
+> **This fork runs the laptop daemon behind `subrouter supervise`, with the
+> scripts in `ops/deploy/macos/`.** `activate-laptop-supervisor.sh` moves the
+> LaunchAgent under the supervisor once, and `--rollback` moves it back.
+> `deploy-laptop.sh <binary>` then installs each build as the worker and asks
+> the supervisor to upgrade, so turns already streaming finish on the old
+> worker. `ops/LAPTOP.md` has the steps and `ops/PATCHES.md` §69 the reasons.
+> The Linux box's deploy scripts are not in this repo.
+> Upstream's LaunchAgent and LaunchDaemon migrations, autoupdaters, release
+> installers and GCP procedures below are not used here. Do not run
+> `migrate-*-to-supervisor.sh`, any `*-autoupdate.sh`, or `sr server install`
+> against the laptop or the box. They rewrite the plist or unit that this
+> fork's deploy scripts write, or install an upstream release binary in place
+> of this fork's.
+> `deploy/run-shadow-rehearsal.py` is not carried in this fork. The
+> [credential-origin rollback boundary](#credential-origin-rollback-boundary)
+> does apply here.
+
 Use this runbook for local macOS daemon upgrades when Codex is already pointed at `127.0.0.1:31415`.
 
 ## Replacing the binary in place on macOS
@@ -66,7 +83,9 @@ an ad-hoc signature has no Team ID and cannot satisfy the constraint.
 ### What a restart costs
 
 `serve` drains on SIGTERM: it stops accepting, finishes in-flight requests, and
-exits, bounded by `--shutdown-timeout` (default 10 minutes). launchd is the
+exits, bounded by `--shutdown-timeout` (default 10 minutes). In this fork that
+covers the `--public-addr` listener and the websocket turns in flight too; an
+idle websocket is not waited for (`ops/PATCHES.md` §38). launchd is the
 shorter fuse. Without an explicit `ExitTimeOut` in the direct `install-daemon`
 plist, the escalation timeout is system-defined and may be shorter than
 `--shutdown-timeout`; a stream still running when launchd escalates is cut, and
@@ -97,6 +116,8 @@ rewrote.
 ## Supervised handoff
 
 On macOS, run Subrouter behind `subrouter supervise`. The supervisor owns the public listener, starts each worker on an inherited private socket, and pins accepted connections to that worker generation. Configure `--local-data-socket` in a current-user-owned mode-0700 directory; the supervisor creates that stable socket mode 0600 and routes local credential-bearing CLI traffic through the same generation switch. Publish it with `sr daemon bind-state STATE_DIR --local-data-socket PATH` only after the socket's exact supervisor ownership, kernel identity, and store handshake succeed. The v2 binding pins that socket identity, and each new connection repeats the mutual store handshake before credentials can be sent. Preserve the exact prior binding for rollback and restore it together with the prior socket/service state. Root or system services must explicitly provide a user-readable private metadata handoff or use a named authenticated remote; never infer a per-user path. An upgrade starts and health-checks the replacement before switching new connections. Old WebSockets, SSE streams, HTTP requests, and keep-alive connections remain on the old worker. The old worker exits only after its connection count reaches zero.
+
+This fork: when the supervisor's own environment sets `SUBROUTER_CLAUDE_SOCKET`, the supervisor serves that Claude Code socket through the same router, so its connections pin to a generation the way TCP connections do. A worker leaves the variable alone and reports `claude_socket: owned_by_supervisor` in `/_subrouter/health`. `GET /_subrouter/supervisor-status` reports the socket's own state (`serving`, `unavailable` or `stopped`). As in `serve`, a socket that cannot open is logged and reported, and TCP keeps serving.
 
 The supervisor is deliberately separate from the replaceable worker binary. Routine releases update `/usr/local/bin/subrouter`; they do not replace or restart `/usr/local/libexec/subrouter-supervisor`.
 
@@ -701,6 +722,8 @@ The following guarded path is only for installations that have not migrated yet.
 
 On macOS, use the new binary's `install-daemon` path so launchd re-registers the LaunchAgent. Modern launchd can attach launch constraints to the binary it bootstrapped; a plain `mv` plus `launchctl kickstart -k` can fail with `OS_REASON_CODESIGNING | Launch Constraint Violation`.
 
+> **This fork: upgrade the laptop with `ops/deploy/macos/deploy-laptop.sh <binary>`, not this recipe.** Under the supervisor it installs the build as the worker and upgrades through the control socket (see the banner). On a LaunchAgent that still runs `serve` directly, it stages beside the live binary, re-signs and renames, restarts the job (with a full bootout and bootstrap when a kickstart is not enough), probes real routes, and rolls back. It never re-renders the plist. `install-daemon` does re-render it: the recipe below resets `--addr`, `--transcripts`, the switch interval and the working directory to what it passes. Since PATCHES §37 it keeps the `EnvironmentVariables` keys it does not write (the remote pool, the Claude socket, reservations); before that it deleted them.
+
 Run from the Subrouter checkout:
 
 ```bash
@@ -805,7 +828,7 @@ curl -fsS http://127.0.0.1:31415/_subrouter/health
 - Keep the public URL stable. Codex desktop and long-running CLI processes do not reliably adopt a new base URL mid-session.
 - Check `/_subrouter/ready` before sending traffic to a process. A draining process returns 503.
 - Use `POST /_subrouter/drain` from loopback before controlled shutdowns when you can.
-- Use `install-daemon` for local macOS binary upgrades so launchd refreshes its launch constraint for the new binary.
+- Use `install-daemon` for local macOS binary upgrades so launchd refreshes its launch constraint for the new binary. (This fork: `deploy-laptop.sh`, which reloads the job when a kickstart is not enough; see the banner.)
 - On Linux, install with `install-systemd` and keep `subrouter.socket` enabled. systemd owns the public TCP listener and passes it to the Subrouter worker, so new client connections queue across worker restarts instead of hitting a closed port.
 - Do not edit the live binary in place. Build a separate binary, smoke-test it, then let `install-daemon` copy it into place.
 - Do not use `kill -9`. Launchd owns restart policy and environment.

@@ -111,19 +111,60 @@ func TestResetCandidatesListsWithoutRedeeming(t *testing.T) {
 	}
 }
 
+// Each conflicting flag set is refused before anything reaches the server,
+// and by its own check. The server records every request: an old version of
+// this test aimed at a closed port and asserted only err != nil, so connection
+// refused satisfied it and deleting any one of these checks left it green --
+// while on a real server `sr reset a@x --min-wait 1d` silently dropped
+// --min-wait and redeemed the credit anyway. Asserting the refusal text pins
+// the specific check; asserting zero requests pins "before any request".
 func TestResetFlagConflicts(t *testing.T) {
-	var out bytes.Buffer
-	runner := srRunner{out: &out, errOut: &out}
-	fixed := &srServerConfig{Name: "test", URL: "http://127.0.0.1:1"}
-	for _, args := range [][]string{
-		{"--local"},
-		{"a@example.com", "--min-wait", "1d"},
-		{"--candidates", "--all"},
-		{"--min-wait", "soon"},
+	var mu sync.Mutex
+	var requests []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		requests = append(requests, r.Method+" "+r.URL.String())
+		mu.Unlock()
+		_, _ = io.WriteString(w, `{"reset":1,"results":[{"email":"a@example.com","eligible":true,"reset":true}]}`)
+	}))
+	t.Cleanup(server.Close)
+	fixed := &srServerConfig{Name: "test", URL: server.URL}
+
+	for _, tc := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"--local"}, "--local cannot be used when this command is bound to a running server"},
+		{[]string{"a@example.com", "--min-wait", "1d"}, "--min-wait applies to the default pick, --all, and --candidates"},
+		{[]string{"--gto", "--min-wait", "1d"}, "--min-wait applies to the default pick, --all, and --candidates"},
+		{[]string{"--candidates", "--all"}, "--candidates lists accounts itself"},
+		{[]string{"--candidates", "a@example.com"}, "--candidates lists accounts itself"},
+		{[]string{"--min-wait", "soon"}, "--min-wait: "},
 	} {
-		if err := runner.resetAgainstServer(t.Context(), args, fixed); err == nil {
-			t.Fatalf("%v: expected an error", args)
+		var out bytes.Buffer
+		runner := srRunner{out: &out, errOut: &out, client: server.Client()}
+		err := runner.resetAgainstServer(t.Context(), tc.args, fixed)
+		if err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%v: error = %v, want the refusal %q", tc.args, err, tc.want)
 		}
+		mu.Lock()
+		got := append([]string(nil), requests...)
+		requests = nil
+		mu.Unlock()
+		if len(got) != 0 {
+			t.Errorf("%v: reached the server before refusing: %v", tc.args, got)
+		}
+	}
+
+	// Calibration: the same server does receive a request when nothing
+	// conflicts, so "zero requests" above is a real observation.
+	var out bytes.Buffer
+	runner := srRunner{out: &out, errOut: &out, client: server.Client()}
+	_ = runner.resetAgainstServer(t.Context(), []string{"a@example.com"}, fixed)
+	mu.Lock()
+	defer mu.Unlock()
+	if len(requests) == 0 {
+		t.Fatalf("calibration: a plain `reset a@example.com` never reached the recording server; output:\n%s", out.String())
 	}
 }
 
@@ -182,5 +223,39 @@ func TestResetAllNonTerminalStdinNeedsYes(t *testing.T) {
 	}
 	if got := redeems(); len(got) != 0 {
 		t.Fatalf("redeemed without confirmation: %v", got)
+	}
+}
+
+// On a machine with no server, `sr reset --all` redeems directly against wham
+// with the local tokens. It used to spend on every cooked account the moment
+// it was typed; from a non-terminal (a script, cron, a pipe) it must now
+// refuse until --yes, and redeem nothing.
+func TestResetLocalAllNeedsConfirmation(t *testing.T) {
+	wham := &localResetWham{rateLimit: map[string]any{
+		"allowed":          false,
+		"limit_reached":    true,
+		"primary_window":   map[string]any{"used_percent": 20, "limit_window_seconds": 18000, "reset_after_seconds": 3600},
+		"secondary_window": map[string]any{"used_percent": 100, "limit_window_seconds": 604800, "reset_after_seconds": 400000},
+	}}
+	runner, out := localResetRunner(t, "cooked@example.com", wham)
+	devNull, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer devNull.Close()
+	runner.in = devNull
+	err = runner.run(t.Context(), []string{"reset", "--all"})
+	if got := wham.consumes(); got != 0 {
+		t.Fatalf("`sr reset --all` spent %d credit(s) without confirmation\n%s", got, out.String())
+	}
+	if err == nil || !strings.Contains(err.Error(), "--yes") {
+		t.Fatalf("err = %v, want a request for --yes\n%s", err, out.String())
+	}
+
+	if err := runner.run(t.Context(), []string{"reset", "--all", "--yes"}); err != nil {
+		t.Fatalf("reset --all --yes: %v\n%s", err, out.String())
+	}
+	if got := wham.consumes(); got != 1 {
+		t.Fatalf("--all --yes consumed %d credit(s), want 1\n%s", got, out.String())
 	}
 }

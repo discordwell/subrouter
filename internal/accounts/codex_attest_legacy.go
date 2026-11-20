@@ -70,6 +70,12 @@ func (s CodexStore) AttestStoredLegacyOAuth(ctx context.Context, client *http.Cl
 
 	previous := account
 	submittedRefreshToken := account.Auth.Tokens.RefreshToken
+	// Detached from the caller from here on, exactly as in refreshStored: the
+	// provider rotates the chain the moment the old refresh token is presented,
+	// so an operator's Ctrl-C mid-exchange must not abandon the only copy of the
+	// new one. The exchange, the breadcrumb and the save share one clock.
+	ctx, cancelExchange := context.WithTimeout(context.WithoutCancel(ctx), codexExchangeTimeout)
+	defer cancelExchange()
 	refreshed, err := RefreshCodexAuth(ctx, client, account.Auth)
 	if err != nil {
 		// A rejected chain is reported, never recorded: the stored record stays

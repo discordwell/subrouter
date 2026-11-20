@@ -146,7 +146,11 @@ func TestProfileRegistrationRejectsSharedInstanceDirectory(t *testing.T) {
 	if _, err := store.CreateProfile("Work"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.CreateProfile("work"); err == nil || !strings.Contains(err.Error(), "already owned by profile \"Work\"") {
+	// The fork refuses a case twin by NAME before any directory is chosen
+	// (store_dir_collision_test.go): a server matches Claude names
+	// case-insensitively, so the refusal names the twin rather than the
+	// directory. Either way nothing is created.
+	if _, err := store.CreateProfile("work"); err == nil || !strings.Contains(err.Error(), `differs from existing profile "Work" only in case`) {
 		t.Fatalf("case-colliding CreateProfile error = %v", err)
 	}
 	if err := store.RegisterProfile("other", "work"); err == nil || !strings.Contains(err.Error(), "already owned by profile \"Work\"") {
@@ -629,56 +633,9 @@ func TestRemoveProfileRemovesPreferredRealLegacyPath(t *testing.T) {
 	}
 }
 
-func TestRemoveProfileDeletesMacOSKeychainCredential(t *testing.T) {
-	if runtime.GOOS != "darwin" {
-		t.Skip("macOS Keychain is only available on Darwin")
-	}
-	home := t.TempDir()
-	store := Store{Dir: filepath.Join(home, ".subrouter", "codex")}
-	fakeBin := t.TempDir()
-	recordPath := filepath.Join(t.TempDir(), "security-arguments")
-	securityPath := filepath.Join(fakeBin, "security")
-	if err := os.WriteFile(securityPath, []byte("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$SUBROUTER_KEYCHAIN_TEST_RECORD\"\n"), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
-	t.Setenv("SUBROUTER_KEYCHAIN_TEST_RECORD", recordPath)
-
-	instancePath, err := store.CreateProfile("work")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := store.ImportProfileCredential("work", CredentialInfo{
-		AccessToken:  "access",
-		RefreshToken: "refresh",
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Truncate(recordPath, 0); err != nil {
-		t.Fatal(err)
-	}
-
-	removed, err := store.RemoveProfile("work")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !removed {
-		t.Fatal("profile was not removed")
-	}
-	record, err := os.ReadFile(recordPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	wantServices := []string{
-		"Claude Code-credentials-" + keychainHash(instancePath),
-		"Claude Code-credentials-" + keychainHash(filepath.Join(home, ".codex-accounts", "claude", "work")),
-	}
-	for _, wantService := range wantServices {
-		if got := string(record); !strings.Contains(got, "delete-generic-password") || !strings.Contains(got, wantService) {
-			t.Fatalf("Keychain removal = %q, want delete for %q", got, wantService)
-		}
-	}
-}
+// The keychain-dependent RemoveProfile/CleanupInstance tests live in
+// keychain_seam_test.go, where a fake keychain lets them run on every OS; the
+// darwin-only exec wiring is covered by keychain_darwin_exec_test.go.
 
 func TestProfileRemovalSnapshotRejectsOperationalKeychainFailure(t *testing.T) {
 	if runtime.GOOS != "darwin" {
@@ -2938,59 +2895,6 @@ func TestSyncPrivateFileDirectoryPropagatesOpenFailure(t *testing.T) {
 	}
 }
 
-func TestRemoveProfileRollsBackWhenKeychainDeletionFails(t *testing.T) {
-	if runtime.GOOS != "darwin" {
-		t.Skip("macOS Keychain is only available on Darwin")
-	}
-	home := t.TempDir()
-	store := Store{Dir: filepath.Join(home, ".subrouter", "codex")}
-	instancePath, err := store.CreateProfile("work")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := store.ImportProfileCredential("work", CredentialInfo{
-		AccessToken:  "access",
-		RefreshToken: "refresh",
-	}); err != nil {
-		t.Fatal(err)
-	}
-	fakeBin := t.TempDir()
-	securityPath := filepath.Join(fakeBin, "security")
-	if err := os.WriteFile(
-		securityPath,
-		[]byte("#!/bin/sh\necho 'forced keychain deletion failure' >&2\nexit 1\n"),
-		0o700,
-	); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
-
-	removed, removeErr := store.RemoveProfile("work")
-	if removeErr == nil {
-		t.Fatal("profile removal ignored the keychain deletion failure")
-	}
-	if removed {
-		t.Fatal("failed profile removal was reported as committed")
-	}
-	if _, ok := store.FindProfile("work"); !ok {
-		t.Fatal("keychain failure left the profile absent from the registry")
-	}
-	credential, err := store.ReadCredential(t.Context(), instancePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if credential == nil || credential.AccessToken != "access" || credential.RefreshToken != "refresh" {
-		t.Fatalf("keychain failure did not restore the staged credential: %+v", credential)
-	}
-	stagingRoots, err := filepath.Glob(filepath.Join(filepath.Dir(instancePath), ".work.remove-*"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(stagingRoots) != 0 {
-		t.Fatalf("profile rollback left staging roots: %v", stagingRoots)
-	}
-}
-
 func TestRemoveProfileContextUsesFreshDeadlineForRollback(t *testing.T) {
 	if runtime.GOOS != "darwin" {
 		t.Skip("macOS Keychain is only available on Darwin")
@@ -3075,42 +2979,6 @@ func TestRemoveProfileReportsCommittedRemovalWhenCleanupAndRollbackFail(t *testi
 	}
 	if _, ok := store.FindProfile("work"); ok {
 		t.Fatal("failed rollback unexpectedly restored the profile registry")
-	}
-}
-func TestCleanupInstanceDeletesMacOSKeychainCredentialAliases(t *testing.T) {
-	if runtime.GOOS != "darwin" {
-		t.Skip("macOS Keychain is only available on Darwin")
-	}
-	home := t.TempDir()
-	store := Store{Dir: filepath.Join(home, ".subrouter", "codex")}
-	fakeBin := t.TempDir()
-	recordPath := filepath.Join(t.TempDir(), "security-arguments")
-	securityPath := filepath.Join(fakeBin, "security")
-	if err := os.WriteFile(securityPath, []byte("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$SUBROUTER_KEYCHAIN_TEST_RECORD\"\n"), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
-	t.Setenv("SUBROUTER_KEYCHAIN_TEST_RECORD", recordPath)
-
-	instancePath, dir, err := store.CreateTempInstance()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := store.CleanupInstance(dir); err != nil {
-		t.Fatal(err)
-	}
-	record, err := os.ReadFile(recordPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	wantServices := []string{
-		"Claude Code-credentials-" + keychainHash(instancePath),
-		"Claude Code-credentials-" + keychainHash(filepath.Join(home, ".codex-accounts", "claude", dir)),
-	}
-	for _, wantService := range wantServices {
-		if got := string(record); !strings.Contains(got, "delete-generic-password") || !strings.Contains(got, wantService) {
-			t.Fatalf("Keychain cleanup = %q, want delete for %q", got, wantService)
-		}
 	}
 }
 
@@ -3307,9 +3175,9 @@ func TestReadCredentialFile(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, ".credentials.json"), []byte(`{"claudeAiOauth":{"accessToken":"tok","refreshToken":"refresh","subscriptionType":"pro"}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	credential, ok := readCredentialFile(dir)
-	if !ok {
-		t.Fatal("credential not read")
+	credential, ok, err := readCredentialFile(dir)
+	if err != nil || !ok {
+		t.Fatalf("credential not read: %v", err)
 	}
 	if credential.AccessToken != "tok" {
 		t.Fatalf("access token = %q, want tok", credential.AccessToken)
@@ -3806,55 +3674,5 @@ func TestReconcileAdoptsStageRecordedUnderAnAliasedLegacySpelling(t *testing.T) 
 	}
 	if roots, listErr := stagedProfileInstanceRoots(canonicalPath); listErr != nil || len(roots) != 0 {
 		t.Fatalf("reconcile left stage roots %v, err %v", roots, listErr)
-	}
-}
-
-func TestPrepareSharedStateDirLinksPluginsOnlyWhenAbsent(t *testing.T) {
-	root := t.TempDir()
-	shared := filepath.Join(root, "shared")
-	store := Store{Dir: filepath.Join(root, "store"), SharedStateDir: shared}
-
-	fresh := filepath.Join(root, "fresh")
-	if err := os.MkdirAll(fresh, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.PrepareSharedStateDir(fresh); err != nil {
-		t.Fatal(err)
-	}
-	link, err := os.Readlink(filepath.Join(fresh, "plugins"))
-	if err != nil {
-		t.Fatalf("new profile plugins is not a link: %v", err)
-	}
-	if link != filepath.Join(shared, "plugins") {
-		t.Fatalf("plugins link = %q, want shared plugins", link)
-	}
-	// Preparing again is idempotent.
-	if err := store.PrepareSharedStateDir(fresh); err != nil {
-		t.Fatal(err)
-	}
-
-	existing := filepath.Join(root, "existing")
-	marketplace := filepath.Join(existing, "plugins", "marketplaces", "official", "README.md")
-	if err := os.MkdirAll(filepath.Dir(marketplace), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(marketplace, []byte("profile copy"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.PrepareSharedStateDir(existing); err != nil {
-		t.Fatal(err)
-	}
-	info, err := os.Lstat(filepath.Join(existing, "plugins"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-		t.Fatalf("existing plugins mode = %v, want the untouched directory", info.Mode())
-	}
-	if body, err := os.ReadFile(marketplace); err != nil || string(body) != "profile copy" {
-		t.Fatalf("existing marketplace changed: %q %v", body, err)
-	}
-	if _, err := os.Stat(filepath.Join(shared, "plugins", "marketplaces")); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("existing plugins were merged into shared state: %v", err)
 	}
 }

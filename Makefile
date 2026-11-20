@@ -1,9 +1,14 @@
 export CGO_ENABLED := 0
 
-.PHONY: test run build build-linux accounts mock-upstream
+.PHONY: test docker-test run build build-linux accounts mock-upstream
 
 test:
 	go test ./...
+
+# Hermetic suite run inside Docker; nothing can touch the host's live agent
+# configs. See deploy/docker/test.sh for passthrough args and --self-check.
+docker-test:
+	./deploy/docker/test.sh
 
 run:
 	go run ./cmd/subrouter serve

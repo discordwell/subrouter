@@ -82,8 +82,9 @@ func windowsTaskArguments(config windowsTaskConfig) (string, error) {
 		return "", fmt.Errorf("daemon address %q must be loopback-only", addr)
 	}
 	args := []string{"serve", "--addr", addr}
-	// "0" is passed through: serve treats a non-positive interval as disabled,
-	// whereas omitting the flag would fall back to serve's 10m default.
+	// "0" is passed through. serve treats a non-positive interval as disabled,
+	// whereas omitting the flag falls back to serve's 10m default -- dropping
+	// "0" silently re-enabled the sweep the operator had turned off.
 	if interval := strings.TrimSpace(config.SRSwitchInterval); interval != "" {
 		args = append(args, "--sr-switch-interval", interval)
 	}
@@ -253,8 +254,10 @@ func installWindowsTask(paths windowsPaths, config windowsTaskConfig, runner tas
 		}
 	}
 	if filepath.Clean(config.Exe) == filepath.Clean(paths.Exe) {
-		// The task runs the per-user copy, so put the current binary there. A
-		// running daemon holds the file open on Windows and the replace would
+		// The task runs the per-user copy (%LOCALAPPDATA%\Subrouter\bin), and
+		// nothing else ever put a binary there: `sr setup` registered a task
+		// whose executable did not exist, so the daemon never started at logon.
+		// A running daemon holds its file open on Windows and the replace would
 		// fail, so end it first; a missing or stopped task is not an error.
 		_ = runner.Run("schtasks", "/End", "/TN", config.TaskName)
 		if err := installCurrentExecutable(paths.Exe); err != nil {

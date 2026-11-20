@@ -100,7 +100,10 @@ func codexEgressTransports(config *CodexEgressConfig) []http.RoundTripper {
 		transport := NewOutboundTransport()
 		transport.Proxy = http.ProxyURL(proxy)
 		// Egress replays reach chatgpt.com too, whose streams carry no
-		// Content-Type.
+		// Content-Type. Upstream #450 as written: these replays
+		// use their own transports, not the labelled base transport
+		// proxyHandler builds, and unlabelled, a region's
+		// server_is_overloaded stream was its "success".
 		transports = append(transports, sniffContentTypeTransport{base: transport})
 	}
 	return transports
@@ -171,7 +174,8 @@ func (t codexEgressFallbackTransport) RoundTrip(req *http.Request) (*http.Respon
 	if err == nil {
 		// Anything but a capacity failure (408/5xx, a failed stream, or a
 		// body naming capacity on any status) is the request's own fault, or
-		// auth/quota, which the layers above own.
+		// auth/quota, which the layers above own. Upstream #373: the same
+		// predicate as the overload failover below it.
 		failed, why, replaced := codexOverloadFailure(response)
 		response = replaced
 		if !failed {
@@ -182,12 +186,6 @@ func (t codexEgressFallbackTransport) RoundTrip(req *http.Request) (*http.Respon
 	start := azureCodexEndpointIndex(t.sessionKey, len(transports))
 	fallback, fallbackErr, served, _ := t.tryEgress(req, addressed, start, false, budget, reason)
 	if !served {
-		if retry, ok := t.server.codexFallbackRetryRequest(req, t.attempt, response); ok && !t.server.AzureCodex.configured() {
-			if response != nil && response.Body != nil {
-				_ = response.Body.Close()
-			}
-			return base.RoundTrip(retry)
-		}
 		return response, err
 	}
 	if t.server.recoveryCounters != nil {

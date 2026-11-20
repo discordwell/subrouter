@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/manaflow-ai/subrouter/internal/agents/claude"
 	"github.com/manaflow-ai/subrouter/internal/broker"
 )
 
@@ -188,6 +189,7 @@ func TestImportAllUploadsAndHandsOverEveryCredential(t *testing.T) {
 
 func TestImportAllRoutesDefaultClaudeConfigAndContinuesToLaterCredential(t *testing.T) {
 	runner, out, store := importRunner(t, "later@example.com")
+	unlockRemoteGateForTest(t)
 	defaultClaudeDir := filepath.Join(os.Getenv("HOME"), ".claude")
 	if err := os.MkdirAll(defaultClaudeDir, 0o700); err != nil {
 		t.Fatal(err)
@@ -237,6 +239,84 @@ func TestImportAllRoutesDefaultClaudeConfigAndContinuesToLaterCredential(t *test
 	}
 	if got := settings.Env["ANTHROPIC_AUTH_TOKEN"]; got != "srt_test" {
 		t.Fatalf("default Claude auth token = %q", got)
+	}
+}
+
+// `sr account import` routes both a Subrouter profile directory and the
+// user's own ~/.claude through hosted cmux with the same writer. Only the
+// profile directory may carry ENABLE_TOOL_SEARCH: ~/.claude is what a plain
+// `claude` reads, and client-config writers there are a known brick class
+// (claudeRoutedToolSearch). Drives the real import against a fake vault.
+func TestImportRoutesToolSearchIntoProfilesOnlyNeverTheUserClaudeConfig(t *testing.T) {
+	runner, out, store := importRunner(t)
+	unlockRemoteGateForTest(t)
+	withoutEnvForTest(t, "CLAUDECODE")
+	withoutEnvForTest(t, "ENABLE_TOOL_SEARCH")
+	withoutEnvForTest(t, "CLAUDE_CONFIG_DIR")
+	defaultClaudeDir := filepath.Join(os.Getenv("HOME"), ".claude")
+	if err := os.MkdirAll(defaultClaudeDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(defaultClaudeDir, ".credentials.json"),
+		[]byte(`{"claudeAiOauth":{"accessToken":"home-access","refreshToken":"home-refresh"}}`),
+		0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+	claudeStore := claude.DefaultStore()
+	if _, err := claudeStore.CreateProfile("work"); err != nil {
+		t.Fatal(err)
+	}
+	profileDir := claudeStore.ClaudeConfigDir("work")
+	if err := os.WriteFile(
+		filepath.Join(profileDir, ".credentials.json"),
+		[]byte(`{"claudeAiOauth":{"accessToken":"work-access","refreshToken":"work-refresh"}}`),
+		0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := defaultSRServerStore(store).save(srServerFile{
+		Default: "cmux",
+		Servers: []srServerConfig{{
+			Name: "cmux", URL: "https://sr.cmux.com", TenantKey: "srt_test",
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	vault := &fakeVault{}
+	client := vault.start(t)
+
+	if err := runner.cloudAccountImport(
+		context.Background(), client, []string{"--all", "--yes"},
+	); err != nil {
+		t.Fatalf("import --all --yes: %v\n%s", err, out.String())
+	}
+	if labels := vault.uploadedLabels(); len(labels) != 2 {
+		t.Fatalf("calibration: uploaded %v, want the work profile and the default ~/.claude", labels)
+	}
+	read := func(dir string) map[string]string {
+		t.Helper()
+		body, err := os.ReadFile(filepath.Join(dir, "settings.json"))
+		if err != nil {
+			t.Fatalf("%s was not routed: %v", dir, err)
+		}
+		var settings struct {
+			Env map[string]string `json:"env"`
+		}
+		if err := json.Unmarshal(body, &settings); err != nil {
+			t.Fatal(err)
+		}
+		if settings.Env["ANTHROPIC_BASE_URL"] != "https://sr.cmux.com/t/srt_test" {
+			t.Fatalf("calibration: %s base URL = %q", dir, settings.Env["ANTHROPIC_BASE_URL"])
+		}
+		return settings.Env
+	}
+	if got, ok := read(defaultClaudeDir)["ENABLE_TOOL_SEARCH"]; ok {
+		t.Fatalf("import put ENABLE_TOOL_SEARCH=%q into ~/.claude/settings.json, which plain `claude` reads", got)
+	}
+	if got := read(profileDir)["ENABLE_TOOL_SEARCH"]; got != "true" {
+		t.Fatalf("the work profile's settings.json ENABLE_TOOL_SEARCH = %q, want \"true\"", got)
 	}
 }
 

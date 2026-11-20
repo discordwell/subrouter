@@ -27,6 +27,79 @@ func TestDockerfileBuildsAHealthCheckedNonRootRuntime(t *testing.T) {
 	}
 }
 
+func TestDockerfileTestStageIsolatesEveryAgentConfigSurface(t *testing.T) {
+	body := readRepositoryFile(t, "Dockerfile")
+	for _, want := range []string{
+		"FROM golang:1.26-bookworm AS test",
+		"HOME=/home/agent",
+		"CLAUDE_CONFIG_DIR=/home/agent/.claude",
+		"CODEX_HOME=/home/agent/.codex",
+		"SUBROUTER_STATE_DIR=/home/agent/.subrouter",
+		"SUBROUTER_CLOUD_CONFIG=/home/agent/.config/subrouter/cloud.json",
+		"SUBROUTER_DOCKER_TEST_HARNESS=1",
+		// The bare-image entrypoint must clear the same three HOME-derived
+		// overrides test.sh clears, or the two entry points disagree and a
+		// direct `docker run` buries the real baseline under spurious reds.
+		`CMD ["env", "-u", "SUBROUTER_STATE_DIR", "-u", "SUBROUTER_CLOUD_CONFIG", "-u", "CODEX_HOME", "go", "test", "./..."]`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("Dockerfile test stage missing %q", want)
+		}
+	}
+	// The default build target is the final stage, so the hardened distroless
+	// runtime must stay last; the test stage may never become the default.
+	lastFrom := ""
+	for _, line := range strings.Split(body, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "FROM ") {
+			lastFrom = strings.TrimSpace(line)
+		}
+	}
+	if !strings.Contains(lastFrom, "gcr.io/distroless/static-debian12:nonroot") {
+		t.Fatalf("final Dockerfile stage = %q, want the distroless runtime", lastFrom)
+	}
+}
+
+func TestDockerTestScriptRunsHermeticallyWithoutHostMounts(t *testing.T) {
+	body := readRepositoryFile(t, filepath.Join("deploy", "docker", "test.sh"))
+	for _, want := range []string{
+		"set -eu",
+		"docker build --target test",
+		`:/src:ro"`,
+		"gomod_volume=subrouter-test-gomod",
+		"gobuild_volume=subrouter-test-gobuild",
+		`:/go/pkg/mod"`,
+		`:/root/.cache/go-build"`,
+		"--network none",
+		"--init",
+		"SUBROUTER_TEST_NETWORK",
+		"--self-check",
+		"TestDockerHarnessCanaryResolvesEveryConfigSurfaceUnderTheAgentHome",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("deploy/docker/test.sh missing %q", want)
+		}
+	}
+	// The whole point of the harness is that no host agent config can be
+	// reached: the repository is the only bind mount, and it is read-only.
+	for _, line := range strings.Split(body, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if !strings.HasPrefix(trimmed, "-v ") {
+			continue
+		}
+		mount := strings.TrimSuffix(strings.TrimPrefix(trimmed, "-v "), " \\")
+		switch {
+		case strings.Contains(mount, ":/src:ro"),
+			strings.HasPrefix(mount, `"${gomod_volume}`),
+			strings.HasPrefix(mount, `"${gobuild_volume}`):
+		default:
+			t.Fatalf("test.sh mounts an unexpected volume %q; host paths must never be mounted", mount)
+		}
+		if strings.Contains(mount, "HOME") || strings.Contains(mount, "~") {
+			t.Fatalf("test.sh mount %q references the host home", mount)
+		}
+	}
+}
+
 func TestDockerComposeDefinesHardenedLocalAndTeamModes(t *testing.T) {
 	body := readRepositoryFile(t, filepath.Join("deploy", "docker", "compose.yaml"))
 	for _, want := range []string{

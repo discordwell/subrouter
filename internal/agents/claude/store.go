@@ -33,6 +33,10 @@ import (
 const (
 	usageURL        = "https://api.anthropic.com/api/oauth/usage"
 	oauthBetaHeader = "oauth-2025-04-20"
+	// usageReadQuery opts every usage read into the saved-reset block
+	// (cedar_ember) at no extra request. skip_spend=1 is deliberately not
+	// sent: the sweep reads spend (balance, auto-reload) from this answer.
+	usageReadQuery = "?cedar_ember=1"
 )
 
 // messagesURL is a var so probe tests can point it at a local server.
@@ -57,6 +61,19 @@ var reservedNames = map[string]bool{
 	"add": true, "login": true, "list": true, "ls": true, "switch": true,
 	"use": true, "remove": true, "rm": true, "env": true, "status": true,
 	"run": true, "help": true,
+	// The house grammar (cmd/subrouter/sr_grammar.go) reads a scope word and a
+	// provider word in the two positions before the account name, so a profile
+	// answering to one of them would make `sr shove remote claude` ambiguous
+	// between "the account named remote" and "the default server". Reserving
+	// them here is the cheap half of that guarantee; the parser's positional
+	// rules are the other half. Existing profiles are unaffected -- this gate
+	// runs on creation and rename only.
+	"local": true, "remote": true,
+	"claude": true, "anthropic": true,
+	"codex": true, "openai": true, "chatgpt": true,
+	"shove": true, "rename": true,
+	// `sr claude reset <account>` is a verb (PATCHES §46).
+	"reset": true,
 }
 
 type Store struct {
@@ -249,6 +266,11 @@ type UsageResponse struct {
 	SevenDayOAuthApps *RateLimit  `json:"seven_day_oauth_apps"`
 	ExtraUsage        *ExtraUsage `json:"extra_usage"`
 	Spend             *Spend      `json:"spend"`
+	// CedarEmber is the saved usage-limit reset block, answered only when
+	// the read opts in with ?cedar_ember=1 (PATCHES §46). Kept raw and
+	// decoded on its own (ResetStatus), so a drifted block can never fail
+	// the usage read that routing depends on.
+	CedarEmber json.RawMessage `json:"cedar_ember,omitempty"`
 }
 
 // ExtraUsageInfoFromUsage maps the OAuth usage response onto the shared
@@ -288,109 +310,30 @@ type ProfileInfo struct {
 	Error      error
 }
 
+// DefaultStore shares history with ~/.claude whatever CLAUDE_CONFIG_DIR says.
+// Upstream #507 routes SharedStateDir through the caller's CLAUDE_CONFIG_DIR;
+// this fork deliberately does not (PATCHES section 6): every `sr claude`
+// session exports a CLAUDE_CONFIG_DIR, profile history is already linked to
+// ~/.claude, and syncMCPServers reads $HOME/.claude.json, not the custom dir.
 func DefaultStore() Store {
-	dir := storepath.CodexDir()
-	return Store{Dir: dir, SharedStateDir: callerClaudeConfigDir(dir)}
+	home, _ := os.UserHomeDir()
+	shared := ""
+	if home != "" {
+		shared = filepath.Join(home, ".claude")
+	}
+	return Store{Dir: storepath.CodexDir(), SharedStateDir: shared}
 }
 
 // DefaultStoreForReadOnlyInspection uses the same effective account root as
 // DefaultStore without importing the legacy Codex store. Serving processes use
 // this constructor so daemon startup cannot copy interactive credentials.
 func DefaultStoreForReadOnlyInspection() Store {
-	dir := storepath.CodexDirForReadOnlyInspection()
-	return Store{Dir: dir, SharedStateDir: callerClaudeConfigDir(dir)}
-}
-
-// DefaultClaudeConfigDir is the directory Claude Code uses when
-// CLAUDE_CONFIG_DIR is unset, or "" without a home directory.
-func DefaultClaudeConfigDir() string {
 	home, _ := os.UserHomeDir()
-	if home == "" {
-		return ""
+	shared := ""
+	if home != "" {
+		shared = filepath.Join(home, ".claude")
 	}
-	return filepath.Join(home, ".claude")
-}
-
-// callerClaudeConfigDir is the Claude config directory the caller's own
-// `claude` would use: $CLAUDE_CONFIG_DIR when set, else ~/.claude. Subrouter
-// shares history, user config and settings with that directory, so a caller
-// with a custom config dir keeps it under sr.
-//
-// A CLAUDE_CONFIG_DIR inside Subrouter's account store is a proxy or profile
-// directory inherited from an sr launch, never a user directory. A pooled
-// launch exports the shared root it attached to as
-// CLAUDE_CODE_REMOTE_MEMORY_DIR, so a nested sr resolves the same root; other
-// managed launches fall back to ~/.claude.
-func callerClaudeConfigDir(storeDir string) string {
-	fallback := DefaultClaudeConfigDir()
-	dir := absClaudeConfigDir(os.Getenv("CLAUDE_CONFIG_DIR"))
-	if dir == "" {
-		return fallback
-	}
-	if !isManagedClaudeConfigDir(storeDir, dir) {
-		return dir
-	}
-	if inherited := absClaudeConfigDir(os.Getenv("CLAUDE_CODE_REMOTE_MEMORY_DIR")); inherited != "" && !isManagedClaudeConfigDir(storeDir, inherited) {
-		return inherited
-	}
-	return fallback
-}
-
-func absClaudeConfigDir(dir string) string {
-	dir = strings.TrimSpace(dir)
-	if dir == "" {
-		return ""
-	}
-	abs, err := filepath.Abs(dir)
-	if err != nil {
-		return ""
-	}
-	return abs
-}
-
-// isManagedClaudeConfigDir reports whether dir lies inside the account store
-// or its legacy ~/.codex-accounts spelling, under either path spelling.
-func isManagedClaudeConfigDir(storeDir, dir string) bool {
-	roots := []string{storeDir, storepath.LegacyCodexDir()}
-	for _, root := range roots {
-		if strings.TrimSpace(root) == "" {
-			continue
-		}
-		root = absClaudeConfigDir(root)
-		if pathWithinDir(dir, root) {
-			return true
-		}
-		resolvedRoot, rootErr := filepath.EvalSymlinks(root)
-		resolvedDir, dirErr := evalExistingPrefix(dir)
-		if rootErr == nil && dirErr == nil && pathWithinDir(resolvedDir, resolvedRoot) {
-			return true
-		}
-	}
-	return false
-}
-
-func pathWithinDir(path, dir string) bool {
-	rel, err := filepath.Rel(filepath.Clean(dir), filepath.Clean(path))
-	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator)) && !filepath.IsAbs(rel)
-}
-
-// evalExistingPrefix resolves symlinks in the longest existing prefix of path
-// and appends the missing remainder, so a not-yet-created proxy directory
-// still compares by its physical location.
-func evalExistingPrefix(path string) (string, error) {
-	path = filepath.Clean(path)
-	rest := ""
-	for {
-		if resolved, err := filepath.EvalSymlinks(path); err == nil {
-			return filepath.Join(resolved, rest), nil
-		}
-		parent := filepath.Dir(path)
-		if parent == path {
-			return "", os.ErrNotExist
-		}
-		rest = filepath.Join(filepath.Base(path), rest)
-		path = parent
-	}
+	return Store{Dir: storepath.CodexDirForReadOnlyInspection(), SharedStateDir: shared}
 }
 
 func (s Store) ProfilesPath() string {
@@ -412,11 +355,24 @@ func (s Store) InstancePath(name string) string {
 }
 
 func (s Store) ClaudeConfigDir(name string) string {
-	path := s.PreferredInstancePath(s.InstancePath(name))
+	path := s.claudeInstancePath(name)
 	if err := s.prepareSharedState(path); err != nil {
 		slog.Warn("Claude shared history setup failed", "profile", name, "error", err)
 	}
 	return path
+}
+
+// claudeInstancePath is ClaudeConfigDir's path without preparing the shared
+// history, and so without its locks. prepareSharedState takes the one
+// shared-state migration lock every profile shares and then, holding it, the
+// profile's credential lock, both with no deadline; with the daemon's
+// SharedStateDir set, every ClaudeConfigDir queued behind whichever profile's
+// `security` read held its credential lock -- the whole pool behind one slow
+// keychain read, whatever budget the caller had. The credential paths that run
+// on every turn and sweep (refreshProfileCredential, keychainAnswerReuse) need
+// only the path; launches and reloads still prepare the history.
+func (s Store) claudeInstancePath(name string) string {
+	return s.PreferredInstancePath(s.InstancePath(name))
 }
 
 // PrepareSharedStateDir gives a credential-isolated Claude config home access
@@ -1587,7 +1543,9 @@ func (s Store) profileCredentialBackups(
 	ctx context.Context,
 	instancePaths []string,
 ) ([]profileCredentialBackup, error) {
-	if runtime.GOOS != "darwin" {
+	// Backups exist to survive a failed keychain deletion; without a vault
+	// there is nothing to back up against.
+	if !systemKeychain.available() {
 		return nil, nil
 	}
 	backups := make([]profileCredentialBackup, 0, len(instancePaths))
@@ -1699,12 +1657,49 @@ func (s Store) ProfileInventoryCount() (int, error) {
 }
 
 func (s Store) ListAccounts(ctx context.Context) ([]accounts.Account, error) {
+	return s.ListAccountsKeeping(ctx, nil)
+}
+
+// ListAccountsKeeping is ListAccounts for the daemon, which must never lose an
+// account to a read that got no answer. A profile whose credential read
+// reached no verdict (ErrCredentialUnchecked) stays listed: with the entry
+// previous returns for it, provided that entry is still the same instance
+// directory, and otherwise -- the daemon's first listing at startup, a profile
+// new since the last one, or a previous entry for an instance directory the
+// profile no longer uses -- as a listing that carries no credential at all
+// (uncheckedProfileAccount). Dropping it -- what ListAccounts does -- makes the
+// account vanish from the pool, which the proxy reads as removed: every
+// session pinned to it takes a fresh pick, a move a slow `security` must not
+// cause. At startup there is no previous listing, so a deploy restart under
+// load dropped every profile whose first read got no answer, and the warm
+// sessions restored with pins to it moved for good.
+//
+// previous == nil is ListAccounts: every caller outside the daemon (status,
+// imports, `sr`) keeps its old view, in which an account without a credential
+// in hand is not listed. The daemon always passes a non-nil previous, empty at
+// startup. A profile whose read ANSWERED -- absent, refused, unparseable -- is
+// skipped as before, previous or not.
+func (s Store) ListAccountsKeeping(ctx context.Context, previous func(id string) (accounts.Account, bool)) ([]accounts.Account, error) {
 	profiles := s.ListProfiles()
 	out := make([]accounts.Account, 0, len(profiles))
 	for _, profile := range profiles {
 		configDir := s.ClaudeConfigDir(profile.Name)
 		credential, err := s.ReadCredential(ctx, configDir)
 		if err != nil {
+			if previous != nil && errors.Is(err, ErrCredentialUnchecked) {
+				if kept, ok := previous(profile.Name); ok && kept.Source == configDir {
+					slog.Warn("Claude profile credential not checked; keeping its previous listing", "profile", profile.Name, "error", err)
+					out = append(out, kept)
+					continue
+				}
+				// Nothing to keep that belongs to this instance directory: list
+				// it with no credential rather than not at all. A stale entry for
+				// another instance directory is never kept -- its token is some
+				// earlier login's.
+				slog.Warn("Claude profile credential not checked; listing it without a credential until a read answers", "profile", profile.Name, "error", err)
+				out = append(out, uncheckedProfileAccount(profile, configDir))
+				continue
+			}
 			// One profile with a corrupt credential (e.g. a malformed
 			// keychain blob) must not drop every other Claude account.
 			// Skip it and keep loading the rest.
@@ -1787,7 +1782,18 @@ func (s Store) CreateProfile(name string) (string, error) {
 	if _, ok := data.Profiles[name]; ok {
 		return "", fmt.Errorf("profile %q already exists", name)
 	}
-	dir := sanitizeName(name)
+	if twin, ok := caseTwin(data, name, ""); ok {
+		return "", caseTwinError(name, twin)
+	}
+	// A free NAME does not mean a free directory. RenameProfile keeps the
+	// directory it had, so after chip-a -> cookie a new `chip-a`
+	// computes cookie's directory. Sharing a directory shares the credential
+	// file and the keychain item, and RemoveProfile on either name then deletes
+	// both -- which is what a move does to the profile it moves. So pick the
+	// first directory nobody owns (a counter, never a refusal: a refusal left a
+	// renamed-away name un-creatable forever), and keep the physical-identity
+	// check below only as a backstop for aliases the registry cannot see.
+	dir := freeProfileDir(data, profileDirForName(name), name)
 	if err := s.ensureClaudeProfileInstanceDirAvailable(data, name, dir); err != nil {
 		return "", err
 	}
@@ -1866,8 +1872,11 @@ func (s Store) ImportProfileCredential(name string, credential CredentialInfo) (
 		}
 	}()
 	data := s.readProfiles()
-	dir := importedProfileDir(name)
 	profile, exists := data.Profiles[name]
+	// For a new name, a directory nobody owns: a renamed profile keeps the
+	// digest directory it was imported under, and importing its old name again
+	// used to overwrite that profile's credential and delete its keychain item.
+	dir := freeProfileDir(data, importedProfileDir(name), name)
 	if exists {
 		if profile.Dir != "" {
 			dir = profile.Dir
@@ -1907,9 +1916,25 @@ func (s Store) ImportProfileCredential(name string, credential CredentialInfo) (
 	if err := writePrivateFileAtomic(filepath.Join(instancePath, ".credentials.json"), body); err != nil {
 		return err
 	}
+	// Clear the keychain item under EVERY spelling of the instance path, not
+	// only the physically distinct ones. readCredential consults the keychain
+	// item named after the spelling the profile is launched with (the legacy
+	// ~/.codex-accounts one when that directory exists), and it prefers a
+	// fresher keychain credential over the file -- so an item left behind
+	// under an aliased spelling could shadow the credential just imported.
+	if err := s.deleteProfileKeychainCredentialsContext(context.Background(), instancePaths); err != nil {
+		return err
+	}
 	for _, path := range instancePaths {
-		if err := deleteKeychainCredential(path); err != nil {
-			return err
+		// An imported file is the profile's store on purpose, never a stand-in
+		// for its keychain item (keychainStandInMarker), and a rotation rescued
+		// before the import no longer applies to it (adoptRescuedRotation, which
+		// would drop it anyway: the store no longer holds what it replaces).
+		for _, leftover := range []string{keychainStandInMarker, rotationRescueFile} {
+			if err := os.Remove(filepath.Join(path, leftover)); err != nil && !errors.Is(err, os.ErrNotExist) {
+				slog.Warn("Claude import could not remove a leftover beside the credentials file",
+					"profile", name, "file", leftover, "error", withoutPath(err))
+			}
 		}
 		if profileInstancePathKey(path) == profileInstancePathKey(instancePath) {
 			continue
@@ -1930,11 +1955,107 @@ func (s Store) ImportProfileCredential(name string, credential CredentialInfo) (
 	return s.writeProfiles(data)
 }
 
+// RenameProfile re-keys a profile in the registry and leaves its instance
+// directory exactly where it is.
+//
+// Not moving the directory is the whole design. The path is referenced from
+// outside this registry -- the daemon's account list, the settings.json written
+// inside the instance, and any session already pinned to it -- so moving it
+// would turn a label change into a credential outage. A directory that does not
+// match its label is already the normal case anyway: CreateTempInstance mints
+// "_p<epoch>", and importedProfileDir appends a digest, so Dir has never been
+// derivable from Name.
+//
+// The active pointer is carried across because it stores a NAME, not a path: a
+// rename that left it behind would silently deactivate the account it renamed.
+func (s Store) RenameProfile(oldName, newName string) error {
+	if err := ValidateProfileNameAllowEmail(newName); err != nil {
+		return err
+	}
+	lock, err := lockProfileRegistry(s.ProfilesPath())
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+	data := s.readProfiles()
+	profile, ok := data.Profiles[oldName]
+	if !ok {
+		return fmt.Errorf("no Claude profile named %q", oldName)
+	}
+	if oldName == newName {
+		return nil
+	}
+	if _, exists := data.Profiles[newName]; exists {
+		return fmt.Errorf("a Claude profile named %q already exists", newName)
+	}
+	if twin, ok := caseTwin(data, newName, oldName); ok {
+		return caseTwinError(newName, twin)
+	}
+	// A registry written before every profile carried Dir resolves the
+	// directory from the NAME; pin it before the name changes, or the renamed
+	// profile would silently point at sanitizeName(newName) instead.
+	if profile.Dir == "" {
+		profile.Dir = resolvedClaudeProfileInstanceDir(oldName, profile)
+	}
+	profile.Name = newName
+	delete(data.Profiles, oldName)
+	data.Profiles[newName] = profile
+	if data.Active == oldName {
+		data.Active = newName
+	}
+	return reportCommittedProfileRegistryWrite("rename profile", s.writeProfiles(data))
+}
+
 func (s Store) RemoveProfile(name string) (removed bool, err error) {
 	return s.RemoveProfileContext(context.Background(), name)
 }
 
 func (s Store) RemoveProfileContext(ctx context.Context, name string) (removed bool, err error) {
+	return s.removeProfileContext(ctx, name, nil)
+}
+
+// ErrProfileCredentialReplaced is RemoveProfileIfCredentialContext's refusal:
+// the profile now serves a different token pair from the one its caller read,
+// so the profile was kept.
+var ErrProfileCredentialReplaced = errors.New("Claude profile credential was replaced after it was read")
+
+// RemoveProfileIfCredentialContext is RemoveProfileContext for a caller that
+// has handed the profile's credential on (`sr claude move`): the profile is
+// removed only while the credential it serves still carries expected's token
+// pair. The re-read is the one every refresh starts from (readCredential, then
+// adoptRescuedRotation), made under the registry lock and every credential
+// lock the removal holds, so nothing that takes those locks can change the
+// credential between the comparison and the removal.
+//
+// Only the pair decides, as in writeRefreshedCredentialIfUnchanged: a
+// metadata-only rewrite is the same chain. A different pair is
+// ErrProfileCredentialReplaced. A re-read that fails, or finds no credential,
+// is another error, so a caller cannot take it for a replacement. Either way
+// nothing is removed.
+func (s Store) RemoveProfileIfCredentialContext(ctx context.Context, name string, expected CredentialInfo) (removed bool, err error) {
+	return s.removeProfileContext(ctx, name, func(dir string) error {
+		instancePath := s.PreferredInstancePath(filepath.Join(s.InstancesDir(), dir))
+		current, err := s.readCredential(ctx, instancePath)
+		if err == nil {
+			current, err = adoptRescuedRotation(instancePath, current)
+		}
+		if err != nil {
+			return fmt.Errorf("re-read Claude profile %q before removing it: %w", name, err)
+		}
+		if current == nil || current.AccessToken == "" {
+			return fmt.Errorf("Claude profile %q no longer holds a credential", name)
+		}
+		if current.AccessToken != expected.AccessToken || current.RefreshToken != expected.RefreshToken {
+			return fmt.Errorf("%w: %q", ErrProfileCredentialReplaced, name)
+		}
+		return nil
+	})
+}
+
+// removeProfileContext is the one removal. check, when set, runs with the
+// registry lock and every credential lock held, before anything is backed up
+// or staged; its error keeps the profile.
+func (s Store) removeProfileContext(ctx context.Context, name string, check func(dir string) error) (removed bool, err error) {
 	lock, err := lockProfileRegistryContext(ctx, s.ProfilesPath())
 	if err != nil {
 		return false, err
@@ -1967,6 +2088,11 @@ func (s Store) RemoveProfileContext(ctx context.Context, name string) (removed b
 			err = closeErr
 		}
 	}()
+	if check != nil {
+		if err := check(dir); err != nil {
+			return false, err
+		}
+	}
 	credentialBackups, err := s.profileCredentialBackups(ctx, instancePaths)
 	if err != nil {
 		return false, err
@@ -2755,7 +2881,7 @@ func (s Store) readCredentialPayloadLocked(ctx context.Context, instancePath str
 	if !errors.Is(err, os.ErrNotExist) {
 		return nil, false, err
 	}
-	if runtime.GOOS != "darwin" {
+	if !systemKeychain.available() {
 		return nil, false, nil
 	}
 	u, err := user.Current()
@@ -2766,19 +2892,11 @@ func (s Store) readCredentialPayloadLocked(ctx context.Context, instancePath str
 	// ran with, so a credential written under an aliased legacy spelling is
 	// invisible to the canonical spelling alone.
 	for _, spelling := range s.instancePathSpellings(instancePath) {
-		service := "Claude Code-credentials-" + keychainHash(spelling)
-		keychainCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		cmd := exec.CommandContext(keychainCtx, "security", "find-generic-password", "-s", service, "-a", u.Username, "-w")
-		body, err = cmd.Output()
-		cancel()
+		body, found, err := systemKeychain.read(ctx, keychainService(spelling), u.Username)
 		if err != nil {
-			var exitErr *exec.ExitError
-			if errors.As(err, &exitErr) && exitErr.ExitCode() == 44 {
-				continue
-			}
 			return nil, false, fmt.Errorf("read Claude credential from keychain: %w", err)
 		}
-		if len(bytes.TrimSpace(body)) == 0 {
+		if !found {
 			continue
 		}
 		return body, true, nil
@@ -2798,20 +2916,68 @@ func (s Store) CleanupInstanceContext(ctx context.Context, dir string) error {
 	if err != nil {
 		return err
 	}
-	credentialLocks, err := lockProfileCredentialPaths(ctx, instancePaths)
-	if err != nil {
-		return err
-	}
-	defer closeProfileCredentialLocks(credentialLocks)
-	if err := s.deleteProfileKeychainCredentialsContext(ctx, instancePaths); err != nil {
-		return err
-	}
+	// Resolve the lock paths up front: each lock file is named after the
+	// symlink-resolved instance path, which stops being computable once the
+	// instance directory is gone.
+	lockPaths := make([]string, 0, 2*len(instancePaths))
 	for _, instancePath := range instancePaths {
-		if err := os.RemoveAll(instancePath); err != nil {
+		lockPaths = append(lockPaths,
+			profileCredentialLockPath(instancePath),
+			profileRefreshLockPath(instancePath),
+		)
+	}
+	if err := func() error {
+		credentialLocks, err := lockProfileCredentialPaths(ctx, instancePaths)
+		if err != nil {
+			return err
+		}
+		defer closeProfileCredentialLocks(credentialLocks)
+		if err := s.deleteProfileKeychainCredentialsContext(ctx, instancePaths); err != nil {
+			return err
+		}
+		for _, instancePath := range instancePaths {
+			if err := os.RemoveAll(instancePath); err != nil {
+				return err
+			}
+		}
+		return nil
+	}(); err != nil {
+		return err
+	}
+	// The lock files sit beside the instance directory rather than inside it,
+	// so RemoveAll leaves them behind and every temp-instance login stranded
+	// one (two, since the refresh lock). Unlink only once the locks are
+	// released: removing a file while its flock is held lets the next caller
+	// lock a fresh inode at the same path and believe it holds the same lock.
+	// The refresh lock is not taken here -- only temp instances, which nothing
+	// refreshes, are cleaned up -- and taking it after the credential locks
+	// would invert the refresh path's refresh-then-credential lock order.
+	for _, lockPath := range lockPaths {
+		if err := os.Remove(lockPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
 	}
 	return nil
+}
+
+// profileCredentialLockPath names the flock file guarding one profile
+// instance's credential. It is shared with lockProfileCredential so the two
+// cannot drift; the lock lives next to the instance directory, not inside it.
+func profileCredentialLockPath(instancePath string) string {
+	if resolved, err := filepath.EvalSymlinks(instancePath); err == nil {
+		instancePath = resolved
+	}
+	return filepath.Clean(instancePath) + ".credentials.lock"
+}
+
+// profileRefreshLockPath names the flock file lockProfileRefresh holds across
+// one profile's OAuth round trip. Shared with lockProfileRefresh for the same
+// reason as profileCredentialLockPath.
+func profileRefreshLockPath(instancePath string) string {
+	if resolved, err := filepath.EvalSymlinks(instancePath); err == nil {
+		instancePath = resolved
+	}
+	return filepath.Clean(instancePath) + ".refresh.lock"
 }
 
 func (s Store) readProfiles() profilesFile {
@@ -2959,6 +3125,16 @@ func profileInstancePhysicalIdentity(path string) (string, error) {
 	return filepath.Abs(filepath.Clean(path))
 }
 
+// WritePrivateFileAtomic writes a 0600 file so readers never observe a partial
+// or missing payload: the bytes land in a same-directory temp file that is
+// fsynced before an atomic rename over the target, and the directory is synced
+// afterwards so the rename survives a crash. It is exported because the client
+// config writers in cmd/subrouter (Claude Code's settings.json and
+// .claude.json) need the same crash-safety as the credential files here.
+func WritePrivateFileAtomic(path string, body []byte) error {
+	return writePrivateFileAtomic(path, body)
+}
+
 func writePrivateFileAtomic(path string, body []byte) error {
 	_, err := writePrivateFileAtomicWithDirectorySync(path, body, nil)
 	return err
@@ -3077,13 +3253,6 @@ func (s Store) prepareSharedState(instancePath string) (err error) {
 	for _, name := range claudeHighGrowthDirs {
 		source := filepath.Join(instancePath, name)
 		target := filepath.Join(s.SharedStateDir, name)
-		if info, statErr := os.Lstat(source); statErr == nil && info.Mode()&os.ModeSymlink == 0 {
-			if err := backupConfigEntryPath(source); err != nil {
-				return fmt.Errorf("backup %s: %w", name, err)
-			}
-		} else if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
-			return fmt.Errorf("inspect %s: %w", name, statErr)
-		}
 		if err := migrateDirectoryToShared(source, target); err != nil {
 			return fmt.Errorf("share %s: %w", name, err)
 		}
@@ -3102,18 +3271,19 @@ func (s Store) prepareSharedState(instancePath string) (err error) {
 }
 
 // claudeLinkWhenAbsentDirs are shared with the user's Claude home only in
-// profile directories that do not have them yet. "plugins" holds the plugin
-// marketplace clones (the official one alone is about 14 MB), which Claude
-// downloads again into every new config directory. Unlike history, an
-// existing plugins directory is never merged: a running Claude may be
-// reading it, and merging two marketplace checkouts file by file would
+// profile and proxy directories that do not have them yet (upstream #435).
+// "plugins" holds the plugin marketplace clones, which Claude downloads again
+// into every new config directory (on 2026-09-28 several laptop profiles held
+// their own 6.2 MB copy, and most were linked by hand). Unlike
+// history, an existing plugins directory is never merged: a running Claude may
+// be reading it, and merging two marketplace checkouts file by file would
 // corrupt both. Existing profiles keep their own copy.
 var claudeLinkWhenAbsentDirs = []string{
 	"plugins",
 }
 
 // linkSharedDirectoryWhenAbsent points source at target when nothing exists
-// at source. Anything already there, including a different link, is left
+// at source. Anything already there, including a link elsewhere, is left
 // exactly as it is.
 func linkSharedDirectoryWhenAbsent(source, target string) error {
 	if _, err := os.Lstat(source); err == nil {
@@ -3672,6 +3842,75 @@ func sanitizeName(name string) string {
 	return strings.ToLower(b.String())
 }
 
+// profileDirForName picks the instance directory for a NEW profile.
+//
+// A simple name keeps the flat, readable directory it has always had. An email
+// name cannot: sanitizeName folds every '@' and '.' to '-', so alice@corp.com
+// and alice-corp-com sanitize to the SAME directory, while CreateProfile only
+// rejects a duplicate NAME. Two profiles sharing an instance directory share a
+// credential file, which is credential mixing rather than a cosmetic clash.
+// Email names therefore reuse importedProfileDir's digest suffix -- the
+// collision-resistant scheme the server-import path has used all along.
+func profileDirForName(name string) string {
+	if validSimpleName(name) {
+		return sanitizeName(name)
+	}
+	return importedProfileDir(name)
+}
+
+// freeProfileDir returns preferred when no registered profile owns it, else the
+// first free directory in name's digest family: importedProfileDir(name), then
+// that with -2, -3, ... appended. A counter rather than a refusal, because the
+// digest directory itself can be owned -- an email name's first choice IS its
+// digest directory, so rename-then-recreate of alice@x.com lands on it -- and a
+// refusal there left a name that could never be created again.
+func freeProfileDir(data profilesFile, preferred, name string) string {
+	if !profileDirInUse(data, preferred) {
+		return preferred
+	}
+	base := importedProfileDir(name)
+	if !profileDirInUse(data, base) {
+		return base
+	}
+	for i := 2; ; i++ {
+		candidate := fmt.Sprintf("%s-%d", base, i)
+		if !profileDirInUse(data, candidate) {
+			return candidate
+		}
+	}
+}
+
+// caseTwin reports a registered profile, other than except, whose name differs
+// from name only in case. A box matches Claude names case-insensitively (its
+// account-import rotates the existing profile), so two local accounts that
+// differ only in case would overwrite each other there.
+func caseTwin(data profilesFile, name, except string) (string, bool) {
+	for existing := range data.Profiles {
+		if existing != name && existing != except && strings.EqualFold(existing, name) {
+			return existing, true
+		}
+	}
+	return "", false
+}
+
+func caseTwinError(name, twin string) error {
+	return fmt.Errorf("Claude profile %q differs from existing profile %q only in case; "+
+		"a server treats them as one account -- use %q, or a different name", name, twin, twin)
+}
+
+// profileDirInUse reports whether a registered profile already owns dir. A
+// profile with no Dir field owns its legacy implicit directory, as InstancePath
+// resolves it. Compared without case because the default macOS volume is
+// case-insensitive, so `Main` and `main` are one directory on disk there.
+func profileDirInUse(data profilesFile, dir string) bool {
+	for name, profile := range data.Profiles {
+		if strings.EqualFold(resolvedClaudeProfileInstanceDir(name, profile), dir) {
+			return true
+		}
+	}
+	return false
+}
+
 func importedProfileDir(name string) string {
 	base := strings.Trim(sanitizeName(name), "-")
 	if base == "" {
@@ -3716,6 +3955,13 @@ var claudeRoutingEnvKeys = []string{
 	"ANTHROPIC_AUTH_TOKEN",
 	"ANTHROPIC_API_KEY",
 	"ANTHROPIC_CUSTOM_HEADERS",
+	// A process-env socket beats ANTHROPIC_BASE_URL for every API request
+	// (Claude Code 2.1.284, measured), so a child launched for a REMOTE server
+	// from a socket-mode shell would talk to the LOCAL daemon -- or write TLS
+	// into it. Only stripping it from the env works: an empty value in
+	// --settings does not override the env's socket, though an empty value
+	// anywhere is harmless (Claude treats it as unset). PATCHES section 29.
+	"ANTHROPIC_UNIX_SOCKET",
 	"CLAUDE_CONFIG_DIR",
 	"CLAUDE_CODE_CONFIG_DIR",
 	"CLAUDE_CODE_OAUTH_TOKEN",
@@ -3778,36 +4024,467 @@ func AuthStatusForPath(ctx context.Context, claudePath, instancePath string) (*A
 	return &status, nil
 }
 
+// ErrCredentialUnchecked marks a credential read that reached NO verdict: the
+// store holding the credential did not answer. `security` was killed by a
+// deadline or could not be started, the keychain refused, or the credentials
+// file exists but could not be read. That is the opposite fact to "this
+// profile has no access token", and every caller that acts on the difference
+// tells them apart with errors.Is, never by reading a message.
+//
+// Measured on the laptop 2026-09-27/28, at sampled loads of 88 to 1009: the
+// proxy scores the whole pool under ONE 5 s budget, a `security` read cut by
+// that budget came back as "signal: killed", keychainCredential turned every
+// vault failure into "no keychain credential", and refreshProfileCredential
+// reported a healthy account as `has no access token`. The proxy reads that
+// text as an auth verdict: it zeroed the account's headroom, carried the zero
+// into the next sweep as its seed, and scored the account evicted -- the one
+// state that moves a warm session. Since PATCHES section 25 made a move stick,
+// every false reading moved its sessions for good and cold-cached their
+// prompts: 14 of the 15 moves committed in the first two hours after that
+// deploy, off accounts with 13-75% of their week left.
+//
+// Only an answer is a verdict: `security` exit 44 or an empty item, a
+// credentials file that does not exist, a stored credential with no access
+// token -- and a credentials file the file system refuses outright
+// (ErrCredentialUnavailable). Every other failure to read wraps this
+// sentinel, and the proxy keeps the account's standing and the session's pin
+// through it (sweepCut, refreshFailureIsTransient). The benefit of the doubt
+// is bounded: a store that stays silent for credentialSilenceVerdictAfter
+// (credentialHangVerdictAfter when `security` only ever hung) becomes
+// ErrCredentialUnavailable too (observeCredentialRead), so an account that can
+// never answer does not answer every turn with a 502 forever.
+var ErrCredentialUnchecked = errors.New("credential not checked (the store did not answer)")
+
+func credentialUnchecked(err error) error {
+	return fmt.Errorf("%w: %w", ErrCredentialUnchecked, err)
+}
+
+// credentialLockFailure classifies a failure to take a profile's credential
+// or refresh lock, which ReadCredential and refreshProfileCredential take
+// before they read anything. It used to be returned raw, ahead of every
+// classifier: a lock file the process could not open -- ENFILE, seen live on
+// 2026-09-06 02:45 on eleven-alpha.credentials.lock, or a lock the daemon's
+// user may not open -- was neither unchecked nor a verdict. The reload dropped
+// the account, which the proxy reads as removed and moves every session on it
+// (a false forced switch), while the pick path, finding the error neither
+// transient nor cannot-serve, answered 503 on every turn and never evicted it
+// (probed: 10 of 10 warm turns and 5 of 5 new sessions). It is classified the
+// way readCredentialFile classifies the file: an errno the file system repeats
+// until someone fixes the lock is a verdict (ErrCredentialUnavailable), any
+// other is unchecked and bounded by observeCredentialRead, and a wait the
+// caller's clock cut is an unchecked cut, which never counts. The path is
+// dropped from the text for the reason readCredentialFile drops it.
+func credentialLockFailure(err error) error {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return credentialUnchecked(fmt.Errorf("wait for the Claude credential lock: %w", err))
+	}
+	var pathErr *os.PathError
+	if errors.As(err, &pathErr) {
+		err = pathErr.Err
+	}
+	if credentialFileRefused(err) {
+		return fmt.Errorf("%w: take the Claude credential lock: %w", ErrCredentialUnavailable, err)
+	}
+	return credentialUnchecked(fmt.Errorf("take the Claude credential lock: %w", err))
+}
+
+// ReadCredential is the read every listing, status row and refresh goes
+// through, so it is where a store's lasting silence becomes a verdict
+// (observeCredentialRead, ErrCredentialUnavailable). A lock it cannot take is
+// part of the same read (credentialLockFailure), and like any read that got
+// no answer it forgets the keychain answer (keychainAnswerReuse). It is also
+// where a rotation rescueRotation saved is taken back (adoptRescuedRotation),
+// before anything can exchange the refresh token that rotation spent.
 func (s Store) ReadCredential(ctx context.Context, instancePath string) (credential *CredentialInfo, err error) {
 	lock, err := lockProfileCredential(ctx, instancePath)
 	if err != nil {
-		return nil, err
+		forgetKeychainAnswer(instancePath)
+		return nil, observeCredentialRead(instancePath, credentialLockFailure(err))
 	}
 	defer func() {
 		if closeErr := lock.Close(); err == nil {
 			err = closeErr
 		}
 	}()
-	return s.readCredential(ctx, instancePath)
+	credential, err = s.readCredential(ctx, instancePath)
+	if err == nil {
+		credential, err = adoptRescuedRotation(instancePath, credential)
+	}
+	return credential, observeCredentialRead(instancePath, err)
 }
 
-func (s Store) readCredential(ctx context.Context, instancePath string) (*CredentialInfo, error) {
-	if credential, ok := readCredentialFile(instancePath); ok {
-		return credential, nil
+// systemKeychain is the process-wide credential-vault seam. Production code
+// reaches the macOS keychain through it; tests swap in fakes so the
+// keychain-backed paths run on every OS instead of only where `security`
+// exists. Before the seam, Ubuntu CI executed none of this logic -- and the
+// hex-mangled-payload brick (fixed by PATCHES §7) lived exactly here.
+var systemKeychain keychain = defaultKeychain()
+
+// keychain is the minimal vault surface the store needs. Items are addressed
+// by (service, account) exactly as `security` addresses generic passwords.
+type keychain interface {
+	// available reports whether this platform has a vault at all. When it is
+	// false the store behaves as the old runtime.GOOS checks did: reads find
+	// nothing, deletes and pre-removal backups are no-ops, and writes fail
+	// with the file-only error.
+	available() bool
+	// read returns an item's raw payload. found=false with a nil error means
+	// the item is missing (`security` exit 44) or empty; a non-nil error means
+	// the vault could not be asked (locked, denied, timed out), which callers
+	// that must not mistake "unknown" for "absent" -- removal's credential
+	// fingerprint -- report instead of skipping. Payloads pass through
+	// verbatim, including the hex-printed form `security` emits for
+	// non-printable data, which parseCredentialPayload undoes.
+	read(ctx context.Context, service, account string) (payload []byte, found bool, err error)
+	// write upserts an item's payload.
+	write(ctx context.Context, service, account string, payload []byte) error
+	// delete removes an item; deleting a missing item is not an error.
+	delete(ctx context.Context, service, account string) error
+}
+
+func defaultKeychain() keychain {
+	if runtime.GOOS == "darwin" {
+		return securityKeychain{}
 	}
-	if runtime.GOOS != "darwin" {
+	return unavailableKeychain{}
+}
+
+// keychainService names the keychain item for one profile instance directory.
+// The service string is shared with Claude Code itself, which reads and
+// rewrites the same entry.
+func keychainService(instancePath string) string {
+	return "Claude Code-credentials-" + keychainHash(instancePath)
+}
+
+// securityKeychain shells out to macOS `security` (securityTool: by absolute
+// path, /usr/bin/security, outside tests), preserving the exact invocations
+// the store has always used.
+type securityKeychain struct{}
+
+func (securityKeychain) available() bool { return true }
+
+// securityItemNotFound is the exit status `security` uses for a missing item.
+const securityItemNotFound = 44
+
+// securityReadTimeout bounds one `security find-generic-password`. A var so a
+// test can let it fire without waiting five seconds.
+var securityReadTimeout = 5 * time.Second
+
+// errSecurityReadHung is a `security` read that ran out its own clock while
+// the caller was still waiting. It deliberately does not wrap
+// context.DeadlineExceeded, and its text carries no context error: a hang is
+// the store not answering, which observeCredentialRead counts (against the
+// longer hang bound), where a read the caller's clock cut is load and never
+// counts. See read.
+var errSecurityReadHung = errors.New("security find-generic-password did not answer")
+
+// errSecurityReadNotRun is a `security` read that never got to answer, with
+// neither clock fired: the process could not be started (fork EAGAIN or
+// ENOMEM under a per-user process limit or memory pressure, a missing tool),
+// it was killed by a signal nobody here sent (jetsam), or its output could not
+// be read. None of that is the keychain refusing -- the keychain was never
+// asked -- and a fork that fails for want of processes fails for every
+// profile at once. So, like a hang, it counts against the hour
+// (credentialHangVerdictAfter) and never takes the account out of new
+// placements (CredentialStoreNotAnswering); only an exit status from a
+// `security` that ran is a refusal and starts the quarter hour. Its text,
+// like the hang's, carries the cause but wraps no context or file-system
+// error. See read.
+var errSecurityReadNotRun = errors.New("security find-generic-password did not run to an answer")
+
+// securityNeverAnswered reports a read that got no answer from the keychain
+// because `security` never gave one -- a hang or a read that never ran --
+// rather than an answer the keychain refused with. observeCredentialRead gives
+// a streak of only these the hour, not the quarter hour.
+func securityNeverAnswered(err error) bool {
+	return errors.Is(err, errSecurityReadHung) || errors.Is(err, errSecurityReadNotRun)
+}
+
+// securitySearchNotCreated is what `security` writes to stderr when it could
+// not even create its keychain search: "SecKeychainSearchCreateFromAttributes:
+// One or more parameters passed to a function were not valid." (-50). A shell
+// left in a macOS login session that has ended (PATCHES §47: Superset's
+// terminal daemon, or a tmux server, outliving a logout) has no security
+// server to ask, and there `security` prints this line, then
+// "SecKeychainSearchCopyNext: The specified item could not be found in the
+// keychain.", and exits 44 -- the exit status and the words of the vault's
+// answer that an item is missing, although no item was ever looked for.
+const securitySearchNotCreated = "SecKeychainSearchCreateFromAttributes"
+
+// securityCouldNotSearch reports `security` output that carries
+// securitySearchNotCreated. It is checked before exit 44 and before "could
+// not be found" are read as answers, because both follow it in that output.
+//
+// Today user.Current() fails first in such a shell (`user: unknown userid
+// 502`), so the store never gets this far there. That shield is an accident:
+// a $USER fallback for the lookup, or a caller that names the account itself,
+// would turn every keychain-only profile into "has no access token" and every
+// keychain delete into a success. This makes the store's own reading of the
+// tool correct whatever runs before it.
+func securityCouldNotSearch(output []byte) bool {
+	return bytes.Contains(output, []byte(securitySearchNotCreated))
+}
+
+// securityReadFailure classifies a failed `security find-generic-password`
+// run: nil for the vault's answer that the item is missing (exit 44), a cut
+// for the caller's clock, errSecurityReadHung for this read's own clock,
+// errSecurityReadNotRun for a `security` that never ran to an answer -- or
+// ran but could not create its search (securityCouldNotSearch) -- and the
+// exit itself for one that ran and refused. parent is the caller's context,
+// ctx the read's own clock over it.
+func securityReadFailure(parent, ctx context.Context, err error) error {
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) && securityCouldNotSearch(exitErr.Stderr) {
+		// Not an answer, whatever the exit status says: the keychain was never
+		// searched. It is bounded like a read that never ran
+		// (securityNeverAnswered), not counted as a refusal: a session with no
+		// security server fails every profile's read at once, exactly like a
+		// fork that fails for want of processes.
+		return fmt.Errorf("%w (%s failed, so no keychain search ran: %s; no security server answers in this login session)",
+			errSecurityReadNotRun, securitySearchNotCreated, exitErr)
+	}
+	if errors.As(err, &exitErr) && exitErr.ExitCode() == securityItemNotFound {
+		return nil
+	}
+	// A read a clock cut is not an answer, and it must not look like one.
+	// When ctx ends, exec kills `security` and reports the kill ("signal:
+	// killed"), which does NOT wrap the context error; the kill wins over
+	// ctx.Err() in exec's own result. So the clocks are consulted here,
+	// and the two clocks mean different things.
+	//
+	// The CALLER's clock is load. The proxy scores the whole pool under
+	// one 5 s budget and a read late in the queue is cut by it; that was
+	// every false `has no access token` of 2026-09-27/28. Name it, so
+	// errors.Is(err, context.DeadlineExceeded) holds and the read neither
+	// starts nor ends a silent streak. A pool budget always started before
+	// this read's own clock, so its deadline is the earlier one and it,
+	// not this read, is what fired.
+	if parentErr := parent.Err(); parentErr != nil {
+		return fmt.Errorf("security find-generic-password: %w (%v)", parentErr, err)
+	}
+	// This read's OWN clock, with the caller still waiting (a request
+	// with no deadline, the reload's Background, the serial pre-read on
+	// the 60 s sweep clock), is `security` not answering for five
+	// seconds: a keychain blocked behind an unlock or access prompt
+	// nobody is there to click, as well as a very slow host. It used to
+	// be named a deadline too, so a keychain that hung on every read never
+	// counted toward a verdict and stayed transient forever -- probed, 49
+	// reads over four hours, still unchecked; every turn waited 5 s for a
+	// 502 and new sessions kept landing on the account. It is
+	// errSecurityReadHung now: it counts, against credentialHangVerdictAfter
+	// rather than the quarter hour, because own-clock expiry is also what
+	// a loaded Mac looks like (`security` writes killed on this same 5 s
+	// under load, 2026-09-27 17:41-17:44). Only the exit status goes into
+	// the text; err is ctx.Err() itself when the clock ran out before the
+	// process started, and context text in a verdict would read as a cut.
+	if ctx.Err() != nil {
+		detail := "killed"
+		if exitErr != nil {
+			detail = exitErr.Error()
+		}
+		return fmt.Errorf("%w within %s (%s)", errSecurityReadHung, securityReadTimeout, detail)
+	}
+	// Neither clock fired. Only a `security` that ran and exited with a
+	// status of its own (36 locked, 51 denied, ...) answered for the
+	// keychain, and that is a refusal. Anything else -- it could not be
+	// started, a signal nobody here sent ended it, its output could not
+	// be read -- means the keychain was never asked, which is what a Mac
+	// out of processes or memory looks like (errSecurityReadNotRun).
+	if exitErr == nil || !exitErr.Exited() {
+		return fmt.Errorf("%w (%v)", errSecurityReadNotRun, err)
+	}
+	return err
+}
+
+func (securityKeychain) read(ctx context.Context, service, account string) ([]byte, bool, error) {
+	parent := ctx
+	ctx, cancel := context.WithTimeout(ctx, securityReadTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, securityTool, "find-generic-password", "-s", service, "-a", account, "-w")
+	body, err := cmd.Output()
+	if err != nil {
+		return nil, false, securityReadFailure(parent, ctx, err)
+	}
+	if len(bytes.TrimSpace(body)) == 0 {
+		return nil, false, nil
+	}
+	return body, true, nil
+}
+
+// securityWriteTimeout bounds one `security add-generic-password`. A var so a
+// test can let it fire without waiting five seconds.
+var securityWriteTimeout = 5 * time.Second
+
+// errSecurityWriteHung is a `security` write that ran out its own clock while
+// the caller was still waiting: the write read's twin (errSecurityReadHung).
+// Under load it is what 2026-09-27 17:41-17:44 logged four times as
+// `write Claude credential to keychain: signal: killed`. Its text, like the
+// read's, carries no context error and never the payload.
+var errSecurityWriteHung = errors.New("security add-generic-password did not answer")
+
+// write runs one upsert. The clocks are told apart the way read tells them
+// apart: exec reports either kill as "signal: killed", which wraps no context
+// error. Retrying is writeKeychainCredential's business, not this one's.
+func (securityKeychain) write(ctx context.Context, service, account string, payload []byte) error {
+	parent := ctx
+	ctx, cancel := context.WithTimeout(ctx, securityWriteTimeout)
+	defer cancel()
+	// -U updates an existing item in place instead of failing on a duplicate.
+	// exec's error names only the exit ("exit status 36", "signal: killed")
+	// or the start failure, never the argument vector, so the payload stays
+	// out of every error built from it.
+	err := securityStartFailure(exec.CommandContext(ctx, securityTool, "add-generic-password", "-U", "-s", service, "-a", account, "-w", string(payload)).Run())
+	if err == nil {
+		return nil
+	}
+	if parentErr := parent.Err(); parentErr != nil {
+		return fmt.Errorf("security add-generic-password: %w (%v)", parentErr, err)
+	}
+	if ctx.Err() != nil {
+		detail := "killed"
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			detail = exitErr.Error()
+		}
+		return fmt.Errorf("%w within %s (%s)", errSecurityWriteHung, securityWriteTimeout, detail)
+	}
+	return err
+}
+
+func (securityKeychain) delete(ctx context.Context, service, account string) error {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	output, err := exec.CommandContext(
+		ctx,
+		securityTool,
+		"delete-generic-password",
+		"-s", service,
+		"-a", account,
+	).CombinedOutput()
+	if securityCouldNotSearch(output) {
+		// The search behind the delete could not be created, so nothing was
+		// found or deleted -- yet the output goes on to say the item "could not
+		// be found" (PATCHES §47). Reading that as an absent item reported a
+		// delete that never happened as done: RemoveProfile would drop the
+		// profile with its Keychain item still in place, and `sr claude move`
+		// would believe the local copy gone after the upload.
+		status := "exit status 0"
+		if err != nil {
+			status = securityStartFailure(err).Error()
+		}
+		return credentialUnchecked(fmt.Errorf("security delete-generic-password: %s failed, so no keychain search ran (%s); "+
+			"no security server answers in this login session, and nothing was deleted", securitySearchNotCreated, status))
+	}
+	if err == nil || strings.Contains(strings.ToLower(string(output)), "could not be found") {
+		return nil
+	}
+	return securityStartFailure(err)
+}
+
+// unavailableKeychain stands in on every platform without a supported vault.
+type unavailableKeychain struct{}
+
+func (unavailableKeychain) available() bool { return false }
+
+func (unavailableKeychain) read(context.Context, string, string) ([]byte, bool, error) {
+	return nil, false, nil
+}
+
+func (unavailableKeychain) write(context.Context, string, string, []byte) error {
+	// This exact wording is the platform contract writeCredential exposes when
+	// no vault exists; the call site delegates here rather than duplicating
+	// the string, so the two can never drift.
+	return fmt.Errorf("Claude credential persistence is only supported for .credentials.json files on %s", runtime.GOOS)
+}
+
+func (unavailableKeychain) delete(context.Context, string, string) error { return nil }
+
+// readCredential returns the FRESHER of the profile's two credential stores.
+//
+// The file used to win unconditionally, and nothing surfaced it. `sr claude add`
+// re-authenticates a profile in place, and Claude Code writes that login to the
+// profile's keychain item, so a leftover .credentials.json from an earlier
+// login shadowed every later re-auth: the daemon kept presenting the dead
+// refresh token, the account stayed invalid_grant forever, and the re-auth
+// looked like a silent no-op. Measured 2026-08-28 on ten-alpha, whose file
+// was a day stale and survived three consecutive re-auths.
+//
+// Between two credentials of the same kind, ExpiresAt is the discriminator: it
+// is exactly what "fresher" means for an OAuth grant, and for two setup tokens
+// (each stamped issue+365d) it orders them by mint time. Across kinds it means
+// nothing -- a setup token's year-long expiry would beat every OAuth login --
+// so there the refreshable credential wins. Imports clear the keychain under
+// every path spelling, so a refreshable keychain item beside a setup-token
+// file was written after that file: it is the re-auth, and a file that kept
+// winning would silence it for a year. Ties go to the file.
+//
+// A credentials file that exists but cannot be read ends the read --
+// unchecked, or refused (ErrCredentialUnavailable) -- without consulting the
+// keychain: the daemon writes its rotations to the file
+// whenever one exists, so the keychain beside it can hold a refresh token the
+// provider has already consumed, and presenting that one would turn a failed
+// read into a real invalid_grant.
+func (s Store) readCredential(ctx context.Context, instancePath string) (*CredentialInfo, error) {
+	fileCredential, haveFile, fileErr := readCredentialFile(instancePath)
+	if fileErr != nil {
+		forgetKeychainAnswer(instancePath)
+		return nil, fileErr
+	}
+	keychainCredential, keychainErr := s.keychainCredential(ctx, instancePath)
+	if !haveFile {
+		// No file: the keychain alone decides, and a keychain that did not
+		// answer leaves the read unchecked (ErrCredentialUnchecked). Only an
+		// answer is remembered for reuse (keychainAnswerReuse); anything else
+		// forgets, so the next caller reads.
+		if keychainErr != nil {
+			forgetKeychainAnswer(instancePath)
+		} else {
+			rememberKeychainAnswer(instancePath, keychainCredential)
+		}
+		return keychainCredential, keychainErr
+	}
+	forgetKeychainAnswer(instancePath)
+	if keychainCredential != nil && keychainCredentialIsFresher(fileCredential, keychainCredential) {
+		return keychainCredential, nil
+	}
+	return fileCredential, nil
+}
+
+// keychainCredentialIsFresher is readCredential's tie-break between a file
+// credential and a keychain credential for the same instance path.
+func keychainCredentialIsFresher(file, keychain *CredentialInfo) bool {
+	if keychain == nil || keychain.AccessToken == "" {
+		return false
+	}
+	if file == nil || file.AccessToken == "" {
+		return true
+	}
+	if file.LongLived() != keychain.LongLived() {
+		return !keychain.LongLived()
+	}
+	return keychain.ExpiresAt > file.ExpiresAt
+}
+
+// keychainCredential reads the keychain item for exactly instancePath. Only
+// the vault's answer that the item is missing or empty (found=false, nil)
+// means "no keychain credential". A vault that could not be asked returns
+// ErrCredentialUnchecked. It used to read as "no keychain credential" as well,
+// and that alone produced every false `has no access token` of 2026-09-27/28
+// (see ErrCredentialUnchecked). Removal's fingerprint
+// (readCredentialPayloadLocked) already drew this line.
+func (s Store) keychainCredential(ctx context.Context, instancePath string) (*CredentialInfo, error) {
+	if !systemKeychain.available() {
 		return nil, nil
 	}
 	u, err := user.Current()
 	if err != nil {
-		return nil, nil
+		return nil, credentialUnchecked(fmt.Errorf("resolve current user for Claude Keychain lookup: %w", err))
 	}
-	service := "Claude Code-credentials-" + keychainHash(instancePath)
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "security", "find-generic-password", "-s", service, "-a", u.Username, "-w")
-	body, err := cmd.Output()
-	if err != nil || len(strings.TrimSpace(string(body))) == 0 {
+	body, found, err := systemKeychain.read(ctx, keychainService(instancePath), u.Username)
+	if err != nil {
+		return nil, credentialUnchecked(fmt.Errorf("read Claude credential from keychain: %w", err))
+	}
+	if !found {
 		return nil, nil
 	}
 	return parseCredentialPayload(body, "keychain")
@@ -3872,6 +4549,67 @@ func (s Store) CredentialRefreshState(ctx context.Context, profile Profile, now 
 	return account, credential, needsRefresh, nil
 }
 
+// HoldProfileRefresh runs hold while holding name's refresh lock, which every
+// refresh of the profile holds from the read of the token it will present
+// until the rotation is written (refreshProfileCredential). While hold runs no
+// subrouter process on this machine can start a refresh of the profile, and
+// none is still in flight: one that was waits for this lock. A caller that
+// hands the credential on (`sr claude move`) can therefore read it, upload it
+// and remove it with no rotation between the read and the removal. Claude
+// Code refreshing the profile's keychain item itself takes no subrouter lock;
+// RemoveProfileIfCredentialContext's re-read is the check for that.
+//
+// Lock order: the account-disk transaction first, when the caller takes it
+// (`sr` status refreshes under it), then this lock, then the registry and
+// credential locks a removal takes. Nothing takes this lock while holding any
+// of those.
+func (s Store) HoldProfileRefresh(ctx context.Context, name string, hold func() error) (err error) {
+	if _, ok := s.FindProfile(name); !ok {
+		return fmt.Errorf("Claude profile %q not found", name)
+	}
+	instancePath := s.claudeInstancePath(name)
+	refreshLock, err := lockProfileRefresh(ctx, instancePath)
+	if err != nil {
+		return fmt.Errorf("take Claude profile %q's refresh lock: %w", name, err)
+	}
+	defer func() {
+		if closeErr := refreshLock.Close(); err == nil {
+			err = closeErr
+		}
+	}()
+	// The lock is keyed by the instance path, so a profile renamed or
+	// re-pointed while this waited is not the one it holds off.
+	if _, ok := s.FindProfile(name); !ok ||
+		profileInstancePathKey(s.claudeInstancePath(name)) != profileInstancePathKey(instancePath) {
+		return fmt.Errorf("Claude profile %q changed while waiting for its refresh lock", name)
+	}
+	return hold()
+}
+
+// credentialExchangeTimeout bounds one refresh-token exchange, on a clock the
+// CALLER cannot stop.
+//
+// Anthropic rotates the refresh token on use: the moment the provider accepts
+// the old token, the old token is dead and the only copy of the new one is in
+// the response in flight. Every caller of this path -- a proxied request, the
+// usage sweep, a status probe -- carries a context its client can cancel, and a
+// client aborting mid-exchange (a hung-up probe, an Esc in the terminal) used
+// to abort the read too. The provider had already rotated; the profile was left
+// holding a token that no longer existed, recoverable only by a fresh login.
+//
+// Waiting for the per-profile refresh lock still honours the caller's context
+// -- that is a queue, and a caller may leave a queue. The exchange itself may
+// not be abandoned once started.
+const credentialExchangeTimeout = 30 * time.Second
+
+// credentialPersistTimeout bounds the re-lock, re-read and write that land a
+// rotated credential on disk. Its own clock, started when the exchange
+// returns: a slow exchange must not eat the time the write needs, or the
+// provider has rotated and nothing was persisted -- the exact loss the
+// exchange clock exists to prevent. A var so a test can run a persist out of
+// time without waiting ten seconds.
+var credentialPersistTimeout = 10 * time.Second
+
 // refreshProfileCredential serializes concurrent refreshes of the same
 // profile using lockProfileRefresh, a lock distinct from
 // lockProfileCredential. Claude refresh tokens are single-use, so two
@@ -3880,24 +4618,46 @@ func (s Store) CredentialRefreshState(ctx context.Context, profile Profile, now 
 // observe the winner's already-refreshed, still-fresh credential on its own
 // subsequent read and skip the network call entirely (see the shouldRefresh
 // check below). Unlike lockProfileCredential, lockProfileRefresh is only ever
-// held here, so holding it across the OAuth round-trip never blocks an
+// held here and by HoldProfileRefresh (a move), so holding it across the
+// OAuth round-trip never blocks an
 // unrelated ImportProfileCredential call for the same profile; each
 // individual disk read/write still takes the short-lived
 // lockProfileCredential via ReadCredential / writeRefreshedCredentialIfUnchanged.
 func (s Store) refreshProfileCredential(ctx context.Context, client *http.Client, profile Profile, force bool, beforeRefresh func() error) (account accounts.Account, credential *CredentialInfo, didRefresh bool, err error) {
-	configDir := s.ClaudeConfigDir(profile.Name)
+	configDir := s.claudeInstancePath(profile.Name)
+	// A keychain answer moments old whose token needs no refresh is the answer
+	// this call would read again, so it is served without either lock and
+	// without `security` (keychainAnswerReuse). Everything else -- a refresh,
+	// a force, a stale or forgotten answer, a profile with a credentials
+	// file -- goes down the locked path below.
+	if !force {
+		if account, credential, ok := s.reuseKeychainAnswer(profile, configDir); ok {
+			return account, credential, false, nil
+		}
+	}
 	refreshLock, err := lockProfileRefresh(ctx, configDir)
 	if err != nil {
-		return accounts.Account{}, nil, false, err
+		// The refresh lock is taken before the read it guards, so failing to
+		// take it is that read failing (credentialLockFailure), counted
+		// against the same profile's streak, and forgetting the answer as any
+		// read that got none does.
+		forgetKeychainAnswer(configDir)
+		return accounts.Account{}, nil, false, observeCredentialRead(configDir, credentialLockFailure(err))
 	}
 	defer func() {
 		if closeErr := refreshLock.Close(); err == nil {
 			err = closeErr
 		}
 	}()
+	// A forced refresh is most often a token the provider just refused, so no
+	// caller reuses the answer holding it from here, its read included, rather
+	// than from the exchange as an expiring token's refresh does below.
+	if force {
+		defer keychainRotationStarted(configDir)()
+	}
 
 	current, ok := s.FindProfile(profile.Name)
-	if !ok || profileInstancePathKey(s.ClaudeConfigDir(current.Name)) != profileInstancePathKey(configDir) {
+	if !ok || profileInstancePathKey(s.claudeInstancePath(current.Name)) != profileInstancePathKey(configDir) {
 		return accounts.Account{}, nil, false, fmt.Errorf("Claude profile %q is no longer current", profile.Name)
 	}
 	profile = current
@@ -3923,6 +4683,7 @@ func (s Store) refreshProfileCredential(ctx context.Context, client *http.Client
 		if !ok {
 			return accounts.Account{}, credential, false, fmt.Errorf("Claude profile %q has no usable credential", profile.Name)
 		}
+		stampKeychainAnswer(configDir, profile.CreatedAt, credential)
 		return account, credential, false, nil
 	}
 
@@ -3933,18 +4694,19 @@ func (s Store) refreshProfileCredential(ctx context.Context, client *http.Client
 			return accounts.Account{}, credential, false, err
 		}
 	}
-	// Once the refresh token is sent, the upstream may rotate it whether or
-	// not we read the answer. From here on, caller cancellation (a client
-	// disconnecting) must not abandon the round trip or the persistence of
-	// the new pair, or disk keeps a spent refresh token and the account's
-	// chain is dead until a human logs in again. Detach from the caller and
-	// bound the work with a timeout of its own instead.
-	if err := ctx.Err(); err != nil {
-		return accounts.Account{}, credential, false, err
+	// No caller reuses this profile's keychain answer from here until the
+	// persist has returned: it holds the token being replaced.
+	if !force {
+		defer keychainRotationStarted(configDir)()
 	}
-	commitCtx, cancelCommit := context.WithTimeout(context.WithoutCancel(ctx), refreshCommitTimeout)
-	defer cancelCommit()
-	refreshed, err := RefreshCredential(commitCtx, client, credentialBeforeRefresh)
+	// From here to the write, the caller's cancellation no longer applies.
+	// Values (refresh reason, breadcrumbs) ride along; only the cancel is
+	// dropped. See credentialExchangeTimeout. The clock starts after
+	// beforeRefresh so a caller that is already gone does not publish and then
+	// abandon; waiting for the refresh lock above still honours the caller.
+	exchangeCtx, cancelExchange := context.WithTimeout(context.WithoutCancel(ctx), credentialExchangeTimeout)
+	refreshed, err := RefreshCredential(exchangeCtx, client, credentialBeforeRefresh)
+	cancelExchange()
 	if err != nil {
 		return accounts.Account{}, credential, false, err
 	}
@@ -3953,11 +4715,13 @@ func (s Store) refreshProfileCredential(ctx context.Context, client *http.Client
 	current, ok = s.FindProfile(profile.Name)
 	if !ok ||
 		current.CreatedAt != profileBeforeRefresh.CreatedAt ||
-		profileInstancePathKey(s.ClaudeConfigDir(current.Name)) != profileInstancePathKey(configDir) {
+		profileInstancePathKey(s.claudeInstancePath(current.Name)) != profileInstancePathKey(configDir) {
 		return accounts.Account{}, credential, false, fmt.Errorf("Claude profile %q is no longer current", profile.Name)
 	}
 	profile = current
-	credential, err = s.writeRefreshedCredentialIfUnchanged(commitCtx, configDir, credentialBeforeRefresh, refreshed)
+	// The provider has rotated. Whatever the exchange cost, the persist
+	// starts with a full clock of its own, and the caller cannot cut it.
+	credential, err = s.persistRefreshedCredential(ctx, profile, configDir, credentialBeforeRefresh, refreshed)
 	if err != nil {
 		return accounts.Account{}, credential, false, err
 	}
@@ -3968,25 +4732,117 @@ func (s Store) refreshProfileCredential(ctx context.Context, client *http.Client
 	if !ok {
 		return accounts.Account{}, credential, false, fmt.Errorf("Claude profile %q has no usable credential", profile.Name)
 	}
+	stampKeychainAnswer(configDir, profile.CreatedAt, credential)
 	return account, credential, didRefresh, nil
 }
 
-// refreshCommitTimeout bounds a refresh round trip plus the persistence of its
-// result once they run detached from the caller's context.
-const refreshCommitTimeout = 45 * time.Second
+// errRotationLockNotTaken marks a persist that never got the profile's
+// credential lock, so nothing was read or written: persistRefreshedCredential
+// asks for the lock again on a fresh clock rather than give up the rotation.
+var errRotationLockNotTaken = errors.New("take the Claude credential lock to persist a rotated credential")
+
+// errRotationRescued is what a refresh returns when its rotation went to
+// rotationRescueFile: the provider rotated and the rotation is safe, but the
+// profile's store does not hold it until its next read adopts it
+// (adoptRescuedRotation). The refresh reached no verdict about the account,
+// so it goes out as ErrCredentialUnchecked, and its text carries no context
+// error: nothing reads it as a clock that merely ran out.
+var errRotationRescued = errors.New("Claude credential rotated but its store could not be written")
+
+// rotationRescueFile is where a rotated credential goes when the profile's
+// store cannot be written at all (rescueRotation). It sits beside
+// .credentials.json, mode 0600, in the credentials file's own form plus the
+// fingerprint of the credential it replaces ("replaces"), and the profile's
+// next read takes it back (adoptRescuedRotation) before anything can present
+// the refresh token that rotation spent.
+const rotationRescueFile = ".credentials.rescued.json"
+
+// keychainStandInMarker marks a .credentials.json that stands in for the
+// profile's keychain item: a rotation the keychain would not take was put
+// there (writeRotation, adoptRescuedRotation). The item beside it holds the
+// refresh token that rotation spent, so the file must win every read until
+// the keychain takes a later credential -- and then it must go, or one slow
+// write would leave the profile file-backed for good, rotating only the file
+// while anything that reads the item itself (a direct Claude Code launch) is
+// handed the spent chain. writeCredential moves a marked profile back to the
+// keychain at the first write the keychain takes (returnStandInToKeychain).
+// An imported file is never a stand-in, and an import clears the mark.
+const keychainStandInMarker = ".credentials.keychain-pending"
+
+// persistRefreshedCredential lands a credential the provider has just rotated.
+// By the time it runs the refresh token read before the exchange is spent and
+// the only live copy of its successor is refreshed, so no failure here may
+// simply drop it:
+//
+//   - writeRefreshedCredentialIfUnchanged gets credentialPersistTimeout,
+//     started now, which the caller cannot cut. Its keychain write retries on
+//     that clock (writeKeychainCredential), and a store that still will not
+//     take it has the rotation written to the profile's credentials file
+//     (writeRotation).
+//   - A persist that never got the credential lock read and wrote nothing, so
+//     it asks again on a second fresh clock. The refresh lock is held
+//     throughout, so no other refresh can present the spent token meanwhile.
+//     This used to be the loss KNOWN-ISSUES named beside the killed write:
+//     "a persist whose credential lock cannot be taken after the exchange".
+//   - A lock refused twice is a lock something is sitting on; the rotation is
+//     written, without it, to rotationRescueFile, where it clobbers nothing a
+//     lock holder might be writing, and the profile's next read, which holds
+//     the lock, adopts it.
+func (s Store) persistRefreshedCredential(ctx context.Context, profile Profile, instancePath string, before, refreshed CredentialInfo) (*CredentialInfo, error) {
+	var err error
+	for attempt := 0; attempt < 2; attempt++ {
+		persistCtx, cancelPersist := context.WithTimeout(context.WithoutCancel(ctx), credentialPersistTimeout)
+		var credential *CredentialInfo
+		credential, err = s.writeRefreshedCredentialIfUnchanged(persistCtx, profile, instancePath, before, refreshed)
+		cancelPersist()
+		if !errors.Is(err, errRotationLockNotTaken) {
+			return credential, err
+		}
+		slog.Warn("Claude credential lock not taken to persist a rotated credential",
+			"profile", profile.Name, "instance", filepath.Clean(instancePath), "attempt", attempt+1, "error", err)
+	}
+	return nil, s.rescueRotation(profile, instancePath, before, refreshed, err)
+}
 
 // writeRefreshedCredentialIfUnchanged briefly holds lockProfileCredential to
 // re-read the on-disk credential and compare its token pair against the pair
 // read before the network refresh. If the pair is unchanged, the refreshed
-// tokens are persisted on top of the current on-disk metadata (plan, tier,
-// scopes), so a metadata-only rewrite during the round trip neither discards
-// the rotated pair nor is itself lost. If the pair changed, the newer on-disk
+// tokens are persisted and returned. If the pair changed, the newer on-disk
 // credential wins and the refreshed value is discarded, so a concurrent
 // ImportProfileCredential is never clobbered by a stale refresh.
-func (s Store) writeRefreshedCredentialIfUnchanged(ctx context.Context, instancePath string, before, refreshed CredentialInfo) (credential *CredentialInfo, err error) {
+//
+// Only the pair decides. A rewrite that changed only metadata during the
+// exchange (plan, tier, scopes -- the same login recorded again) used to fail
+// the whole-credential comparison, so the rotated pair was dropped and disk
+// kept the spent refresh token: the account's next refresh was an
+// invalid_grant, fixed only by a fresh login. Now the rotated tokens are
+// written under the current metadata, so neither write is lost (upstream #368,
+// PATCHES section 44).
+//
+// A re-read that reached no verdict (ErrCredentialUnchecked) persists the
+// refreshed credential anyway. By the time this runs the provider has rotated:
+// the token read before the exchange is spent, and the only live copy of its
+// successor is `refreshed`. This used to read a cut re-read as "no credential"
+// and return it -- the rotated credential was dropped and the profile's next
+// refresh presented a spent token, a real invalid_grant manufactured from a
+// slow `security`. Writing risks clobbering only an import that landed during
+// the exchange itself, under a keychain too slow to be read; dropping the
+// rotation loses the account every time. A vault too slow to write no longer
+// loses it either (writeRotation).
+//
+// A re-read the file system refused (ErrCredentialUnavailable: a root-run
+// write renamed a root-owned 0600 file into place during the exchange) is
+// the same case: the rename that persists replaces the unreadable file with
+// one the daemon owns, and returning the refusal instead would drop the only
+// live copy of the rotation. So is any other re-read with nothing to compare
+// -- a keychain item rewritten during the exchange into a payload that will
+// not parse, or deleted -- because nothing on disk is newer than the
+// rotation. The one exception is a store emptied because the profile itself
+// was removed, checked under this lock: the rotation belongs to nobody then.
+func (s Store) writeRefreshedCredentialIfUnchanged(ctx context.Context, profile Profile, instancePath string, before, refreshed CredentialInfo) (credential *CredentialInfo, err error) {
 	lock, err := lockProfileCredential(ctx, instancePath)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: %w", errRotationLockNotTaken, err)
 	}
 	defer func() {
 		if closeErr := lock.Close(); err == nil {
@@ -3996,17 +4852,23 @@ func (s Store) writeRefreshedCredentialIfUnchanged(ctx context.Context, instance
 
 	current, err := s.readCredential(ctx, instancePath)
 	if err != nil {
-		return nil, err
+		slog.Warn("Claude credential re-read after refresh not checked; persisting the rotated credential", "profile", profile.Name, "error", err)
+		return s.writeRotation(ctx, profile, instancePath, before, refreshed)
 	}
 	if current == nil || current.AccessToken == "" {
-		return current, nil
+		if !s.profileStillAt(profile, instancePath) {
+			return nil, fmt.Errorf("Claude profile %q is no longer current", profile.Name)
+		}
+		slog.Warn("Claude credential re-read after refresh found no credential; persisting the rotated credential", "profile", profile.Name)
+		return s.writeRotation(ctx, profile, instancePath, before, refreshed)
 	}
 	if current.AccessToken != before.AccessToken || current.RefreshToken != before.RefreshToken {
 		return current, nil
 	}
-	// Nothing else wrote: the refresh response, including any plan or scope
-	// change it carries, is the newest state. Only a metadata-only rewrite
-	// during the round trip keeps the on-disk metadata under the new tokens.
+	// Nothing replaced the pair: the refresh is the newest token state. Only a
+	// metadata-only rewrite during the exchange keeps its metadata under the
+	// new tokens. The rotation then goes through writeRotation, so a store that
+	// will not take it still keeps it (PATCHES sections 34 and 44).
 	merged := refreshed
 	if !current.Equal(before) {
 		merged = *current
@@ -4014,10 +4876,216 @@ func (s Store) writeRefreshedCredentialIfUnchanged(ctx context.Context, instance
 		merged.RefreshToken = refreshed.RefreshToken
 		merged.ExpiresAt = refreshed.ExpiresAt
 	}
-	if err := s.writeCredential(ctx, instancePath, merged); err != nil {
+	return s.writeRotation(ctx, profile, instancePath, before, merged)
+}
+
+// writeRotation writes a rotated credential under the credential lock its
+// caller holds. When the store will not take it -- the keychain write failed
+// on every retry the persist clock allowed (writeKeychainCredential) -- the
+// rotation is written to the profile's .credentials.json instead, still under
+// that lock, and the refresh succeeds. readCredential prefers the fresher of
+// file and keychain, and the rotation is fresher than the spent keychain copy,
+// so the profile is read, refreshed and written through the file until the
+// keychain takes a later rotation (keychainStandInMarker). While the file
+// exists the profile reuses no keychain answer and still runs `security` on
+// every read, to compare; the ERROR line says it happened. Only when the file
+// cannot be written either is the rotation given up, to rotationRescueFile if
+// that can be written, and the refresh fails.
+func (s Store) writeRotation(ctx context.Context, profile Profile, instancePath string, before, refreshed CredentialInfo) (*CredentialInfo, error) {
+	err := s.writeCredential(ctx, instancePath, refreshed)
+	if err == nil {
+		return &refreshed, nil
+	}
+	path := filepath.Join(instancePath, ".credentials.json")
+	if _, statErr := os.Lstat(path); errors.Is(statErr, os.ErrNotExist) {
+		// The keychain is this profile's store: the file only holds the
+		// rotation until the keychain takes one. A mark that cannot be
+		// written costs only the way back, never the rotation.
+		if markErr := markKeychainStandIn(instancePath); markErr != nil {
+			slog.Warn("Claude credentials file could not be marked a keychain stand-in; the profile stays file-backed",
+				"profile", profile.Name, "instance", filepath.Clean(instancePath), "error", markErr)
+		}
+	}
+	body, fileErr := credentialPayload(refreshed)
+	if fileErr == nil {
+		fileErr = writePrivateFileAtomic(path, body)
+	}
+	if fileErr != nil {
+		return nil, s.rescueRotation(profile, instancePath, before, refreshed, fmt.Errorf("%w; write Claude credentials file: %w", err, fileErr))
+	}
+	slog.Error("Claude credential rotated but the keychain would not take it; the rotation is in the profile's credentials file until the keychain takes a later one",
+		"profile", profile.Name, "instance", filepath.Clean(instancePath), "file", path, "error", err)
+	return &refreshed, nil
+}
+
+// rescueRotation is the last place a rotated credential can go:
+// rotationRescueFile, written without the credential lock, beside the
+// fingerprint of the credential it replaces, so the profile's next read can
+// tell whether it still applies (adoptRescuedRotation). It logs at ERROR,
+// naming the profile and the file and never the token, and returns what the
+// refresh returns.
+//
+// Up to twenty seconds of lock waits can separate the exchange from this, so
+// the profile is checked first: one removed, or removed and added again,
+// meanwhile is not the profile that rotated, and the rotation belongs to
+// nobody. Nor is anything written into an instance directory that is gone,
+// which writing would recreate after a removal staged it away.
+func (s Store) rescueRotation(profile Profile, instancePath string, before, refreshed CredentialInfo, cause error) error {
+	// The answer this process remembers holds the token the rotation
+	// replaced; the next caller must read, and so adopt.
+	forgetKeychainAnswer(instancePath)
+	if !s.profileStillAt(profile, instancePath) {
+		slog.Error("Claude credential rotated for a profile that is no longer current; the rotation is dropped",
+			"profile", profile.Name, "instance", filepath.Clean(instancePath), "error", cause)
+		return fmt.Errorf("Claude profile %q is no longer current", profile.Name)
+	}
+	path := filepath.Join(instancePath, rotationRescueFile)
+	err := errors.New("the profile's instance directory is gone")
+	if info, statErr := os.Stat(instancePath); statErr == nil && info.IsDir() {
+		var body []byte
+		body, err = rescuePayload(before, refreshed)
+		if err == nil {
+			err = writePrivateFileAtomic(path, body)
+		}
+	}
+	if err != nil {
+		slog.Error("Claude credential rotated and could not be saved anywhere; this profile needs a new login",
+			"profile", profile.Name, "instance", filepath.Clean(instancePath), "error", cause, "rescue_error", err)
+		// A verdict, not a cut: the only live refresh token is gone, and the
+		// store's is spent. The cause stays in the log line, out of this
+		// text, which readers classify.
+		return fmt.Errorf("%w: Claude profile %q rotated and the rotation could not be saved anywhere; it needs a new login", ErrCredentialUnavailable, profile.Name)
+	}
+	slog.Error("Claude credential rotated and its store could not be written; the rotation is saved beside it, and the profile's next read adopts it",
+		"profile", profile.Name, "instance", filepath.Clean(instancePath), "rescued", path, "error", cause)
+	return credentialUnchecked(fmt.Errorf("%w: the rotation is in %s, and the profile's next read adopts it", errRotationRescued, rotationRescueFile))
+}
+
+// rescuePayload is rotationRescueFile's body: the credentials file's own form
+// (so the file still reads as one), plus the fingerprint of the credential
+// the rotation replaced, which is a hash and never a token.
+func rescuePayload(before, refreshed CredentialInfo) ([]byte, error) {
+	body, err := json.MarshalIndent(rescuedRotation{
+		ClaudeAIOAuth: &refreshed,
+		Replaces:      accountpkg.OAuthCredentialVersion(before.AccessToken, before.RefreshToken),
+	}, "", "  ")
+	if err != nil {
 		return nil, err
 	}
-	return &merged, nil
+	return append(body, '\n'), nil
+}
+
+type rescuedRotation struct {
+	ClaudeAIOAuth *CredentialInfo `json:"claudeAiOauth"`
+	Replaces      string          `json:"replaces"`
+}
+
+// adoptRescuedRotation takes back a rotation rescueRotation saved. It runs on
+// every read that answered, under the credential lock (ReadCredential), so
+// before any exchange: refreshProfileCredential reads through ReadCredential,
+// and a store beside a rescue holds the refresh token the rescued rotation
+// spent. Presenting that token is invalid_grant -- seconds after the rescue,
+// since the rotation happened because the token was expiring -- and if the
+// provider revokes a chain whose spent token is presented, it kills the
+// rescued one too.
+//
+// The rescue applies while the store still holds the credential it replaced
+// ("replaces"), or holds none: it is written over the profile's
+// .credentials.json, which readCredential prefers as the fresher, and is the
+// read's answer. A keychain-only profile's file is marked a stand-in
+// (keychainStandInMarker), so its next rotation goes back to the keychain. A
+// store holding anything else has moved on since -- an import, a re-login,
+// this very rescue adopted by a read that died before removing it -- and the
+// rescue is removed. A rescue that cannot be read, or written into place,
+// fails the read, so nothing exchanges the spent token while it waits.
+func adoptRescuedRotation(instancePath string, current *CredentialInfo) (*CredentialInfo, error) {
+	path := filepath.Join(instancePath, rotationRescueFile)
+	body, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return current, nil
+	}
+	if err != nil {
+		err = withoutPath(err)
+		if credentialFileRefused(err) {
+			return nil, fmt.Errorf("%w: read the rescued Claude rotation (%s): %w", ErrCredentialUnavailable, rotationRescueFile, err)
+		}
+		return nil, credentialUnchecked(fmt.Errorf("read the rescued Claude rotation (%s): %w", rotationRescueFile, err))
+	}
+	var rescue rescuedRotation
+	if err := json.Unmarshal(body, &rescue); err != nil || rescue.ClaudeAIOAuth == nil ||
+		rescue.ClaudeAIOAuth.AccessToken == "" || rescue.Replaces == "" {
+		// Written whole (writePrivateFileAtomic), so this is no partial write
+		// a retry clears: it waits for someone to look, and nothing presents
+		// the store's token meanwhile.
+		return nil, fmt.Errorf("%w: the rescued Claude rotation (%s) does not hold a rotation and what it replaces", ErrCredentialUnavailable, rotationRescueFile)
+	}
+	rescued := rescue.ClaudeAIOAuth
+	if current != nil && current.AccessToken != "" &&
+		accountpkg.OAuthCredentialVersion(current.AccessToken, current.RefreshToken) != rescue.Replaces {
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			slog.Warn("Claude rescued rotation no longer applies and could not be removed; the next read decides again",
+				"instance", filepath.Clean(instancePath), "error", withoutPath(err))
+			return current, nil
+		}
+		slog.Warn("Claude rescued rotation no longer applies: the profile's credential has changed since; removed it",
+			"instance", filepath.Clean(instancePath))
+		return current, nil
+	}
+	credentialsPath := filepath.Join(instancePath, ".credentials.json")
+	if _, err := os.Lstat(credentialsPath); errors.Is(err, os.ErrNotExist) {
+		if err := markKeychainStandIn(instancePath); err != nil {
+			slog.Warn("Claude credentials file could not be marked a keychain stand-in; the profile stays file-backed",
+				"instance", filepath.Clean(instancePath), "error", withoutPath(err))
+		}
+	}
+	fileBody, err := credentialPayload(*rescued)
+	if err == nil {
+		err = writePrivateFileAtomic(credentialsPath, fileBody)
+	}
+	if err != nil {
+		return nil, credentialUnchecked(fmt.Errorf("adopt the rescued Claude rotation (%s): %w", rotationRescueFile, withoutPath(err)))
+	}
+	forgetKeychainAnswer(instancePath)
+	// The credentials file holds the rotation now; a rescue left behind is
+	// removed by the next read, which finds the store holding it.
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		slog.Warn("Claude rescued rotation adopted but its file could not be removed; the next read removes it",
+			"instance", filepath.Clean(instancePath), "error", withoutPath(err))
+	}
+	slog.Warn("Claude rescued rotation adopted into the profile's credentials file", "instance", filepath.Clean(instancePath))
+	return rescued, nil
+}
+
+// withoutPath drops the path from a file-system error, for the reason
+// readCredentialFile drops it: the proxy string-matches "401"/"403" as auth
+// failures, and an instance path may hold digits.
+func withoutPath(err error) error {
+	var pathErr *os.PathError
+	if errors.As(err, &pathErr) {
+		return pathErr.Err
+	}
+	var linkErr *os.LinkError
+	if errors.As(err, &linkErr) {
+		return linkErr.Err
+	}
+	return err
+}
+
+func markKeychainStandIn(instancePath string) error {
+	return writePrivateFileAtomic(filepath.Join(instancePath, keychainStandInMarker), nil)
+}
+
+func keychainStandIn(instancePath string) bool {
+	_, err := os.Lstat(filepath.Join(instancePath, keychainStandInMarker))
+	return err == nil
+}
+
+// profileStillAt reports whether profile is still registered, as the same
+// profile (CreatedAt), at instancePath.
+func (s Store) profileStillAt(profile Profile, instancePath string) bool {
+	current, ok := s.FindProfile(profile.Name)
+	return ok && current.CreatedAt == profile.CreatedAt &&
+		profileInstancePathKey(s.claudeInstancePath(current.Name)) == profileInstancePathKey(instancePath)
 }
 
 func (s Store) RefreshAccountIfExpired(ctx context.Context, client *http.Client, account accounts.Account) (accounts.Account, bool, error) {
@@ -4048,23 +5116,139 @@ func (s Store) writeCredential(ctx context.Context, instancePath string, credent
 	}
 	filePath := filepath.Join(instancePath, ".credentials.json")
 	if _, err := os.Stat(filePath); err == nil {
+		forgetKeychainAnswer(instancePath)
+		if keychainStandIn(instancePath) && systemKeychain.available() && returnStandInToKeychain(ctx, instancePath, credential) {
+			return nil
+		}
 		return writePrivateFileAtomic(filePath, body)
 	}
-	if runtime.GOOS != "darwin" {
-		return fmt.Errorf("Claude credential persistence is only supported for .credentials.json files on %s", runtime.GOOS)
+	if !systemKeychain.available() {
+		// The unavailable seam owns the exact no-vault message; its write
+		// ignores every argument, so nothing user-specific is resolved first.
+		return systemKeychain.write(ctx, "", "", nil)
 	}
+	if err := writeCredentialToKeychain(ctx, instancePath, credential); err != nil {
+		forgetKeychainAnswer(instancePath)
+		return err
+	}
+	rememberKeychainAnswer(instancePath, &credential)
+	return nil
+}
+
+// returnStandInToKeychain writes credential to the keychain item of a profile
+// whose .credentials.json is a stand-in (keychainStandInMarker) and, once the
+// keychain has taken it, removes the file and the mark: the profile is
+// keychain-only again and reuses keychain answers again. It reports whether
+// the keychain now holds the credential alone. A keychain that still will not
+// take the write leaves the credential to the file (false), and so does a
+// file that cannot be removed, which is then written the same credential: the
+// file must never keep the one this replaces, whose refresh token is spent
+// and which a silent keychain would hand the next read.
+func returnStandInToKeychain(ctx context.Context, instancePath string, credential CredentialInfo) bool {
+	if err := writeCredentialToKeychain(ctx, instancePath, credential); err != nil {
+		slog.Warn("Claude credential stays in its stand-in credentials file: the keychain still will not take it",
+			"instance", filepath.Clean(instancePath), "error", err)
+		return false
+	}
+	if err := os.Remove(filepath.Join(instancePath, ".credentials.json")); err != nil && !errors.Is(err, os.ErrNotExist) {
+		slog.Warn("Claude credential is back in the keychain but its stand-in credentials file could not be removed; the file is given the same credential",
+			"instance", filepath.Clean(instancePath), "error", withoutPath(err))
+		return false
+	}
+	// A mark with no file beside it marks nothing.
+	if err := os.Remove(filepath.Join(instancePath, keychainStandInMarker)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		slog.Warn("Claude keychain stand-in mark could not be removed", "instance", filepath.Clean(instancePath), "error", withoutPath(err))
+	}
+	rememberKeychainAnswer(instancePath, &credential)
+	slog.Warn("Claude credential is back in the keychain; its stand-in credentials file is removed", "instance", filepath.Clean(instancePath))
+	return true
+}
+
+// writeCredentialToKeychain upserts credential into instancePath's keychain
+// item (writeKeychainCredential), in the single-line form.
+func writeCredentialToKeychain(ctx context.Context, instancePath string, credential CredentialInfo) error {
 	u, err := user.Current()
 	if err != nil {
 		return err
 	}
-	service := "Claude Code-credentials-" + keychainHash(instancePath)
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "security", "add-generic-password", "-U", "-s", service, "-a", u.Username, "-w", string(body))
-	if err := cmd.Run(); err != nil {
+	// The keychain copy must be a single printable line. `security
+	// find-generic-password -w` hex-encodes any data containing a newline, and
+	// this store's reader is not the only consumer -- Claude Code itself reads
+	// the same entry and writes it compact for the same reason. Writing the
+	// indented file form here is what turned every pool account unreadable
+	// after the first self-hosted token refresh. (parseCredentialPayload's
+	// hex fallback repairs this store's reads only, not Claude Code's.)
+	compact, err := compactCredentialPayload(credential)
+	if err != nil {
+		return err
+	}
+	if err := writeKeychainCredential(ctx, instancePath, u.Username, compact); err != nil {
 		return fmt.Errorf("write Claude credential to keychain: %w", err)
 	}
 	return nil
+}
+
+// keychainWriteRetryBackoff is the first pause between two attempts of one
+// keychain write; it doubles up to keychainWriteRetryBackoffMax. Vars so a test
+// can shrink them.
+var (
+	keychainWriteRetryBackoff    = 250 * time.Millisecond
+	keychainWriteRetryBackoffMax = 2 * time.Second
+)
+
+// writeKeychainCredential upserts instancePath's keychain item, and tries
+// again until the upsert lands or the caller's clock runs out.
+//
+// One `security add-generic-password` on its own five-second clock was the
+// whole write, and a loaded Mac kills it on that clock: 2026-09-27
+// 17:41-17:44, four rotations were written and killed, and two of those
+// accounts (fifteen-beta, nine-alpha) went invalid_grant minutes
+// later -- Anthropic had rotated, and the only copy of the new refresh token
+// died with the killed write. -U makes the upsert idempotent: an attempt the
+// clock killed after securityd committed it and the retry both leave the one
+// item holding this payload, so retrying can never do harm and is the only
+// thing that turns a slow `security` into a write that landed. Any failure is
+// retried, not only a hang: a fork that got EAGAIN or a keychain that answered
+// "locked" can clear within the caller's clock, and the pause between tries
+// keeps a keychain that keeps refusing from being asked forty times.
+//
+// Every caller today brings a clock (the rotation's credentialPersistTimeout,
+// removal rollback's ten seconds). One that does not gets
+// credentialPersistTimeout, so a keychain that never takes the write cannot
+// hold its caller forever.
+func writeKeychainCredential(ctx context.Context, instancePath, account string, payload []byte) error {
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, credentialPersistTimeout)
+		defer cancel()
+	}
+	service := keychainService(instancePath)
+	backoff := keychainWriteRetryBackoff
+	for attempt := 1; ; attempt++ {
+		err := systemKeychain.write(ctx, service, account, payload)
+		if err == nil {
+			if attempt > 1 {
+				slog.Warn("Claude credential keychain write landed on a retry",
+					"instance", filepath.Clean(instancePath), "attempts", attempt)
+			}
+			return nil
+		}
+		if ctx.Err() != nil {
+			return fmt.Errorf("%w (after %d attempts)", err, attempt)
+		}
+		slog.Warn("Claude credential keychain write failed; retrying",
+			"instance", filepath.Clean(instancePath), "attempt", attempt, "error", err)
+		pause := time.NewTimer(backoff)
+		select {
+		case <-ctx.Done():
+			pause.Stop()
+			return fmt.Errorf("%w (after %d attempts)", err, attempt)
+		case <-pause.C:
+		}
+		if backoff *= 2; backoff > keychainWriteRetryBackoffMax {
+			backoff = keychainWriteRetryBackoffMax
+		}
+	}
 }
 
 // UpsertCredentialProfile stores one remotely managed Claude credential
@@ -4092,36 +5276,48 @@ func deleteKeychainCredential(instancePath string) error {
 }
 
 func deleteKeychainCredentialContext(ctx context.Context, instancePath string) error {
-	if runtime.GOOS != "darwin" {
+	forgetKeychainAnswer(instancePath)
+	if !systemKeychain.available() {
 		return nil
 	}
 	u, err := user.Current()
 	if err != nil {
 		return err
 	}
-	service := "Claude Code-credentials-" + keychainHash(instancePath)
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	output, err := exec.CommandContext(
-		ctx,
-		"security",
-		"delete-generic-password",
-		"-s", service,
-		"-a", u.Username,
-	).CombinedOutput()
-	if err == nil || strings.Contains(strings.ToLower(string(output)), "could not be found") {
-		return nil
+	if err := systemKeychain.delete(ctx, keychainService(instancePath), u.Username); err != nil {
+		return fmt.Errorf("delete Claude credential from keychain: %w", err)
 	}
-	return fmt.Errorf("delete Claude credential from keychain: %w", err)
+	return nil
 }
 
-func readCredentialFile(instancePath string) (*CredentialInfo, bool) {
+// readCredentialFile reads the profile's .credentials.json. A file that does
+// not exist is an answer (no file credential). So is a refusal the file system
+// will repeat on every retry -- EACCES, EPERM, EISDIR, ENOTDIR, ELOOP -- and
+// it returns ErrCredentialUnavailable: the account cannot serve until someone
+// fixes the file (credentialFileRefused). Any other read failure -- EMFILE or
+// EIO under load -- is not an answer, and returns ErrCredentialUnchecked
+// instead of posing as absence, which on a vault-less host (the box) is "has
+// no access token". A file that reads but will not parse keeps its old
+// meaning (no file credential), unchanged.
+func readCredentialFile(instancePath string) (*CredentialInfo, bool, error) {
 	body, err := os.ReadFile(filepath.Join(instancePath, ".credentials.json"))
 	if err != nil {
-		return nil, false
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, false, nil
+		}
+		// The path is dropped from the message: the proxy still string-matches
+		// "401"/"403" as auth failures, and an instance path may hold digits.
+		var pathErr *os.PathError
+		if errors.As(err, &pathErr) {
+			err = pathErr.Err
+		}
+		if credentialFileRefused(err) {
+			return nil, false, fmt.Errorf("%w: read Claude credentials file: %w", ErrCredentialUnavailable, err)
+		}
+		return nil, false, credentialUnchecked(fmt.Errorf("read Claude credentials file: %w", err))
 	}
 	credential, err := parseCredentialPayload(body, "credentials file")
-	return credential, err == nil && credential != nil
+	return credential, err == nil && credential != nil, nil
 }
 
 // parseCredentialPayload decodes a stored credential blob. source names where
@@ -4170,6 +5366,13 @@ func credentialPayload(credential CredentialInfo) ([]byte, error) {
 	}
 	body = append(body, '\n')
 	return body, nil
+}
+
+// compactCredentialPayload is the keychain form of credentialPayload: one line,
+// no trailing newline, so `security find-generic-password -w` echoes it back
+// verbatim instead of hex-encoding it. Files keep the indented form.
+func compactCredentialPayload(credential CredentialInfo) ([]byte, error) {
+	return json.Marshal(map[string]CredentialInfo{"claudeAiOauth": credential})
 }
 
 func credentialExpired(credential *CredentialInfo, skew time.Duration) bool {
@@ -4241,6 +5444,24 @@ func profileAccount(profile Profile, configDir string, credential *CredentialInf
 	if credential == nil || credential.AccessToken == "" {
 		return accounts.Account{}, false
 	}
+	account := uncheckedProfileAccount(profile, configDir)
+	account.Token = credential.AccessToken
+	account.CredentialVersion = accountpkg.OAuthCredentialVersion(
+		credential.AccessToken, credential.RefreshToken,
+	)
+	return account, true
+}
+
+// uncheckedProfileAccount is a profile's listing with no credential in it: the
+// daemon's entry for a profile whose read got no answer and that it has no
+// earlier listing of (ListAccountsKeeping). It carries no token on purpose.
+// Every path that serves or measures a Claude OAuth account refreshes it
+// through the store first (AccountRef.Refresh -> RefreshAccountIfExpired),
+// which reads the credential and returns the real account -- or, while the
+// store still does not answer, an unchecked error the proxy treats as
+// transient -- so an empty token never reaches an upstream, and the first read
+// that answers replaces this entry with the real one.
+func uncheckedProfileAccount(profile Profile, configDir string) accounts.Account {
 	addedAt, _ := time.Parse(time.RFC3339, profile.CreatedAt)
 	email := ""
 	if strings.Contains(profile.Name, "@") {
@@ -4253,12 +5474,8 @@ func profileAccount(profile Profile, configDir string, credential *CredentialInf
 		Label:    profile.Name,
 		Email:    email,
 		AddedAt:  addedAt,
-		Token:    credential.AccessToken,
-		CredentialVersion: accountpkg.OAuthCredentialVersion(
-			credential.AccessToken, credential.RefreshToken,
-		),
-		Source: configDir,
-	}, true
+		Source:   configDir,
+	}
 }
 
 func keychainHash(instancePath string) string {
@@ -4320,13 +5537,16 @@ func FetchUsage(ctx context.Context, client *http.Client, accessToken string) (*
 	if client == nil {
 		client = &http.Client{Timeout: 10 * time.Second}
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, usageURL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, usageURL+usageReadQuery, nil)
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	req.Header.Set("anthropic-beta", oauthBetaHeader)
 	req.Header.Set("Content-Type", "application/json")
+	// Claude Code's identity: Anthropic grades reset eligibility by surface
+	// and CLI version, and a Go default User-Agent is neither (PATCHES §46).
+	req.Header.Set("User-Agent", ResetClientUserAgent)
 	res, err := client.Do(req)
 	if err != nil {
 		return nil, err
@@ -4453,6 +5673,33 @@ func FableProbe(ctx context.Context, client *http.Client, accessToken string) (F
 	return result, nil
 }
 
+// WithUnusedFableWindow is the null-means-unused fallback for the Fable
+// meter: a non-empty window set with no Fable window gains one at 0% used.
+// Callers apply it only after the probe declined to supply a real one. Beyond
+// Fable routing, this window carries scheduling weight: it is how the
+// scheduler recognizes a Claude-family account (Opus and Sonnet publish no
+// placeholder pool to do it). Without it the account would lose the Fable
+// reservation on its non-Fable weekly headroom when that is on (PATCHES §57),
+// and so be over-ranked, would be ranked on 5h expiry pressure, and, with no
+// `five_hour` reading, would be scored weekly-only, with its week floored as
+// if it were a 5h window (PATCHES §62). The daemon and `sr status` both apply
+// it so they score an account alike.
+func WithUnusedFableWindow(windows []accounts.UsageWindow) []accounts.UsageWindow {
+	if len(windows) == 0 {
+		return windows
+	}
+	for _, window := range windows {
+		if window.Name == FableWindowName {
+			return windows
+		}
+	}
+	return append(windows, accounts.UsageWindow{
+		Name:               FableWindowName,
+		LimitWindowSeconds: int64(7 * 24 * 60 * 60),
+		Feature:            FableFeature,
+	})
+}
+
 func usageWindowsFromFableHeaders(header http.Header, now time.Time) []accounts.UsageWindow {
 	const (
 		fiveHourSeconds = int64(5 * 60 * 60)
@@ -4500,6 +5747,74 @@ func usageWindowsFromFableHeaders(header http.Header, now time.Time) []accounts.
 	add("7d_opus", "opus-weekly", sevenDaySeconds, "claude-opus")
 	add("7d_sonnet", "sonnet-weekly", sevenDaySeconds, "claude-sonnet")
 	return windows
+}
+
+// claudeUserConfigEntries are the user's own Claude skills, subagents,
+// commands, memory file and key bindings (upstream #441). They hold no
+// credentials or routing, so a proxy config home links them to the user's
+// real Claude home instead of starting without them: `sr claude proxy` homes
+// (claude-proxy/<hash>) otherwise ran with none of the user's skills or
+// CLAUDE.md. settings.json is deliberately absent: launches carry it in the
+// private --settings file with routing keys and credential sources removed
+// (withClaudeUserSettings), which a linked file would bypass. .claude.json is
+// absent too; it holds the proxy home's own login and onboarding state.
+var claudeUserConfigEntries = []string{
+	"CLAUDE.md",
+	"skills",
+	"agents",
+	"commands",
+	"keybindings.json",
+}
+
+// ShareUserConfigDir links the user's Claude configuration entries into a
+// proxy config home. It is only for proxy homes: a profile directory is a
+// login a user may launch and customize directly, so it is left as it is.
+//
+// An entry is linked when the user has it and the proxy home has nothing
+// there, or only an empty directory (which is kept beside the link with a
+// .subrouter-local suffix, in case something was about to use it). Anything
+// else in the proxy home -- a file, a populated directory, a link to anywhere
+// -- is left alone, so a choice made inside a proxy session survives.
+func (s Store) ShareUserConfigDir(configDir string) error {
+	if strings.TrimSpace(s.SharedStateDir) == "" {
+		return nil
+	}
+	var errs []error
+	for _, name := range claudeUserConfigEntries {
+		if err := shareUserConfigEntry(configDir, s.SharedStateDir, name); err != nil {
+			errs = append(errs, fmt.Errorf("share %s: %w", name, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func shareUserConfigEntry(configDir, userDir, name string) error {
+	target := filepath.Join(userDir, name)
+	if _, err := os.Stat(target); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	link := filepath.Join(configDir, name)
+	info, err := os.Lstat(link)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		return os.Symlink(target, link)
+	case err != nil:
+		return err
+	case info.Mode()&os.ModeSymlink != 0:
+		return nil // already linked, possibly to the user's own choice
+	case !info.IsDir():
+		return nil // a file the proxy home owns
+	}
+	if entries, err := os.ReadDir(link); err != nil || len(entries) != 0 {
+		return err // a populated directory the proxy home owns
+	}
+	if err := os.Rename(link, link+".subrouter-local"); err != nil {
+		return err
+	}
+	return os.Symlink(target, link)
 }
 
 // parseFableUtilization accepts Anthropic's current fractional header form

@@ -234,7 +234,14 @@ func DefaultConfigPath() (string, error) {
 	return filepath.Join(home, ".config", "subrouter", "cloud.json"), nil
 }
 
-func LoadConfig(path string) (Config, error) {
+// LoadConfigRaw reads and parses the config without validating it. A missing
+// file yields the same fresh default LoadConfig returns. Callers that need a
+// usable config must run Validate themselves (or use LoadConfig); the raw form
+// exists so recovery paths can distinguish "the file is not JSON" from "the
+// file is well-formed but a validation rule rejects it" — the latter still
+// holds real secrets, most importantly the LocalProxyToken the daemon is
+// enforcing right now.
+func LoadConfigRaw(path string) (Config, error) {
 	if strings.TrimSpace(path) == "" {
 		var err error
 		path, err = DefaultConfigPath()
@@ -253,13 +260,29 @@ func LoadConfig(path string) (Config, error) {
 	if err := json.Unmarshal(body, &config); err != nil {
 		return Config{}, err
 	}
-	config = config.Normalized()
+	return config.Normalized(), nil
+}
+
+func LoadConfig(path string) (Config, error) {
+	config, err := LoadConfigRaw(path)
+	if err != nil {
+		return Config{}, err
+	}
 	if err := config.Validate(); err != nil {
 		return Config{}, err
 	}
 	return config, nil
 }
 
+// SaveConfig persists the config. Saving is not a key ceremony: when the
+// caller holds no LocalProxyToken, the token already on disk is preserved, and
+// when there is nothing to preserve the config is saved without one. SaveConfig
+// NEVER generates a token — minting one here is how three total outages
+// happened: the daemon re-reads the new secret at its next restart while every
+// already-written client config still carries the old one, and the proxy env
+// those clients hold has overridden the login they would otherwise fall back
+// to. Minting happens only in EnsureLocalProxyToken, called from the explicit
+// key-ceremony paths that also rewrite the client configs.
 func SaveConfig(path string, config Config) error {
 	if strings.TrimSpace(path) == "" {
 		var err error
@@ -270,11 +293,9 @@ func SaveConfig(path string, config Config) error {
 	}
 	config = config.Normalized()
 	if config.LocalProxyToken == "" {
-		raw := make([]byte, 32)
-		if _, err := rand.Read(raw); err != nil {
-			return fmt.Errorf("generate local proxy token: %w", err)
+		if existing, err := LoadConfigRaw(path); err == nil {
+			config.LocalProxyToken = existing.LocalProxyToken
 		}
-		config.LocalProxyToken = base64.RawURLEncoding.EncodeToString(raw)
 	}
 	if err := config.Validate(); err != nil {
 		return err
@@ -305,6 +326,44 @@ func SaveConfig(path string, config Config) error {
 		return err
 	}
 	return os.Rename(tempPath, path)
+}
+
+// EnsureLocalProxyToken is the key ceremony: it guarantees the config at path
+// holds a LocalProxyToken, minting one only when none exists, and returns the
+// resulting config. Call it only from the paths that immediately re-point the
+// client configs at the (possibly new) secret — setup, and a storage switch
+// into a source that enforces the token. A second call returns the same token.
+func EnsureLocalProxyToken(path string) (Config, error) {
+	config, err := LoadConfigRaw(path)
+	if err != nil {
+		return Config{}, err
+	}
+	if config.LocalProxyToken != "" {
+		return config, nil
+	}
+	token, err := NewLocalProxyToken()
+	if err != nil {
+		return Config{}, err
+	}
+	config.LocalProxyToken = token
+	if err := SaveConfig(path, config); err != nil {
+		return Config{}, err
+	}
+	return config, nil
+}
+
+// NewLocalProxyToken mints a fresh local proxy secret. Callers that flip the
+// credential source and mint in the same command should set this on the config
+// BEFORE their SaveConfig, so the source switch and the key ceremony land in
+// one atomic write — two consecutive writes leave a window where an I/O
+// failure strands the file source-switched but tokenless, which the daemon
+// then refuses to serve.
+func NewLocalProxyToken() (string, error) {
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		return "", fmt.Errorf("generate local proxy token: %w", err)
+	}
+	return base64.RawURLEncoding.EncodeToString(raw), nil
 }
 
 func DeleteConfig(path string) error {

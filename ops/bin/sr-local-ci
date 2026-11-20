@@ -1,0 +1,1646 @@
+#!/usr/bin/env bash
+# sr-local-ci -- run subrouter's whole Go suite locally, on demand, without
+# letting any test reach this machine's live pool, logins or keychain.
+#
+# Owner decision, 2026-09-29: no macOS GitHub job and no required check. The
+# macOS suite runs locally when someone asks for it, and this is how. GitHub
+# CI (.github/workflows/ci.yml) runs the Go suite and the deploy harness on
+# Linux only. PATCHES.md §45.1 has the why, ops/README.md the how.
+#
+#   sr-local-ci                         # preflight + ./... + the deploy harness
+#   sr-local-ci ./internal/proxy        # only these packages (module-relative)
+#   sr-local-ci -run 'TestClaude' ./cmd/subrouter
+#   sr-local-ci --docker                # the same run, on Linux, in golang:<go.mod>
+#   sr-local-ci --selftest              # prove the isolation, run no suite
+#   sr-local-ci -- -race -p 4           # extra `go test` flags after --
+#
+# What a run does:
+#   1. Isolation. `go test` and everything it starts run under `env -i` with a
+#      short allowlist of variables, a throwaway HOME and a short TMPDIR (Unix
+#      socket paths are capped near 104 bytes), both free of symlinks. Every
+#      store and routing override is dropped by construction: SUBROUTER_*,
+#      ANTHROPIC_*, CLAUDE*, CODEX_*, OPENAI_*, AWS_*, gh tokens, everything
+#      not on the allowlist.
+#      The real Go caches stay (GOCACHE, GOMODCACHE, GOPATH, GOENV), and the
+#      toolchain's own bin/ goes first on PATH, so a version-manager shim that
+#      needs the real HOME never answers for `go` or `gofmt`. ./... runs with
+#      CGO_ENABLED=0, as CI and the Makefile do, unless you set CGO_ENABLED or
+#      pass -race.
+#      On macOS, also:
+#        - a fake `security` first on PATH. It is a small file-backed keychain
+#          that starts empty, logs every call (never a payload), and answers
+#          like the real tool: 44 for an item it does not hold.
+#        - sandbox-exec, required: the run stops (exit 2) if it is unavailable,
+#          unless --no-sandbox. Exec of /usr/bin/security, /bin/launchctl,
+#          sudo, open and tailscale is refused (a test that runs security by
+#          absolute path would otherwise bypass the fake); connections to the
+#          live daemon (localhost:31415) and to any Unix socket under your real
+#          home are refused; your real home is read-only except the Go caches;
+#          ~/.claude, ~/.codex, ~/.subrouter, ~/Library/Keychains and the other
+#          credential stores are unreadable. "Your real home" is both $HOME and
+#          the password database's home, when they differ. /bin/ps is setuid,
+#          so a sandboxed process may not exec it; it runs outside the sandbox.
+#      On a Linux host there is no sandbox, so a host run there stops (exit 2)
+#      unless --no-sandbox; --docker is the fenced Linux run.
+#   2. Preflight: gofmt -l, go build ./..., go vet ./..., and go vet for the
+#      other OS (linux/amd64 from a Mac, darwin/arm64 from Linux, as CI does).
+#   3. The suite: go test -json -count=1 (never a cached verdict).
+#   4. Every top-level test that failed (or never finished) is re-run ALONE,
+#      once. Failed again -> a real failure. Passed alone -> a load/timing red,
+#      unless the race detector reported it in the suite (always real).
+#      Failed alone with a sandbox refusal as its failing line (macOS) -> real,
+#      because a test must never reach for the keychain tool, the live daemon
+#      or the real home -- except the tests on the known_refused list below,
+#      which are reported as "not verified on macOS". All are reported.
+#   5. Exit 1 on any real failure (preflight, build, a package that did not
+#      finish, a go test that exited non-zero with no failing package, a test
+#      that fails alone). Exit 0 otherwise, including when the only reds are
+#      load reds or known refusals, unless --strict. Exit 2 on a harness
+#      problem, including a missing sandbox.
+#
+# The script itself never runs `sr`, `subrouter serve` or the real `security`.
+
+set -u
+umask 022
+
+prog=sr-local-ci
+# Follow a symlink to this file (say, from ~/bin) back to the checkout it lives in.
+self=$0
+while [ -L "$self" ]; do
+  link=$(readlink -- "$self")
+  case $link in /*) self=$link ;; *) self="$(dirname -- "$self")/$link" ;; esac
+done
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$self")" && pwd -P)
+script_file="$script_dir/$(basename -- "$self")"
+
+usage() {
+  cat <<'EOF'
+usage: sr-local-ci [options] [package ...] [-- go-test-flags ...]
+
+Runs subrouter's Go suite locally with this machine's live pool, logins and
+keychain out of reach, then re-runs each failing test alone to separate real
+failures from load/timing reds.
+
+packages are module-relative (./cmd/subrouter, ./internal/...). With none, the
+run is ./... plus the deploy scripts' harness, like CI. Name the harness alone
+with the word `deploy`.
+
+options:
+  -run REGEX, --run REGEX  only tests matching REGEX (go test -run)
+  --docker                 run on Linux in golang:<go.mod version> instead
+  --image IMAGE            the image --docker uses (default golang:<go.mod>)
+  --selftest               prove the isolation (and that the proof can fail)
+  --timeout DUR            go test -timeout for the suite (default 40m)
+  --rerun-timeout DUR      -timeout for each lone re-run (default 10m)
+  --max-reruns N           re-run at most N failing tests (default 40); the
+                           rest count as real failures
+  --no-rerun               do not re-run; every failing test counts as real
+  --strict                 exit 1 on load/timing reds and on the known
+                           tests the sandbox refuses, too
+  --skip-preflight         skip gofmt, build and vet
+  --no-sandbox             run with NO fence: nothing then refuses the live
+                           daemon (:31415), launchctl, or writes to your real
+                           home. macOS: without sandbox-exec (the fake
+                           security and env isolation still apply, and the
+                           known tests that put /usr/bin on PATH are skipped).
+                           A Linux host has no sandbox, so a host run there
+                           needs this flag; --docker is the fenced Linux run.
+  -C DIR                   the checkout to test (default: this script's own)
+  --out DIR                where logs go (default /tmp/sr-local-ci-<time>.XXXX)
+  --keep                   keep the throwaway HOME/TMPDIR after the run
+  -h, --help               this text
+
+exit: 0 clean (or only load reds and known refusals), 1 real failure (or,
+under --strict, any red), 2 harness problem (including no sandbox on macOS).
+EOF
+}
+
+die() {
+  echo "${prog}: $*" >&2
+  exit 2
+}
+
+say() { printf '%s\n' "$*"; }
+
+# ---------------------------------------------------------------- arguments
+
+mode=host          # host | docker | in-container | in-container-user
+selftest=0
+run_re=""
+timeout=40m
+rerun_timeout=10m
+max_reruns=40
+do_rerun=1
+strict=0
+preflight=1
+use_sandbox=1
+repo_arg=""
+out=""
+keep=0
+image=""
+pkgs=()
+extra=()
+
+while [ $# -gt 0 ]; do
+  case $1 in
+    -h|--help) usage; exit 0 ;;
+    --docker) mode=docker ;;
+    --in-container) mode=in-container ;;
+    --in-container-user) mode=in-container-user ;;
+    --selftest) selftest=1 ;;
+    -run|--run) [ $# -ge 2 ] || die "$1 needs a regex"; run_re=$2; shift ;;
+    -run=*|--run=*) run_re=${1#*=} ;;
+    --timeout) [ $# -ge 2 ] || die "--timeout needs a duration"; timeout=$2; shift ;;
+    --rerun-timeout) [ $# -ge 2 ] || die "--rerun-timeout needs a duration"; rerun_timeout=$2; shift ;;
+    --max-reruns) [ $# -ge 2 ] || die "--max-reruns needs a number"; max_reruns=$2; shift ;;
+    --no-rerun) do_rerun=0 ;;
+    --strict) strict=1 ;;
+    --skip-preflight|--no-preflight) preflight=0 ;;
+    --no-sandbox) use_sandbox=0 ;;
+    -C) [ $# -ge 2 ] || die "-C needs a directory"; repo_arg=$2; shift ;;
+    --out) [ $# -ge 2 ] || die "--out needs a directory"; out=$2; shift ;;
+    --keep) keep=1 ;;
+    --image) [ $# -ge 2 ] || die "--image needs an image"; image=$2; shift ;;
+    --) shift; extra=("$@"); break ;;
+    -*) die "unknown option $1 (go test flags go after --; see --help)" ;;
+    *) pkgs+=("$1") ;;
+  esac
+  shift
+done
+
+case $max_reruns in ''|*[!0-9]*) die "--max-reruns wants a number, got ${max_reruns}" ;; esac
+
+# ---------------------------------------------------------------- the module
+
+if [ -n "$repo_arg" ]; then
+  repo_root=$(CDPATH='' cd -- "$repo_arg" 2>/dev/null && pwd -P) || die "no such directory: ${repo_arg}"
+else
+  repo_root=$(CDPATH='' cd -- "$script_dir/../.." && pwd -P)
+fi
+mod="$repo_root"
+# ops/ has a go.mod of its own, and a run there tests only the deploy harness.
+{ [ -f "$mod/go.mod" ] && [ -d "$mod/cmd/subrouter" ]; } ||
+  die "no subrouter module at ${mod}: -C names the checkout, the directory that holds cmd/subrouter/, not its ops/"
+deploy_test_rel=./ops/deploy/tests/deploy_scripts_test.go
+[ -f "$mod/$deploy_test_rel" ] || deploy_test_rel=""
+
+# go.mod's toolchain line wins over its go line, as it does for setup-go.
+gomod_version() {
+  local v
+  v=$(awk '$1 == "toolchain" { sub(/^go/, "", $2); print $2; exit }' "$mod/go.mod")
+  [ -n "$v" ] || v=$(awk '$1 == "go" { print $2; exit }' "$mod/go.mod")
+  printf '%s\n' "$v"
+}
+
+# The deploy harness is on by default and when named as `deploy`.
+want_deploy=0
+pkgs_explicit=0
+if [ ${#pkgs[@]} -eq 0 ]; then
+  pkgs=(./...)
+  want_deploy=1
+else
+  pkgs_explicit=1
+  kept_pkgs=()
+  for p in "${pkgs[@]}"; do
+    if [ "$p" = deploy ]; then want_deploy=1; else kept_pkgs+=("$p"); fi
+  done
+  pkgs=(${kept_pkgs[@]+"${kept_pkgs[@]}"})
+fi
+[ -n "$deploy_test_rel" ] || want_deploy=0
+
+# ---------------------------------------------------------------- out dir
+
+stamp=$(date +%Y%m%d-%H%M%S)
+if [ -z "$out" ]; then
+  if [ "$mode" = in-container ] || [ "$mode" = in-container-user ]; then
+    out=/out
+  else
+    out=$(mktemp -d "/tmp/sr-local-ci-${stamp}.XXXX") || die "cannot create an output directory"
+  fi
+fi
+mkdir -p "$out" || die "cannot create ${out}"
+out=$(CDPATH='' cd -- "$out" && pwd -P)
+
+# The options a container run passes on to the script inside it.
+build_fwd() {
+  fwd=()
+  if [ "$selftest" = 1 ]; then fwd+=(--selftest); fi
+  if [ -n "$run_re" ]; then fwd+=(-run "$run_re"); fi
+  fwd+=(--timeout "$timeout" --rerun-timeout "$rerun_timeout" --max-reruns "$max_reruns")
+  if [ "$do_rerun" = 0 ]; then fwd+=(--no-rerun); fi
+  if [ "$strict" = 1 ]; then fwd+=(--strict); fi
+  if [ "$preflight" = 0 ]; then fwd+=(--skip-preflight); fi
+  if [ "$pkgs_explicit" = 1 ]; then
+    if [ "$want_deploy" = 1 ]; then fwd+=(deploy); fi
+    fwd+=(${pkgs[@]+"${pkgs[@]}"})
+  fi
+  if [ ${#extra[@]} -gt 0 ]; then fwd+=(-- "${extra[@]}"); fi
+}
+
+# ================================================================ docker mode
+
+if [ "$mode" = docker ]; then
+  command -v docker >/dev/null 2>&1 || die "--docker needs docker on PATH"
+  docker info >/dev/null 2>&1 || die "the docker daemon is not reachable"
+  version=$(gomod_version)
+  [ -n "$version" ] || die "cannot read the go version from ${mod}/go.mod"
+  [ -n "$image" ] || image="golang:${version}"
+  gomod_volume=sr-local-ci-gomod
+  gocache_volume=sr-local-ci-gocache
+  label="$(git -C "$repo_root" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+  if [ -n "$(git -C "$repo_root" status --porcelain --untracked-files=no 2>/dev/null | head -1)" ]; then
+    label="${label}+uncommitted"
+  fi
+  say "${prog}: --docker: ${image}, checkout ${repo_root} (${label}) mounted read-only, logs in ${out}"
+  docker image inspect "$image" >/dev/null 2>&1 || docker pull "$image" || die "cannot pull ${image}"
+
+  # Modules come down with the network on. The suite then runs with none.
+  docker run --rm \
+    -v "${repo_root}:/work:ro" \
+    -v "${gomod_volume}:/go/pkg/mod" \
+    -w /work \
+    -e GOTOOLCHAIN=local -e GOFLAGS=-mod=readonly \
+    "$image" go mod download || die "go mod download failed in ${image}"
+
+  build_fwd
+
+  name="sr-local-ci-$$"
+  trap 'docker rm -f "$name" >/dev/null 2>&1' INT TERM
+  # Like a GitHub runner: --init reaps orphans (the process-group tests need a
+  # reaper), and Docker's default seccomp filter blocks pidfd_getfd, which the
+  # TCP takeover tests use. The tree is read-only; nothing of the host's home
+  # is mounted; only the output directory is writable. This script is mounted
+  # on its own, so -C can name a checkout that predates it. The test user in
+  # the container takes your uid and gid, so the logs in the output directory
+  # stay yours and the directory itself is never chowned.
+  rc=0
+  docker run --rm --init --name "$name" --network none \
+    --security-opt seccomp=unconfined \
+    -v "${repo_root}:/work:ro" \
+    -v "${gomod_volume}:/go/pkg/mod:ro" \
+    -v "${gocache_volume}:/cache" \
+    -v "${out}:/out" \
+    -v "${script_file}:/opt/sr-local-ci/sr-local-ci:ro" \
+    -e GOTOOLCHAIN=local -e GOPROXY=off -e "GOFLAGS=-mod=readonly -buildvcs=false" \
+    -e "SR_LOCAL_CI_LABEL=${label}, ${image}" \
+    -e "SR_LOCAL_CI_UID=$(id -u)" -e "SR_LOCAL_CI_GID=$(id -g)" \
+    "$image" bash /opt/sr-local-ci/sr-local-ci --in-container -C /work ${fwd[@]+"${fwd[@]}"} || rc=$?
+  say "${prog}: logs in ${out}"
+  exit "$rc"
+fi
+
+in_a_container() { [ -f /.dockerenv ] || [ -f /run/.containerenv ]; }
+
+if [ "$mode" = in-container ] || [ "$mode" = in-container-user ]; then
+  # These modes add a user and change ownership; never on a host.
+  in_a_container || die "--in-container is for the container --docker starts, and this is not one"
+fi
+
+if [ "$mode" = in-container ]; then
+  # Root inside the container: make a non-root user like a GitHub runner's,
+  # with the invoking user's uid and gid (1001 if that is root), give it the
+  # build cache volume, and re-run as it. The bind-mounted output directory
+  # is left as it is: it already belongs to that uid on a Linux host, and
+  # Docker Desktop does not enforce ownership on a Mac.
+  [ "$(id -u)" = 0 ] || die "--in-container expects to start as root"
+  ci_uid=${SR_LOCAL_CI_UID:-1001}
+  ci_gid=${SR_LOCAL_CI_GID:-1001}
+  case $ci_uid in ''|0|*[!0-9]*) ci_uid=1001 ;; esac
+  case $ci_gid in ''|0|*[!0-9]*) ci_gid=1001 ;; esac
+  getent group srci >/dev/null 2>&1 || groupadd -o -g "$ci_gid" srci >/dev/null 2>&1 || die "groupadd failed"
+  getent passwd srci >/dev/null 2>&1 || useradd -o -m -u "$ci_uid" -g srci -s /bin/bash srci >/dev/null 2>&1 || die "useradd failed"
+  mkdir -p /cache/go-build
+  if [ "$(stat -c %u /cache/go-build 2>/dev/null)" != "$ci_uid" ]; then chown -R srci:srci /cache 2>/dev/null; fi
+  setpriv --reuid=srci --regid=srci --init-groups test -w /out ||
+    die "the output directory is not writable by uid ${ci_uid} in the container"
+  build_fwd
+  exec setpriv --reuid=srci --regid=srci --init-groups \
+    env HOME=/home/srci USER=srci LOGNAME=srci GOCACHE=/cache/go-build \
+    bash /opt/sr-local-ci/sr-local-ci --in-container-user -C /work --out /out ${fwd[@]+"${fwd[@]}"}
+fi
+
+# ================================================================ isolation
+
+goos=$(go env GOOS 2>/dev/null) || die "go is not on PATH"
+goarch=$(go env GOARCH)
+real_home=${HOME:-}
+real_path=$PATH
+[ -n "$real_home" ] || die "HOME is empty; the Go caches and the fence both need the real one"
+
+# A Linux host has no sandbox: nothing there refuses the live daemon's port,
+# systemctl, or a test that finds the real home through the password database.
+if [ "$goos" != darwin ] && [ "$use_sandbox" = 1 ] && ! in_a_container; then
+  die "a ${goos} host run has no fence around the live daemon, systemctl or your real home. Use --docker, or pass --no-sandbox to run unfenced anyway"
+fi
+
+# The home the password database gives this user. A wrapper that exported a
+# throwaway HOME (a gotest.sh, an agent harness) leaves this one real, and ssh,
+# os/user and ~user all find it; the fence covers it as well as $HOME.
+pw_home=$(perl -e '@p = getpwuid($<); print $p[7] if @p' 2>/dev/null)
+if [ -z "$pw_home" ] && [ "$goos" = darwin ]; then
+  pw_home=$(dscl . -read "/Users/$(id -un)" NFSHomeDirectory 2>/dev/null | awk '{ print $2; exit }')
+fi
+if [ -z "$pw_home" ] && command -v getent >/dev/null 2>&1; then
+  pw_home=$(getent passwd "$(id -u)" | cut -d: -f6)
+fi
+if [ -z "$pw_home" ] && [ "$goos" = darwin ] && [ "$use_sandbox" = 1 ]; then
+  die "cannot resolve your home from the password database, so the sandbox cannot fence it"
+fi
+# Both homes, each once. Newline-separated: the sandbox rules and the
+# refusal classifier take the list.
+phys_dir() { (CDPATH='' cd -- "$1" 2>/dev/null && pwd -P) || printf '%s\n' "$1"; }
+real_homes=$real_home
+if [ -n "$pw_home" ] && [ "$(phys_dir "$pw_home")" != "$(phys_dir "$real_home")" ]; then
+  real_homes="${real_home}
+${pw_home}"
+fi
+
+# The toolchain's own bin/ goes first on the tests' PATH. A version manager's
+# `go` shim (asdf, mise, goenv) finds its version through the real HOME and
+# its own variables, and would fail under the isolation below.
+goroot_bin=$(cd "$mod" 2>/dev/null && go env GOROOT 2>/dev/null)
+[ -n "$goroot_bin" ] || goroot_bin=$(go env GOROOT)
+goroot_bin="${goroot_bin}/bin"
+[ -x "$goroot_bin/go" ] || die "no go binary in ${goroot_bin} (go env GOROOT)"
+
+# Resolved before HOME changes: by default they all live under the real home.
+real_gocache=$(go env GOCACHE)
+real_gomodcache=$(go env GOMODCACHE)
+real_gopath=$(go env GOPATH)
+real_goenv=$(go env GOENV)
+
+# TMPDIR is never longer than the platform's default and holds no symlink:
+#  - /tmp resolved: on macOS it is a symlink to /private/tmp, and the Claude
+#    store refuses a profile whose parents include a symlink (it exempts only
+#    /var), so a TMPDIR under /tmp fails 35 tests (internal/agents/claude,
+#    cmd/subrouter) that pass under the default /var/folders one.
+#  - macOS: a per-run /private/tmp/srci.XXXXXX/t, 26 bytes against the
+#    default's 49, removed afterwards.
+#  - Linux: /tmp itself, 4 bytes, as on a GitHub runner. Anything longer
+#    overflows the 108-byte sun_path of a socket some tests bind under
+#    t.TempDir(): with an 18-byte TMPDIR, TestListenerTransferAcceptsLegacy-
+#    DualStackWildcardForIPv4Configuration failed in --docker and not on CI.
+tmp_base=$(CDPATH='' cd -- /tmp && pwd -P) || die "no /tmp"
+root=$(mktemp -d "$tmp_base/srci.XXXXXX") || die "cannot create a scratch directory under ${tmp_base}"
+iso_home="$root/h"
+if [ "$goos" = darwin ]; then iso_tmp="$root/t"; else iso_tmp=$tmp_base; fi
+shim_dir="$root/bin"
+kc_dir="$root/kc"
+mkdir -p "$iso_home" "$iso_tmp" "$shim_dir" "$kc_dir"
+
+# shellcheck disable=SC2329 # run by the EXIT trap
+cleanup() {
+  # shellcheck disable=SC2086 # one pid per word
+  [ -n "${sock_pids:-}" ] && kill $sock_pids 2>/dev/null
+  if [ "$keep" = 1 ]; then
+    say "${prog}: kept ${root}"
+    return
+  fi
+  chmod -R u+w "$root" 2>/dev/null
+  rm -rf "$root" 2>/dev/null
+}
+trap cleanup EXIT
+trap 'exit 130' INT TERM
+
+# The environment every test sees: this allowlist, plus HOME, TMPDIR, PATH and
+# the Go cache locations set below. Everything else is dropped, so an override
+# nobody has listed yet cannot leak in either.
+keep_vars="USER LOGNAME SHELL TERM LANG LC_ALL LC_CTYPE LC_MESSAGES LC_COLLATE LC_NUMERIC LC_TIME TZ
+GOROOT GOFLAGS GOTOOLCHAIN GOPROXY GOPRIVATE GONOPROXY GONOSUMDB GONOSUMCHECK GOSUMDB GOINSECURE
+GOAMD64 GOARM GOARM64 CGO_ENABLED CC CXX CGO_CFLAGS CGO_CPPFLAGS CGO_CXXFLAGS CGO_LDFLAGS PKG_CONFIG
+DEVELOPER_DIR SDKROOT http_proxy https_proxy no_proxy HTTP_PROXY HTTPS_PROXY NO_PROXY ALL_PROXY all_proxy
+SSL_CERT_FILE SSL_CERT_DIR"
+
+env_args=()
+for v in $keep_vars; do
+  if [ -n "${!v+x}" ]; then env_args+=("$v=${!v}"); fi
+done
+env_args+=("GOCACHE=$real_gocache" "GOMODCACHE=$real_gomodcache" "GOPATH=$real_gopath" "GOENV=$real_goenv")
+
+# Names only, never values.
+: > "$out/env-dropped.txt"
+# shellcheck disable=SC2086 # split the list into words on purpose
+keep_line=" $(printf '%s ' $keep_vars)HOME TMPDIR PATH GOCACHE GOMODCACHE GOPATH GOENV "
+for v in $(compgen -e | sort); do
+  case $keep_line in
+    *" $v "*) ;;
+    *) printf '%s\n' "$v" >> "$out/env-dropped.txt" ;;
+  esac
+done
+
+# ---------------------------------------------------------------- fake security
+
+shim=""
+kc_log="$out/security-calls.log"
+: > "$kc_log"
+write_fake_security() { # <path> <log> <store dir>
+  {
+    printf '#!/bin/sh\n'
+    printf "log='%s'\nstore='%s'\n" "$2" "$3"
+    cat <<'EOF'
+# A fake macOS `security`, written by sr-local-ci. It stands in for the real
+# tool so no test can reach the login keychain: a file-backed keychain that
+# starts empty, answers find/add/delete-generic-password the way the real
+# tool does (44 = no such item, 45 = already exists), and logs every call's
+# subcommand, service and account -- never a password.
+sub=${1-}
+[ $# -gt 0 ] && shift
+svc='' acct='' pw='' pwsrc=none update=0 show=0
+while [ $# -gt 0 ]; do
+  case $1 in
+    -s) svc=${2-}; [ $# -gt 0 ] && shift ;;
+    -a) acct=${2-}; [ $# -gt 0 ] && shift ;;
+    -U) update=1 ;;
+    -g) show=1 ;;
+    -w)
+      if [ "$sub" = add-generic-password ]; then
+        if [ $# -ge 2 ]; then pw=$2; pwsrc=arg; shift; else pwsrc=stdin; fi
+      else
+        show=1
+      fi
+      ;;
+    -l|-j|-c|-C|-D|-G|-T|-X|-k|-r) [ $# -gt 0 ] && shift ;;
+  esac
+  [ $# -gt 0 ] && shift
+done
+printf '%s %s svc=%s acct=%s\n' "$(date +%s)" "${sub:-<none>}" "$svc" "$acct" >> "$log"
+key() { printf '%s' "$1" | cksum | cut -d' ' -f1; }
+svc_key=$(key "$svc")
+item=''
+if [ -n "$acct" ]; then
+  [ -f "$store/$svc_key.$(key "$acct")" ] && item="$store/$svc_key.$(key "$acct")"
+else
+  for f in "$store/$svc_key".*; do [ -f "$f" ] && { item=$f; break; }; done
+fi
+missing() {
+  echo "security: SecKeychainSearchCopyNext: The specified item could not be found in the keychain." >&2
+  exit 44
+}
+case $sub in
+  find-generic-password)
+    [ -n "$item" ] || missing
+    if [ "$show" = 1 ]; then cat "$item"; echo; else
+      printf 'keychain: "sr-local-ci fake"\nclass: "genp"\nattributes:\n    "acct"<blob>="%s"\n    "svce"<blob>="%s"\n' "$acct" "$svc"
+    fi
+    exit 0 ;;
+  add-generic-password)
+    if [ -n "$item" ] && [ "$update" = 0 ]; then
+      echo "security: SecKeychainItemCreateFromContent (<default>): The specified item already exists in the keychain." >&2
+      exit 45
+    fi
+    [ "$pwsrc" = stdin ] && pw=$(cat)
+    dest="$store/$svc_key.$(key "$acct")"
+    umask 077
+    printf '%s' "$pw" > "$dest.$$" && mv -f "$dest.$$" "$dest"
+    exit 0 ;;
+  delete-generic-password)
+    [ -n "$item" ] || missing
+    rm -f "$item"
+    echo "password has been deleted."
+    exit 0 ;;
+  find-*)
+    missing ;;
+  *)
+    echo "security (sr-local-ci fake): ${sub:-no subcommand} is not emulated" >&2
+    exit 1 ;;
+esac
+EOF
+  } > "$1"
+  chmod 0755 "$1"
+}
+
+iso_path="$goroot_bin:$PATH"
+if [ "$goos" = darwin ]; then
+  shim="$shim_dir/security"
+  write_fake_security "$shim" "$kc_log" "$kc_dir"
+  iso_path="$shim_dir:$iso_path"
+fi
+
+# ---------------------------------------------------------------- sandbox (macOS)
+
+# The sandbox matches resolved paths (/tmp is /private/tmp on macOS), so every
+# path a rule names is resolved first; a symlinked leaf adds its target too.
+phys() { # the nearest existing ancestor, resolved, plus the rest of the path
+  local p=$1 rest="" d r
+  while [ ! -d "$p" ]; do
+    d=$(dirname -- "$p")
+    [ "$d" = "$p" ] && break
+    rest="/$(basename -- "$p")$rest"
+    p=$d
+  done
+  r=$(CDPATH='' cd -- "$p" 2>/dev/null && pwd -P) || r=$p
+  [ "$r" = / ] && r=""
+  printf '%s%s\n' "$r" "$rest"
+}
+phys_all() {
+  local p=$1 t
+  phys "$p"
+  if [ -L "$p" ]; then
+    t=$(readlink -- "$p")
+    case $t in /*) ;; *) t="$(dirname -- "$p")/$t" ;; esac
+    phys "$t"
+  fi
+}
+sbq() { # quote a path for the profile
+  local s=$1
+  s=${s//\\/\\\\}
+  s=${s//\"/\\\"}
+  printf '"%s"' "$s"
+}
+subpaths() { # <path>... -> (subpath "...") for each resolved form
+  local p q
+  for p in "$@"; do
+    [ -n "$p" ] || continue
+    while IFS= read -r q; do printf ' (subpath %s)' "$(sbq "$q")"; done <<EOF
+$(phys_all "$p")
+EOF
+  done
+}
+# The credential stores under a home, relative to it.
+store_rel=".claude .claude.json .codex .codex-accounts .subrouter .config/subrouter .config/gh
+.local/share/opencode .pi .gemini .aws .ssh Library/Keychains"
+
+# What a test may never exec on this machine: the keychain tool (the PATH
+# fake cannot catch an absolute path), launchd's control tool (one bootout of
+# the live label and every session dies), and sudo, open and tailscale, as the
+# deploy scripts' harness fences them.
+fenced_tools="/usr/bin/security
+/bin/launchctl
+/usr/bin/sudo
+/usr/bin/open
+/usr/local/bin/tailscale
+/opt/homebrew/bin/tailscale
+/Applications/Tailscale.app/Contents/MacOS/Tailscale"
+
+# profile_rules <homes> <tools> <daemon port> <readable dir> <writable dir>...
+# homes and tools are newline-separated lists; <readable dir> is a checkout
+# that sits inside a credential store (empty for none).
+# One generator for the real rules and, in --selftest, the decoy copies that
+# prove them, so the proof exercises the code that writes the real ones.
+profile_rules() {
+  local homes=$1 tools=$2 port=$3 readable=$4 rel h t q stores=() hs=()
+  shift 4
+  while IFS= read -r t; do
+    [ -n "$t" ] || continue
+    while IFS= read -r q; do printf '(deny process-exec (literal %s))\n' "$(sbq "$q")"; done <<PATHS
+$(phys_all "$t")
+PATHS
+  done <<TOOLS
+$tools
+TOOLS
+  printf '(deny network-outbound (remote ip "localhost:%s"))\n' "$port"
+  while IFS= read -r h; do
+    if [ -n "$h" ]; then hs+=("$h"); fi
+  done <<HOMES
+$homes
+HOMES
+  [ ${#hs[@]} -gt 0 ] || return 0
+  # One rule per path: (remote unix-socket ...) honours only its first filter,
+  # so a second home in the same rule would go unfenced.
+  for h in "${hs[@]}"; do
+    while IFS= read -r q; do
+      printf '(deny network-outbound (remote unix-socket (subpath %s)))\n' "$(sbq "$q")"
+    done <<PATHS
+$(phys_all "$h")
+PATHS
+  done
+  printf '(deny file-write*%s)\n' "$(subpaths "${hs[@]}")"
+  if [ $# -gt 0 ]; then printf '(allow file-write*%s)\n' "$(subpaths "$@")"; fi
+  for h in "${hs[@]}"; do
+    for rel in $store_rel; do stores+=("$h/$rel"); done
+  done
+  printf '(deny file-read* file-write*%s)\n' "$(subpaths "${stores[@]}")"
+  if [ -n "$readable" ]; then printf '(allow file-read*%s)\n' "$(subpaths "$readable")"; fi
+}
+
+sandbox_on=0
+sandbox_note="not macOS"
+profile="$root/sandbox.sb"
+decoy=""
+decoy_port=""
+checkout_read=""
+if [ "$goos" = darwin ]; then
+  if [ "$use_sandbox" = 0 ]; then
+    sandbox_note="off (--no-sandbox)"
+  elif ! command -v sandbox-exec >/dev/null 2>&1; then
+    sandbox_note="unavailable (no sandbox-exec)"
+  else
+    # A checkout inside a store (a Codex worktree under ~/.codex/worktrees)
+    # stays readable, and only it; a checkout that holds a store is refused.
+    co=$(phys "$repo_root")
+    while IFS= read -r h; do
+      for rel in $store_rel; do
+        st=$(phys "$h/$rel")
+        case "$st/" in "$co/"*) die "the checkout ${repo_root} holds ${h}/${rel}, a credential store the sandbox keeps unreadable; test a checkout that holds none" ;; esac
+        case "$co/" in "$st/"*) checkout_read=$repo_root ;; esac
+      done
+    done <<HOMES
+$real_homes
+HOMES
+    if [ "$selftest" = 1 ]; then
+      decoy="$root/decoy"
+      mkdir -p "$decoy/home/cache" "$decoy/home/.claude/checkout" "$decoy/pwhome/.claude" "$decoy/bin"
+      echo secret > "$decoy/home/.claude/credentials"
+      echo secret > "$decoy/pwhome/.claude/credentials"
+      echo 'module decoy' > "$decoy/home/.claude/checkout/go.mod"
+      for t in security launchctl; do
+        printf '#!/bin/sh\necho RAN\n' > "$decoy/bin/$t"
+        chmod 0755 "$decoy/bin/$t"
+      done
+      decoy_port=$(( 40000 + $$ % 20000 ))
+    fi
+    gopkg=()
+    case $real_gopath in *:*) gopkg=("${real_gopath%%:*}/pkg") ;; ?*) gopkg=("$real_gopath/pkg") ;; esac
+    {
+      echo '(version 1)'
+      echo '(allow default)'
+      echo ';; sr-local-ci: tests may not exec the keychain tool, launchctl, sudo, open'
+      echo ';; or tailscale, reach the live daemon or a socket in the real home, read'
+      echo ';; the credential stores, or write anywhere in the real home but the Go'
+      echo ';; caches. The last matching rule wins.'
+      profile_rules "$real_homes" "$fenced_tools" 31415 "$checkout_read" \
+        "$real_gocache" "$real_gomodcache" ${gopkg[@]+"${gopkg[@]}"}
+      echo ';; A sandboxed process may not exec a setuid binary, and /bin/ps is one.'
+      echo ';; The canary runner and the transport observer need it; it only reads the'
+      echo ';; process table, so it runs outside the sandbox.'
+      echo '(allow process-exec (literal "/bin/ps") (with no-sandbox))'
+      if [ -n "$decoy" ]; then
+        echo ';; --selftest decoys: the same rules on paths the probe may touch. Two'
+        echo ';; homes, as when HOME and the password database disagree.'
+        profile_rules "$decoy/home
+$decoy/pwhome" "$decoy/bin/security
+$decoy/bin/launchctl" "$decoy_port" "$decoy/home/.claude/checkout" "$decoy/home/cache"
+      fi
+    } > "$profile"
+    if err=$(sandbox-exec -f "$profile" /usr/bin/true 2>&1); then
+      sandbox_on=1
+      sandbox_note="on"
+    else
+      sandbox_note="unavailable (sandbox-exec refused: ${err})"
+    fi
+  fi
+  # The fence is not optional on a Mac: without it, the two tests on the
+  # known_refused list below run the real /usr/bin/security, and nothing
+  # refuses :31415, launchctl or the real home. --no-sandbox is the explicit
+  # opt-out. The selftest goes on and reports it as a failed check.
+  if [ "$use_sandbox" = 1 ] && [ "$sandbox_on" = 0 ] && [ "$selftest" = 0 ]; then
+    die "the sandbox is ${sandbox_note}, so nothing would fence the real keychain tool, the live daemon or your real home. Use --docker, or pass --no-sandbox to run unfenced anyway"
+  fi
+fi
+
+sabotage=""   # --selftest only: which guard to switch off
+run_isolated() {
+  local home=$iso_home tmp=$iso_tmp path=$iso_path add=() sb=()
+  case $sabotage in
+    home) home=$real_home ;;
+    tmpdir) tmp="$root/a-directory-name-long-enough-to-overflow-a-socket-path"; mkdir -p "$tmp" ;;
+    shim) path=$real_path ;;
+    env) add=("CODEX_HOME=${CODEX_HOME:-/sr-local-ci-selftest/CODEX_HOME}" "ANTHROPIC_AUTH_TOKEN=sr-local-ci-selftest") ;;
+  esac
+  if [ "$sandbox_on" = 1 ] && [ "$sabotage" != sandbox ]; then sb=(sandbox-exec -f "$profile"); fi
+  env -i ${env_args[@]+"${env_args[@]}"} HOME="$home" TMPDIR="$tmp" PATH="$path" \
+    ${add[@]+"${add[@]}"} ${sb[@]+"${sb[@]}"} "$@"
+}
+
+describe_isolation() {
+  local n_drop dropped_hot
+  n_drop=$(wc -l < "$out/env-dropped.txt" | tr -d ' ')
+  dropped_hot=$(grep -E '^(SUBROUTER_|ANTHROPIC_|CLAUDE|CODEX_|OPENAI_|AWS_|GH_|GITHUB_TOKEN)' "$out/env-dropped.txt" | tr '\n' ' ')
+  say "isolation: HOME=${iso_home}  TMPDIR=${iso_tmp}  real Go caches kept"
+  say "  env: ${#env_args[@]} variables kept (+HOME, TMPDIR, PATH); ${n_drop} dropped (names in env-dropped.txt)"
+  [ -n "$dropped_hot" ] && say "  dropped here: ${dropped_hot}"
+  say "  go: ${goroot_bin} first on PATH"
+  if [ "$goos" = darwin ]; then
+    say "  keychain: fake security first on PATH (${shim})"
+    if [ "$sandbox_on" = 1 ]; then
+      say "  sandbox: on; fences $(printf '%s\n' "$real_homes" | tr '\n' ' ')and :31415; no exec of security, launchctl, sudo, open, tailscale"
+      [ -n "$checkout_read" ] && say "  sandbox: the checkout sits in a credential store; it alone stays readable"
+    else
+      say "  sandbox: ${sandbox_note}"
+    fi
+  elif in_a_container; then
+    say "  keychain: none on ${goos}; fence: this container"
+  else
+    say "  keychain: none on ${goos}; fence: NONE (--no-sandbox on a ${goos} host)"
+  fi
+}
+
+# ---------------------------------------------------------------- go test -json parsing
+
+# parse_json <json> <prefix>: writes
+#   <prefix>.results   T<TAB>pkg<TAB>test<TAB>pass|fail|skip|unfinished   (top-level tests)
+#                      P<TAB>pkg<TAB>pass|fail|skip|unfinished<TAB>-|build|timeout|aborted
+#                      R<TAB>pkg<TAB>test|-   the race detector reported a race in that
+#                                             test, or in the package but no one test
+#   <prefix>.log       the plain text of every Output
+#   <prefix>.excerpts  pkg<TAB>test<TAB>line: the last lines of each red test / package
+parse_json() {
+  awk -v RES="$2.results" -v LOG="$2.log" -v EXC="$2.excerpts" '
+    function field(name,   key, i, s, j) {
+      key = "\"" name "\":\""
+      i = index(L, key); if (i == 0) return ""
+      s = substr(L, i + length(key)); j = index(s, "\"")
+      return j ? substr(s, 1, j - 1) : ""
+    }
+    function text(s) {
+      gsub(/\\n/, "\n", s); gsub(/\\t/, "\t", s); gsub(/\\r/, "", s); gsub(/\\\//, "/", s)
+      gsub(/\\u003c/, "<", s); gsub(/\\u003e/, ">", s); gsub(/\\u0026/, "\\&", s); gsub(/\\u001b/, "", s)
+      gsub(/\002/, "\"", s); gsub(/\001/, "\\", s)
+      return s
+    }
+    # Two rings per test: its last lines, and its last lines that say what
+    # went wrong (a t.Error location, a panic, a FAIL, a timeout, a compile
+    # error). The excerpt is the second when it has any.
+    function keep(k, line) {
+      ring[k, cnt[k] % 8] = line; cnt[k]++
+      if (line ~ /^panic: |_test\.go:[0-9]+:|\.go:[0-9]+:[0-9]+: |test timed out after|^--- FAIL|^FAIL|WARNING: DATA RACE|race detected/) {
+        kring[k, kcnt[k] % 8] = line; kcnt[k]++
+      }
+    }
+    function dump(k, p, t,   i, from) {
+      if (kcnt[k] > 0) {
+        from = kcnt[k] > 8 ? kcnt[k] - 8 : 0
+        for (i = from; i < kcnt[k]; i++) printf "%s\t%s\t%s\n", p, t, kring[k, i % 8] > EXC
+        return
+      }
+      from = cnt[k] > 8 ? cnt[k] - 8 : 0
+      for (i = from; i < cnt[k]; i++) printf "%s\t%s\t%s\n", p, t, ring[k, i % 8] > EXC
+    }
+    function seenpkg(p) { if (p != "" && !(p in pseen)) { pseen[p] = 1; porder[++pn] = p } }
+    {
+      L = $0
+      gsub(/\\\\/, "\001", L); gsub(/\\"/, "\002", L)
+      a = field("Action"); p = field("Package"); t = field("Test")
+      if (p == "") { ip = field("ImportPath"); if (ip != "") { split(ip, parts, " "); p = parts[1] } }
+      if (a == "output" || a == "build-output") {
+        o = text(field("Output"))
+        printf "%s", o > LOG
+        line = o; sub(/\n$/, "", line)
+        if (line ~ /test timed out after/) timedout[p] = 1
+        else if (line ~ /^panic: /) panicked[p] = 1
+        if (line ~ /^=== (RUN|PAUSE|CONT|NAME)/ || line ~ /^[ \t]*$/) next
+        # The race detector: "WARNING: DATA RACE" goes to whichever test
+        # test2json thinks is running; "race detected during execution of
+        # test" is the testing package failing the test the race happened in.
+        israce = (line ~ /WARNING: DATA RACE|race detected during execution of test|race detected outside/)
+        if (israce) racepkg[p] = 1
+        if (t != "") { top = t; sub(/\/.*/, "", top); if (israce) raced[p SUBSEP top] = 1; keep(p SUBSEP top, line) }
+        else if (p != "") keep(p SUBSEP "", line)
+        next
+      }
+      if (a == "build-fail") { buildfail[p] = 1; seenpkg(p); next }
+      if (t != "") {
+        if (index(t, "/")) next
+        k = p SUBSEP t
+        if (a == "run") { if (!(k in st)) order[++n] = k; st[k] = "run" }
+        else if (a == "pass" || a == "fail" || a == "skip") st[k] = a
+        next
+      }
+      if (a == "start") { seenpkg(p); next }
+      if (a == "pass" || a == "fail" || a == "skip") {
+        seenpkg(p); pst[p] = a
+        if (index(L, "\"FailedBuild\"")) buildfail[p] = 1
+      }
+    }
+    END {
+      printf "" > RES; printf "" > EXC
+      for (i = 1; i <= n; i++) {
+        k = order[i]; split(k, kk, SUBSEP); s = st[k]
+        if (s == "run") { s = "unfinished"; unfin[kk[1]]++ }
+        printf "T\t%s\t%s\t%s\n", kk[1], kk[2], s > RES
+        if (s == "fail" || s == "unfinished") { dump(k, kk[1], kk[2]); redtests[kk[1]]++ }
+        if ((k in raced) && (s == "fail" || s == "unfinished")) { printf "R\t%s\t%s\n", kk[1], kk[2] > RES; racedin[kk[1]]++ }
+      }
+      for (p in racepkg) if (!(p in racedin)) printf "R\t%s\t-\n", p > RES
+      for (i = 1; i <= pn; i++) {
+        p = porder[i]; s = (p in pst) ? pst[p] : "unfinished"; flag = "-"
+        if (p in buildfail) flag = "build"
+        else if (s != "pass" && s != "skip" && p in timedout) flag = "timeout"
+        else if (s != "pass" && s != "skip" && (unfin[p] > 0 || p in panicked)) flag = "aborted"
+        printf "P\t%s\t%s\t%s\n", p, s, flag > RES
+        if (s != "pass" && s != "skip") dump(p SUBSEP "", p, "-")
+      }
+    }
+  ' "$1"
+}
+
+# ================================================================ selftest
+
+if [ "$selftest" = 1 ]; then
+  say "${prog} --selftest: ${goos}/${goarch}, logs in ${out}"
+  canaries="SUBROUTER_STATE_DIR SUBROUTER_CLOUD_CONFIG CODEX_HOME CLAUDE_CONFIG_DIR ANTHROPIC_BASE_URL
+ANTHROPIC_AUTH_TOKEN ANTHROPIC_UNIX_SOCKET ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN SUBROUTER_REMOTE_POOL
+SUBROUTER_REMOTE_POOL_TOKEN SUBROUTER_REMOTE_POOLS_FILE SUBROUTER_SERVER SUBROUTER_LOCAL_BASE_URL
+SR_LOCAL_CI_SELFTEST_UNLISTED"
+  # Plant every canary in this process, as a developer shell would export them.
+  # env_args was built before this and holds none of them; the probe checks
+  # that nothing on the way to a test put them back.
+  for v in $canaries; do export "$v=/sr-local-ci-selftest-decoy/$v"; done
+  describe_isolation
+
+  # shellcheck disable=SC2016 # expanded by the probe's own shell
+  probe='
+fail=0
+leak() { echo "LEAK $*"; fail=1; }
+exp_home=$1 real_home=$2 shim=$3 decoy=$4 decoy_port=$5 write_probe=$6; shift 6
+[ "$HOME" = "$exp_home" ] || leak "HOME=$HOME, not the throwaway $exp_home"
+[ "$HOME" != "$real_home" ] || leak "HOME is the real home"
+for v in "$@"; do
+  eval "is_set=\${$v+x}"
+  [ -z "$is_set" ] || leak "$v reached the test environment"
+done
+for v in $(env | sed -n "s/^\([A-Za-z_][A-Za-z0-9_]*\)=.*/\1/p"); do
+  case $v in
+    SUBROUTER_*|ANTHROPIC_*|CLAUDE*|CODEX_*|OPENAI_*|AWS_*|GH_*|GITHUB_TOKEN|SR_*) leak "$v reached the test environment (by pattern)" ;;
+  esac
+done
+if [ -z "${TMPDIR-}" ] || [ ! -d "$TMPDIR" ] || ! : > "$TMPDIR/.sr-local-ci-probe.$$"; then leak "TMPDIR=${TMPDIR-} is not a writable directory"; fi
+rm -f "${TMPDIR-}/.sr-local-ci-probe.$$"
+[ ${#TMPDIR} -le 32 ] || leak "TMPDIR is ${#TMPDIR} bytes; socket paths under t.TempDir() would overflow"
+[ "$(cd "$TMPDIR" 2>/dev/null && pwd -P)" = "$TMPDIR" ] || leak "TMPDIR=$TMPDIR has a symlink in it; the Claude store refuses symlinked parents"
+[ "$(cd "$HOME" 2>/dev/null && pwd -P)" = "$HOME" ] || leak "HOME=$HOME has a symlink in it"
+if [ -n "$shim" ]; then
+  got=$(command -v security)
+  [ "$got" = "$shim" ] || leak "security resolves to ${got:-nothing}, not the fake $shim"
+  if [ "$got" = "$shim" ]; then
+    security find-generic-password -s sr-local-ci-selftest -a probe -w >/dev/null 2>&1; rc=$?
+    [ "$rc" = 44 ] || leak "security: the fake answered $rc for a missing item, want 44"
+    security add-generic-password -U -s sr-local-ci-selftest -a probe -w payload-1 || leak "security: the fake refused an add"
+    [ "$(security find-generic-password -s sr-local-ci-selftest -a probe -w)" = payload-1 ] || leak "security: the fake lost an added item"
+    security delete-generic-password -s sr-local-ci-selftest -a probe >/dev/null || leak "security: the fake refused a delete"
+    security find-generic-password -s sr-local-ci-selftest -a probe -w >/dev/null 2>&1; rc=$?
+    [ "$rc" = 44 ] || leak "security: the fake still held a deleted item ($rc)"
+  fi
+fi
+if [ -n "$decoy" ]; then
+  for h in home pwhome; do
+    if (: > "$decoy/$h/written") 2>/dev/null; then leak "sandbox: a write into the decoy $h was allowed"; fi
+    if cat "$decoy/$h/.claude/credentials" >/dev/null 2>&1; then leak "sandbox: the decoy credential store in $h was readable"; fi
+    errno=$(perl -MSocket -e "socket(S, PF_UNIX, SOCK_STREAM, 0) or die; connect(S, pack_sockaddr_un(\$ARGV[0])) or print \$!+0" "$decoy/$h/d.sock" 2>/dev/null)
+    [ "$errno" = 1 ] || leak "sandbox: a connection to the decoy daemon socket in $h was not refused by the sandbox (errno ${errno:-none: it connected})"
+  done
+  (: > "$decoy/home/cache/written") 2>/dev/null || leak "sandbox: a write into the decoy Go cache was refused"
+  cat "$decoy/home/.claude/checkout/go.mod" >/dev/null 2>&1 || leak "sandbox: a checkout inside the decoy store was unreadable"
+  for tool in security launchctl; do
+    case $("$decoy/bin/$tool" 2>&1) in *RAN*) leak "sandbox: the decoy $tool ran by absolute path" ;; esac
+  done
+  /bin/ps -p $$ -o pid= >/dev/null 2>&1 || leak "sandbox: BROKE /bin/ps (setuid); the canary runner needs it"
+  errno=$(perl -MSocket -e "socket(S,PF_INET,SOCK_STREAM,0) or die; connect(S, sockaddr_in($decoy_port, inet_aton(\"127.0.0.1\"))) or print \$!+0" 2>/dev/null)
+  [ "$errno" = 1 ] || leak "sandbox: a connection to the decoy daemon port was not refused by the sandbox (errno ${errno:-none})"
+fi
+if [ -n "$write_probe" ]; then
+  while IFS= read -r h; do
+    [ -n "$h" ] || continue
+    d="$h/.sr-local-ci-write-probe.$$"
+    if mkdir "$d" 2>/dev/null; then rmdir "$d"; leak "sandbox: a write into the real home $h was allowed"; fi
+  done <<HOMES
+$write_probe
+HOMES
+fi
+[ "$fail" = 0 ] && echo "probe: isolated"
+exit $fail
+'
+  pass_n=0
+  fail_n=0
+  check() { # <name> <ok 0|1> <detail>
+    if [ "$2" = 0 ]; then pass_n=$((pass_n + 1)); say "  PASS  $1"; else fail_n=$((fail_n + 1)); say "  FAIL  $1${3:+: $3}"; fi
+  }
+  probe_run() { # -> output on stdout, status in probe_rc (call it without $(...))
+    local o wp=""
+    # The real-home write probe runs only where the sandbox should refuse it;
+    # with the sandbox switched off it would really write.
+    if [ "$sandbox_on" = 1 ] && [ "$sabotage" != sandbox ]; then wp=$real_homes; fi
+    # shellcheck disable=SC2086 # one argument per canary name
+    o=$(run_isolated sh -c "$probe" probe "$iso_home" "$real_home" "$shim" "$decoy" "$decoy_port" "$wp" $canaries 2>&1)
+    probe_rc=$?
+    printf '%s\n' "$o"
+  }
+
+  # A listening socket in each decoy home, so an unfenced connect succeeds
+  # and only the sandbox's unix-socket rule can refuse it.
+  sock_pids=""
+  if [ -n "$decoy" ]; then
+    for h in home pwhome; do
+      perl -MIO::Socket::UNIX -e 'my $s = IO::Socket::UNIX->new(Type => SOCK_STREAM(), Local => $ARGV[0], Listen => 5) or die "listen $ARGV[0]: $!\n"; sleep 900' \
+        "$decoy/$h/d.sock" </dev/null >/dev/null 2>&1 &
+      sock_pids="$sock_pids $!"
+    done
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+      [ -S "$decoy/home/d.sock" ] && [ -S "$decoy/pwhome/d.sock" ] && break
+      perl -e 'select(undef, undef, undef, 0.5)'
+    done
+  fi
+
+  say "1. the probe, under the isolation a run uses"
+  probe_run > "$root/probe.out"
+  probe_out=$(cat "$root/probe.out")
+  printf '%s\n' "$probe_out" | sed 's/^/     /'
+  check "nothing leaks" "$probe_rc" "$(printf '%s' "$probe_out" | grep -c LEAK) leak(s)"
+
+  say "2. a real go test, under the same isolation"
+  gp="$root/probe"
+  mkdir -p "$gp"
+  printf 'module srlocalciprobe\n\ngo 1.21\n' > "$gp/go.mod"
+  cat > "$gp/probe_test.go" <<EOF
+package probe
+
+import (
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+func TestTheIsolationATestSees(t *testing.T) {
+	if home, err := os.UserHomeDir(); err != nil || home != "${iso_home}" {
+		t.Errorf("os.UserHomeDir() = %q, %v; want the throwaway ${iso_home}", home, err)
+	}
+	for _, kv := range os.Environ() {
+		name, _, _ := strings.Cut(kv, "=")
+		for _, bad := range []string{"SUBROUTER_", "ANTHROPIC_", "CLAUDE", "CODEX_", "OPENAI_", "AWS_", "SR_"} {
+			if strings.HasPrefix(name, bad) {
+				t.Errorf("%s reached the test", name)
+			}
+		}
+	}
+	if dir := os.TempDir(); len(dir) > 32 {
+		t.Errorf("os.TempDir() = %q, %d bytes", dir, len(dir))
+	}
+	dir := t.TempDir()
+	if resolved, err := filepath.EvalSymlinks(dir); err != nil || resolved != dir {
+		t.Errorf("t.TempDir() = %q resolves to %q (%v); a symlinked parent fails the Claude store's checks", dir, resolved, err)
+	}
+	if shim := "${shim}"; shim != "" {
+		got, err := exec.LookPath("security")
+		if got != shim {
+			// Never run it then: it would be the real keychain tool.
+			t.Fatalf("security resolves to %q (%v), not the fake %q", got, err, shim)
+		}
+		err = exec.Command(got, "find-generic-password", "-s", "sr-local-ci-go-probe", "-a", "probe", "-w").Run()
+		if exit, ok := err.(*exec.ExitError); !ok || exit.ExitCode() != 44 {
+			t.Errorf("security find answered %v, want the fake's exit 44", err)
+		}
+	}
+}
+EOF
+  go_out=$(cd "$gp" && run_isolated go test -count=1 -v ./... 2>&1)
+  go_rc=$?
+  printf '%s\n' "$go_out" | grep -E -- '--- |_test.go|^(ok|FAIL)' | sed 's/^/     /'
+  check "a go test sees the isolated HOME, env, TMPDIR and keychain" "$go_rc"
+  if [ "$go_rc" = 0 ]; then
+    go_cache_seen=$(run_isolated go env GOCACHE)
+    [ "$go_cache_seen" = "$real_gocache" ]; check "the real GOCACHE is kept (${real_gocache})" $?
+  fi
+
+  say "3. each guard switched off in turn: the probe must go red and name it"
+  guards="home:HOME env:CODEX_HOME tmpdir:TMPDIR"
+  [ -n "$shim" ] && guards="$guards shim:security"
+  [ "$sandbox_on" = 1 ] && guards="$guards sandbox:sandbox"
+  for g in $guards; do
+    sabotage=${g%%:*}
+    want="LEAK ${g#*:}"
+    probe_run > "$root/probe.out"
+    s_out=$(cat "$root/probe.out")
+    ok=1
+    if [ "$probe_rc" != 0 ] && printf '%s' "$s_out" | grep -q "$want"; then ok=0; fi
+    check "without the ${sabotage} guard the probe fails (${want}...)" "$ok" "exit ${probe_rc}; $(printf '%s' "$s_out" | head -3 | tr '\n' ' ')"
+    sabotage=""
+  done
+  if [ "$goos" = darwin ] && [ "$sandbox_on" != 1 ]; then
+    check "sandbox-exec is available" 1 "$sandbox_note"
+  fi
+  # shellcheck disable=SC2086 # one pid per word
+  [ -n "$sock_pids" ] && kill $sock_pids 2>/dev/null
+  sock_pids=""
+
+  say "4. the red sorting, on a fixture module whose outcomes are known"
+  # The fixture is a fake checkout: <fx>/go.mod, an empty cmd/subrouter/ and
+  # eight packages. Two pass (one only when built without cgo, as CI builds).
+  # In the others: one test fails every time; one fails only after another
+  # test in the same process ran first (a load red: it passes alone); one
+  # panics; one hangs past -timeout; one does not compile; one races only in a
+  # crowd; three print a sandbox refusal. This script runs it for real.
+  fx="$root/fixture"
+  mkdir -p "$fx/cmd/subrouter" "$fx/ok" "$fx/red" "$fx/crash" "$fx/hang" "$fx/broken" "$fx/refused" "$fx/racy" "$fx/nocgo"
+  printf 'module fixture\n\ngo 1.21\n' > "$fx/go.mod"
+  printf '//go:build cgo\n\npackage nocgo\n\nconst cgoOn = true\n' > "$fx/nocgo/on.go"
+  printf '//go:build !cgo\n\npackage nocgo\n\nconst cgoOn = false\n' > "$fx/nocgo/off.go"
+  printf 'package nocgo\n\nimport "testing"\n\nfunc TestBuiltWithoutCgo(t *testing.T) {\n\tif cgoOn {\n\t\tt.Fatal("built with cgo; CI runs ./... with CGO_ENABLED=0")\n\t}\n}\n' > "$fx/nocgo/nocgo_test.go"
+  printf 'package ok\n\nimport "testing"\n\nfunc TestPasses(t *testing.T) {}\n' > "$fx/ok/ok_test.go"
+  cat > "$fx/red/red_test.go" <<'EOF'
+package red
+
+import "testing"
+
+var crowded bool
+
+func TestAaCrowdsTheRun(t *testing.T) { crowded = true }
+
+func TestAlwaysFails(t *testing.T) { t.Fatal("this fails every time") }
+
+func TestFailsOnlyInACrowd(t *testing.T) {
+	t.Run("sub", func(t *testing.T) {
+		if crowded {
+			t.Fatal("another test ran first in this process")
+		}
+	})
+}
+EOF
+  printf 'package crash\n\nimport "testing"\n\nfunc TestPanics(t *testing.T) { panic("boom") }\n\nfunc TestNeverRuns(t *testing.T) {}\n' > "$fx/crash/crash_test.go"
+  cat > "$fx/refused/refused_test.go" <<'EOF'
+package refused
+
+import "testing"
+
+// Each prints the line a test gets when the sandbox refuses it the real
+// keychain tool, without going near that tool.
+
+// Not on the known list: a refusal is a real failure.
+func TestReachesTheRealKeychain(t *testing.T) {
+	t.Fatal("delete Claude credential from keychain: fork/exec /usr/bin/security: operation not permitted")
+}
+
+// On the known list, and the refusal is what it fails on.
+func TestClaudeAddTokenFlagNeedsNoClaudeCLI(t *testing.T) {
+	t.Fatal("add --token: delete Claude credential from keychain: fork/exec /usr/bin/security: operation not permitted")
+}
+
+// On the known list, but it fails on something else after logging one.
+func TestClaudeAddDefaultsToSetupTokenAndRecordsExpiry(t *testing.T) {
+	t.Log("cleanup: fork/exec /usr/bin/security: operation not permitted (ignored)")
+	t.Fatal("stored credential = {}, want the setup token")
+}
+EOF
+  cat > "$fx/racy/racy_test.go" <<'EOF'
+package racy
+
+import (
+	"testing"
+	"time"
+)
+
+var shared int
+
+// Leaves a writer running, as a leaked goroutine from another test would.
+func TestAaLeavesAWriterRunning(t *testing.T) {
+	go func() {
+		for end := time.Now().Add(3 * time.Second); time.Now().Before(end); {
+			shared++
+			time.Sleep(time.Millisecond)
+		}
+	}()
+}
+
+// Reads what that writer writes: a data race, in a crowd. Alone it passes.
+func TestRacesOnlyInACrowd(t *testing.T) {
+	sum := 0
+	for end := time.Now().Add(300 * time.Millisecond); time.Now().Before(end); {
+		sum += shared
+		time.Sleep(time.Millisecond)
+	}
+	_ = sum
+}
+EOF
+  printf 'package hang\n\nimport (\n\t"testing"\n\t"time"\n)\n\nfunc TestHangs(t *testing.T) { time.Sleep(time.Hour) }\n' > "$fx/hang/hang_test.go"
+  printf 'package broken\n\nfunc Fine() {}\n' > "$fx/broken/broken.go"
+  printf 'package broken\n\nimport "testing"\n\nfunc TestDoesNotCompile(t *testing.T) { undefined() }\n' > "$fx/broken/broken_test.go"
+
+  fx_flags=()
+  [ "$use_sandbox" = 0 ] && fx_flags=(--no-sandbox)
+  fx_run() { # <out dir> <args...>: runs this script on the fixture; status in fx_rc
+    local o=$1
+    shift
+    bash "$script_file" -C "$fx" --skip-preflight --timeout 15s --rerun-timeout 5s --out "$o" \
+      ${fx_flags[@]+"${fx_flags[@]}"} "$@" > "$o.stdout" 2>&1
+    fx_rc=$?
+  }
+  has() { grep -q -F -- "$2" "$1/summary.txt" 2>/dev/null; }
+  section() { # <summary dir> <REAL|LOAD|UNVERIFIED> <line>: is <line> inside that section?
+    awk -v want="$3" -v sec="$2" '
+      /^REAL FAILURES:/ { cur = "REAL" } /^LOAD\/TIMING REDS:/ { cur = "LOAD" }
+      /^NOT VERIFIED ON MACOS:/ { cur = "UNVERIFIED" } /^verdict:/ { cur = "" }
+      cur == sec && index($0, want) { found = 1 } END { exit !found }' "$1/summary.txt"
+  }
+
+  fo="$out/fixture-all"
+  fx_run "$fo"
+  [ "$fx_rc" = 1 ]; check "a run with real failures exits 1" $? "exit ${fx_rc}; see ${fo}.stdout"
+  section "$fo" REAL "fixture/red TestAlwaysFails: failed again alone"; check "a test that always fails is real" $?
+  section "$fo" LOAD "fixture/red TestFailsOnlyInACrowd: failed in the suite, passed alone"; check "a test that passes alone is a load red, and still reported" $?
+  section "$fo" REAL "fixture/crash TestPanics: failed again alone"; check "a panicking test is real" $?
+  section "$fo" REAL "fixture/crash: the package stopped early"; check "a package cut short by a panic is real" $?
+  section "$fo" REAL "fixture/hang TestHangs (never finished): failed again alone"; check "a test that never finishes is real" $?
+  section "$fo" REAL "fixture/hang: the package hit -timeout"; check "a package cut by -timeout is real" $?
+  section "$fo" REAL "fixture/broken: did not build"; check "a test that does not compile is real" $?
+  ! has "$fo" "fixture/ok"; check "a passing package is not listed" $?
+  has "$fo" "LOAD/TIMING REDS: 1 "; check "exactly one load red" $?
+  if [ "$sandbox_on" = 1 ]; then
+    section "$fo" REAL "fixture/refused TestReachesTheRealKeychain: failed alone on a sandbox refusal"
+    check "an unlisted test failing on a sandbox refusal is real" $?
+    section "$fo" UNVERIFIED "fixture/refused TestClaudeAddTokenFlagNeedsNoClaudeCLI: failed alone on a sandbox refusal"
+    check "a known test failing on a refusal is listed as not verified, not real" $?
+    section "$fo" REAL "fixture/refused TestClaudeAddDefaultsToSetupTokenAndRecordsExpiry: failed again alone"
+    check "a known test that only logs a refusal and fails on something else is real" $?
+    fo="$out/fixture-refused"
+    fx_run "$fo" -run TestClaudeAddTokenFlagNeedsNoClaudeCLI ./refused
+    [ "$fx_rc" = 0 ] && has "$fo" "and 1 not verified on macOS"; check "known refusals alone exit 0, and say so" $? "exit ${fx_rc}"
+    fx_run "$out/fixture-refused-strict" --strict -run TestClaudeAddTokenFlagNeedsNoClaudeCLI ./refused
+    [ "$fx_rc" = 1 ]; check "--strict exits 1 on a known refusal" $? "exit ${fx_rc}"
+    fx_run "$out/fixture-refused-unlisted" -run TestReachesTheRealKeychain ./refused
+    [ "$fx_rc" = 1 ]; check "an unlisted refusal alone exits 1" $? "exit ${fx_rc}"
+  elif [ "$goos" = darwin ]; then
+    ! has "$fo" "TestClaudeAddTokenFlagNeedsNoClaudeCLI"; check "without the sandbox, the known tests are skipped" $?
+    section "$fo" REAL "fixture/refused TestReachesTheRealKeychain: failed again alone"
+    check "without the sandbox, an unlisted refusal line is an ordinary real failure" $?
+  else
+    section "$fo" REAL "fixture/refused TestReachesTheRealKeychain: failed again alone"
+    check "without the sandbox, the same failure is real" $?
+  fi
+
+  fo="$out/fixture-race"
+  fx_run "$fo" ./racy -- -race
+  [ "$fx_rc" = 1 ] && section "$fo" REAL "fixture/racy TestRacesOnlyInACrowd: the race detector reported a data race"
+  check "a data race is real even when the test passes alone" $? "exit ${fx_rc}; see ${fo}.stdout"
+
+  fo="$out/fixture-load"
+  fx_run "$fo" -run 'TestAaCrowdsTheRun|TestFailsOnlyInACrowd' ./red
+  [ "$fx_rc" = 0 ] && has "$fo" "verdict: PASS with 1 load/timing red"; check "load reds alone exit 0, and say so" $? "exit ${fx_rc}"
+  fo="$out/fixture-strict"
+  fx_run "$fo" --strict -run 'TestAaCrowdsTheRun|TestFailsOnlyInACrowd' ./red
+  [ "$fx_rc" = 1 ]; check "--strict exits 1 on a load red" $? "exit ${fx_rc}"
+  fo="$out/fixture-clean"
+  fx_run "$fo" ./ok
+  [ "$fx_rc" = 0 ] && has "$fo" "verdict: PASS"; check "a clean run exits 0" $? "exit ${fx_rc}"
+
+  fo="$out/fixture-cgo"
+  fx_run "$fo" ./nocgo
+  [ "$fx_rc" = 0 ] && has "$fo" "cgo: CGO_ENABLED=0 for ./..."
+  check "./... builds with CGO_ENABLED=0, as CI" $? "exit ${fx_rc}; see ${fo}.stdout"
+
+  if [ "$goos" = darwin ] && [ "$use_sandbox" = 1 ]; then
+    # A sandbox-exec that refuses every profile, as a macOS that drops it
+    # would: the run must stop, not go on unfenced.
+    fs="$root/fake-sandbox-exec"
+    mkdir -p "$fs"
+    printf '#!/bin/sh\necho "sandbox-exec: this profile is refused (sr-local-ci selftest)" >&2\nexit 71\n' > "$fs/sandbox-exec"
+    chmod 0755 "$fs/sandbox-exec"
+    fo="$out/fixture-no-sandbox"
+    mkdir -p "$fo"
+    PATH="$fs:$PATH" bash "$script_file" -C "$fx" --skip-preflight --timeout 15s --out "$fo" ./ok > "$fo.stdout" 2>&1
+    fx_rc=$?
+    [ "$fx_rc" = 2 ] && grep -q -- "--no-sandbox" "$fo.stdout" && [ ! -e "$fo/suite.json" ]
+    check "without a working sandbox the run stops (exit 2) before any test" $? "exit ${fx_rc}; see ${fo}.stdout"
+  fi
+
+  # A go that exits non-zero after every package it reported passed, as when
+  # it is killed between packages: a toolchain whose `go` runs the real one,
+  # then exits 137 from a suite run.
+  fk="$root/fake-goroot"
+  mkdir -p "$fk/bin"
+  # shellcheck disable=SC2016 # expanded by the fake go
+  {
+    printf '#!/bin/sh\n'
+    printf 'if [ "$1 $2" = "env GOROOT" ]; then echo %s; exit 0; fi\n' "'$fk'"
+    printf '%s "$@"; rc=$?\n' "'$goroot_bin/go'"
+    printf 'case " $* " in *" -run ^"*) exit $rc ;; esac\n'
+    printf '[ "$1" = test ] && [ "$rc" = 0 ] && exit 137\n'
+    printf 'exit $rc\n'
+  } > "$fk/bin/go"
+  chmod 0755 "$fk/bin/go"
+  fo="$out/fixture-killed"
+  PATH="$fk/bin:$PATH" fx_run "$fo" ./ok
+  [ "$fx_rc" = 1 ] && section "$fo" REAL "exited 137 with no failing package"
+  check "a go test that exits non-zero with every package passed is real" $? "exit ${fx_rc}"
+
+  # Preflight, on two more fixtures: one unformatted with a vet error, one that
+  # does not build.
+  pf="$root/fixture-preflight"
+  mkdir -p "$pf/cmd/subrouter" "$pf/a"
+  printf 'module fixture\n\ngo 1.21\n' > "$pf/go.mod"
+  printf 'package a\n\nimport "fmt"\n\nfunc Say() string {\n  return fmt.Sprintf("%%d", "not a number")\n}\n' > "$pf/a/a.go"
+  printf 'package a\n\nimport "testing"\n\nfunc TestSay(t *testing.T) { _ = Say() }\n' > "$pf/a/a_test.go"
+  fo="$out/fixture-preflight"
+  bash "$script_file" -C "$pf" --timeout 60s --out "$fo" ${fx_flags[@]+"${fx_flags[@]}"} ./a > "$fo.stdout" 2>&1
+  fx_rc=$?
+  [ "$fx_rc" = 1 ] && has "$fo" "gofmt FAIL" && section "$fo" REAL "gofmt: unformatted: a/a.go"
+  check "an unformatted file is a real failure" $? "exit ${fx_rc}"
+  has "$fo" ", vet FAIL" && section "$fo" REAL "go vet ./... failed:"; check "a vet error is a real failure" $?
+  pb="$root/fixture-build"
+  mkdir -p "$pb/cmd/subrouter" "$pb/b"
+  printf 'module fixture\n\ngo 1.21\n' > "$pb/go.mod"
+  printf 'package b\n\nfunc Broken() { undefined() }\n' > "$pb/b/b.go"
+  fo="$out/fixture-build"
+  bash "$script_file" -C "$pb" --timeout 60s --out "$fo" ${fx_flags[@]+"${fx_flags[@]}"} ./b > "$fo.stdout" 2>&1
+  fx_rc=$?
+  [ "$fx_rc" = 1 ] && has "$fo" "build FAIL" && has "$fo" "suite: 0 package(s)"
+  check "a build failure is real and stops the run before the suite" $? "exit ${fx_rc}"
+
+  # A go that a version manager's shim answers for (asdf, mise, goenv): the
+  # shim needs its own variables, which the isolation drops. The toolchain's
+  # bin/ goes first on the tests' PATH, so the whole run still passes.
+  va="$root/fake-version-manager"
+  pv="$root/fixture-version-manager"
+  mkdir -p "$va" "$pv/cmd/subrouter" "$pv/c"
+  for t in go gofmt; do
+    # shellcheck disable=SC2016 # expanded by the fake shim
+    {
+      printf '#!/bin/sh\n'
+      printf '[ -n "${SR_LOCAL_CI_FAKE_SHIM:-}" ] || { echo "No version is set for command %s" >&2; exit 126; }\n' "$t"
+      printf 'exec %s "$@"\n' "'$goroot_bin/$t'"
+    } > "$va/$t"
+    chmod 0755 "$va/$t"
+  done
+  printf 'module fixture\n\ngo 1.21\n' > "$pv/go.mod"
+  printf 'package c\n\nfunc C() int { return 1 }\n' > "$pv/c/c.go"
+  printf 'package c\n\nimport "testing"\n\nfunc TestC(t *testing.T) { _ = C() }\n' > "$pv/c/c_test.go"
+  fo="$out/fixture-version-manager"
+  SR_LOCAL_CI_FAKE_SHIM=1 PATH="$va:$PATH" bash "$script_file" -C "$pv" --timeout 60s --out "$fo" \
+    ${fx_flags[@]+"${fx_flags[@]}"} ./c > "$fo.stdout" 2>&1
+  fx_rc=$?
+  [ "$fx_rc" = 0 ] && has "$fo" "gofmt ok, build ok, vet ok" && has "$fo" "verdict: PASS"
+  check "a go behind a version-manager shim runs isolated all the same" $? "exit ${fx_rc}; see ${fo}.stdout"
+
+  # ops/ is a module too. -C pointed there would test one passing package and
+  # report PASS for the whole checkout.
+  pw="$root/fixture-ops-dir"
+  mkdir -p "$pw/cmd/subrouter" "$pw/ops/d"
+  printf 'module fixture\n\ngo 1.21\n' > "$pw/go.mod"
+  printf 'module fixture/ops\n\ngo 1.21\n' > "$pw/ops/go.mod"
+  printf 'package d\n\nimport "testing"\n\nfunc TestD(t *testing.T) {}\n' > "$pw/ops/d/d_test.go"
+  fo="$out/fixture-ops-dir"
+  bash "$script_file" -C "$pw/ops" --skip-preflight --timeout 15s --out "$fo" ${fx_flags[@]+"${fx_flags[@]}"} > "$fo.stdout" 2>&1
+  fx_rc=$?
+  [ "$fx_rc" = 2 ] && grep -qF "not its ops/" "$fo.stdout" && [ ! -e "$fo/summary.txt" ]
+  check "-C <checkout>/ops is refused, not run as the subrouter module" $? "exit ${fx_rc}; see ${fo}.stdout"
+
+  say ""
+  say "selftest: ${pass_n} passed, ${fail_n} failed"
+  [ "$fail_n" = 0 ] && exit 0
+  exit 1
+fi
+
+# ================================================================ the run
+
+label=${SR_LOCAL_CI_LABEL:-}
+if [ -z "$label" ]; then
+  label="$(git -C "$repo_root" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+  if [ -n "$(git -C "$repo_root" status --porcelain --untracked-files=no 2>/dev/null | head -1)" ]; then
+    label="${label}+uncommitted"
+  fi
+fi
+host_go=$(go env GOVERSION)
+want_go=$(gomod_version)
+load() { uptime 2>/dev/null | sed 's/.*load averages*: *//'; }
+t0=$(date +%s)
+summary="$out/summary.txt"
+real_n=0
+load_n=0
+real_lines=""
+load_lines=""
+add_real() { real_n=$((real_n + 1)); real_lines="${real_lines}$1
+"; }
+add_load() { load_n=$((load_n + 1)); load_lines="${load_lines}$1
+"; }
+refused_n=0
+refused_lines=""
+add_refused() { refused_n=$((refused_n + 1)); refused_lines="${refused_lines}$1
+"; }
+
+# Tests known to reach for the real keychain tool on purpose: they put /usr/bin
+# on PATH "so the store can still reach macOS `security`" (KNOWN-ISSUES,
+# "Residual gaps §45 leaves open"). The sandbox refuses them, and they are
+# reported as not verified on macOS; with --no-sandbox they are skipped. A
+# refusal in any other test is a real failure. When one of these is fixed,
+# drop it from here.
+known_refused="TestClaudeAddDefaultsToSetupTokenAndRecordsExpiry TestClaudeAddTokenFlagNeedsNoClaudeCLI"
+is_known_refused() { case " $known_refused " in *" $1 "*) return 0 ;; esac; return 1; }
+
+# The line a test failed on, when it is the sandbox refusing it something it
+# must never have: a fenced tool, the live daemon, the real home. Only the
+# last message the test printed counts, so a test that logs a refusal it
+# handled and then fails on something else is not taken for one.
+refusal() { # <excerpts file> <pkg> <test> -> that line, if it is one
+  [ "$sandbox_on" = 1 ] || return 1
+  local last pats=() t h
+  last=$(awk -F'\t' -v p="$2" -v t="$3" '
+    $1 == p && $2 == t { sub(/^[^\t]*\t[^\t]*\t/, ""); if ($0 !~ /^[ \t]*(--- |FAIL|ok[ \t])/) l = $0 }
+    END { print l }' "$1")
+  printf '%s' "$last" | grep -qi 'operation not permitted' || return 1
+  while IFS= read -r t; do [ -n "$t" ] && pats+=(-e "$t"); done <<TOOLS
+$fenced_tools
+TOOLS
+  while IFS= read -r h; do [ -n "$h" ] && pats+=(-e "$h/"); done <<HOMES
+$real_homes
+HOMES
+  printf '%s\n' "$last" | grep -F "${pats[@]}" -e :31415 | head -1 | grep .
+}
+
+# With --no-sandbox on a Mac, nothing refuses the known tests the real
+# /usr/bin/security, so they do not run at all.
+skip_args=()
+if [ "$goos" = darwin ] && [ "$sandbox_on" = 0 ]; then
+  for a in ${extra[@]+"${extra[@]}"}; do
+    case $a in
+      -skip|-skip=*|--skip|--skip=*|-test.skip|-test.skip=*)
+        die "--no-sandbox passes its own -skip (the known tests that run the real security); drop yours, or run with the sandbox" ;;
+    esac
+  done
+  skip_args=(-skip "^($(printf '%s' "$known_refused" | tr ' ' '|'))\$")
+fi
+
+# CI runs ./... with CGO_ENABLED=0, as the Makefile's test target does, and the
+# deploy harness with the default. So does this, unless you set CGO_ENABLED or
+# pass -race (which needs cgo on Linux).
+suite_env=(env CGO_ENABLED=0)
+cgo_note="CGO_ENABLED=0 for ./... and its re-runs, as CI"
+if [ -n "${CGO_ENABLED+x}" ]; then
+  suite_env=()
+  cgo_note="CGO_ENABLED=${CGO_ENABLED} (yours)"
+else
+  for a in ${extra[@]+"${extra[@]}"}; do
+    case $a in -race|-race=true|--race|--race=true) suite_env=(); cgo_note="cgo at the toolchain default (-race)" ;; esac
+  done
+fi
+
+say "${prog}: ${goos}/${goarch} ${host_go} (go.mod: ${want_go}; CI: ${want_go} on linux/amd64)"
+say "  checkout ${repo_root} (${label}); logs in ${out}; load $(load)"
+describe_isolation
+say "  cgo: ${cgo_note}"
+[ ${#skip_args[@]} -gt 0 ] && say "  skipped (--no-sandbox): ${known_refused}"
+
+# ---------------------------------------------------------------- preflight
+
+pre_line="skipped"
+build_ok=1
+if [ "$preflight" = 1 ]; then
+  pre_line=""
+  plog="$out/preflight.log"
+  : > "$plog"
+  step() { # <name> <cmd...>: runs in the module, isolated
+    local name=$1 rc o
+    shift
+    say "preflight: ${name} ..."
+    o=$(cd "$mod" && run_isolated "$@" 2>&1)
+    rc=$?
+    { echo "== ${name} (exit ${rc})"; printf '%s\n' "$o"; } >> "$plog"
+    step_out=$o
+    return $rc
+  }
+  if step gofmt gofmt -l . && [ -z "$step_out" ]; then
+    pre_line="gofmt ok"
+  else
+    pre_line="gofmt FAIL"
+    add_real "gofmt: unformatted: $(printf '%s' "$step_out" | tr '\n' ' ')"
+  fi
+  if step build go build ./...; then
+    pre_line="${pre_line}, build ok"
+  else
+    pre_line="${pre_line}, build FAIL"
+    build_ok=0
+    add_real "go build ./... failed:
+$(printf '%s\n' "$step_out" | head -15 | sed 's/^/      /')"
+  fi
+  if [ "$build_ok" = 1 ]; then
+    if step vet go vet ./...; then pre_line="${pre_line}, vet ok"; else
+      pre_line="${pre_line}, vet FAIL"
+      add_real "go vet ./... failed:
+$(printf '%s\n' "$step_out" | head -15 | sed 's/^/      /')"
+    fi
+    if [ "$goos" = darwin ]; then xos=linux; xarch=amd64; else xos=darwin; xarch=arm64; fi
+    if step "vet ${xos}/${xarch}" env GOOS=$xos GOARCH=$xarch go vet ./...; then pre_line="${pre_line}, vet ${xos}/${xarch} ok"; else
+      pre_line="${pre_line}, vet ${xos}/${xarch} FAIL"
+      add_real "GOOS=${xos} GOARCH=${xarch} go vet ./... failed:
+$(printf '%s\n' "$step_out" | head -15 | sed 's/^/      /')"
+    fi
+  fi
+fi
+
+# ---------------------------------------------------------------- the suite
+
+suite_json="$out/suite.json"
+: > "$suite_json"
+: > "$out/suite.stderr"
+test_args=(test -json -count=1 -timeout "$timeout")
+[ -n "$run_re" ] && test_args+=(-run "$run_re")
+test_args+=(${skip_args[@]+"${skip_args[@]}"} ${extra[@]+"${extra[@]}"})
+
+# One line per package as it finishes, so a 10-minute run shows progress.
+progress() {
+  awk '
+    /"Action":"(pass|fail|skip)","Package":"[^"]*","Elapsed"/ {
+      match($0, /"Action":"[a-z]+"/); a = substr($0, RSTART + 10, RLENGTH - 11)
+      match($0, /"Package":"[^"]*"/); p = substr($0, RSTART + 11, RLENGTH - 12)
+      match($0, /"Elapsed":[0-9.]+/); e = substr($0, RSTART + 10, RLENGTH - 10)
+      if (a == "skip") next
+      printf "  %-4s %s (%.1fs)\n", (a == "pass" ? "ok" : "FAIL"), p, e + 0
+      fflush()
+    }'
+}
+
+# Each go test invocation keeps its own JSON, stderr and exit status: a
+# non-zero exit that no failing package accounts for (go killed between
+# packages, a go-command error after the others reported) is a real failure.
+invs=""
+suite_go() { # <n> <what> <go test args...>
+  local n=$1 what=$2 rc
+  shift 2
+  : > "$out/suite.$n.json"
+  (cd "$mod" && run_isolated "$@") 2> "$out/suite.$n.stderr" | tee -a "$suite_json" "$out/suite.$n.json" | progress
+  rc=${PIPESTATUS[0]}
+  invs="${invs}$(printf '%s\t%s\t%s' "$n" "$rc" "$what")
+"
+  cat "$out/suite.$n.stderr" >> "$out/suite.stderr"
+}
+
+if [ "$build_ok" = 1 ]; then
+  if [ ${#pkgs[@]} -gt 0 ]; then
+    say "suite: go test -count=1 -timeout ${timeout}${run_re:+ -run $run_re} ${skip_args[*]-} ${extra[*]-} ${pkgs[*]}"
+    suite_go 1 "${pkgs[*]}" ${suite_env[@]+"${suite_env[@]}"} go "${test_args[@]}" "${pkgs[@]}"
+  fi
+  if [ "$want_deploy" = 1 ]; then
+    say "suite: the deploy scripts' harness (${deploy_test_rel})"
+    suite_go 2 "the deploy harness" go "${test_args[@]}" "$deploy_test_rel"
+  fi
+fi
+t1=$(date +%s)
+
+parse_json "$suite_json" "$out/suite"
+res="$out/suite.results"
+
+# ---------------------------------------------------------------- sort the reds
+
+# One awk pass: a bash read loop over ~3,500 lines takes a minute on a loaded host.
+# A package that skips has no test files and is not counted.
+read -r pkg_total pkg_ok pkg_fail t_total t_pass t_skip t_red <<EOF
+$(awk -F'\t' '
+  $1 == "P" && $3 != "skip" { pt++; if ($3 == "pass") po++; else pf++ }
+  $1 == "T" { tt++; if ($4 == "pass") tp++; else if ($4 == "skip") ts++; else tr++ }
+  END { printf "%d %d %d %d %d %d %d\n", pt, po, pf, tt, tp, ts, tr }' "$res")
+EOF
+
+# A go test that exited non-zero with no failing or unfinished package of its
+# own: it was killed between packages, or failed before or after them. Its
+# packages may look clean, but the run is not.
+while IFS="$(printf '\t')" read -r n rc what; do
+  [ -n "$n" ] && [ "$rc" != 0 ] || continue
+  parse_json "$out/suite.$n.json" "$out/suite.$n"
+  if awk -F'\t' '$1 == "P" && $3 != "pass" && $3 != "skip" { f = 1 } END { exit !f }' "$out/suite.$n.results"; then
+    continue
+  fi
+  add_real "go test (${what}) exited ${rc} with no failing package recorded: it was killed, or failed before, between or after its packages
+$(tail -8 "$out/suite.$n.stderr" | sed 's/^/      | /')"
+done <<EOF
+$invs
+EOF
+
+excerpt() { # <excerpts file> <pkg> <test> -> indented last lines
+  awk -F'\t' -v p="$2" -v t="$3" '$1 == p && $2 == t { sub(/^[^\t]*\t[^\t]*\t/, ""); print "      | " $0 }' "$1" | tail -8
+}
+short() { printf '%s' "$1" | sed 's#^github.com/manaflow-ai/subrouter/##'; }
+
+# Packages that failed as a whole: a build failure, or a run that ended early
+# (a panic, a timeout, os.Exit) -- the tests after that point never ran.
+# shellcheck disable=SC2094 # the loop and the awk inside it only read $res
+while IFS="$(printf '\t')" read -r kind p s flag; do
+  [ "$kind" = P ] || continue
+  case $s in pass|skip) continue ;; esac
+  case $flag in
+    build) add_real "$(short "$p"): did not build
+$(excerpt "$out/suite.excerpts" "$p" -)" ;;
+    timeout) add_real "$(short "$p"): the package hit -timeout ${timeout} and did not finish; tests after that point never ran (a loaded host may need --timeout 60m)
+$(excerpt "$out/suite.excerpts" "$p" -)" ;;
+    aborted) add_real "$(short "$p"): the package stopped early (a panic or an exit); tests after that point never ran
+$(excerpt "$out/suite.excerpts" "$p" -)" ;;
+    *)
+      # shellcheck disable=SC2094 # both only read it
+      if ! awk -F'\t' -v p="$p" '$1 == "T" && $2 == p && ($4 == "fail" || $4 == "unfinished") { found = 1 } END { exit !found }' "$res"; then
+        add_real "$(short "$p"): failed outside any test (TestMain, init or exit)
+$(excerpt "$out/suite.excerpts" "$p" -)"
+      fi ;;
+  esac
+done < "$res"
+
+# A race the detector charged to no failing test is still a race.
+# shellcheck disable=SC2094 # only read
+while IFS="$(printf '\t')" read -r kind p t; do
+  [ "$kind" = R ] && [ "$t" = - ] || continue
+  add_real "$(short "$p"): the race detector reported a data race that no failing test was charged with
+$(excerpt "$out/suite.excerpts" "$p" -)"
+done < "$res"
+raced() { awk -F'\t' -v p="$1" -v t="$2" '$1 == "R" && $2 == p && $3 == t { f = 1 } END { exit !f }' "$res"; }
+
+reruns=0
+mkdir -p "$out/rerun"
+while IFS="$(printf '\t')" read -r kind p t s; do
+  [ "$kind" = T ] || continue
+  case $s in fail|unfinished) ;; *) continue ;; esac
+  name="$(short "$p") ${t}"
+  [ "$s" = unfinished ] && name="${name} (never finished)"
+  # A race needs the crowd that caused it, so a lone re-run proves nothing.
+  if raced "$p" "$t"; then
+    add_real "${name}: the race detector reported a data race in the suite (real, whatever a lone re-run does)
+$(excerpt "$out/suite.excerpts" "$p" "$t")"
+    continue
+  fi
+  if [ "$do_rerun" = 0 ]; then
+    add_real "${name}: failed (not re-run: --no-rerun)
+$(excerpt "$out/suite.excerpts" "$p" "$t")"
+    continue
+  fi
+  if [ "$reruns" -ge "$max_reruns" ]; then
+    add_real "${name}: failed (not re-run: over --max-reruns ${max_reruns})"
+    continue
+  fi
+  reruns=$((reruns + 1))
+  target=$p
+  rerun_env=(${suite_env[@]+"${suite_env[@]}"})
+  if [ "$p" = command-line-arguments ]; then target=$deploy_test_rel; rerun_env=(); fi
+  f="$out/rerun/${reruns}"
+  say "rerun ${reruns}: ${name} alone ..."
+  (cd "$mod" && run_isolated ${rerun_env[@]+"${rerun_env[@]}"} go test -json -count=1 -timeout "$rerun_timeout" -run "^${t}\$" \
+    ${skip_args[@]+"${skip_args[@]}"} ${extra[@]+"${extra[@]}"} "$target") > "$f.json" 2> "$f.stderr" < /dev/null
+  parse_json "$f.json" "$f"
+  lone=$(awk -F'\t' -v t="$t" '$1 == "T" && $3 == t { s = $4 } END { print s }' "$f.results")
+  if [ "$lone" = pass ]; then
+    add_load "${name}: failed in the suite, passed alone
+$(excerpt "$out/suite.excerpts" "$p" "$t")"
+  elif why=$(refusal "$f.excerpts" "$p" "$t"); then
+    why=$(printf '%s' "$why" | sed 's/^[[:space:]]*//' | cut -c1-200)
+    if is_known_refused "$t"; then
+      add_refused "${name}: failed alone on a sandbox refusal (known; rerun/${reruns}.log)
+      | ${why}"
+    else
+      add_real "${name}: failed alone on a sandbox refusal: it reached for a fenced tool, the live daemon or your real home, which no test may do on a developer machine (rerun/${reruns}.log)
+      | ${why}"
+    fi
+  else
+    add_real "${name}: failed again alone (${lone:-no result}; rerun/${reruns}.log)
+$(excerpt "$f.excerpts" "$p" "$t")"
+  fi
+done < "$res"
+t2=$(date +%s)
+
+# ---------------------------------------------------------------- summary
+
+kc_summary() {
+  [ -n "$shim" ] || return 0
+  local calls by named
+  calls=$(wc -l < "$kc_log" | tr -d ' ')
+  by=$(awk '{ n[$2]++ } END { for (k in n) printf "%s %d, ", k, n[k] }' "$kc_log" | sed 's/, $//')
+  # Items not named after a test's temp dir are the ones a real keychain holds.
+  named=$(sed -n 's/.* svc=\(.*\) acct=.*/\1/p' "$kc_log" | grep -v -E -- '-[0-9a-f]{6,}$' | sort -u | head -6 | tr '\n' ';' | sed 's/;$//; s/;/; /g')
+  say "keychain: the fake security answered ${calls} calls${by:+ (${by})}"
+  if [ "$sandbox_on" = 1 ]; then
+    say "  /usr/bin/security by absolute path: refused by the sandbox"
+  else
+    say "  /usr/bin/security by absolute path: NOT fenced (sandbox ${sandbox_note}); the known tests that run it were skipped, and any other test that runs it reaches the real keychain"
+  fi
+  [ -n "$named" ] && say "  services not named after a temp dir (a real keychain holds these): ${named}"
+}
+
+{
+  say ""
+  say "==================== ${prog} summary ===================="
+  say "run: ${goos}/${goarch} ${host_go}, ${label}, $(date '+%Y-%m-%d %H:%M'), load now $(load)"
+  say "time: preflight+suite $((t1 - t0))s, reruns $((t2 - t1))s"
+  say "cgo: ${cgo_note}"
+  say "preflight: ${pre_line}"
+  say "suite: ${pkg_total} package(s) with tests (${pkg_ok} ok, ${pkg_fail} FAIL); ${t_total} top-level tests: ${t_pass} passed, ${t_skip} skipped, ${t_red} red"
+  kc_summary
+  if [ "$sandbox_on" = 1 ] && [ -s "$out/suite.log" ]; then
+    pats=(-e :31415)
+    while IFS= read -r x; do [ -n "$x" ] && pats+=(-e "$x"); done <<LIST
+$fenced_tools
+$real_homes
+LIST
+    denied=$(grep -i 'operation not permitted' "$out/suite.log" | grep -c -F "${pats[@]}")
+    if [ "$denied" -gt 0 ]; then
+      say "sandbox: ${denied} suite-log line(s) show a refusal naming your real home, a fenced tool or :31415 (grep -i 'operation not permitted' suite.log). A refusal a test swallowed prints nothing."
+    fi
+  fi
+  say ""
+  say "REAL FAILURES: ${real_n}  (failed again when run alone, a data race, a refusal outside the known list, or a failure outside a test)"
+  [ -n "$real_lines" ] && printf '%s' "$real_lines" | sed 's/^\([^ |]\)/  - \1/'
+  say ""
+  say "LOAD/TIMING REDS: ${load_n}  (failed in the full run, passed when re-run alone once; still reds)"
+  [ -n "$load_lines" ] && printf '%s' "$load_lines" | sed 's/^\([^ |]\)/  - \1/'
+  say ""
+  if [ "$sandbox_on" = 1 ]; then
+    say "NOT VERIFIED ON MACOS: ${refused_n}  (tests on sr-local-ci's known_refused list, which run the real keychain tool on purpose; the sandbox refuses it here, and on Linux, CI and --docker take the vault-less path, so their macOS keychain branch is verified nowhere)"
+    [ -n "$refused_lines" ] && printf '%s' "$refused_lines" | sed 's/^\([^ |]\)/  - \1/'
+    say ""
+  fi
+  if [ "$real_n" -gt 0 ]; then
+    say "verdict: FAIL (${real_n} real, ${load_n} load/timing, ${refused_n} not verified on macOS)"
+  elif [ "$load_n" -gt 0 ] || [ "$refused_n" -gt 0 ]; then
+    say "verdict: PASS with ${load_n} load/timing red(s) and ${refused_n} not verified on macOS$([ "$strict" = 1 ] && echo ' -- FAIL under --strict')"
+  else
+    say "verdict: PASS"
+  fi
+  say "logs: ${out} (summary.txt, preflight.log, suite.log, suite.json, rerun/)"
+} | tee "$summary"
+
+[ "$real_n" -gt 0 ] && exit 1
+[ "$strict" = 1 ] && [ $((load_n + refused_n)) -gt 0 ] && exit 1
+exit 0

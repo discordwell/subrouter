@@ -32,6 +32,13 @@ import (
 
 func pluginTestServer(t *testing.T, upstream *httptest.Server) http.Handler {
 	t.Helper()
+	return pluginTestServerSharing(t, upstream, nil)
+}
+
+// pluginTestServerSharing is pluginTestServer on the single-flight the test
+// passes, so it can see who is waiting on a fetch.
+func pluginTestServerSharing(t *testing.T, upstream *httptest.Server, flight *singleFlight) http.Handler {
+	t.Helper()
 	codexUpstream, err := url.Parse(upstream.URL + "/backend-api/codex")
 	if err != nil {
 		t.Fatal(err)
@@ -50,6 +57,7 @@ func pluginTestServer(t *testing.T, upstream *httptest.Server) http.Handler {
 		Sessions:     store,
 		Scheduler:    selectacct.NewScheduler(nil),
 		MaxBodyBytes: 1 << 20,
+		CacheFlight:  flight,
 	}.Handler()
 }
 
@@ -123,6 +131,9 @@ func TestSequentialIdenticalPluginRequestsEachReachUpstream(t *testing.T) {
 func TestConcurrentCatalogRequestsShareOneCompleteWalk(t *testing.T) {
 	var listHits atomic.Int32
 	const pages, perPage = 4, 5
+	const clients = 6
+	flight := newSingleFlight()
+	var holdOnce sync.Once
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/backend-api/ps/plugins/list" {
 			http.NotFound(w, r)
@@ -134,10 +145,17 @@ func TestConcurrentCatalogRequestsShareOneCompleteWalk(t *testing.T) {
 			fmt.Sscanf(tok, "page-%d", &page)
 		}
 		if page == 1 {
-			// Keep the leader in flight long enough for every concurrently started
-			// client to join. Without overlap, multiple correct sequential flights
-			// make this a scheduler-speed test instead of a coalescing test.
-			time.Sleep(50 * time.Millisecond)
+			// Hold the leader's first page until every other client waits on its
+			// walk. A fixed sleep here failed under load: each request takes the
+			// session store's lock several times before it reaches the flight,
+			// so the last clients arrived after a 50 ms walk had finished and
+			// correctly started a second one.
+			holdOnce.Do(func() {
+				deadline := time.Now().Add(10 * time.Second)
+				for flight.waiting() < clients-1 && time.Now().Before(deadline) {
+					time.Sleep(time.Millisecond)
+				}
+			})
 		}
 		plugins := make([]map[string]string, 0, perPage)
 		for i := 0; i < perPage; i++ {
@@ -150,11 +168,10 @@ func TestConcurrentCatalogRequestsShareOneCompleteWalk(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(body)
 	}))
 	defer upstream.Close()
-	handler := pluginTestServer(t, upstream)
+	handler := pluginTestServerSharing(t, upstream, flight)
 	proxy := httptest.NewServer(handler)
 	defer proxy.Close()
 
-	const clients = 6
 	bodies := make([][]byte, clients)
 	var wg sync.WaitGroup
 	for i := 0; i < clients; i++ {

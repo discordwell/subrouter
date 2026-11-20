@@ -21,7 +21,9 @@ A shared server autoupdates its worker. A laptop does not, so clients drift behi
 curl -fsSL https://raw.githubusercontent.com/manaflow-ai/subrouter/main/deploy/macos/install-cli-autoupdate.sh | bash
 ```
 
-It installs a LaunchAgent that checks daily, compares the release tag against `~/.subrouter/cli-version`, and exits without downloading when they match. Updates go through `install.sh`, so the release checksum is verified, and a missing binary forces a reinstall even when the marker looks current. Once the installed `sr` has `sr update --auto`, the LaunchAgent hands each run to it instead (same checksum, plus a backup, an idle check, a health check and automatic restore; details in `~/.subrouter/logs/auto-update.log`); install.sh remains the path for older CLIs and for a daemon LaunchAgent that runs a different binary than `~/bin/subrouter`. A Mac that installed the LaunchAgent before this runs its own copy of the updater; rerun the command above to pick up the hand-over. Logs land in `~/Library/Logs/subrouter-cli-autoupdate.log`. Remove it with `launchctl bootout gui/$(id -u)/ai.manaflow.subrouter-cli-autoupdate`.
+It installs a LaunchAgent that checks daily, compares the release tag against `~/.subrouter/cli-version`, and exits without downloading when they match. Updates go through `install.sh`, so the release checksum is verified, and a missing binary forces a reinstall even when the marker looks current. Logs land in `~/Library/Logs/subrouter-cli-autoupdate.log`. Remove it with `launchctl bootout gui/$(id -u)/ai.manaflow.subrouter-cli-autoupdate`.
+
+On this fork, do not install it: it updates to upstream's public release (manaflow-ai/subrouter), which would replace this fork's binary and drop every fork patch. This fork publishes no release. It is built from source, and `ops/deploy/` deploys it to a Mac; see [docs/upgrades.md](docs/upgrades.md).
 
 ### GCP setup prompt
 
@@ -119,34 +121,11 @@ All install paths provide `subrouter`, `sr`, and `cx`. The npm and Python wrappe
 
 ### Updating and rolling back
 
-On a laptop or a self-managed Linux/Windows install (a `sr setup` LaunchAgent, a user or system systemd unit, the Windows scheduled task, or a plain binary on `PATH`):
-
-```bash
-sr update --check          # installed, running and available versions; changes nothing
-sr update                  # install the latest release (asks first; --yes skips the prompt)
-sr update --version v0.1.140
-sr rollback                # put the binary the last update replaced back
-sr rollback --list         # kept backups
-sr rollback --to v0.1.139
-```
-
-`sr update` downloads the release asset and `SHA256SUMS` from the GitHub release (the same source and check as `install.sh`), keeps the replaced binary in `.subrouter-backups/` next to it (the last three), swaps it in atomically along with the `sr`/`cx` aliases, restarts the daemon, and waits for `/_subrouter/health` to report the new version. If health or the version check fails within 45 seconds it restores the previous binary and restarts again. A system-wide install needs `sudo sr update`. `sr doctor` warns when the CLI and the daemon report different versions.
-
-It refuses where something else owns the binary: npm and pip installs upgrade with `npm install -g subrouter@latest` or `pip install --upgrade subrouter` (`pipx upgrade subrouter`), and team hosts use the deploy script instead.
-
-On a supervised team Mac (the `ai.manaflow.subrouter-team` LaunchDaemon), use [`subrouter-deploy.sh`](deploy/macos/DEPLOY.md):
-
-```bash
-sudo subrouter-deploy.sh install-release v0.1.140   # download, verify, hot-swap; reverts itself on failure
-sudo subrouter-deploy.sh pin v0.1.139               # install v0.1.139 and stop autoupdate replacing it
-sudo subrouter-deploy.sh unpin                      # let autoupdate move to the latest release again
-sudo subrouter-deploy.sh list                       # installed version, pin state, kept backups
-sudo subrouter-deploy.sh rollback [--to v0.1.139]   # last-good, or a kept release
-```
+This fork has no `sr update` or `sr rollback`, no `sr doctor` version check, and no `subrouter-deploy.sh`. Upstream's versions of all of them install upstream's public release binary (manaflow-ai/subrouter) in place of this fork's, which drops every fork patch (`ops/PATCHES.md` §23; §37.3 refuses the same binary in `sr server install`), so they are not wired here and the deploy wrappers are not carried. This fork is built from source (a `make build` binary reports its mainline as `local-build`). `ops/deploy/macos/deploy-laptop.sh` deploys it to the laptop. The box's deploy scripts are not in this repo. See [docs/upgrades.md](docs/upgrades.md).
 
 ### Local macOS daemon
 
-On macOS, install Subrouter as a localhost-only LaunchAgent:
+On macOS, install Subrouter as a loopback-only LaunchAgent:
 
 ```bash
 make build
@@ -162,6 +141,8 @@ This installs the binary to `~/bin/subrouter`, installs `~/bin/sr` and `~/bin/cx
 Transcript recording is off by default. Enable it explicitly with `subrouter install-daemon --transcripts ~/.subrouter/transcripts`.
 
 The 10 minute `sr` auto-switch interval is the default. Override it with `subrouter install-daemon --sr-switch-interval 5m`, or disable it with `--sr-switch-interval 0`. The old `--cx-switch-interval` flag remains a compatibility alias.
+
+To serve other machines from this Mac instead, pass a tailnet address and an admin token — `install-daemon` refuses a non-loopback bind without one. See [docs/tailscale.md](docs/tailscale.md).
 
 ### Linux systemd service
 
@@ -201,7 +182,7 @@ GET /_subrouter/dashboard
 GET /_subrouter/transcripts
 ```
 
-`/_subrouter/health` is liveness. `/_subrouter/ready` returns 503 while the process is draining. `/_subrouter/drain` is loopback-only and tells the process to reject new proxy sessions while allowing active sessions to continue. `GET /_subrouter/account-status` validates only expired OAuth tokens; `POST /_subrouter/account-status` force-refreshes token chains and should be reserved for explicit diagnostics. `GET /_subrouter/usage-status` returns account usage data. `sr server status <name>` uses `?refresh=1` to check current provider usage for the stored accounts, including after a previously cached telemetry 429. Use `?snapshot=1` for a read-only historical controller snapshot without another provider usage sweep.
+`/_subrouter/health` is liveness. `/_subrouter/ready` returns 503 while the process is draining. `/_subrouter/drain` tells the process to reject new proxy sessions while allowing active sessions to continue; it takes a loopback caller or, in this fork, a configured admin credential: the admin token, or a tailnet identity `--tailscale-auth` admits (`ops/PATCHES.md` §38). `/_subrouter/resume` undoes it, and lifts a quiesce only for a loopback caller; once SIGTERM has begun the shutdown's drain, every resume answers 409. On the daemon's own machine, `subrouter drain`, `subrouter resume` and `subrouter drain-status` do the same with no token. They use the daemon's drain socket, `<state dir>/drain.sock`, a mode-0600 Unix socket that serves only those three and never TCP (`ops/PATCHES.md` §38.1); `SUBROUTER_DRAIN_SOCKET=<path>|off` moves it or turns it off. `GET /_subrouter/account-status` validates only expired OAuth tokens; `POST /_subrouter/account-status` force-refreshes token chains and should be reserved for explicit diagnostics. `GET /_subrouter/usage-status` returns the account usage data rendered by `sr server status <name>`, from the daemon's shared sweep cache. `?refresh=1` asks for a live provider sweep (the CLI does not send it in this fork: each sweep refreshes every account's token, `ops/PATCHES.md` §44), and `?snapshot=1` returns a read-only historical controller snapshot without another provider usage sweep.
 
 For servers that listen on a non-loopback address, set an admin token before exposing account, session, dashboard, or transcript endpoints:
 
@@ -210,6 +191,8 @@ TOKEN="$(openssl rand -hex 32)"
 sudo sr install-systemd --addr 0.0.0.0:31415 --admin-token "$TOKEN"
 sr server add team --url http://100.64.0.1:31415 --admin-token "$TOKEN" --default
 ```
+
+The macOS equivalent is `install-daemon --addr <tailnet-ip>:31415 --admin-token-file <path>`; [docs/tailscale.md](docs/tailscale.md) covers that topology, including why tailnet membership is not itself authorization.
 
 When `SUBROUTER_ADMIN_TOKEN` or `--admin-token` is set, non-loopback requests to sensitive `/_subrouter/*` endpoints must send `Authorization: Bearer <token>` or `X-Subrouter-Admin-Token: <token>`. Loopback stays trusted for ordinary admin endpoints. Account onboarding uses a distinct `SUBROUTER_ACCOUNT_IMPORT_TOKEN`; that token authorizes only `GET` and `POST /_subrouter/account-import` and cannot access admin APIs or proxy traffic.
 
@@ -255,6 +238,8 @@ Enabling it closes the unsecured legacy default: a caller the tailnet does not r
 sr server add mac-mini --url http://100.64.0.9:31415 --ssh-host worker@mac-mini
 sr server install mac-mini
 ```
+
+On this fork that command refuses: it installs upstream's public release binary before provisioning, which would replace this fork's. This fork deploys its own hosts from a source build instead.
 
 On the host that resolves to `sudo sr install-systemd` on Linux and `sudo sr install-launchd` on macOS. `install-launchd` provisions credentials into an existing LaunchDaemon rather than creating the service: it writes the tokens to 0600 files owned by the service user, points `SUBROUTER_ADMIN_TOKEN_FILE` and `SUBROUTER_ACCOUNT_IMPORT_TOKEN_FILE` at them, and reloads the job. Every other key in the plist is left alone, so a host keeps its supervisor layout, service user, and per-host flags across a credential rotation. Build the service itself with [deploy/macos/migrate-launchdaemon-to-supervisor.sh](deploy/macos/migrate-launchdaemon-to-supervisor.sh) first.
 
@@ -441,10 +426,10 @@ experimental_realtime_ws_base_url = "http://100.64.0.1:31415/v1"
 
 Use `--no-codex-config` to change only Subrouter's selected server. Use `sr server use local` or `sr server clear-default` to return to the local daemon and rewrite Codex config to `127.0.0.1:31415`.
 
-The server name is only a local nickname. Use whatever matches your setup, such as `team`, `prod`, or `staging`. For a one-off command, set `SUBROUTER_SERVER=team` (`SUBROUTER_CODEX_SERVER` is an older alias; when both are set, `SUBROUTER_SERVER` wins).
+The server name is only a local nickname. Use whatever matches your setup, such as `team`, `prod`, or `staging`. For a one-off command, set `SUBROUTER_CODEX_SERVER=team`.
 Rename a local server nickname with `sr server rename <old> <new>`.
 
-Top-level `sr` account commands follow the selected target. If `sr server use team` is active, `sr add`, `sr add-key`, `sr list`, `sr status`, `sr usage`, and `sr pick` talk to that server. If the selected target is local, those same commands use the local account store. Commands without a remote-safe implementation fail before editing local auth when a server is selected. Use `SUBROUTER_SERVER=local sr <command>` for a one-off local command.
+Top-level `sr` account commands follow the selected target. If `sr server use team` is active, `sr add`, `sr add-key`, `sr list`, `sr status`, `sr usage`, and `sr pick` talk to that server. If the selected target is local, those same commands use the local account store. Commands without a remote-safe implementation fail before editing local auth when a server is selected. Use `SUBROUTER_CODEX_SERVER=local sr <command>` for a one-off local command.
 
 Set `SUBROUTER_CODEX_USER_EMAIL` to attribute Codex traffic to a teammate:
 
@@ -529,9 +514,13 @@ Claude profiles are also native Go and use the same Subrouter store:
 sr add claude <profile>                 # 1-year setup token (default)
 sr add claude <profile> --token -       # paste an existing setup token on stdin
 sr claude login <profile>               # classic browser OAuth login (refresh token)
+sr claude addr [<profile>]              # this fork: same as `sr claude login` ("add refresh")
+sr claude move <profile> [<server>]     # this fork: MOVE to a server (upload, verify, drop local)
+sr claude rename <old> <new>            # this fork: re-label a local profile
+sr claude remove <profile> [--server <server>]
 sr claude list
 sr claude switch <profile>
-sr claude env
+sr claude env [<profile>]               # CLAUDE_CONFIG_DIR export for that profile (default: active)
 sr claude run <profile>
 sr claude proxy [claude args...]
 ```
@@ -549,6 +538,11 @@ credential and the profile name defaults to the account email. Profiles created
 that way keep refreshing exactly as before; the two kinds coexist in one store
 and one server pool.
 
+In this fork a refresh-token profile is never left in two places (every refresh
+rotates the token, and the second holder dies): `sr claude login`/`addr` never
+upload, `sr claude push` on such a profile MOVES it, and `sr claude move` is the
+explicit move. A setup token is still copied. See `ops/PATCHES.md` §22.
+
 `sr claude list` reports only isolated local managed profiles and their local
 login state. `sr claude run <profile>` launches one of those profiles directly
 and refuses to start Claude when its local login is unavailable. Bare
@@ -558,47 +552,67 @@ same without the picker, and `sr claude proxy --account <profile>` pins one
 server-pool account with no failover. Server-pool availability is separate from
 local managed-profile login state, so the same label can be usable in
 `sr status` while `sr claude list` says its local profile is not logged in.
-See [Claude proxy home migration](docs/claude-proxy-migration.md) for the shared
-configuration and memory-permission behavior.
 Remote server-pool launches need neither local Claude profiles nor a local
 Subrouter daemon; Claude arguments such as `--resume <session-id>` pass through
 unchanged.
 
+Every one of those launches runs Claude Code with `CLAUDE_CONFIG_DIR` at a
+profile or proxy directory, which hides `~/.claude/settings.json`. Its hooks,
+permissions, status line and other settings therefore ride in the private
+`--settings` file Subrouter already passes, minus every routing and provider
+env key (`ANTHROPIC_BASE_URL`, the auth tokens, `CLAUDE_CODE_USE_BEDROCK` and the
+rest, in any letter case) and the credential-source settings (`apiKeyHelper`,
+`awsAuthRefresh`, `awsCredentialExport`, `gcpAuthRefresh`, `forceLoginMethod`,
+`forceLoginOrgUUID`). A single-value setting the profile directory's own
+settings.json sets (a `/config` change made in that session) keeps the
+profile's value. A launch with no profile already reads `~/.claude` and gets no
+copy, and neither does one given `--setting-sources`.
+`SUBROUTER_CLAUDE_USER_SETTINGS=0` turns the merge off: Claude rejects a whole
+settings file when one field fails its schema, so a broken user file would
+otherwise fail a routed launch. New profile and proxy directories also link
+`plugins/` to `~/.claude/plugins` instead of downloading the marketplace again,
+and `sr claude proxy` homes link the user's `skills`, `agents`, `commands`,
+`CLAUDE.md` and `keybindings.json` wherever the home has nothing of its own
+there (an empty first-run directory is kept beside the link as
+`<name>.subrouter-local`). Before each `sr claude proxy` launch, folder trust you
+accepted in your own Claude (`hasTrustDialogAccepted` and the project onboarding
+flags in `~/.claude.json`, or `$CLAUDE_CONFIG_DIR/.claude.json`) is copied into
+the proxy home's `.claude.json`. Only accepted flags move, an explicit `false`
+there is kept, and your own `.claude.json` is only read, so trust granted inside
+a proxy session stays in that proxy home.
+
 Overload (Anthropic 529 or another 5xx) should be rare and brief, and it is
-API-wide, so by default Subrouter waits it out on the session's own account,
-where its prompt cache lives: it retries after 1s, 2s, 4s and 8s, then every
-15s, for up to 8 minutes from the first attempt (no retry starts past that),
-then passes the 529 to Claude Code, which gives a request 10 minutes.
-`SUBROUTER_CLAUDE_OVERLOAD_MAX_WAIT` on the daemon changes the cap (a Go
-duration; `0` keeps retrying until the client disconnects) and
-`SUBROUTER_CLAUDE_OVERLOAD_RETRY_INTERVAL` the steady gap (at least 500ms; the
-ramp is capped at it, so `2s` retries after 1s, 2s, 2s, ...). With
-`SUBROUTER_CLAUDE_OVERLOAD_RETRY_HEADER=1` on the daemon a client may choose
-its own with the `X-Subrouter-Retry: interval=2s,max-wait=20m` header (either
-key optional; the interval is clamped to 500ms-60m and max-wait capped at 60m,
-and `max-wait=0` also means 60m: only the operator's `MAX_WAIT=0` makes the
-wait unbounded), which is what
-`sr claude --retry-interval 2s --retry-max-wait 20m` sends. To retry harder:
-
-```bash
-# daemon: every 2s after the ramp, for up to 20 minutes
-SUBROUTER_CLAUDE_OVERLOAD_RETRY_INTERVAL=2s SUBROUTER_CLAUDE_OVERLOAD_MAX_WAIT=20m subrouter serve
-# or per launch, when the daemon sets SUBROUTER_CLAUDE_OVERLOAD_RETRY_HEADER=1
-sr claude --retry-interval 2s --retry-max-wait 20m
-```
-
-Past 10 minutes Claude Code's own request timeout ends the request first. A
-long wait is
-logged on its first retry and then about once a minute, and
-`/_subrouter/health` counts requests currently waiting under
-`overload_retry_held`.
-
-If you really want to move a conversation, start or fork a new session (it is
-placed fresh), or launch with `sr claude proxy --account <profile>`. For
-operators who prefer it, `SUBROUTER_CLAUDE_OVERLOAD_REROUTE=1` on the daemon
-opts in to trying one other account, once per request, after the first two
-retries; it costs the conversation its prompt cache. Codex capacity errors
-follow the same rule; see
+API-wide, so Subrouter retries it twice on the session's own account, where
+its prompt cache lives (after about 1s and 2s, longer if the response carries
+a Retry-After, up to 10s). What happens next depends on the status
+(`ops/PATCHES.md` §27, §58): a 529 is passed to Claude Code, which
+retries it itself. A 500, 502, 503 or 504 from a pool account is held instead:
+the daemon keeps the client waiting and runs the whole turn again (selection,
+token refresh, failover, and the two retries above each time) with backoff,
+for up to 8 minutes by default (`--hold-deadline`, `SUBROUTER_HOLD_DEADLINE`;
+0 turns the hold off), and Claude Code sees the 5xx only if the hold gives
+up (its deadline, or a full hold). A session whose prompt cache is warm on an
+account (a peer account it is held on, or its local account) is held the same
+way when that account's peer or upstream cannot be dialed, so an outage does
+not move it to a cold cache. A hold that ends first (its deadline, a full
+hold, a drain) answers 502, Claude Code retries it, and the retry is held
+again: the session waits across retries until its account answers. A session
+held on a peer moves only once that peer is found down, as a refugee: to
+another peer's account first and a local account last, at most 4 warm
+refugees to an account, and never back. With no slot anywhere it keeps its
+hold and waits. A session's held turns give up an hour after its last
+answered turn, when an idle session goes unlinked (`SUBROUTER_STRANDED_GIVE_UP`;
+0 is no limit), with a 503, `Retry-After: 3600` and `X-Subrouter-Reason:
+stranded_gave_up`, which Claude Code shows at once. The session is then
+unlinked, and its next turn is placed as a new session (`ops/PATCHES.md`
+§67). The public listener never holds. Upstream's 8-minute same-account ladder, its
+`SUBROUTER_CLAUDE_OVERLOAD_*` settings, the `X-Subrouter-Retry` header,
+`sr claude --retry-interval/--retry-max-wait` and its opt-in reroute are not
+part of this fork. If you really want to move a conversation, start or fork a
+new session (it is placed fresh), or launch with
+`sr claude proxy --account <profile>`. Codex capacity errors follow a
+different rule: the Codex account failover is on unless
+`SUBROUTER_CODEX_OVERLOAD_FAILOVER=0` (`ops/PATCHES.md` §27); see
 [docs/codex.md](docs/codex.md#selected-model-is-at-capacity).
 
 For manual client configuration, authenticate to the Subrouter proxy rather
@@ -610,7 +624,8 @@ single-tenant server accepts the non-secret placeholder `subrouter`:
   "env": {
     "ANTHROPIC_BASE_URL": "http://127.0.0.1:31415",
     "ANTHROPIC_AUTH_TOKEN": "subrouter",
-    "ANTHROPIC_CUSTOM_HEADERS": "X-Subrouter-Agent: claude"
+    "ANTHROPIC_CUSTOM_HEADERS": "X-Subrouter-Agent: claude",
+    "CLAUDE_CODE_PROMPT_CACHE_TTL": "1h"
   }
 }
 ```
@@ -623,7 +638,8 @@ the same key as the auth token:
   "env": {
     "ANTHROPIC_BASE_URL": "https://router.example/t/srt_REDACTED",
     "ANTHROPIC_AUTH_TOKEN": "srt_REDACTED",
-    "ANTHROPIC_CUSTOM_HEADERS": "X-Subrouter-Agent: claude"
+    "ANTHROPIC_CUSTOM_HEADERS": "X-Subrouter-Agent: claude",
+    "CLAUDE_CODE_PROMPT_CACHE_TTL": "1h"
   }
 }
 ```
@@ -635,13 +651,16 @@ name alone is not trusted. Because `/t/<key>` contains a credential, URL logs
 and diagnostics must redact that path segment. The
 `X-Subrouter-Agent: claude` marker remains required as the agent discriminator;
 it does not replace the tenant path or token. `sr claude proxy` sets all three
-values correctly from the selected server.
+routing values correctly from the selected server.
 Subrouter then selects a Claude OAuth account from its own store, strips client
-auth before forwarding, and adds the OAuth beta header. Claude Code prompt
-caching does not require Subrouter-specific cache settings: Subrouter keeps the
-same Claude conversation pinned to the same Claude account when that account is
-still available, and forwards the client `Anthropic-Beta` values and request
-body `cache_control` blocks unchanged.
+auth before forwarding, and adds the OAuth beta header. Subrouter keeps the same
+Claude conversation pinned to the same Claude account while it is warm, and
+forwards the client `Anthropic-Beta` values and request body `cache_control`
+blocks unchanged.
+
+Prompt caching does need one client setting. `ANTHROPIC_AUTH_TOKEN` makes Claude Code behave as an API-key client, and an API-key client asks for the 5-minute prompt cache on the main thread; a signed-in subscriber gets the 1-hour cache by default. Without `CLAUDE_CODE_PROMPT_CACHE_TTL=1h`, every pause longer than five minutes re-writes the whole conversation prefix (measured 2026-09-24: zero 1-hour cache tokens through Subrouter until the variable was set). So every Subrouter writer and launcher (`sr setup`, `sr claude`, `sr claude push`, the storage/server switches, `claudemode`) sets `CLAUDE_CODE_PROMPT_CACHE_TTL=1h`, unless you already chose a TTL: an existing `CLAUDE_CODE_PROMPT_CACHE_TTL` (any value, even empty), `FORCE_PROMPT_CACHING_5M`, or a top-level `promptCacheTtl` in the same settings file is left alone. Nothing is written either while the environment a writer runs in holds your own export, `FORCE_PROMPT_CACHING_5M` (any value) or `CLAUDE_CODE_PROMPT_CACHE_TTL` with a value other than `1h`: for a terminal launch Claude Code applies settings.json `env` over the environment it started with, so a written `1h` would beat the export. Such an export reaches only launches from a shell that has it; the desktop app and GUI-launched IDEs never see it and get the 5-minute default. An exported `1h` is no conflict, so it is written anyway and reaches every launch. A writer run inside a Claude Code session (`CLAUDECODE` set) ignores exported values altogether: that environment carries every settings file's `env` and the `1h` that `sr claude` injects, and cannot be told from your shell. (`sr claude` itself only adds the key to the environment of the Claude Code it launches, and never over a value already there.) Subagents are not changed (`CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL` stays unset, so they keep 5m: a 1-hour cache write costs 2x base input, a 5-minute one 1.25x). A `promptCacheTtl` in a project or managed settings file is invisible to these writers, and the env value they write beats it; to override, set `env.CLAUDE_CODE_PROMPT_CACHE_TTL` in the user `settings.json` the writer wrote (`~/.claude/settings.json`, or the profile's `settings.json`) to the value you want (every writer keeps an existing value, even an empty one).
+
+Tool search is handled more narrowly. Claude Code turns it off whenever `ANTHROPIC_BASE_URL` is not a first-party Anthropic host, because most proxies drop `tool_reference` blocks; with it off, deferred tools (the desktop app's session tools, MCP tools) are unreachable and every MCP schema is loaded into context up front. Subrouter forwards the request body and the client's `Anthropic-Beta` values unchanged, so `sr claude` adds `ENABLE_TOOL_SEARCH=true` to the environment of a routed Claude Code it launches (never over a value already there, never to a direct profile launch; any settings.json value still wins), and the writers that route a Subrouter profile directory (`sr claude push`, `sr account import` for a profile) write it into that profile's `settings.json` unless the file already has the key. Nothing writes it into your own `~/.claude/settings.json` (or `$CLAUDE_CONFIG_DIR`): that is the file a plain `claude` reads, and `sr setup`, the storage/server switches and `claudemode` leave the key out of it until the routed-session check in `ops/PATCHES.md` §29.9.1 has been signed off. Set it there yourself if you want it for plain `claude` launches.
 
 Gemini has its own `sr gemini` namespace and store scaffold so future routing
 cannot collide with Codex or Claude state. It is not currently a routed

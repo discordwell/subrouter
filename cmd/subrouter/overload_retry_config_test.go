@@ -1,52 +1,61 @@
 package main
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
 
+// Upstream manaflow-ai/subrouter's TestOverloadMaxWaitEnvironment and
+// TestOverloadRetryIntervalEnvironment (#389, as at c9303d3), Codex halves
+// only: the fork does not port the Claude overload ladder (PATCHES section 27).
+
 func TestOverloadMaxWaitEnvironment(t *testing.T) {
-	t.Setenv("SUBROUTER_CLAUDE_OVERLOAD_MAX_WAIT", "")
 	t.Setenv("SUBROUTER_CODEX_CAPACITY_RETRY_MAX_WAIT", "")
-	claude, err := claudeOverloadRetryConfigFromEnvironment()
-	if err != nil || claude.MaxWait != 0 || claude.Unbounded {
-		t.Fatalf("claude = %+v err = %v, want the default", claude, err)
-	}
 	codex, err := codexOverloadFailoverConfigFromEnvironment()
 	if err != nil || codex.StayMaxWait != 0 || codex.StayUnbounded {
 		t.Fatalf("codex = %+v err = %v, want the default", codex, err)
 	}
 
-	t.Setenv("SUBROUTER_CLAUDE_OVERLOAD_MAX_WAIT", "20m")
 	t.Setenv("SUBROUTER_CODEX_CAPACITY_RETRY_MAX_WAIT", "90s")
-	if claude, err = claudeOverloadRetryConfigFromEnvironment(); err != nil || claude.MaxWait != 20*time.Minute || claude.Unbounded {
-		t.Fatalf("claude = %+v err = %v, want 20m", claude, err)
-	}
 	if codex, err = codexOverloadFailoverConfigFromEnvironment(); err != nil || codex.StayMaxWait != 90*time.Second || codex.StayUnbounded {
 		t.Fatalf("codex = %+v err = %v, want 90s", codex, err)
 	}
 
 	for _, zero := range []string{"0", "0s"} {
-		t.Setenv("SUBROUTER_CLAUDE_OVERLOAD_MAX_WAIT", zero)
 		t.Setenv("SUBROUTER_CODEX_CAPACITY_RETRY_MAX_WAIT", zero)
-		if claude, err = claudeOverloadRetryConfigFromEnvironment(); err != nil || !claude.Unbounded {
-			t.Fatalf("claude %q = %+v err = %v, want no cap", zero, claude, err)
-		}
 		if codex, err = codexOverloadFailoverConfigFromEnvironment(); err != nil || !codex.StayUnbounded {
 			t.Fatalf("codex %q = %+v err = %v, want no cap", zero, codex, err)
 		}
 	}
 
 	for _, bad := range []string{"soon", "-1m"} {
-		t.Setenv("SUBROUTER_CLAUDE_OVERLOAD_MAX_WAIT", bad)
-		if _, err := claudeOverloadRetryConfigFromEnvironment(); err == nil {
-			t.Fatalf("SUBROUTER_CLAUDE_OVERLOAD_MAX_WAIT=%q accepted", bad)
-		}
-		t.Setenv("SUBROUTER_CLAUDE_OVERLOAD_MAX_WAIT", "")
 		t.Setenv("SUBROUTER_CODEX_CAPACITY_RETRY_MAX_WAIT", bad)
 		if _, err := codexOverloadFailoverConfigFromEnvironment(); err == nil {
 			t.Fatalf("SUBROUTER_CODEX_CAPACITY_RETRY_MAX_WAIT=%q accepted", bad)
 		}
 		t.Setenv("SUBROUTER_CODEX_CAPACITY_RETRY_MAX_WAIT", "")
+	}
+}
+
+func TestOverloadRetryIntervalEnvironment(t *testing.T) {
+	for _, key := range []string{"SUBROUTER_CODEX_CAPACITY_RETRY_INTERVAL", "SUBROUTER_CODEX_CAPACITY_RETRY_MAX_WAIT"} {
+		t.Setenv(key, "")
+	}
+	t.Setenv("SUBROUTER_CODEX_CAPACITY_RETRY_INTERVAL", "500ms")
+	codex, err := codexOverloadFailoverConfigFromEnvironment()
+	if err != nil || codex.StayInterval != 500*time.Millisecond {
+		t.Fatalf("codex = %+v err = %v, want the 500ms floor accepted", codex, err)
+	}
+
+	// Below the floor is rejected, not clamped.
+	for _, bad := range []string{"499ms", "0", "fast"} {
+		t.Setenv("SUBROUTER_CODEX_CAPACITY_RETRY_INTERVAL", bad)
+		if _, err := codexOverloadFailoverConfigFromEnvironment(); err == nil {
+			t.Fatalf("SUBROUTER_CODEX_CAPACITY_RETRY_INTERVAL=%q accepted", bad)
+		} else if bad == "499ms" && !strings.Contains(err.Error(), "at least 500ms") {
+			t.Fatalf("error = %v, want it to name the 500ms floor", err)
+		}
+		t.Setenv("SUBROUTER_CODEX_CAPACITY_RETRY_INTERVAL", "")
 	}
 }

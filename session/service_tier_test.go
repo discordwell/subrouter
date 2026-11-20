@@ -2,12 +2,18 @@ package session
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 )
 
+// Ported from upstream manaflow-ai/subrouter session/service_tier_test.go
+// (862a5a5, #382). The zstd case is the fork's: codex-cli compresses every
+// responses body, and a tier read off the compressed bytes would silently mark
+// every failure in the default pool.
 func TestExtractServiceTierRestoresBody(t *testing.T) {
 	cases := map[string]string{
 		`{"model":"gpt-6-astra","service_tier":"priority","input":[]}`: "priority",
@@ -27,8 +33,36 @@ func TestExtractServiceTierRestoresBody(t *testing.T) {
 	}
 }
 
+func TestExtractServiceTierReadsZstdCodexBody(t *testing.T) {
+	// A conversation-sized body, so zstd Huffman-codes its literals: a short
+	// one is stored as raw literals and a scan of the COMPRESSED bytes would
+	// find the tier too, proving nothing about the decode.
+	var input strings.Builder
+	for i := range 400 {
+		fmt.Fprintf(&input, "turn %d said %x; ", i, i*7919)
+	}
+	body := `{"model":"gpt-6-astra","input":[{"role":"user","content":"` + input.String() + `"}],"service_tier":"priority"}`
+	wire := zstdBytes(t, body)
+	if bytes.Contains(wire, []byte("service_tier")) || bytes.Contains(wire, []byte("priority")) {
+		t.Fatal("fixture drift: the compressed body carries the tier in the clear")
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(wire))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Content-Encoding", "zstd")
+	req.ContentLength = int64(len(wire))
+	if got := ExtractServiceTier(req, 1<<20); got != "priority" {
+		t.Fatalf("ExtractServiceTier on a zstd body = %q, want priority", got)
+	}
+	rest, _ := io.ReadAll(req.Body)
+	if !bytes.Equal(rest, wire) {
+		t.Fatal("zstd body was not restored byte-identical for the upstream")
+	}
+}
+
 // ExtractBodySize measures the decoded body, so a zstd-compressed long
-// conversation reads as long rather than as its small wire size.
+// conversation reads as long rather than as its small wire size. Upstream's
+// test (c9303d3, #454), unchanged: the Codex overload failover's size cap
+// (#457) reads it, and codex-cli compresses every responses body.
 func TestExtractBodySizeReportsDecodedLength(t *testing.T) {
 	body := `{"model":"gpt-6-astra","input":[{"type":"message","content":"` + strings.Repeat("hello world ", 20000) + `"}]}`
 	plain, _ := http.NewRequest(http.MethodPost, "http://x/responses", strings.NewReader(body))

@@ -1,0 +1,198 @@
+#!/usr/bin/env python3
+"""public-scrub -- replace private values in this repo's tracked files with fixed placeholders.
+
+The map lives outside the repo so the repo never holds the real values:
+$SUBROUTER_PUBLIC_SCRUB_MAP, else ~/.config/subrouter-public-scrub/map.tsv. Each line is
+<kind> TAB <real> TAB <placeholder>. Every branch uses the same map, so the same real value
+always becomes the same placeholder and a rebased branch merges cleanly.
+
+Kinds: ip, ip6, email, dns (a domain suffix, matched after a dot), label, and label-cs (a
+label that --check matches only in the case the map gives).
+
+  public-scrub                 rewrite the tracked files in place; print a count per file
+  public-scrub --check         change nothing; print each file:line that still holds a real value; exit 1 if any
+  public-scrub --check --rev R the same for the tree of commit R, read through git, so no checkout is needed
+
+The rewrite replaces each value exactly as the map writes it. --check also finds what the
+rewrite leaves: another case, a label at a camelCase boundary (fooBar), an email's local part
+on its own, and an IP address written with hyphens or URL-encoded separators. Fix those by hand.
+"""
+import os, re, shutil, subprocess, sys
+
+KINDS = {"ip", "ip6", "email", "dns", "label", "label-cs"}
+
+def load_map():
+    path = os.environ.get("SUBROUTER_PUBLIC_SCRUB_MAP") or os.path.expanduser("~/.config/subrouter-public-scrub/map.tsv")
+    try:
+        lines = open(path, encoding="utf-8").read().splitlines()
+    except FileNotFoundError:
+        sys.exit(f"public-scrub: no map at {path}")
+    rows = [l.split("\t") for l in lines if l and not l.startswith("#")]
+    bad = [r for r in rows if len(r) != 3 or r[0] not in KINDS]
+    if bad:
+        sys.exit(f"public-scrub: {len(bad)} malformed map line(s) in {path}")
+    return sorted(rows, key=lambda r: len(r[1]), reverse=True)
+
+def pattern(kind, real):
+    v = re.escape(real)
+    if kind == "ip":
+        return re.compile(r"(?<![\d.])" + v + r"(?!\.?\d)")
+    if kind == "ip6":
+        return re.compile(r"(?<![0-9A-Fa-f:])" + v + r"(?![0-9A-Fa-f:])")
+    if kind == "email":
+        return re.compile(r"(?<![\w.+-])" + v + r"(?![\w-])")
+    if kind == "dns":
+        return re.compile(r"(?<![A-Za-z0-9-])" + v + r"(?![A-Za-z0-9-])")
+    return re.compile(r"(?<![A-Za-z0-9@.])" + v + r"(?![A-Za-z0-9@])")
+
+# --check finds each value with a plain substring search of the lower-cased bytes, then tests
+# the bytes on either side: each kind's edges(t, i, j) says whether t[i:j] stands on its own.
+def at(t, i):
+    return t[i:i + 1] if i >= 0 else b""
+
+def label_edges(t, i, j):
+    # A camelCase boundary (fooBar) also ends a label: an upper-case letter after a lower-case
+    # letter or digit.
+    camel = lambda a, b: (a.islower() or a.isdigit()) and b.isupper()
+    left = not at(t, i - 1).isalnum() or camel(at(t, i - 1), at(t, i))
+    right = not at(t, j).isalnum() or camel(at(t, j - 1), at(t, j))
+    return left and right
+
+def ip_edges(t, i, j):
+    left = not (at(t, i - 1).isdigit() or at(t, i - 1) == b".")
+    right = not (at(t, j).isdigit() or at(t, j) in (b".", b"-") and at(t, j + 1).isdigit())
+    return left and right
+
+def ip6_edges(t, i, j):
+    hex_or_colon = lambda c: c != b"" and c in b"0123456789abcdefABCDEF:"
+    return not hex_or_colon(at(t, i - 1)) and not hex_or_colon(at(t, j))
+
+def email_edges(t, i, j):
+    return not (at(t, i - 1).isalnum() or at(t, i - 1) in b"_.+-" and at(t, i - 1) != b"") and \
+        not (at(t, j).isalnum() or at(t, j) in b"_-" and at(t, j) != b"")
+
+def dns_edges(t, i, j):
+    return not (at(t, i - 1).isalnum() or at(t, i - 1) == b"-") and not (at(t, j).isalnum() or at(t, j) == b"-")
+
+def needles(kind, real, case_sensitive):
+    """(bytes to find, match case exactly, edges): a superset of what the rewrite replaces."""
+    if kind == "ip":
+        parts = real.split(".")
+        return [(sep.join(parts).encode(), False, ip_edges) for sep in (".", "-", "%2e")]
+    if kind == "ip6":
+        parts = real.lower().split(":")
+        return [(sep.join(parts).encode(), False, ip6_edges) for sep in (":", "-", "%3a")]
+    if kind == "email":
+        local = real.split("@")[0]
+        return [(real.lower().encode(), False, email_edges),
+                (local.encode() if local.lower() in case_sensitive else local.lower().encode(),
+                 local.lower() in case_sensitive, label_edges)]
+    if kind == "dns":
+        return [(real.lower().encode(), False, dns_edges)]
+    if kind == "label-cs":
+        return [(real.encode(), True, label_edges)]
+    return [(real.lower().encode(), False, label_edges)]
+
+def hits(data, all_needles):
+    """The offsets in data where a value starts."""
+    lower = data.lower()
+    out = []
+    for needle, exact, edges in all_needles:
+        hay = data if exact else lower
+        i = hay.find(needle)
+        while i >= 0:
+            if edges(data, i, i + len(needle)):
+                out.append(i)
+            i = hay.find(needle, i + 1)
+    return out
+
+def text_of(data):
+    if b"\0" in data[:8192]:
+        return None
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+def worktree_files(root):
+    out = subprocess.run(["git", "-C", root, "ls-files", "-z"], capture_output=True, check=True).stdout
+    for rel in out.decode().split("\0"):
+        p = os.path.join(root, rel)
+        if rel and os.path.isfile(p) and not os.path.islink(p):
+            yield rel, open(p, "rb").read()
+
+def commit_files(rev):
+    out = subprocess.run(["git", "ls-tree", "-r", "-z", rev], capture_output=True, check=True).stdout
+    blobs = []
+    for entry in out.decode().split("\0"):
+        if entry:
+            meta, rel = entry.split("\t", 1)
+            mode, kind, sha = meta.split()
+            if kind == "blob" and mode != "120000":
+                blobs.append((rel, sha))
+    batch = subprocess.run(["git", "cat-file", "--batch"], input="".join(sha + "\n" for _, sha in blobs).encode(),
+                           capture_output=True, check=True).stdout
+    pos = 0
+    for rel, _ in blobs:
+        eol = batch.index(b"\n", pos)
+        size = int(batch[pos:eol].split()[2])
+        yield rel, batch[eol + 1:eol + 1 + size]
+        pos = eol + 2 + size
+
+def check(rows, files):
+    case_sensitive = {real.lower() for kind, real, _ in rows if kind == "label-cs"}
+    all_needles = [n for kind, real, _ in rows for n in needles(kind, real, case_sensitive)]
+    found = 0
+    for rel, data in files:
+        if hits(rel.encode(), all_needles):
+            found += 1
+            print(f"{rel}: in the path")
+        if text_of(data) is None:
+            continue
+        for line in sorted({data.count(b"\n", 0, i) + 1 for i in hits(data, all_needles)}):
+            found += 1
+            print(f"{rel}:{line}")
+    return 1 if found else 0
+
+def main():
+    args = sys.argv[1:]
+    rows = load_map()
+    if args[:1] == ["--check"]:
+        args = args[1:]
+        if not args:
+            return check(rows, worktree_files(git_root()))
+    if len(args) == 2 and args[0] == "--rev":
+        return check(rows, commit_files(args[1]))
+    if args:
+        sys.exit(__doc__)
+    root = git_root()
+    pats = [(pattern(k, real), ph) for k, real, ph in rows]
+    found = 0
+    rewritten_go = []
+    for rel, data in worktree_files(root):
+        text = text_of(data)
+        if text is None:
+            continue
+        new, n = text, 0
+        for rx, ph in pats:
+            new, k = rx.subn(ph, new)
+            n += k
+        if not n:
+            continue
+        found += n
+        p = os.path.join(root, rel)
+        open(p, "w", encoding="utf-8").write(new)
+        print(f"{n:5}  {rel}")
+        if rel.endswith(".go"):
+            rewritten_go.append(p)
+    if rewritten_go and shutil.which("gofmt"):
+        # A placeholder of another length shifts gofmt's column alignment.
+        subprocess.run(["gofmt", "-w", *rewritten_go], check=True)
+    print(f"replaced {found} value(s)", file=sys.stderr)
+    return 0
+
+def git_root():
+    return subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True, check=True).stdout.strip()
+
+if __name__ == "__main__":
+    sys.exit(main())

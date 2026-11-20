@@ -15,10 +15,13 @@ import (
 
 // errCodexWebSocketTurnRetry says an upstream Codex websocket turn failed
 // for a server-side reason (capacity, overload) before the client saw any of
-// its output, on an autonomous connection. The failure is not delivered and
-// the client socket stays open: the relay replays the turn's response.create
-// upstream itself. Closing 1012 instead would make Codex reconnect and print
-// "continue (the model was at capacity)" once per failure.
+// its output, on a connection that can retry it in another egress region
+// (upstream #666). The failure is not delivered and the client socket stays
+// open: the relay replays the turn's response.create upstream itself.
+// Closing 1012 instead would make Codex reconnect and print "continue (the
+// model was at capacity)" once per failure. Upstream also replayed turns
+// without a budget for clients on its autonomous retry policy (#505), which
+// this fork does not port (PATCHES §27 declines client-held capacity waits).
 var errCodexWebSocketTurnRetry = errors.New("codex websocket turn is retried behind the open client socket")
 
 const (
@@ -46,7 +49,7 @@ func (s Server) webSocketTurnRetryDelay(attempt int) time.Duration {
 }
 
 // webSocketUpstreamLink is the upstream side of one proxied websocket. Data
-// frames to the upstream are written through it so an autonomous retry can
+// frames to the upstream are written through it so a region retry can
 // resend a turn, or swap in a freshly dialed connection, without racing the
 // client-to-upstream copy.
 type webSocketUpstreamLink struct {
@@ -57,7 +60,7 @@ type webSocketUpstreamLink struct {
 	// backoff stops there.
 	done chan struct{}
 	// redial opens a new upstream connection on the same account, nil when
-	// the connection is not autonomous.
+	// the connection has no region retry.
 	redial func(context.Context) (*websocket.Conn, error)
 	// region is the slot the current connection went out of; regional says
 	// the dial could have gone elsewhere (codex_websocket_regions.go).
@@ -87,7 +90,7 @@ func (l *webSocketUpstreamLink) openWriter(messageType int) (io.WriteCloser, err
 		l.mu.Unlock()
 		return nil, err
 	}
-	return &lockedWebSocketWriter{WriteCloser: writer, unlock: l.mu.Unlock}, nil
+	return &lockedWebSocketWriter{WriteCloser: writer, unlock: l.mu.Unlock, link: l}, nil
 }
 
 func (l *webSocketUpstreamLink) send(body []byte) error {
@@ -144,6 +147,7 @@ type lockedWebSocketWriter struct {
 	io.WriteCloser
 	once   sync.Once
 	unlock func()
+	link   *webSocketUpstreamLink
 }
 
 func (w *lockedWebSocketWriter) Close() error {
@@ -152,10 +156,29 @@ func (w *lockedWebSocketWriter) Close() error {
 	return err
 }
 
+// abandon gives up a vetoed client message without finishing it and ends the
+// link. The fork's relay vetoes a client message that would start a turn on a
+// stopping process (errWebSocketTurnRefused, PATCHES §38); upstream's
+// relay never vetoes in that direction. Left open, this writer kept the link
+// locked, so link.close() blocked forever and the handler never returned. The
+// message's final frame is never written: gorilla flushes an open writer only
+// on the connection's next NextWriter, and once the link is marked closed
+// send and swap refuse, so nothing can call it before close() drops the
+// connection.
+func (w *lockedWebSocketWriter) abandon() {
+	w.once.Do(func() {
+		if w.link != nil && !w.link.closed {
+			w.link.closed = true
+			close(w.link.done)
+		}
+		w.unlock()
+	})
+}
+
 // bufferedWebSocketWriter writes its message to the client only on Close.
 // streamWebSocketMessage vetoes a message by never closing its writer, and a
-// gorilla writer left open is flushed by the connection's next NextWriter; an
-// autonomous connection keeps writing after a veto, so its client messages
+// gorilla writer left open is flushed by the connection's next NextWriter; a
+// region-retry connection keeps writing after a veto, so its client messages
 // are held until they are known to be deliverable.
 type bufferedWebSocketWriter struct {
 	conn        *websocket.Conn
@@ -198,8 +221,8 @@ func (s Server) retryCodexWebSocketTurn(ctx context.Context, link *webSocketUpst
 	}
 	chained := codexWebSocketCreateChained(body)
 	if modelState.regionRetry && chained {
-		// Only the old connection holds the previous response, and a
-		// non-autonomous client did not opt into waiting on it.
+		// Only the old connection holds the previous response, and the
+		// client did not opt into waiting on it.
 		return false
 	}
 	if connAlive && !chained && link.regional {
@@ -259,13 +282,3 @@ func (e webSocketRedialCredentialError) Error() string {
 	return "upstream rejected the credential: " + e.err.Error()
 }
 func (e webSocketRedialCredentialError) Unwrap() error { return e.err }
-
-// webSocketUpstreamLost reports a copy error that is the connection itself
-// failing, as opposed to a relay decision (quota reroute, Azure divert, a
-// bounded capacity retry) or an oversized message, which a redial cannot fix.
-func webSocketUpstreamLost(err error) bool {
-	return !errors.Is(err, errCodexWebSocketReroute) &&
-		!errors.Is(err, errAzureCodexWebSocketDivert) &&
-		!errors.Is(err, errCodexWebSocketCapacityRetry) &&
-		!errors.Is(err, websocket.ErrReadLimit)
-}

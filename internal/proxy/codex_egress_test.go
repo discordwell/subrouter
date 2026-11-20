@@ -83,7 +83,7 @@ func codexEgressServer(t *testing.T, poolURL *url.URL, proxies []*url.URL, accou
 		MaxBodyBytes:  1 << 20,
 		Logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
 		// The fallbacks are under test, not the default capacity retry in
-		// front of them; tests that want it replace this.
+		// front of them; tests that want it replace this (upstream #389).
 		CodexOverloadFailover: withoutCapacityRetry(),
 	}
 	if len(proxies) > 0 {
@@ -118,8 +118,6 @@ func codexEgressPost(t *testing.T, proxyURL, sessionID string) (int, string) {
 		t.Fatal(err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set(CodexCapacityRetryableHeader, "1")
-	req.Header.Set(AgentRetryPolicyHeader, "bounded")
 	response, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
@@ -238,8 +236,8 @@ func TestCodexEgressAllRegionsFailReturnsPoolResponse(t *testing.T) {
 	defer proxy.Close()
 
 	status, body := codexEgressPost(t, proxy.URL, "session-4")
-	if status != http.StatusServiceUnavailable || !strings.Contains(body, "subrouter_capacity_retry") || strings.Contains(body, "server_is_overloaded") {
-		t.Fatalf("status=%d body=%s, want a retryable capacity failure", status, body)
+	if status != http.StatusOK || !strings.Contains(body, "server_is_overloaded") {
+		t.Fatalf("status=%d body=%s, want the pool's own failure stream", status, body)
 	}
 	if calls.Load() != 1 {
 		t.Fatalf("egress calls=%d, want 1", calls.Load())
@@ -282,7 +280,7 @@ func TestCodexEgressOffByDefault(t *testing.T) {
 	defer proxy.Close()
 
 	status, body := codexEgressPost(t, proxy.URL, "session-6")
-	if status != http.StatusServiceUnavailable || !strings.Contains(body, "subrouter_capacity_retry") || strings.Contains(body, "server_is_overloaded") {
+	if status != http.StatusOK || !strings.Contains(body, "server_is_overloaded") {
 		t.Fatalf("status=%d body=%s", status, body)
 	}
 }
@@ -364,9 +362,9 @@ func TestCodexEgressCapsAttemptsPerRequest(t *testing.T) {
 	proxy := httptest.NewServer(server.Handler())
 	defer proxy.Close()
 
-	status, _ := codexEgressPost(t, proxy.URL, "session-cap")
-	if status != http.StatusServiceUnavailable {
-		t.Fatalf("status=%d, want the pool's capacity failure", status)
+	status, body := codexEgressPost(t, proxy.URL, "session-cap")
+	if status != http.StatusOK || !strings.Contains(body, "server_is_overloaded") {
+		t.Fatalf("status=%d body=%s, want the pool's own failure stream", status, body)
 	}
 	if calls.Load() != 3 {
 		t.Fatalf("egress calls=%d, want 3", calls.Load())
@@ -433,8 +431,8 @@ func TestCodexEgressPinnedSessionSharesAttemptBudget(t *testing.T) {
 	}
 	shortage.Store(true)
 	calls.Store(0)
-	if status, _ := codexEgressPost(t, proxy.URL, "session-budget"); status != http.StatusServiceUnavailable {
-		t.Fatalf("second turn status=%d, want the capacity failure", status)
+	if status, body := codexEgressPost(t, proxy.URL, "session-budget"); status != http.StatusOK || !strings.Contains(body, "server_is_overloaded") {
+		t.Fatalf("second turn status=%d body=%s, want the pool's own failure stream", status, body)
 	}
 	// 3 from the shared egress budget, plus the pool attempt between the
 	// passes, which leaves through a region too while local is cooling.

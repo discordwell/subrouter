@@ -3,6 +3,7 @@ package proxy
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"sort"
 	"sync"
@@ -160,6 +161,34 @@ type CodexCapacityEventCount struct {
 	Last15m int    `json:"last_15m"`
 	Last1h  int    `json:"last_1h"`
 	Last24h int    `json:"last_24h"`
+}
+
+// CodexCapacityReport is the payload of /_subrouter/codex-capacity: per
+// (model, region) health and the capacity event counts (upstream #665).
+// Upstream's report also carries #599's per-account capacity history and its
+// persistent and taint rules, which this fork does not keep (PATCHES §27:
+// upstream 862a5a5's capacity marks as written).
+type CodexCapacityReport struct {
+	GeneratedAt string `json:"generated_at"`
+	// Regions is per (model, region) health: local is the router's own
+	// uplink, the rest are regional egresses (codex_regions.go).
+	Regions []CodexRegionReport `json:"regions,omitempty"`
+	// Events counts capacity failures by outcome and region, with the
+	// recent client-visible ones.
+	Events *CodexCapacityEventsReport `json:"events,omitempty"`
+}
+
+// handleCodexCapacity serves the capacity report.
+func (s Server) handleCodexCapacity(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	writeJSON(w, CodexCapacityReport{
+		GeneratedAt: time.Now().UTC().Format(time.RFC3339),
+		Regions:     s.codexRegions.snapshot(),
+		Events:      s.codexCapacityEvents.snapshot(),
+	})
 }
 
 // CodexCapacityEventsReport is the events section of /_subrouter/codex-capacity.

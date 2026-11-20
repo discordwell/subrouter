@@ -21,6 +21,16 @@ func TestInstalledClaudeAcceptsPrivateSettingsTransport(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
+	// Baseline: the CLI on PATH must answer a bare --version before its
+	// verdict on --settings means anything. A stub (the sandboxed test recipe
+	// puts an exit-1 `claude` first on PATH so no test can start a real login)
+	// or a broken install fails here, and that says nothing about the
+	// settings transport.
+	baseline := exec.CommandContext(ctx, path, "--version")
+	baseline.Env = os.Environ()
+	if out, err := baseline.CombinedOutput(); err != nil {
+		t.Skipf("Claude CLI at %s does not answer --version (%v: %s); cannot judge the settings transport", path, err, bytes.TrimSpace(out))
+	}
 	cmd := exec.CommandContext(ctx, path)
 	settingsArg, cleanup, err := attachClaudeLaunchSettings(cmd, []byte(`{"env":{"SUBROUTER_TRANSPORT_SMOKE":"1"}}`))
 	if err != nil {

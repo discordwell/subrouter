@@ -1,0 +1,629 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Switchboard</title>
+<style>
+:root{
+  --bg:#0A0C11; --panel:rgba(255,255,255,.035); --edge:rgba(255,255,255,.07);
+  --hair:rgba(255,255,255,.055); --hover:rgba(255,255,255,.045);
+  --ink:#E7EAF0; --dim:rgba(231,234,240,.45); --faint:rgba(231,234,240,.28);
+  --claude:#E9A23B; --codex:#3BE9C7;
+  --ok:#4ADE80; --burn:#FBBF24; --dead:#F87171; --drain:#A78BFA;
+  --shared:#60A5FA; --unknown:#6B7280; --pristine:#38BDF8;
+  --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;
+}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{
+  margin:0;background:
+    radial-gradient(1200px 700px at 12% -10%,rgba(59,233,199,.06),transparent 60%),
+    radial-gradient(1000px 600px at 92% 0%,rgba(233,162,59,.05),transparent 60%),
+    var(--bg);
+  color:var(--ink);
+  font:13px/1.45 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;
+  -webkit-font-smoothing:antialiased;
+  padding:14px 16px 40px;
+}
+.num{font-family:var(--mono);font-variant-numeric:tabular-nums;text-align:right}
+.lbl{font-size:10px;letter-spacing:.07em;text-transform:uppercase;color:var(--faint)}
+
+/* ---- chrome ---------------------------------------------------------- */
+header{
+  display:flex;align-items:center;gap:18px;flex-wrap:wrap;
+  background:var(--panel);border:1px solid var(--edge);border-radius:16px;
+  backdrop-filter:blur(24px) saturate(160%);-webkit-backdrop-filter:blur(24px) saturate(160%);
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.05);
+  padding:10px 16px;margin-bottom:10px;
+}
+.brand{font-weight:650;letter-spacing:.14em;font-size:12px;text-transform:uppercase}
+.brand em{font-style:normal;color:var(--codex);text-shadow:0 0 12px rgba(59,233,199,.45)}
+header .sep{flex:1}
+.chip{
+  display:inline-flex;align-items:center;gap:6px;padding:2px 9px;border-radius:999px;
+  border:1px solid var(--edge);background:rgba(255,255,255,.03);font-size:11px;color:var(--dim)
+}
+.chip b{color:var(--ink);font-family:var(--mono);font-weight:600}
+kbd{
+  font-family:var(--mono);font-size:10px;padding:1px 5px;border-radius:5px;
+  border:1px solid var(--edge);background:rgba(255,255,255,.05);color:var(--dim)
+}
+
+/* ---- daemon cards + spill -------------------------------------------- */
+.strip{display:grid;grid-template-columns:1fr 1fr 1.35fr;gap:10px;margin-bottom:10px}
+.card{
+  background:var(--panel);border:1px solid var(--edge);border-radius:14px;
+  backdrop-filter:blur(24px) saturate(160%);-webkit-backdrop-filter:blur(24px) saturate(160%);
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.05);padding:9px 13px;
+}
+.card h3{margin:0 0 5px;font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--dim);display:flex;gap:8px;align-items:center}
+.dot{width:6px;height:6px;border-radius:50%;background:var(--ok);box-shadow:0 0 8px currentColor;color:var(--ok)}
+.dot.bad{background:var(--dead);color:var(--dead)}
+.dot.warn{background:var(--burn);color:var(--burn)}
+.card .row{display:flex;gap:14px;flex-wrap:wrap;align-items:baseline}
+.card .big{font-family:var(--mono);font-size:17px;font-variant-numeric:tabular-nums}
+.spill-line{display:flex;gap:9px;align-items:baseline;padding:2px 0;font-size:11.5px}
+.spill-line .who{font-family:var(--mono);font-size:10px;letter-spacing:.06em;text-transform:uppercase;min-width:52px}
+.verdict{font-family:var(--mono);font-size:10px;padding:1px 7px;border-radius:999px;border:1px solid var(--edge)}
+.verdict.local{color:var(--ok);border-color:rgba(74,222,128,.35);background:rgba(74,222,128,.08)}
+.verdict.peer{color:var(--shared);border-color:rgba(96,165,250,.4);background:rgba(96,165,250,.1)}
+.reason{color:var(--dim);font-size:11px}
+
+/* ---- board ----------------------------------------------------------- */
+.board{
+  background:var(--panel);border:1px solid var(--edge);border-radius:16px;
+  backdrop-filter:blur(24px) saturate(160%);-webkit-backdrop-filter:blur(24px) saturate(160%);
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.05);padding:6px 8px 10px;overflow-x:auto;
+}
+.stale{opacity:.55;filter:saturate(.5)}
+.grouphead{
+  display:flex;align-items:center;gap:10px;padding:9px 8px 5px;
+  font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--dim)
+}
+.grouphead .tag{font-weight:650;color:var(--ink)}
+.grouphead.claude .tag{color:var(--claude)}
+.grouphead.codex .tag{color:var(--codex)}
+.grouphead .rule{flex:1;height:1px;background:var(--hair)}
+table{width:100%;border-collapse:separate;border-spacing:0 1px;font-size:12px}
+th{
+  font-size:9.5px;letter-spacing:.08em;text-transform:uppercase;color:var(--faint);
+  font-weight:500;text-align:left;padding:2px 7px 4px;white-space:nowrap
+}
+th.r{text-align:right}
+td{padding:4px 7px;border-top:1px solid transparent;border-bottom:1px solid transparent;white-space:nowrap}
+tr.row td{background:transparent;transition:background .12s}
+tr.row:hover td{background:var(--hover)}
+tr.row.sel td{background:rgba(59,233,199,.06)}
+tr.row.sel td:first-child{box-shadow:inset 2px 0 0 var(--codex);border-radius:8px 0 0 8px}
+tr.row.claude.sel td{background:rgba(233,162,59,.06)}
+tr.row.claude.sel td:first-child{box-shadow:inset 2px 0 0 var(--claude)}
+tr.row td:first-child{border-radius:8px 0 0 8px}
+tr.row td:last-child{border-radius:0 8px 8px 0}
+.acct{font-family:var(--mono);font-size:11.5px;max-width:200px;overflow:hidden;text-overflow:ellipsis;display:inline-block;vertical-align:bottom}
+.unmeasured .acct{color:var(--dim)}
+
+/* status glyph */
+.st{font-size:11px;width:14px;display:inline-block;text-align:center}
+.st.ok{color:var(--ok)} .st.burn{color:var(--burn)} .st.week,.st.short{color:var(--dead)}
+.st.drain{color:var(--drain)} .st.unknown{color:var(--unknown)} .st.pristine{color:var(--pristine)}
+.st.active{text-shadow:0 0 9px currentColor}
+/* the reset-hold 2x beside a raw pace (PATCHES §56) */
+.hold{font-family:var(--mono);font-size:9.5px;color:var(--drain)}
+
+/* pool badge */
+.pool{font-family:var(--mono);font-size:9.5px;letter-spacing:.04em;padding:1px 5px;border-radius:5px;border:1px solid var(--edge);color:var(--dim)}
+.pool.both{color:var(--shared);border-color:rgba(96,165,250,.4);background:rgba(96,165,250,.09)}
+
+/* meters */
+.meter{position:relative;width:74px;height:6px;border-radius:3px;background:rgba(255,255,255,.06);overflow:hidden;display:inline-block;vertical-align:middle}
+.meter>i{position:absolute;top:0;bottom:0;left:0;border-radius:3px;display:block;
+  box-shadow:0 0 8px currentColor;border-top:1px solid rgba(255,255,255,.28);transition:width .24s cubic-bezier(.2,.8,.2,1)}
+.meter>i.ok{background:var(--ok);color:rgba(74,222,128,.33)}
+.meter>i.burn{background:var(--burn);color:rgba(251,191,36,.33)}
+.meter>i.dead{background:var(--dead);color:rgba(248,113,113,.33)}
+.meter>i.drain{background:var(--drain);color:rgba(167,139,250,.33)}
+.meter>i.pristine{background:var(--pristine);color:rgba(56,189,248,.33)}
+/* forfeit band: budget the clock has already put out of reach at even pace */
+.meter>u{position:absolute;top:0;bottom:0;border-radius:0;
+  background:repeating-linear-gradient(115deg,rgba(251,191,36,.42) 0 2px,rgba(251,191,36,.10) 2px 5px)}
+/* elapsed tick: where an even-pace spender would be right now */
+.meter>b{position:absolute;top:-2px;bottom:-2px;width:1.5px;background:rgba(255,255,255,.85);box-shadow:0 0 6px rgba(255,255,255,.6)}
+.meter.hollow{border:1px dashed rgba(255,255,255,.22);background:transparent}
+.pct{display:inline-block;width:30px}
+
+.fuse{font-family:var(--mono);font-size:9.5px;letter-spacing:.05em;padding:1px 5px;border-radius:5px;border:1px solid var(--edge)}
+.fuse.pristine{color:var(--pristine);border-color:rgba(56,189,248,.4);background:rgba(56,189,248,.1)}
+.fuse.running{color:var(--burn);border-color:rgba(251,191,36,.3);background:rgba(251,191,36,.07)}
+.fuse.none{color:var(--faint)}
+.why{color:var(--dim);font-size:11px;max-width:290px;overflow:hidden;text-overflow:ellipsis;display:inline-block;vertical-align:bottom}
+.rk{color:var(--faint);font-family:var(--mono);font-size:10px}
+.note-row td{padding:0 7px 6px 34px;color:var(--dim);font-size:11px;white-space:normal}
+.note-row .bad{color:var(--burn)}
+
+/* legend + footer */
+.legend{display:flex;flex-wrap:wrap;gap:6px 18px;padding:10px 10px 2px;font-size:11px;color:var(--dim)}
+.legend span b{color:var(--ink);font-weight:500}
+.warn{color:var(--burn)}
+
+/* ---- overlay --------------------------------------------------------- */
+.scrim{position:fixed;inset:0;background:rgba(6,8,12,.66);backdrop-filter:blur(6px);display:none;align-items:center;justify-content:center;z-index:40}
+.scrim.on{display:flex}
+.modal{
+  width:min(760px,92vw);max-height:84vh;overflow:auto;
+  background:linear-gradient(rgba(255,255,255,.05),rgba(255,255,255,.025));
+  border:1px solid rgba(255,255,255,.11);border-radius:18px;
+  box-shadow:0 30px 70px rgba(0,0,0,.6),inset 0 1px 0 rgba(255,255,255,.07);
+  backdrop-filter:blur(30px) saturate(170%);padding:18px 20px;
+}
+.modal h2{margin:0 0 3px;font-size:13px;letter-spacing:.08em;text-transform:uppercase}
+.modal .sub{color:var(--dim);font-size:11.5px;margin-bottom:12px}
+.modal section{border-top:1px solid var(--hair);padding:11px 0}
+.modal section:first-of-type{border-top:0}
+.modal h4{margin:0 0 6px;font-size:10px;letter-spacing:.09em;text-transform:uppercase;color:var(--faint)}
+.opt{display:flex;gap:9px;align-items:baseline;padding:4px 8px;border-radius:8px;cursor:default}
+.opt.on{background:rgba(59,233,199,.09);box-shadow:inset 2px 0 0 var(--codex)}
+.opt .mark{color:var(--codex);width:11px}
+.opt .aside{color:var(--faint);font-size:11px;margin-left:auto}
+.blocked{border:1px solid rgba(248,113,113,.34);background:rgba(248,113,113,.07);border-radius:12px;padding:11px 13px;color:#FCA5A5;font-size:12px;line-height:1.5}
+.willdo{color:var(--dim);font-size:11.5px;line-height:1.65}
+.willdo li{margin:1px 0}
+.actions{display:flex;gap:10px;align-items:center;justify-content:flex-end;padding-top:12px;border-top:1px solid var(--hair);margin-top:4px;font-size:11px;color:var(--dim)}
+.flash{position:fixed;left:50%;bottom:22px;transform:translateX(-50%);z-index:60;
+  background:rgba(12,16,22,.94);border:1px solid var(--edge);border-radius:12px;padding:9px 16px;font-size:12px;
+  box-shadow:0 14px 40px rgba(0,0,0,.5);display:none}
+.flash.on{display:block}
+.flash.err{border-color:rgba(248,113,113,.45);color:#FCA5A5}
+input.filter{background:rgba(255,255,255,.05);border:1px solid var(--edge);border-radius:8px;color:var(--ink);
+  padding:3px 9px;font-size:11.5px;font-family:var(--mono);width:190px;outline:none}
+input.filter:focus{border-color:rgba(59,233,199,.5)}
+@media (prefers-reduced-motion:reduce){*{transition:none!important}}
+@media (max-width:1000px){.strip{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="brand">SWITCH<em>BOARD</em></div>
+  <div class="chip" id="c-accts"><b>—</b>&nbsp;accounts</div>
+  <div class="chip" id="c-inst"><b>—</b>&nbsp;instances</div>
+  <div class="chip" id="c-shared"><b>—</b>&nbsp;shared</div>
+  <div class="chip" id="c-ready"><b>—</b></div>
+  <div class="sep"></div>
+  <input class="filter" id="filter" placeholder="/ filter" autocomplete="off" spellcheck="false">
+  <div class="chip" id="c-age">—</div>
+  <div class="chip"><kbd>?</kbd>&nbsp;keys</div>
+</header>
+
+<div class="strip">
+  <div class="card" id="card-local">
+    <h3><span class="dot" id="d-local"></span> LOCAL <span id="l-local" style="color:var(--faint)"></span></h3>
+    <div class="row">
+      <div><div class="lbl">in flight</div><div class="big" id="local-active">—</div></div>
+      <div><div class="lbl">ready</div><div class="big" id="local-ready">—</div></div>
+      <div><div class="lbl">pins (lifetime)</div><div class="big" id="local-pins">—</div></div>
+      <div><div class="lbl">orphaned</div><div class="big warn" id="local-orph">—</div></div>
+    </div>
+  </div>
+  <div class="card" id="card-box">
+    <h3><span class="dot" id="d-box"></span> BOX <span id="l-box" style="color:var(--faint)"></span></h3>
+    <div class="row">
+      <div><div class="lbl">in flight</div><div class="big" id="box-active">—</div></div>
+      <div><div class="lbl">ready</div><div class="big" id="box-ready">—</div></div>
+      <div><div class="lbl">as of</div><div class="big" id="box-age">—</div></div>
+    </div>
+    <div class="reason" id="box-note" style="margin-top:4px"></div>
+  </div>
+  <div class="card">
+    <h3>SPILL &mdash; where the next request goes</h3>
+    <div id="spill"></div>
+  </div>
+</div>
+
+<div class="board" id="board"></div>
+
+<div class="legend" id="legend">
+  <span><b class="st ok">●</b> ok</span>
+  <span><b class="st pristine">◇</b> pristine &mdash; weekly fuse never lit, nothing at risk</span>
+  <span><b class="st drain">◈</b> drain &mdash; rolls within 24h, budget expires either way; or holds an unclaimed saved reset with under 25% of its week left, which the claim would wipe</span>
+  <span><b class="hold">2x</b> holds an unclaimed saved reset: ranks at twice its pace until it expires or is claimed</span>
+  <span><b class="st burn">◐</b> burn &mdash; refused for new sessions, but a pin still holds</span>
+  <span><b class="st week">○</b> exhausted</span>
+  <span><b class="st unknown">?</b> unmeasured &mdash; not measured, which is not the same as healthy</span>
+  <span><b>◆</b> currently selected</span>
+  <span><b class="pool both">L·B</b> one subscription loaded on both daemons &mdash; one budget, seen twice</span>
+</div>
+<div class="legend">
+  <span><b>LIVE</b> current concurrency, local only. <b>·</b> on box rows: per-account load is not on the peer's HTTP surface.</span>
+  <span><b>PINS</b> lifetime sticky assignments &mdash; never load; nothing prunes them.</span>
+  <span><b>&#9474;</b> on a codex meter: where an even-pace spender would be now. The hatched span is budget the clock already put out of reach.</span>
+</div>
+
+<div class="scrim" id="scrim"><div class="modal" id="modal"></div></div>
+<div class="flash" id="flash"></div>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+let BOARD = null, CUR = 0, VIEW = "pool", MODAL = null, FILTER = "";
+
+/* ------------------------------------------------------------------ fmt */
+function dur(s){
+  if(s===null||s===undefined) return "–";
+  s = Math.max(0, Math.round(s));
+  const d=Math.floor(s/86400), h=Math.floor(s%86400/3600), m=Math.floor(s%3600/60), sec=s%60;
+  if(d>0) return d+"d"+String(h).padStart(2,"0")+"h";
+  if(h>0) return h+"h"+String(m).padStart(2,"0")+"m";
+  if(m>0) return m+"m"+String(sec).padStart(2,"0")+"s";
+  return sec+"s";
+}
+function pct(f){ return (f===null||f===undefined) ? "–" : Math.round(f*100); }
+function esc(t){ const n=document.createElement("div"); n.textContent=(t===null||t===undefined)?"":String(t); return n.innerHTML; }
+// Countdowns tick from the snapshot's own timestamp, so a codex fuse visibly falls
+// between polls instead of stepping once every 5 seconds.
+function drift(){ return BOARD ? (Date.now()-BOARD._recv)/1000 : 0; }
+function live(v){ return (v===null||v===undefined) ? null : v-drift(); }
+
+const TONE = {ok:"ok", pristine:"pristine", drain:"drain", burn:"burn", week:"dead", short:"dead", unknown:"unknown"};
+const GLYPH = {ok:"●", pristine:"◇", drain:"◈", burn:"◐", week:"○", short:"◐", unknown:"?"};
+
+/* meter: remaining fraction, tinted by state. Optional fuse adds the elapsed
+   tick and the forfeit band -- the one codex fact no ordinary meter shows. */
+function meter(remaining, state, fuse){
+  if(remaining===null||remaining===undefined) return '<span class="meter hollow"></span>';
+  const tone = TONE[state]||"ok";
+  const w = Math.max(0,Math.min(1,remaining))*100;
+  // Track = the whole window's budget. Spend grows from the LEFT, so what is
+  // left is drawn flush right and the spent span is the gap on the left. The
+  // elapsed tick and the forfeit band are both measured from the left edge in
+  // the same units, which is the only way the three read against each other.
+  let extra = "";
+  if(fuse){
+    const spent = Math.max(0,Math.min(1,fuse.spent))*100;
+    const el = Math.max(0,Math.min(1,
+      (fuse.window_seconds-Math.max(0,live(fuse.reset_seconds)))/fuse.window_seconds))*100;
+    // Between spent and elapsed sits budget the clock has already put out of
+    // reach at an even pace: the one tumbling-window fact no meter shows.
+    if(el>spent) extra += '<u style="left:'+spent+'%;width:'+(el-spent)+'%"></u>';
+    extra += '<b style="left:'+Math.min(99.5,el)+'%"></b>';
+  }
+  return '<span class="meter"><i class="'+tone+'" style="left:auto;right:0;width:'+w+'%"></i>'+extra+'</span>';
+}
+
+/* ------------------------------------------------------------ rendering */
+function visibleRows(){
+  if(!BOARD) return [];
+  const f = FILTER.trim().toLowerCase();
+  return BOARD.rows.filter(r => !f || r.id.toLowerCase().includes(f) || (r.email||"").toLowerCase().includes(f) || r.state.includes(f));
+}
+
+function renderHeader(){
+  const b=BOARD, ru=b.rollup;
+  $("c-accts").innerHTML = "<b>"+ru.accounts+"</b>&nbsp;accounts";
+  $("c-inst").innerHTML  = "<b>"+ru.instances+"</b>&nbsp;instances";
+  $("c-shared").innerHTML= "<b>"+ru.shared+"</b>&nbsp;on both";
+  $("c-ready").innerHTML = "claude <b>"+ru.claude+"</b> &middot; codex <b>"+ru.codex+"</b>";
+
+  $("l-local").textContent = b.local.label||"";
+  // null = not read, which is not 0: a box on its public listener never serves
+  // drain-status, and "0 in flight" there described an idle box that was not.
+  const inflight = (p) => (p.active_proxy_requests===null||p.active_proxy_requests===undefined) ? "–" : p.active_proxy_requests;
+  $("local-active").textContent = inflight(b.local);
+  $("local-ready").textContent  = ru.ready_local+"/"+ru.total_local;
+  $("local-pins").textContent   = b.local.pins;
+  $("local-orph").textContent   = ru.orphaned_pins;
+  $("d-local").className = "dot"+(b.local.draining?" warn":"");
+
+  const box=b.box;
+  $("l-box").textContent = box.present ? (box.label||"") : "not configured";
+  $("box-active").textContent = box.present ? inflight(box) : "–";
+  $("box-ready").textContent  = box.present ? (ru.ready_box+"/"+ru.total_box) : "–";
+  const ageS = box.as_of ? (Date.now()-new Date(box.as_of).getTime())/1000 : null;
+  $("box-age").textContent = box.present && ageS!==null ? dur(ageS)+" ago" : "–";
+  $("d-box").className = "dot"+(!box.present?" warn":(box.reachable?"":" bad"));
+  $("box-note").textContent = !box.present ? "no peer configured"
+    : (box.reachable ? "read server-side; the browser never talks to the box"
+                     : "UNREACHABLE — rows below are the last good reading" + (box.error?" ("+box.error+")":""));
+  $("card-box").classList.toggle("stale", box.present && !box.reachable);
+
+  $("spill").innerHTML = (b.spill&&b.spill.length) ? b.spill.map(s =>
+    '<div class="spill-line"><span class="who" style="color:var(--'+esc(s.provider)+')">'+esc(s.provider)+'</span>'+
+    '<span class="verdict '+(s.prefer_peer?"peer":"local")+'">'+(s.prefer_peer?"PEER":"LOCAL")+'</span>'+
+    '<span class="reason">'+esc(s.reason)+'</span></div>').join("")
+    : '<div class="reason">no peer configured</div>';
+
+  const age = (Date.now()-BOARD._recv)/1000;
+  $("c-age").textContent = "⟳ "+Math.round(age)+"s";
+  document.querySelectorAll(".board").forEach(n=>n.classList.toggle("stale", age>30));
+}
+
+function claudeCells(r){
+  return ''
+    + '<td class="num">'+(r.short_left!==undefined?pct(r.short_left):"–")+'</td>'
+    + '<td>'+meter(r.short_left, r.state, null)+'</td>'
+    + '<td class="num">'+dur(live(r.short_reset_s))+'</td>'
+    + '<td class="num">'+(r.weekly_left!==undefined?pct(r.weekly_left):"–")+'</td>'
+    + '<td>'+meter(r.weekly_left, r.state, null)+'</td>'
+    + '<td class="num">'+dur(live(r.weekly_roll_s))+'</td>'
+    + '<td class="num">'+(r.pace!==undefined?(r.pace*1e7).toFixed(1):"–")+(r.reset_hold?' <span class="hold">2x</span>':'')+'</td>';
+}
+function codexCells(r){
+  const f=r.fuse;
+  const fuseTag = f ? '<span class="fuse '+f.state+'">'+(f.state==="pristine"?"PRISTINE":"RUNNING")+'</span>'
+                    : '<span class="fuse none">–</span>';
+  const forfeit = (f&&f.state==="running") ? (f.forfeit>0.005?pct(f.forfeit)+"%":"–") : "–";
+  const sp=r.spark;
+  const sparkTag = sp ? '<span class="fuse '+sp.state+'">'+(sp.state==="pristine"?"ARMED":"LIT")+'</span>'
+                      : '<span class="fuse none">–</span>';
+  return ''
+    + '<td class="num">'+(r.weekly_left!==undefined?pct(r.weekly_left):(r.headroom!==undefined?pct(r.headroom):"–"))+'</td>'
+    + '<td>'+meter(r.weekly_left!==undefined?r.weekly_left:r.headroom, r.state, f)+'</td>'
+    + '<td class="num">'+dur(live(r.weekly_roll_s))+'</td>'
+    + '<td>'+fuseTag+'</td>'
+    + '<td class="num warn">'+forfeit+'</td>'
+    + '<td>'+sparkTag+'</td>';
+}
+
+function renderBoard(){
+  const rows = visibleRows();
+  const groups = [["claude","CLAUDE"],["codex","CODEX"]];
+  let html = "";
+  let flat = [];
+  for(const [prov,label] of groups){
+    const sub = rows.filter(r=>r.provider===prov);
+    if(!sub.length) continue;
+    const ready = sub.filter(r=>["ok","drain","pristine"].includes(r.state)).length;
+    html += '<div class="grouphead '+prov+'"><span class="tag">'+label+'</span>'
+         +  '<span>'+ready+'/'+sub.length+' ready for a new session</span><span class="rule"></span></div>';
+    html += '<table><thead><tr>'
+      + '<th></th><th>account</th><th>pool</th>'
+      + (prov==="claude"
+          ? '<th class="r">5h</th><th></th><th class="r">reset</th><th class="r">week</th><th></th><th class="r">roll</th><th class="r">pace&nbsp;e-7</th>'
+          : '<th class="r">week</th><th></th><th class="r">roll</th><th>fuse</th><th class="r">forfeit</th><th>spark</th>')
+      + '<th class="r">live</th><th class="r">pins</th><th>binding</th><th>why it ranks here</th>'
+      + '</tr></thead><tbody>';
+    for(const r of sub){
+      const idx = flat.length; flat.push(r);
+      const sel = idx===CUR ? " sel" : "";
+      const act = (r.active_on&&r.active_on.length) ? " active" : "";
+      const glyph = act ? "◆" : (GLYPH[r.state]||"?");
+      const both = r.pools.length>1;
+      const poolTag = '<span class="pool'+(both?" both":"")+'">'+(both?"L·B":(r.pools[0]==="local"?"L":"B"))+'</span>';
+      html += '<tr class="row '+r.provider+sel+(r.state==="unknown"?" unmeasured":"")+'" data-i="'+idx+'">'
+        + '<td><span class="st '+r.state+act+'">'+glyph+'</span></td>'
+        + '<td><span class="acct" title="'+esc(r.email||r.id)+'">'+esc(r.id)+'</span></td>'
+        + '<td>'+poolTag+'</td>'
+        + (r.provider==="claude" ? claudeCells(r) : codexCells(r))
+        + '<td class="num">'+(r.live_known?r.live:"·")+'</td>'
+        + '<td class="num" style="color:var(--faint)">'+(r.live_known?r.pins:"·")+'</td>'
+        + '<td class="lbl">'+esc(r.binding_window||"–")+'</td>'
+        + '<td><span class="rk">'+(r.rank?("#"+r.rank+" "):"")+'</span><span class="why" title="'+esc(r.reason)+'">'+esc(r.reason||"peer-only; not ranked locally")+'</span></td>'
+        + '</tr>';
+      if(idx===CUR){
+        let note = esc(r.state_note);
+        if(both) note += ' <span class="bad">· loaded on both daemons: benching it here protects nothing, the box keeps spending the same meter and the same fuse keeps burning at 1s/s.</span>';
+        if(!r.pinnable) note += ' <span class="bad">· not a pin target: '+esc(r.pin_refusal)+'</span>';
+        html += '<tr class="note-row"><td colspan="14">'+note+'</td></tr>';
+      }
+    }
+    html += '</tbody></table>';
+  }
+  $("board").innerHTML = html || '<div class="legend">no accounts match.</div>';
+  window._flat = flat;
+  if(CUR>=flat.length) CUR = Math.max(0, flat.length-1);
+  document.querySelectorAll("tr.row").forEach(tr=>{
+    tr.onclick = ()=>{ CUR = +tr.dataset.i; renderBoard(); };
+  });
+}
+
+function render(){ if(!BOARD) return; renderHeader(); if(VIEW==="pool") renderBoard(); else renderSessions(); }
+
+function renderSessions(){
+  const s = BOARD.sessions||[];
+  const f = FILTER.trim().toLowerCase();
+  const rows = s.filter(x=>!f||x.session_id.toLowerCase().includes(f)||x.account_id.toLowerCase().includes(f));
+  let html = '<div class="grouphead"><span class="tag">SESSIONS</span><span>'
+    + s.length+' sticky assignments · '+s.filter(x=>x.live).length+' live · '
+    + s.filter(x=>x.orphaned).length+' orphaned</span><span class="rule"></span></div>';
+  html += '<table><thead><tr><th></th><th>agent</th><th>session</th><th>account</th><th>state</th><th>last assigned</th></tr></thead><tbody>';
+  rows.forEach((x,i)=>{
+    const sel = i===CUR ? " sel" : "";
+    html += '<tr class="row'+sel+'" data-i="'+i+'">'
+      + '<td>'+(x.live?'<span class="st ok">⚡</span>':(x.orphaned?'<span class="st week">⚠</span>':''))+'</td>'
+      + '<td class="lbl">'+esc(x.agent_type)+'</td>'
+      + '<td><span class="acct">'+esc(x.session_id)+'</span></td>'
+      + '<td><span class="acct">'+esc(x.account_id)+'</span></td>'
+      + '<td>'+(x.orphaned ? '<span class="fuse none warn">'+(x.on_peer?"ON BOX — INERT":"NO SUCH ACCOUNT")+'</span>'
+                           : '<span class="st '+(x.state||"unknown")+'">'+(GLYPH[x.state]||"?")+'</span> '+esc(x.state||""))+'</td>'
+      + '<td class="num" style="color:var(--faint)">'+esc((x.updated_at||"").replace("T"," ").replace("Z",""))+'</td>'
+      + '</tr>';
+  });
+  html += '</tbody></table><div class="legend">'
+    + '<span><b>ON BOX — INERT</b> pinned to a real account this daemon does not hold. The pin cannot resolve, so selection picks locally and overwrites it on the same turn — but CountByAccount still counts it, skewing new-session spread toward accounts that cannot serve. <kbd>⇧P</kbd> prunes these.</span>'
+    + '<span><b>LAST ASSIGNED</b> is written only by the sticky write. It is NOT last use: a session in daily use for a week still shows the day it was first assigned. There is no last-turn stamp in this process, so nothing here is pruned on age.</span>'
+    + '</div>';
+  $("board").innerHTML = html;
+  window._flat = rows;
+  if(CUR>=rows.length) CUR = Math.max(0,rows.length-1);
+  document.querySelectorAll("tr.row").forEach(tr=>{ tr.onclick=()=>{CUR=+tr.dataset.i;renderSessions();}; });
+}
+
+/* --------------------------------------------------------------- modals */
+function closeModal(){ MODAL=null; $("scrim").classList.remove("on"); }
+function showModal(html, handler){ MODAL=handler||{}; $("modal").innerHTML=html; $("scrim").classList.add("on"); }
+
+function flash(msg, bad){
+  const n=$("flash"); n.textContent=msg; n.className="flash on"+(bad?" err":"");
+  clearTimeout(window._ft); window._ft=setTimeout(()=>n.className="flash",4200);
+}
+
+async function post(path, body){
+  const res = await fetch(path,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body||{})});
+  const text = await res.text();
+  if(!res.ok) throw new Error(text.trim()||("HTTP "+res.status));
+  try{ return JSON.parse(text); }catch(e){ return {}; }
+}
+
+function openSwitch(){
+  if(VIEW!=="pool") return;
+  const r = window._flat[CUR]; if(!r) return;
+  const target = r.id;
+  const liveSessions = (BOARD.sessions||[]).filter(x=>x.live && providerOf(x.agent_type)===r.provider);
+  const onOther = liveSessions.filter(x=>x.account_id!==r.id);
+
+  if(!r.pinnable){
+    const alts = BOARD.rows.filter(x=>x.provider===r.provider && x.pinnable);
+    showModal(
+      '<h2>Move sessions &rarr; '+esc(target)+'</h2>'
+      + '<div class="sub">'+esc(r.pools.join(" + ").toUpperCase())+' &middot; '+esc(r.provider)+'</div>'
+      + '<div class="blocked"><b>PIN REFUSED.</b> '+esc(r.pin_refusal)+'</div>'
+      + '<section><h4>Accounts in the local pool that can hold a pin</h4>'
+      + (alts.length ? alts.map(a=>'<div class="opt"><span class="mark"></span><span class="acct">'+esc(a.id)+'</span>'
+          + '<span class="reason">'+esc(a.state)+' &middot; '+(a.weekly_left!==undefined?pct(a.weekly_left)+"% week":"")+'</span></div>').join("")
+         : '<div class="reason">none — every local '+esc(r.provider)+' account is exhausted or unmeasured.</div>')
+      + '</section><div class="actions"><kbd>esc</kbd> close</div>', {});
+    return;
+  }
+
+  showModal(
+    '<h2>Move sessions &rarr; '+esc(target)+'</h2>'
+    + '<div class="sub">LOCAL &middot; '+esc(r.provider)+' &middot; '+esc(r.state)+'</div>'
+    + '<section><h4>Scope</h4>'
+    + '<div class="opt on"><span class="mark">◉</span><span>'+onOther.length+' live '+esc(r.provider)+' session'+(onOther.length===1?"":"s")+' on other accounts</span>'
+    + '<span class="aside">'+(onOther.length? "will move on their next turn" : "nothing to move")+'</span></div>'
+    + '<div class="opt"><span class="mark"></span><span>'+liveSessions.length+' live '+esc(r.provider)+' sessions total</span>'
+    + '<span class="aside">'+(liveSessions.length-onOther.length)+' already here</span></div>'
+    + '</section>'
+    + '<section><h4>Target readings at write time</h4><div class="willdo">'
+    + (r.short_left!==undefined ? '5h '+pct(r.short_left)+'% left, resets in '+dur(live(r.short_reset_s))+'<br>' : '')
+    + (r.weekly_left!==undefined ? 'week '+pct(r.weekly_left)+'% left, rolls in '+dur(live(r.weekly_roll_s))+'<br>' : '')
+    + (r.fuse ? 'fuse '+r.fuse.state.toUpperCase()+(r.fuse.state==="running"&&r.fuse.forfeit>0.005?(' · '+pct(r.fuse.forfeit)+'% of the week already out of reach at even pace'):'')+'<br>' : '')
+    + esc(r.state_note)
+    + '</div></section>'
+    + '<section><h4>What happens</h4><ul class="willdo">'
+    + '<li>in-flight turns finish on their current account, untouched — selection ran before this write</li>'
+    + '<li>each session moves on its NEXT turn, and re-pays cold prompt-cache cost once</li>'
+    + '<li>the pin is a PREFERENCE, not a lock: if this account later exhausts, the sticky-reuse path drops it and selection overwrites the row with its own pick — silently, and correctly, because the alternative is a 429 loop</li>'
+    + '<li>writes '+onOther.length+' row'+(onOther.length===1?"":"s")+' to ~/.subrouter/sessions.json (flock, tmp+rename, 0600)</li>'
+    + '</ul></section>'
+    + '<div class="actions"><kbd>esc</kbd> cancel <kbd>⏎</kbd> confirm move</div>',
+    {confirm: async()=>{
+      if(!onOther.length){ flash("nothing to move"); closeModal(); return; }
+      try{
+        const res = await post("/_subrouter/pool/pin",{account_id:r.id,
+          sessions:onOther.map(x=>({agent_type:x.agent_type,session_id:x.session_id}))});
+        flash("pinned "+res.ok+" session"+(res.ok===1?"":"s")+" to "+r.id);
+      }catch(e){ flash(String(e.message||e), true); }
+      closeModal(); refresh();
+    }});
+}
+
+function providerOf(agent){ return agent==="claude" ? "claude" : "codex"; }
+
+async function openPrune(){
+  let preview;
+  try{ preview = await post("/_subrouter/pool/prune",{dry_run:true}); }
+  catch(e){ flash(String(e.message||e),true); return; }
+  const n = preview.ok||0;
+  showModal(
+    '<h2>Prune orphaned pins</h2>'
+    + '<div class="sub">'+n+' assignment'+(n===1?"":"s")+' point at accounts this daemon does not hold</div>'
+    + (n===0 ? '<div class="willdo">Nothing to prune.</div>' :
+      '<section><h4>Why these are not free</h4><div class="willdo">'
+      + 'An orphaned pin cannot resolve, so selection picks locally and overwrites it — inert. But CountByAccount still counts every one, and that map feeds the new-session spread signal, so the router is currently spreading load toward accounts that cannot serve a single request.'
+      + '</div></section>'
+      + '<section><h4>Scope — orphans only</h4><div class="willdo">'
+      + 'Rows are selected by checking each account ID against the live local account list, which is verifiable right now. Nothing is pruned on age: the only two candidate recency signals in this process are an in-memory map that starts empty at boot and a timestamp written solely by the sticky write, so "stale" here would mean "assigned a while ago" and would delete the pins of the longest-lived, most-used sessions. Live sessions are excluded outright.'
+      + '</div></section>'
+      + '<section><h4>Rows</h4><div class="willdo" style="max-height:150px;overflow:auto;font-family:var(--mono);font-size:10.5px">'
+      + (preview.refs||[]).slice(0,60).map(x=>esc(x)).join("<br>")
+      + ((preview.refs||[]).length>60 ? "<br>… and "+((preview.refs||[]).length-60)+" more" : "")
+      + '</div></section>')
+    + '<div class="actions"><kbd>esc</kbd> cancel'+(n?' <kbd>⏎</kbd> delete '+n+' rows':'')+'</div>',
+    {confirm: async()=>{
+      if(!n){ closeModal(); return; }
+      try{ const res = await post("/_subrouter/pool/prune",{}); flash("pruned "+res.ok+" orphaned pins"); }
+      catch(e){ flash(String(e.message||e),true); }
+      closeModal(); refresh();
+    }});
+}
+
+async function unpinCurrent(){
+  if(VIEW!=="sessions"){ flash("switch to sessions (g) to unpin a specific session"); return; }
+  const x = window._flat[CUR]; if(!x) return;
+  if(x.live){ flash("that session has work in flight; not touching it", true); return; }
+  try{
+    const res = await post("/_subrouter/pool/unpin",{sessions:[{agent_type:x.agent_type,session_id:x.session_id}]});
+    flash(res.ok ? "released "+x.session_id.slice(0,8)+" back to scheduler routing" : "no such assignment");
+  }catch(e){ flash(String(e.message||e),true); }
+  refresh();
+}
+
+function openHelp(){
+  showModal('<h2>Keys</h2><div class="sub">nothing here needs a mouse</div><section><div class="willdo">'
+    + '<b>j / k</b> &nbsp;move &nbsp;&middot;&nbsp; <b>g</b> sessions &nbsp;&middot;&nbsp; <b>G</b> pool &nbsp;&middot;&nbsp; <b>/</b> filter<br>'
+    + '<b>⏎</b> switch palette on the selected account &nbsp;&middot;&nbsp; <b>u</b> unpin selected session &nbsp;&middot;&nbsp; <b>⇧P</b> prune orphans<br>'
+    + '<b>r</b> refresh now &nbsp;&middot;&nbsp; <b>?</b> this &nbsp;&middot;&nbsp; <b>esc</b> close'
+    + '</div></section>'
+    + '<section><h4>What a switch actually does</h4><div class="willdo">'
+    + 'It writes the same sticky assignment the <b>X-Subrouter-Account-ID</b> header writes — the identical Sessions.Put call. It is not header injection: this page cannot add a header to another agent’s request, it performs the write that header would have performed, and the next turn reads it because the store re-reads the file on every lookup. No restart, no reload, no signal.'
+    + '</div></section>'
+    + '<section><h4>What is deliberately not here</h4><div class="willdo">'
+    + '<b>drain</b> is a one-way, unpersisted, loopback-only whole-daemon trapdoor with no undo anywhere in the tree, so it is not a button on a board you navigate with arrow keys.<br>'
+    + '<b>rate-limit-reset</b> redeems a finite, real upstream credit and cannot be taken back.<br>'
+    + '<b>sr auto-switch</b> rotates the local CLI default profile, not pool routing — showing its choice as “the active account” would be a straight lie.<br>'
+    + '<b>/_subrouter/switch</b> swaps the backend process for binary upgrades. Nothing to do with accounts.'
+    + '</div></section>'
+    + '<div class="actions"><kbd>esc</kbd> close</div>', {});
+}
+
+/* ----------------------------------------------------------------- keys */
+document.addEventListener("keydown",(e)=>{
+  if(e.target===$("filter")){
+    if(e.key==="Escape"){ $("filter").blur(); FILTER=""; $("filter").value=""; render(); }
+    return;
+  }
+  if(MODAL){
+    if(e.key==="Escape") closeModal();
+    else if(e.key==="Enter" && MODAL.confirm) MODAL.confirm();
+    return;
+  }
+  const n = (window._flat||[]).length;
+  switch(e.key){
+    case "j": case "ArrowDown": CUR=Math.min(n-1,CUR+1); render(); e.preventDefault(); break;
+    case "k": case "ArrowUp":   CUR=Math.max(0,CUR-1);   render(); e.preventDefault(); break;
+    case "g": VIEW="sessions"; CUR=0; render(); break;
+    case "G": VIEW="pool"; CUR=0; render(); break;
+    case "Enter": openSwitch(); break;
+    case "u": unpinCurrent(); break;
+    case "P": openPrune(); break;
+    case "r": refresh(); break;
+    case "?": openHelp(); break;
+    case "/": $("filter").focus(); e.preventDefault(); break;
+    case "Escape": FILTER=""; $("filter").value=""; render(); break;
+  }
+});
+$("filter").addEventListener("input",(e)=>{ FILTER=e.target.value; CUR=0; render(); });
+$("scrim").addEventListener("click",(e)=>{ if(e.target===$("scrim")) closeModal(); });
+
+/* ----------------------------------------------------------------- poll */
+async function refresh(){
+  try{
+    const res = await fetch("/_subrouter/pool.json",{cache:"no-store"});
+    if(!res.ok) throw new Error("HTTP "+res.status);
+    const data = await res.json();
+    data._recv = Date.now();
+    BOARD = data;
+    render();
+  }catch(e){ flash("snapshot failed: "+String(e.message||e), true); }
+}
+refresh();
+// Polling stops when the tab is hidden: an open board must not keep a
+// peer's daemon awake all day. The peer read is server-side and cached, so
+// N tabs cost the same as one either way.
+setInterval(()=>{ if(!document.hidden) refresh(); }, 5000);
+// Countdowns tick locally between polls so a fuse visibly falls.
+setInterval(()=>{ if(BOARD && !document.hidden && !MODAL) render(); }, 1000);
+</script>
+</body>
+</html>

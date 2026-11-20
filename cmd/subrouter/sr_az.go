@@ -366,6 +366,16 @@ func (r srRunner) openai(ctx context.Context, args []string) error {
 // tests the same server the agents use. The /v1 suffix Codex needs is trimmed:
 // these commands talk to the daemon's own paths.
 func azBaseURL() (string, error) {
+	// PATCHES 17: codexBaseURL reads the servers.json default straight from the
+	// file, outside selectedRemoteServer's gate, so on a keyless machine a stale
+	// default made `sr az status|test|cost|codex` and `sr oai codex` talk to a
+	// box. Keyless means this machine's daemon; an explicit environment pin is
+	// still honoured, exactly as the Codex launcher honours one.
+	if !remoteUnlocked() &&
+		strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_BASE_URL")) == "" &&
+		strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_SERVER")) == "" {
+		return strings.TrimSuffix(strings.TrimRight(localBaseURL(), "/"), "/v1"), nil
+	}
 	baseURL, err := codexBaseURL(defaultSRServerStore(accounts.DefaultCodexStore()))
 	if err != nil {
 		return "", err

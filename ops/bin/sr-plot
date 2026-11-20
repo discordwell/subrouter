@@ -1,0 +1,1087 @@
+#!/usr/bin/env python3
+"""Compact terminal read-out of subrouter 7d burn pace.
+
+pace = sum(consumed) / sum(window-time elapsed), normalised so 1.00x is exactly
+on pace to finish the week at 100%. ceiling = what pace would read if every
+account in the pool were fully spent at that instant.
+
+What it reads (PATCHES §32.1 -- the scopes `sr status` reads, under its gates):
+
+  * local: this machine's daemon, /_subrouter/usage-status, 65 s. A cold read
+    waits on the daemon's sweep, which the daemon itself bounds at 60 s
+    (usageSweepTimeout); it took 5.7 s at moderate load and 18 s at load ~100,
+    and the old 8 s cap dropped this machine's own accounts silently.
+  * each servers.json entry, at its own address with its admin token, 8 s.
+    Built-in names (local, cmux, ...) are skipped, as `sr status` skips them.
+  * this machine's daemon's peer view, /_subrouter/peers/usage-status, read in
+    parallel. A peer whose whole (provider, id) roster sits in ONE servers.json
+    section that was read is that box and is not counted again; any other peer
+    with a body is its own scope ("<name> via peer link"). Nothing else -- not
+    a name, not a host -- makes a peer "the same box" (§32 refuses to guess).
+    A 404 is a daemon older than the route: nothing is added.
+  * none of the box reads without remote.key, or with SR_STATUS_SERVERS=0.
+
+How it degrades: a scope that was not read is never drawn as empty. The
+headline names the scopes actually in the numbers, and every missing one is an
+amber line right under it ("LOCAL MISSING -- ..."). A peer body the daemon did
+not just read says how old it is, its reset clocks are moved on by that age,
+and one older than 15 min (the daemon's own last-good horizon) is not counted.
+Rows the sweep did not measure are counted and named, and a scope with none
+measured says so in the headline.
+
+  sr-plot                        draw it
+  sr-plot --selftest             run the fixtures (no daemon, no network)
+  sr-plot --selftest --against F run the same fixtures against another copy F
+                                 (--verbose prints what each fixture drew)
+
+Installing: `sr plot` runs whatever `sr-plot` is on PATH. Link it to a checkout
+(ln -sf <checkout>/ops/bin/sr-plot ~/bin/sr-plot), as srq is linked.
+"""
+import json, math, os, re, stat, sys, shutil, textwrap, urllib.error, urllib.request, concurrent.futures as cf
+from datetime import datetime, timedelta, timezone
+from urllib.parse import urlparse
+
+W, WH = 604800.0, 168.0
+HOME = os.path.expanduser("~")
+SCALE = 3.5
+EIGHTHS = "▏▎▍▌▋▊▉█"
+LEVELS = "▁▂▃▄▅▆▇█"
+
+LOCAL = "http://127.0.0.1:31415"
+USAGE = "/_subrouter/usage-status"
+PEERS = "/_subrouter/peers/usage-status"
+LOCAL_TIMEOUT = 65.0    # this machine's own daemon: a cold read waits on its sweep (<= 60 s)
+REMOTE_TIMEOUT = 8.0    # a servers.json box; a black-holed tailnet must not stall us
+PEERS_TIMEOUT = 15.0    # the route answers within remotePoolAdminTimeout + 250 ms
+STALE_AFTER = 120.0     # a peer body older than this says so (sr status: 2 min)
+LAST_GOOD_MAX = 900.0   # older than this is not counted (usageWindowsLastGoodTTL)
+PROVIDERS = ("claude", "codex")   # the providers weekly() can read
+BUILT_IN = {"", "local", "localhost", "cmux", "cmux-local", "local-egress"}   # isBuiltInRemoteName
+
+TTY = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+def c(s, code): return f"\033[{code}m{s}\033[0m" if TTY else s
+BOLD, DIM = "1", "2"
+ACC, ACCD, AMBER, GREY, WHITE = "38;5;39", "38;5;24", "38;5;214", "38;5;243", "1;97"
+
+
+def state_dir():
+    return os.environ.get("SUBROUTER_STATE_DIR", "").strip() or os.path.join(HOME, ".subrouter")
+
+
+def remote_gate(codex):
+    """sr's remote.key gate (remote_gate.go): (on, a line to print or None).
+    No key is total silence, as it is for sr; a key that is there but unusable
+    says why, as sr does on stderr."""
+    path = os.path.join(codex, "remote.key")
+    try:
+        st = os.stat(path)
+    except OSError:
+        return False, None
+    if not stat.S_ISREG(st.st_mode):
+        return False, f"{path} is not a regular file; the box was not read"
+    if st.st_mode & 0o077:
+        return False, f"{path} is mode {stat.S_IMODE(st.st_mode):04o}; chmod 600 it to read the box"
+    try:
+        with open(path, "rb") as f:
+            key = f.read()
+    except OSError as e:
+        return False, f"cannot read {path} ({type(e).__name__}); the box was not read"
+    if len(key.strip()) < 16:
+        return False, f"{path} is too short to be a key; the box was not read"
+    return True, None
+
+
+def servers():
+    """([(scope, url, token, timeout)], [(line, colour)], read the peer view?).
+
+    The same gates `sr status` has: SR_STATUS_SERVERS=0 and a missing
+    remote.key keep it local-only (no box, no peer view); built-in names are
+    this machine or cmux, never a box."""
+    out, notes = [("local", LOCAL, None, LOCAL_TIMEOUT)], []
+    if os.environ.get("SR_STATUS_SERVERS", "").strip().lower() in ("0", "false", "no", "off"):
+        notes.append(("SR_STATUS_SERVERS=0: local only; the box and the daemon's peer view were not read", DIM))
+        return out, notes, False
+    codex = os.path.join(state_dir(), "codex")
+    on, why_off = remote_gate(codex)
+    if not on:
+        if why_off:
+            notes.append((why_off, AMBER))
+        return out, notes, False
+    path = os.path.join(codex, "servers.json")
+    if not os.path.exists(path):
+        return out, notes, True
+    try:
+        with open(path) as f:
+            entries = json.load(f).get("servers") or []
+    except Exception as e:
+        # the message carries no file content, so no token can leak through it
+        notes.append((f"servers.json unreadable ({type(e).__name__}); its boxes were not read", AMBER))
+        return out, notes, True
+    for i, s in enumerate(entries, 1):
+        try:
+            name, url = str(s["name"]).strip(), str(s["url"]).strip().rstrip("/")
+            tok = s.get("adminToken")
+        except Exception as e:
+            notes.append((f"servers.json entry #{i} unreadable ({type(e).__name__}); not read", AMBER))
+            continue
+        if name.lower() in BUILT_IN or not url:
+            continue
+        out.append((name, url, tok, REMOTE_TIMEOUT))
+    return out, notes, True
+
+
+def scrub(msg):
+    return re.sub(r"/t/[^/?#\s\"']+", "/t/[redacted]", str(msg or "").strip())
+
+
+def why(e, timeout, tok=None):
+    """One short reason, never a URL's userinfo or tenant path, never a header.
+    Only the network's own errors carry their text; anything else (http.client
+    quoting a header value, or a URL's userinfo as a 'port') is its type."""
+    if isinstance(e, urllib.error.HTTPError):
+        return f"HTTP {e.code}"
+    if isinstance(e, TimeoutError) or (isinstance(e, urllib.error.URLError) and isinstance(e.reason, TimeoutError)):
+        return f"timeout after {timeout:g}s"
+    if isinstance(e, urllib.error.URLError):
+        r = e.reason
+        msg = scrub(getattr(r, "strerror", None) or r)
+        if "timed out" in msg:
+            return f"timeout after {timeout:g}s"
+    elif isinstance(e, (OSError, json.JSONDecodeError, Redirected)):
+        msg = scrub(getattr(e, "strerror", None) or e)
+        if "timed out" in msg:
+            return f"timeout after {timeout:g}s"
+    else:
+        return type(e).__name__
+    for t in {str(tok or ""), str(tok or "").strip()} - {""}:
+        msg = msg.replace(t, "[redacted]")
+    msg = re.sub(r"//[^/@\s]*@", "//[redacted]@", msg)
+    return msg[:60] or type(e).__name__
+
+
+class Redirected(Exception):
+    pass
+
+
+def get_json(url, tok, timeout):
+    req = urllib.request.Request(url)
+    if tok:
+        # unredirected: a redirect (captive portal, stray proxy) never carries it
+        req.add_unredirected_header("Authorization", "Bearer " + tok)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        final = getattr(r, "geturl", None)
+        if final and final() not in (None, url):
+            raise Redirected("redirected to another address")
+        return json.load(r)
+
+
+def fetch(entry):
+    scope, url, tok, timeout = entry
+    try:
+        data = get_json(url + USAGE, tok, timeout)
+    except Exception as e:
+        return scope, url, None, why(e, timeout, tok)
+    if data is None:                 # a fresh box serves null: measured, and empty
+        data = []
+    if not isinstance(data, list):
+        return scope, url, None, "its answer was not a list of accounts"
+    return scope, url, data, None
+
+
+def fetch_peers():
+    """The daemon's peer view: (peers, None); (None, None) for a daemon older
+    than the route, which adds nothing; (None, reason) when it could not be read."""
+    try:
+        body = get_json(LOCAL + PEERS, None, PEERS_TIMEOUT)
+    except urllib.error.HTTPError as e:
+        return (None, None) if e.code in (404, 405) else (None, f"HTTP {e.code}")
+    except Exception as e:
+        return None, why(e, PEERS_TIMEOUT)
+    peers = body.get("peers") if isinstance(body, dict) else None
+    if not isinstance(peers, list):
+        return None, "its answer did not decode"
+    return peers, None
+
+
+def gather(entries, read_peers):
+    """Every read in parallel; a read still pending after 2 s gets a transient
+    note naming it. The pool is never joined on the way out, so Ctrl-C during a
+    long local read leaves at once (see __main__)."""
+    ex = cf.ThreadPoolExecutor(max_workers=len(entries) + 1)
+    waiting = False
+    try:
+        futs = {ex.submit(fetch, e): e for e in entries}
+        pfut = ex.submit(fetch_peers) if read_peers else None
+        _, pending = cf.wait(list(futs) + ([pfut] if pfut else []), timeout=2.0)
+        if pending and sys.stderr.isatty():
+            what = []
+            for f in futs:
+                if f in pending:
+                    scope, _, _, timeout = futs[f]
+                    what.append(f"{scope}, up to {timeout:g}s" + (": its daemon may be mid-sweep" if scope == "local" else ""))
+            if pfut in pending:
+                what.append(f"the daemon's peer view, up to {PEERS_TIMEOUT:g}s")
+            sys.stderr.write("  reading… " + "; ".join(what))
+            sys.stderr.flush()
+            waiting = True
+        results = [f.result() for f in futs]
+        peers = pfut.result() if pfut else (None, None)
+    finally:
+        ex.shutdown(wait=False)
+        if waiting:
+            sys.stderr.write("\r\033[K")
+            sys.stderr.flush()
+    return results, peers
+
+
+def keys(rows):
+    return {(a.get("provider"), a.get("id")) for a in rows if isinstance(a, dict) and a.get("id")}
+
+
+def host(url):
+    return (urlparse(url or "").hostname or "").lower()
+
+
+def age(stamp):
+    """Seconds since an RFC 3339 stamp, or None."""
+    try:
+        t = datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=timezone.utc)
+    return max(0.0, (datetime.now(timezone.utc) - t).total_seconds())
+
+
+def ago(s):
+    if s < 90:
+        return f"{int(s)}s ago"
+    if s < 5400:
+        return f"{int(s // 60)}m ago"
+    return f"{s / 3600:.0f}h ago"
+
+
+def unmeasured(a):
+    """The daemon's own rule (remotePoolAccountUsage.unmeasured, srq _auth_flag):
+    an OAuth row is unmeasured when the sweep was cut before it, when nobody
+    checked it, or when an older daemon left a context error. auth_valid:false
+    on such a row is not a verdict."""
+    if a.get("auth_mode") not in (None, "", "oauth"):
+        return False
+    if a.get("sweep_cut") or a.get("auth_checked") is False:
+        return True
+    err = str(a.get("error") or "")
+    return "context canceled" in err or "context deadline exceeded" in err
+
+
+def scopes_of(results, peers, perr):
+    """The scopes in the numbers, and the lines that say what is not.
+
+    Returns (included, top, bottom): included is [(name, label, rows, shift)],
+    shift being how many seconds ago the rows were measured (a peer body's
+    age; 0 for a direct read); top is [(text, colour)] for right under the
+    headline; bottom for after the chart.
+
+    Same-box matching is §32's and nothing else: a peer IS a servers.json
+    section only when its whole (provider, id) roster is in that one section
+    that was read. When a servers.json box failed and a peer with a body is
+    counted, the CLI cannot tell whether that peer is the box, so it says so.
+    """
+    included, top, bottom = [], [], []
+    direct = [r for r in results if r[0] != "local"]
+    ok = [(s, keys(rows)) for s, u, rows, err in direct if err is None]
+    failed = [(s, err) for s, u, rows, err in direct if err]
+
+    for scope, url, rows, err in results:
+        if err is None:
+            included.append((scope, scope, rows, 0.0))
+        elif scope == "local":
+            top.append((f"LOCAL MISSING — this machine's accounts are not in the numbers below ({err})", AMBER))
+
+    stand_ins, bodiless = [], []
+    for p in (peers or []):
+        if not isinstance(p, dict):
+            continue
+        name = str(p.get("name") or host(p.get("url")) or "peer")
+        reason = scrub(p.get("error")) or "its latest read failed"
+        rows = p.get("accounts")
+        if not isinstance(rows, list):
+            bodiless.append((name, scrub(p.get("error")) or "no reading yet"))
+            continue
+        k = keys(rows)
+        same = next((s for s, sk in ok if (not k and not sk) or (k and k <= sk)), None)
+        if same:
+            if not p.get("reachable"):
+                bottom.append((f"this machine's peer link to {name} is failing ({reason}); "
+                               f"its accounts are in the numbers via {same}", DIM))
+            continue
+        s = age(p.get("as_of"))
+        if (s is None and not p.get("reachable")) or (s is not None and s > LAST_GOOD_MAX):
+            # windows measured that long ago have moved on; the daemon itself
+            # stops carrying a last-good reading after 15 min
+            when = f"last read it {ago(s)}" if s is not None else "holds a last-good reading of unknown age"
+            top.append((f"{name.upper()} MISSING — this machine's peer link {when}, too old to count"
+                        + ("" if p.get("reachable") else f" ({reason})"), AMBER))
+            continue
+        label = f"{name} via peer link"
+        if not p.get("reachable"):
+            label += f", last good as of {ago(s)}"
+            top.append((f"{name} is a last-good reading — this machine's daemon cannot reach it now ({reason})", AMBER))
+        elif s is not None and s >= STALE_AFTER:
+            label += f", as of {ago(s)}"
+        short = f"{name} (peer link)"
+        included.append((short, label, rows, s or 0.0))
+        stand_ins.append(short)
+
+    hedged = set()
+    if failed and stand_ins and len(failed) <= len(stand_ins):
+        for scope, err in failed:
+            hedged.add(scope)
+            top.append((f"{scope.upper()} NOT READ ({err}) — {' and '.join(stand_ins)} "
+                        f"{'is' if len(stand_ins) == 1 else 'are'} in the numbers; "
+                        f"if that is {scope}, nothing is missing", AMBER))
+    elif failed and stand_ins:
+        n = len(failed) - len(stand_ins)
+        top.append((f"AT LEAST {n} OF {', '.join(s.upper() for s, _ in failed)} MISSING — none was read at its "
+                     f"servers.json address ({'; '.join(f'{s}: {e}' for s, e in failed)}); "
+                     f"{' and '.join(stand_ins)} {'is' if len(stand_ins) == 1 else 'are'} in the numbers "
+                     f"and may be {'one' if len(stand_ins) == 1 else 'some'} of them", AMBER))
+    else:
+        for scope, err in failed:
+            top.append((f"{scope.upper()} MISSING — {scope}'s accounts are not in the numbers below ({err})", AMBER))
+
+    # a peer with no body has no roster to match: §32 keeps it loud
+    for name, reason in bodiless:
+        if ok:
+            top.append((f"peer link to {name} has no reading ({reason}) — unless it is "
+                        f"{' or '.join(s for s, _ in ok)}, its accounts are not in the numbers below", AMBER))
+        else:
+            top.append((f"{name.upper()} MISSING — this machine's peer link to it has no reading, "
+                        f"so its accounts are not in the numbers below ({reason})", AMBER))
+    if failed and perr:
+        top.append((f"no fallback through this machine's daemon: {perr}", DIM))
+    # the old bottom line stays for every direct read that failed; dim where a
+    # peer link stood in, since the line above already says what that means
+    for scope, _, _, err in results:
+        if not err:
+            continue
+        if scope in hedged:
+            bottom.append((f"{scope}'s servers.json address is down ({err}); a peer link stood in, see above", DIM))
+        else:
+            bottom.append((f"{scope} unreachable — {err}", AMBER))
+    return included, top, bottom
+
+
+def weekly(a):
+    for w in (a.get("windows") or []):
+        if a.get("provider") == "claude" and w["Name"] == "7d":
+            return w
+        if a.get("provider") == "codex" and w["Name"] == "primary" and w.get("LimitWindowSeconds") == 604800:
+            return w
+    return None
+
+
+def ceiling(elapsed, t):
+    n = len(elapsed)
+    if not n:
+        return None
+    s = sum(((e + t) % WH) for e in elapsed)
+    return None if s < 1e-9 else n * WH / s
+
+
+def bar(val, width, over):
+    """Eighth-block resolution. The 1.00x notch is drawn last so the fill
+    can never hide the one reference the number is read against."""
+    notch = int(round(width / SCALE))
+    exact = max(0.0, min(float(width), val / SCALE * width))
+    full, rem = int(exact), exact - int(exact)
+    hue = AMBER if over else ACC
+    cells = []
+    for i in range(width):
+        if i < full:
+            cells.append(c("█", hue))
+        elif i == full and rem >= 0.125:
+            cells.append(c(EIGHTHS[min(7, int(rem * 8))], hue))
+        else:
+            cells.append(" ")
+    if 0 <= notch < width:
+        cells[notch] = c("╎", WHITE if notch < full else DIM)
+    return c("▕", DIM) + "".join(cells) + c("▏", DIM)
+
+
+def vchart(elapsed, width, rows, lo=1.0, hi=SCALE):
+    """Vertical area plot. Each cell carries 8 sub-levels, so `rows` cells give
+    8*rows of vertical resolution instead of the 8 a one-row sparkline gets.
+    The curve's top cell is drawn bright and everything under it recessive, so
+    the fill reads as a wash under a line rather than a solid block."""
+    step = (hi - lo) / rows
+    hs = []
+    for i in range(width):
+        v = ceiling(elapsed, i * WH / (width - 1))
+        hs.append(0.0 if v is None else max(0.0, min(float(rows), (v - lo) / step)))
+    out = []
+    for r in range(rows - 1, -1, -1):
+        row = []
+        for h in hs:
+            top = -1 if h <= 0 else max(0, math.ceil(h) - 1)
+            if r < top:
+                row.append(c("░", ACCD))     # wash, not a block: keeps the
+                                             # contour readable with no colour
+            elif r == top:
+                frac = h - r
+                ch = "█" if frac >= 0.999 else LEVELS[max(0, min(7, int(frac * 8)))]
+                row.append(c(ch, ACC))
+            else:
+                row.append(" ")
+        val = lo + step * (r + 1)
+        tick = f"{val:.1f}×" if abs(val * 2 - round(val * 2)) < 1e-9 else ""
+        out.append((tick, "".join(row)))
+    return out
+
+
+def place(width, items):
+    """Position labels on a row by column index so nothing can drift."""
+    row = [" "] * width
+    for txt, start in items:
+        for j, ch in enumerate(txt):
+            if 0 <= start + j < width:
+                row[start + j] = ch
+    return "".join(row).rstrip()
+
+
+def say(text, colour, cols):
+    """A status line, wrapped rather than cut: its end is usually the reason."""
+    for i, line in enumerate(textwrap.wrap(text, max(20, cols - 6))):
+        print(("  " if i == 0 else "    ") + c(line, colour))
+
+
+def left_line(left):
+    """One line for every account not in the numbers, by why."""
+    kinds = ("unmeasured", "auth-invalid", "no weekly window", "rolled since the reading")
+    parts = [f"{n} {k}" for k in kinds for n in [sum(1 for v in left.values() if v == k)] if n]
+    ids = ", ".join(sorted(str(i) for (_, i) in left))
+    return f"{' · '.join(parts)} — not in the numbers: {ids}"
+
+
+def main():
+    cols = min(shutil.get_terminal_size((92, 40)).columns, 104)
+    entries, cfg_notes, read_peers = servers()
+    results, (peers, perr) = gather(entries, read_peers)
+    included, top, bottom = scopes_of(results, peers, perr)
+    top += cfg_notes
+
+    # Merge every scope into one pool per provider. Identity is (provider, id):
+    # Claude local/home are disjoint, but Codex accounts are registered on BOTH
+    # the local daemon and the home server, so a naive sum counts them twice.
+    merged, folded, conflicts = {}, 0, []
+    stale, left_out = {}, []      # rows in the numbers on a last-good reading; rows not in them
+    took = {n: 0 for n, *_ in included}          # rows each scope put in the numbers
+    for scope, _, data, shift in included:
+        for a in data:
+            if not isinstance(a, dict):
+                continue
+            key = (a.get("provider"), a.get("id"))
+            w = weekly(a)
+            if not w or not a.get("auth_valid"):
+                if a.get("provider") in PROVIDERS and a.get("auth_mode") in (None, "", "oauth"):
+                    valid = a.get("auth_valid")
+                    what = ("unmeasured" if unmeasured(a) or valid is None
+                            else "auth-invalid" if valid is False else "no weekly window")
+                    left_out.append((key, what, scope))
+                continue
+            if a.get("sweep_cut"):
+                stale[key] = True
+            # a peer body measured `shift` seconds ago: its reset clock has run on
+            rs = float(w["ResetAfterSeconds"]) - shift
+            if rs <= 0:
+                left_out.append((key, "rolled since the reading", scope))
+                continue
+            took[scope] += 1
+            rec = dict(id=a["id"], used=float(w["UsedPercent"]) / 100.0,
+                       elapsed=(W - rs) / 3600.0, reset=rs / 3600.0, scopes=[scope])
+            if key in merged:
+                prev = merged[key]
+                # same subscription seen twice should agree; if it doesn't, say so
+                if abs(prev["used"] - rec["used"]) > 0.02 or abs(prev["reset"] - rec["reset"]) > 1.0:
+                    conflicts.append(a["id"])
+                prev["scopes"].append(scope)
+                folded += 1
+            else:
+                merged[key] = rec
+    # a row unmeasured in one scope but measured in another IS in the numbers
+    left_out = [(k, v, sc) for k, v, sc in left_out if k not in merged]
+    unread = {n: len({k for k, v, sc in left_out if sc == n and v == "unmeasured"}) for n in took}
+    left = {}
+    for k, v, _ in left_out:
+        left.setdefault(k, v)
+    stale = {k for k in stale if k in merged}
+    # a scope the sweep did not measure is not "in the numbers" because it answered
+    for n, *_ in included:
+        if unread[n] and not took[n]:
+            who = "this machine's" if n == "local" else f"{n}'s"
+            top.append((f"{n.upper()} UNMEASURED — none of {who} {unread[n]} accounts has a weekly reading "
+                        f"this read (sweep cut, or not yet checked), so they are not in the numbers below", AMBER))
+    counted = [n for n, *_ in included if took[n] or not unread[n]]
+
+    pools = {}
+    for (prov, _), rec in merged.items():
+        pools.setdefault(prov, []).append(rec)
+
+    def score(prov):
+        A = pools[prov]
+        num = sum(a["used"] for a in A)
+        den = sum(a["elapsed"] for a in A) / WH
+        noise = len(A) * 0.005      # UsedPercent steps by 1% => +/-0.5pp per account
+        return num, den, (den >= 0.05 and num > 0 and noise / num <= 0.10)
+
+    NAME, PACE = 8, 7
+    STEM = 2 + NAME
+    CELL0 = STEM + PACE + 2
+    mw = max(20, cols - CELL0 - 15)
+    now = datetime.now()
+
+    # The headline names what is in the numbers, never what was merely asked for.
+    names = counted
+    labels = " + ".join(l + (f" ({took[n]} of {took[n] + unread[n]} measured)" if unread[n] else "")
+                        for n, l, *_ in included) or "nothing read"
+    print()
+    head = "subrouter · 7d burn pace"
+    room = cols - 4 - 11
+    if len(head) + 3 + len(labels) <= room:
+        tail = " · " + labels
+        print("  " + c(head, BOLD) + tail + " " * max(1, room - len(head) - len(tail))
+              + c(now.strftime("%a %H:%M"), GREY))
+    else:
+        print("  " + c(head, BOLD) + " " * max(1, room - len(head)) + c(now.strftime("%a %H:%M"), GREY))
+        for i, line in enumerate(textwrap.wrap(labels, max(20, cols - 6))):
+            print(("  " if i == 0 else "    ") + line)
+    print("  " + c("─" * (cols - 4), DIM))
+    for text, colour in top:            # every missing scope, right under the headline
+        say(text, colour, cols)
+    print()
+
+    if not included:
+        say("no scope could be read, so there are no numbers to show", AMBER, cols)
+        print()
+        return 1
+    if not counted:
+        say("no scope that answered has a measured account, so there are no numbers to show", AMBER, cols)
+        say(left_line(left), AMBER, cols)
+        for text, colour in bottom:
+            say(text, colour, cols)
+        print()
+        return 1
+
+    order = sorted(pools, key=lambda p: p != "claude")
+    for prov in order:
+        A = pools[prov]
+        num, den, ok = score(prov)
+        stem = "  " + c(f"{prov:<{NAME}}", BOLD)
+        if not ok:
+            why = (f"{num*100:.0f}% drawn over {den*WH:.1f}h of window" if den < 0.05
+                   else f"{num*100:.0f}% across {len(A)} accounts, under meter resolution")
+            avail = cols - CELL0 - 12
+            if len(why) > avail:
+                why = why[:max(0, avail - 1)].rstrip() + "…"
+            print(stem + c(f"{'–':>5}", DIM) + " " * (CELL0 - STEM - 5)
+                  + c("no signal", AMBER) + c(f" · {why}", DIM))
+            continue
+        pace = num / den
+        cl = ceiling([a["elapsed"] for a in A], 0)
+        print(stem + c(f"{pace:5.2f}× ", BOLD) + " " + bar(pace, mw, pace > 1.0)
+              + c(f"  ceil {cl:.2f}×", GREY))
+
+    print(" " * CELL0 + c(place(mw, [("0×", 0), ("1×", int(round(mw / SCALE))),
+                                     (f"{SCALE}×", mw - 4)]), DIM))
+
+    room = cols - CELL0
+    where = " + ".join(names)
+    both = "both" if len(names) == 2 else "more than one scope"
+    note = f"{len(merged)} accounts {'across' if len(names) > 1 else 'from'} {where}"
+    if folded:
+        note += f" · {folded} held on {both}, counted once"
+    if len(note) > room:                       # narrow terminal: shorter phrasing
+        note = f"{len(merged)} accounts, {where}"
+        if folded:
+            note += f" · {folded} folded"
+    if len(note) > room:
+        note = note[:max(0, room - 1)].rstrip() + "…"
+    print(" " * CELL0 + c(note, DIM))
+    if left:
+        say(left_line(left), AMBER, cols)
+    if stale:
+        say(f"{len(stale)} in the numbers on a last-good reading (sweep cut this read)", GREY, cols)
+    if conflicts:
+        print("  " + c(f"same account disagrees across scopes: {', '.join(conflicts[:3])}", AMBER))
+
+    live = [p for p in order if score(p)[2]]
+    if live:
+        prov = max(live, key=lambda p: len(pools[p]))     # one graph
+        el = [a["elapsed"] for a in pools[prov]]
+        GUT = 8
+        sw = max(24, cols - GUT - 2)
+        term_h = shutil.get_terminal_size((92, 40)).lines
+        peak = max(ceiling(el, i * WH / (sw - 1)) or 0 for i in range(sw))
+        hi = max(2.0, math.ceil(peak / 0.5) * 0.5)
+        span = hi - 1.0
+        max_rows = 10 if term_h >= 40 else (8 if term_h >= 32 else 6)
+        rows = int(round(span / 0.25))
+        if rows > max_rows:
+            rows = int(round(span / 0.5))
+        print()
+        print("  " + c("ceiling · next 168h", BOLD)
+              + c(f"   {prov}, {len(pools[prov])} accounts", GREY))
+        for tick, row in vchart(el, sw, rows, 1.0, hi):
+            print(c(f"{tick:>6}", DIM) + c("┤" if tick else "│", DIM) + " " + row)
+        print(c(f"{1.0:>5.1f}×", DIM) + c("└" + "─" * (sw + 1), DIM))
+        marks = [((now + timedelta(hours=h)).strftime("%a"), int(h / WH * (sw - 1)))
+                 for h in (0, 48, 96, 144)]
+        print(" " * GUT + c(place(sw, marks), DIM))
+        for other in live:
+            if other != prov:
+                print("  " + c(f"({other} ceiling not charted)", DIM))
+
+    soon = sorted([a for p in order for a in pools[p] if a["elapsed"] / WH >= 0.02],
+                  key=lambda a: a["reset"])[:3]
+    if soon:
+        print()
+        print("  " + c("unspent · expiring soonest", BOLD))
+        for a in soon:
+            print("  " + c(f"{a['id'][:30]:<32}", GREY)
+                  + c(f"{(1-a['used'])*100:3.0f}%", BOLD) + c(f"  in {a['reset']:5.1f}h", DIM))
+    for text, colour in bottom:
+        say(text, colour, cols)
+    print()
+    return 0
+
+
+# --- selftest ---------------------------------------------------------------
+#
+# Black-box fixtures: each run fakes urllib.request.urlopen (answering by URL,
+# and timing out when the caller's timeout is shorter than the fixture's
+# latency), points HOME at a temp dir holding a servers.json and a remote.key,
+# and reads what main() prints. The seams (urlopen, HOME, TTY, main) are the
+# ones the 2026-08-25 script already had, so `--against <that copy>` runs the
+# very same fixtures against it -- which is how each one is shown to fail there.
+# Nothing is written outside the temp dirs, which are removed: no bytecode is
+# cached next to the script under test.
+
+def _load(path):
+    import importlib.machinery, importlib.util
+    sys.dont_write_bytecode = True
+    loader = importlib.machinery.SourceFileLoader("sr_plot_under_test", path)
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+def _selftest(argv):
+    import io, tempfile, contextlib
+    sys.dont_write_bytecode = True
+    target = os.path.abspath(__file__)
+    if "--against" in argv:
+        target = argv[argv.index("--against") + 1]
+    only = argv[argv.index("--only") + 1] if "--only" in argv else None
+    mod = _load(target)
+    print(f"sr-plot selftest against {target}")
+    TOKEN = "tok-selftest-must-never-print"
+    BOX = "http://box.test:31415"
+    WORK = "http://work.test:31415"
+    ALL = []
+    real_urlopen = urllib.request.urlopen
+
+    def claude(i, used=40, reset_h=60, **kw):
+        row = dict(id=i, provider="claude", auth_mode="oauth", auth_checked=True, auth_valid=True,
+                   windows=[{"Name": "7d", "UsedPercent": used, "LimitWindowSeconds": 604800,
+                             "ResetAfterSeconds": reset_h * 3600}])
+        row.update(kw)
+        return row
+
+    def codex(i, used=10, reset_h=90, **kw):
+        row = dict(id=i, provider="codex", auth_mode="oauth", auth_checked=True, auth_valid=True,
+                   windows=[{"Name": "primary", "UsedPercent": used, "LimitWindowSeconds": 604800,
+                             "ResetAfterSeconds": reset_h * 3600}])
+        row.update(kw)
+        return row
+
+    def body(obj, latency=0.0):
+        def answer(timeout, req):
+            if timeout is not None and timeout < latency:
+                raise TimeoutError("timed out")       # http.client's read timeout, unwrapped
+            return io.BytesIO(json.dumps(obj).encode())
+        return answer
+
+    def fail(exc):
+        def answer(timeout, req):
+            raise exc
+        return answer
+
+    def http(code):
+        return fail(urllib.error.HTTPError("http://x", code, "fixture", None, None))
+
+    def real(timeout, req):
+        # the stdlib's own path: both fixtures that use it raise before any
+        # socket is opened (a bad header value; userinfo read as a port)
+        return real_urlopen(req, timeout=timeout)
+
+    def stamp(seconds_ago):
+        t = datetime.now(timezone.utc) - timedelta(seconds=seconds_ago)
+        return t.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def peer(name, rows, reachable=True, seconds_ago=5, error="", url=None):
+        return dict(name=name, url=url or f"https://{name}:31416", reachable=reachable,
+                    as_of=stamp(seconds_ago) if rows is not None else "", error=error, accounts=rows)
+
+    def run(routes, boxes=(("home", BOX),), token=TOKEN, key=True, env=None, raw_servers=None):
+        calls, sent_on = [], []
+
+        def fake_urlopen(req, timeout=None, **_):
+            url = getattr(req, "full_url", req)
+            calls.append((url, timeout, req))
+            answer = routes.get(url)
+            if answer is None:
+                raise urllib.error.URLError(ConnectionRefusedError(61, "Connection refused"))
+            return answer(timeout, req)
+
+        names = ("SUBROUTER_STATE_DIR", "SR_STATUS_SERVERS", "COLUMNS", "LINES")
+        saved = (urllib.request.urlopen, mod.HOME, mod.TTY, {k: os.environ.get(k) for k in names})
+        out, rc = io.StringIO(), None
+        with tempfile.TemporaryDirectory(prefix="sr-plot-selftest-") as home:
+            codex_dir = os.path.join(home, ".subrouter", "codex")
+            os.makedirs(codex_dir)
+            with open(os.path.join(codex_dir, "servers.json"), "w") as f:
+                json.dump(raw_servers if raw_servers is not None else
+                          {"servers": [{"name": n, "url": u, "adminToken": token} for n, u in boxes]}, f)
+            if key:
+                kp = os.path.join(codex_dir, "remote.key")
+                with open(kp, "w") as f:
+                    f.write("k" * 32)
+                os.chmod(kp, 0o600)
+            for k in names:
+                os.environ.pop(k, None)
+            os.environ.update({"COLUMNS": "100", "LINES": "40", **(env or {})})
+            urllib.request.urlopen, mod.HOME, mod.TTY = fake_urlopen, home, False
+            try:
+                with contextlib.redirect_stdout(out):
+                    try:
+                        rc = mod.main()
+                    except SystemExit as e:
+                        rc = e.code
+                    except Exception as e:                  # a crash is a result too
+                        print(f"CRASHED: {type(e).__name__}: {e}")
+                        rc = "crash"
+            finally:
+                urllib.request.urlopen, mod.HOME, mod.TTY = saved[0], saved[1], saved[2]
+                for k, v in saved[3].items():
+                    if v is None:
+                        os.environ.pop(k, None)
+                    else:
+                        os.environ[k] = v
+        text = out.getvalue()
+        return text, text.splitlines(), (0 if rc is None else rc), calls
+
+    def title(lines):
+        # the headline: the title line plus any wrapped scope line before the rule
+        i = next((j for j, l in enumerate(lines) if "7d burn pace" in l), 0)
+        rule = next((j for j, l in enumerate(lines) if l.strip().startswith("─")), i + 1)
+        return " ".join(lines[i:rule])
+
+    def note(lines):
+        return next((l for l in lines if re.match(r"\s*\d+ accounts\b", l)), "")
+
+    def first_bar(lines):
+        return next((j for j, l in enumerate(lines) if re.match(r"\s{2}(claude|codex)\s", l)), len(lines))
+
+    def expiring(lines):
+        i = next((j for j, l in enumerate(lines) if "expiring soonest" in l), len(lines))
+        return lines[i + 1:i + 4]
+
+    def check_all(label, checks, text):
+        if only and only not in label:
+            return
+        # a fragment is enough to leak: the old script cut its errors at 48 chars
+        checks.append(("no admin token in the output", TOKEN[:12] not in text))
+        failed = [d for d, ok in checks if not ok]
+        print(("  ok   " if not failed else "  FAIL ") + label)
+        for d in failed:
+            print(f"         - {d}")
+        if "--verbose" in argv:
+            print(textwrap.indent(text, "       | "))
+        ALL.append((label, not failed))
+
+    LOCAL_ROWS = [claude("l-one", 50, 40), claude("l-two", 30, 100), codex("shared-codex", 10, 90)]
+    BOX_ROWS = [claude("b-one", 60, 30), claude("b-two", 20, 120), codex("shared-codex", 10, 90)]
+    U, P, B, WK = LOCAL + USAGE, LOCAL + PEERS, BOX + USAGE, WORK + USAGE
+    NOROUTE = urllib.error.URLError(OSError(65, "No route to host"))
+
+    # 1. the incident: local drops out and the headline still says "local + home"
+    text, lines, rc, _ = run({U: fail(TimeoutError("timed out")), P: fail(TimeoutError("timed out")),
+                             B: body(BOX_ROWS)})
+    miss = next((j for j, l in enumerate(lines) if "LOCAL MISSING" in l), None)
+    check_all("local failed: loud right under the headline, and the headline does not claim it", [
+        ("a LOCAL MISSING line", miss is not None),
+        ("it sits above the numbers (right under the headline)", miss is not None and miss < first_bar(lines)),
+        ("it gives the reason", miss is not None and "timeout after 65s" in lines[miss]),
+        ("the headline names home", "home" in title(lines)),
+        ("the headline does not claim local", "local" not in title(lines)),
+        ("the accounts line does not claim local", "local" not in note(lines)),
+        ("the accounts line counts home's 3", note(lines).lstrip().startswith("3 accounts")),
+    ], text)
+
+    # 2. bug (1): a cold local read of 45 s (a sweep under load; the daemon bounds it at 60 s)
+    text, lines, rc, calls = run({U: body(LOCAL_ROWS, latency=45.0), P: http(404), B: body(BOX_ROWS)})
+    check_all("a cold local read of 45 s is waited for, not dropped", [
+        ("nothing reported missing", "MISSING" not in text and "unreachable" not in text),
+        ("local + home both counted, the shared codex once (5)", note(lines).lstrip().startswith("5 accounts")),
+        ("the headline names local + home", "local + home" in title(lines)),
+        ("the local read was given >= 60 s (the daemon's own sweep bound)",
+         any(u == U and (t or 0) >= 60 for u, t, _ in calls)),
+    ], text)
+
+    # 3. bug (4): home's servers.json address is out of reach, the daemon's peer link is not
+    routes = {U: body(LOCAL_ROWS), B: fail(NOROUTE), P: body({"peers": [peer("box.example", BOX_ROWS)]})}
+    text, lines, rc, _ = run(routes)
+    check_all("home unreachable directly: the box is read through the daemon's peer view", [
+        ("the box's accounts are in the numbers (5)", note(lines).lstrip().startswith("5 accounts")),
+        ("the headline names the peer-link scope", "box.example via peer link" in title(lines)),
+        ("the failed direct read is still said, above the numbers",
+         any("HOME NOT READ" in l for l in lines[:first_bar(lines)])),
+        ("and it is not called missing, since a stand-in is counted", "HOME MISSING" not in text),
+        ("no bottom 'home unreachable' alarm for a box a peer link stood in for",
+         not any(re.match(r"\s*home unreachable", l) for l in lines)),
+    ], text)
+
+    # 3b. stale peer bodies say they are stale
+    routes[P] = body({"peers": [peer("box.example", BOX_ROWS, seconds_ago=300)]})
+    text, lines, rc, _ = run(routes)
+    old = "as of 5m ago" in title(lines)
+    routes[P] = body({"peers": [peer("box.example", BOX_ROWS, reachable=False, seconds_ago=600,
+                                     error="dial tcp 203.0.113.7:31416: i/o timeout")]})
+    text2, lines2, rc2, _ = run(routes)
+    check_all("a peer body the daemon did not just read says how old it is", [
+        ("5 minutes old: 'as of 5m ago' in the headline", old),
+        ("latest read failed: 'last good as of 10m ago' in the headline", "last good as of 10m ago" in title(lines2)),
+        ("and the reason above the numbers",
+         any("i/o timeout" in l for l in lines2[:first_bar(lines2)])),
+        ("still counted (5)", note(lines2).lstrip().startswith("5 accounts")),
+    ], text + text2)
+
+    # 3c. a last-good body hours old is not counted as current
+    six_h = [claude("b-one", 95, 1), claude("b-two", 90, 2), codex("shared-codex", 10, 96)]
+    routes[P] = body({"peers": [peer("box.example", six_h, reachable=False, seconds_ago=6 * 3600,
+                                     error="dial tcp 203.0.113.7:31416: i/o timeout")]})
+    text, lines, rc, _ = run(routes)
+    check_all("a last-good peer body 6h old is not counted as current", [
+        ("the headline does not claim it", "box.example" not in title(lines)),
+        ("it is loud and says how old", any("BOX.EXAMPLE MISSING" in l and "6h ago" in l
+                                             for l in lines[:first_bar(lines)])),
+        ("its rolled windows are not 'expiring soonest'", not any("b-one" in l or "b-two" in l for l in lines)),
+        ("no false 'disagrees' on the shared account", "disagrees" not in text),
+        ("home is plainly missing (no stand-in)", "HOME MISSING" in text),
+        ("local's 3 counted", note(lines).lstrip().startswith("3 accounts")),
+    ], text)
+
+    # 3d. a body minutes old: its reset clocks move on by its age
+    ten_m = [claude("b-one", 60, 0.1), claude("b-two", 20, 3)]
+    routes[P] = body({"peers": [peer("box.example", ten_m, seconds_ago=600)]})
+    text, lines, rc, _ = run(routes)
+    soon = expiring(lines)
+    check_all("a peer body 10m old: resets rebased by its age, a rolled window left out", [
+        ("b-two resets in 2.8h, not 3.0h", any("b-two" in l and "2.8h" in l for l in soon)),
+        ("b-one (reset due 6 min after the reading) is not 'expiring'", not any("b-one" in l for l in soon)),
+        ("b-one is named as rolled since the reading",
+         any("rolled since the reading" in l and "b-one" in l for l in lines)),
+    ], text)
+
+    # 4. both paths succeed: the peer that IS home is not counted again; a different box is
+    other = [claude("o-one", 70, 20), claude("b-two", 20, 120)]      # shares one account with home
+    routes = {U: body(LOCAL_ROWS), B: body(BOX_ROWS),
+              P: body({"peers": [peer("box.example", BOX_ROWS[:2]), peer("other-box", other)]})}
+    text, lines, rc, _ = run(routes)
+    check_all("both succeed: no double count, and a different box still counts", [
+        ("6 accounts: local 2 + home 2 + shared codex + o-one (b-two once)",
+         note(lines).lstrip().startswith("6 accounts")),
+        ("the same-box peer is not a scope of its own", "box.example" not in text),
+        ("the other box is named in the headline", "other-box via peer link" in title(lines)),
+        ("home is named in the headline", "home" in title(lines)),
+    ], text)
+
+    # 4b. §32 matches on the roster only: a peer that shares a servers.json name is not that box by name
+    routes = {U: body(LOCAL_ROWS), B: body(BOX_ROWS),
+              P: body({"peers": [peer("home", None, url="https://elsewhere.test:31416",
+                                      error="dial tcp: connection refused")]})}
+    text, lines, rc, _ = run(routes)
+    routes[P] = body({"peers": [peer("home", [claude("h-extra", 30, 50)], url="https://elsewhere.test:31416")]})
+    text2, lines2, rc2, _ = run(routes)
+    check_all("a peer named like a servers.json entry is matched by roster, not by name", [
+        ("a bodiless peer 'home' is loud above the numbers",
+         any("peer link to home has no reading" in l for l in lines[:first_bar(lines)])),
+        ("a peer 'home' with its own account is its own scope", note(lines2).lstrip().startswith("6 accounts")),
+        ("and the accounts line tells the two apart", "home (peer link)" in note(lines2)),
+    ], text + text2)
+
+    # 4c. two boxes fail and one peer stands in: at least one is missing, and says so
+    routes = {U: body(LOCAL_ROWS), B: fail(NOROUTE), WK: fail(NOROUTE),
+              P: body({"peers": [peer("boxpeer", BOX_ROWS)]})}
+    text, lines, rc, _ = run(routes, boxes=(("home", BOX), ("work", WORK)))
+    top = " ".join(lines[:first_bar(lines)])
+    check_all("two boxes fail, one peer stands in: 'at least 1 of HOME, WORK MISSING'", [
+        ("an at-least-one MISSING line above the numbers", "AT LEAST 1 OF HOME, WORK MISSING" in top),
+        ("no box is told 'nothing is missing'", "nothing is missing" not in text),
+        ("the stand-in is counted", "boxpeer via peer link" in title(lines)),
+    ], text)
+
+    # 5. bug (3): rows with no measured weekly reading are counted, not dropped
+    cut = dict(id="cut-new", provider="claude", auth_mode="oauth", auth_checked=False, auth_valid=False,
+               sweep_cut=True, windows=[])
+    legacy = dict(id="cut-old", provider="claude", auth_mode="oauth", auth_checked=True, auth_valid=False,
+                  error="context deadline exceeded", windows=[])
+    dead = dict(id="dead-one", provider="claude", auth_mode="oauth", auth_checked=True, auth_valid=False,
+                error="invalid_grant", windows=[])
+    apikey = dict(id="key-row", provider="codex", auth_mode="apikey", auth_checked=False, auth_valid=False)
+    kimi = dict(id="kimi", provider="kimi", auth_checked=False, auth_valid=False, sweep_cut=True)
+    elsewhere = dict(id="shared-codex", provider="codex", auth_mode="oauth", auth_checked=False,
+                     auth_valid=False, sweep_cut=True, windows=[])     # measured on home
+    routes = {U: body(LOCAL_ROWS[:2] + [cut, legacy, dead, apikey, kimi, elsewhere]), P: http(404),
+              B: body(BOX_ROWS)}
+    text, lines, rc, _ = run(routes)
+    line = next((l for l in lines if "not in the numbers:" in l), "")
+    check_all("unmeasured rows are counted and named, not silently dropped", [
+        ("a 'not in the numbers' line", bool(line)),
+        ("2 unmeasured (the cut row and the older daemon's context error)", "2 unmeasured" in line),
+        ("1 auth-invalid (a real verdict)", "1 auth-invalid" in line),
+        ("the rows are named", "cut-new" in text and "cut-old" in text),
+        ("an api-key row, another provider, and a row measured elsewhere are not counted",
+         "key-row" not in text and "kimi" not in line and "shared-codex" not in line),
+        ("local's headline says 2 of 4 measured", "local (2 of 4 measured)" in title(lines)),
+    ], text)
+
+    # 5b. a measured, valid row with no weekly window read is not "unmeasured"
+    fiveh = dict(id="codex-5h", provider="codex", auth_mode="oauth", auth_checked=True, auth_valid=True,
+                 windows=[{"Name": "primary", "UsedPercent": 5, "LimitWindowSeconds": 18000, "ResetAfterSeconds": 900},
+                          {"Name": "secondary", "UsedPercent": 30, "LimitWindowSeconds": 604800,
+                           "ResetAfterSeconds": 200000}])
+    routes = {U: body(LOCAL_ROWS + [fiveh]), P: http(404), B: body(BOX_ROWS)}
+    text, lines, rc, _ = run(routes)
+    line = next((l for l in lines if "codex-5h" in l), "")
+    check_all("a measured row with no weekly window is not called unmeasured", [
+        ("it is not 'unmeasured'", "unmeasured" not in text),
+        ("it is named as having no weekly window", "no weekly window" in line),
+        ("the headline does not call local partly measured", "measured)" not in title(lines)),
+    ], text)
+
+    # 5c. local answered, but the sweep measured none of it
+    all_cut = [dict(id=f"cut-{i}", provider="claude", auth_mode="oauth", auth_checked=False, auth_valid=False,
+                    sweep_cut=True, windows=[]) for i in range(12)]
+    routes = {U: body(all_cut), P: http(404), B: body(BOX_ROWS[:2])}
+    text, lines, rc, _ = run(routes)
+    routes = {U: body(all_cut), P: http(404), B: fail(NOROUTE)}
+    text2, lines2, rc2, _ = run(routes)
+    check_all("local answered with nothing measured: the headline does not claim it", [
+        ("the headline says 'local (0 of 12 measured)'", "local (0 of 12 measured)" in title(lines)),
+        ("LOCAL UNMEASURED above the numbers", any("LOCAL UNMEASURED" in l for l in lines[:first_bar(lines)])),
+        ("the accounts line does not claim local", note(lines).lstrip().startswith("2 accounts")
+         and "local" not in note(lines)),
+        ("with home down too: no '0 accounts'", not re.search(r"\b0 accounts\b", text2)),
+        ("and a non-zero exit", rc2 not in (0, None)),
+    ], text + text2)
+
+    # 6. a daemon older than the route (404): today's reads, and home is loud when down
+    routes = {U: body(LOCAL_ROWS), B: fail(urllib.error.URLError(ConnectionRefusedError(61, "Connection refused"))),
+              P: http(404)}
+    text, lines, rc, _ = run(routes)
+    check_all("peer route 404: falls back silently to the direct reads", [
+        ("HOME MISSING above the numbers", any("HOME MISSING" in l for l in lines[:first_bar(lines)])),
+        ("nothing about a peer link or a fallback", "peer link" not in text and "fallback" not in text),
+        ("the headline names local only", "local" in title(lines) and "home" not in title(lines)),
+        ("local's 3 counted", note(lines).lstrip().startswith("3 accounts")),
+        ("exit 0", rc == 0),
+    ], text)
+
+    # 7. the daemon's peer view fails for another reason while home is down
+    routes[P] = http(500)
+    text, lines, rc, _ = run(routes)
+    check_all("peer view fails while home is down: says there is no fallback", [
+        ("HOME MISSING", "HOME MISSING" in text),
+        ("a no-fallback line with the reason", any("no fallback" in l and "HTTP 500" in l for l in lines)),
+    ], text)
+
+    # 8. nothing read is not an empty pool
+    routes = {U: fail(TimeoutError("timed out")), P: fail(TimeoutError("timed out")),
+              B: fail(urllib.error.URLError(ConnectionRefusedError(61, "Connection refused")))}
+    text, lines, rc, _ = run(routes)
+    check_all("every scope failed: no '0 accounts', both named missing, non-zero exit", [
+        ("no '0 accounts' line", not re.search(r"\b0 accounts\b", text)),
+        ("LOCAL MISSING and HOME MISSING", "LOCAL MISSING" in text and "HOME MISSING" in text),
+        ("non-zero exit", rc not in (0, None)),
+    ], text)
+
+    # 9. no credential in a reason: http.client quotes a bad header value, and a
+    # URL's userinfo reads as a "port" -- both through the real urlopen
+    SECRET = "pw-selftest-userinfo"
+    routes = {U: body(LOCAL_ROWS), P: http(404), B: real, f"http://u:{SECRET}@box2.test{USAGE}": real}
+    text, lines, rc, _ = run(routes, boxes=(("home", BOX), ("lab", f"http://u:{SECRET}@box2.test")),
+                             token=TOKEN + "\n")
+    check_all("no token or userinfo in a failure reason", [
+        ("home is missing, with a reason", "HOME MISSING" in text),
+        ("no userinfo password", SECRET not in text),
+    ], text)
+
+    # 10. a box that redirects: the token does not follow, and the answer is not the box
+    sent = []
+    def redirect(to):
+        def answer(timeout, req):
+            new = urllib.request.HTTPRedirectHandler().redirect_request(req, None, 302, "Found", {}, to)
+            sent.append(new.has_header("Authorization"))
+            r = io.BytesIO(b"[]")
+            r.geturl = lambda: to
+            return r
+        return answer
+    routes = {U: body(LOCAL_ROWS), P: http(404), B: redirect("http://portal.test/login")}
+    text, lines, rc, _ = run(routes)
+    check_all("a box that answers with a redirect: no token sent on, not counted as an empty box", [
+        ("the redirected request carries no Authorization", sent and not any(sent)),
+        ("home is not in the headline", "home" not in title(lines)),
+        ("home is loud", "HOME MISSING" in text),
+    ], text)
+
+    # 11. sr status's gates: SR_STATUS_SERVERS=0, no remote.key, built-in names, a bad entry
+    routes = {U: body(LOCAL_ROWS), P: body({"peers": [peer("box.example", BOX_ROWS)]}), B: body(BOX_ROWS),
+              WK: body([claude("w-one", 10, 50)]), "http://127.0.0.1:9" + USAGE: fail(NOROUTE)}
+    _, l_off, _, c_off = run(routes, env={"SR_STATUS_SERVERS": "0"})
+    _, l_key, _, c_key = run(routes, key=False)
+    t_bi, l_bi, _, _ = run(routes, boxes=(("local", "http://127.0.0.1:9"), ("home", BOX)))
+    raw = {"servers": [{"name": "home", "url": BOX, "adminToken": TOKEN}, {"name": "lab"},
+                       {"name": "work", "url": WORK, "adminToken": TOKEN}]}
+    t_bad, l_bad, _, _ = run(routes, raw_servers=raw)
+    check_all("sr status's gates hold: SR_STATUS_SERVERS=0, remote.key, built-in names, one bad entry", [
+        ("SR_STATUS_SERVERS=0: only this machine's usage is read", [u for u, *_ in c_off] == [U]),
+        ("no remote.key: only this machine's usage is read", [u for u, *_ in c_key] == [U]),
+        ("a servers.json entry named 'local' is not a box (no LOCAL MISSING)", "LOCAL MISSING" not in t_bi),
+        ("a malformed entry is named", any("entry #2" in l for l in l_bad[:first_bar(l_bad)])),
+        ("and the entries after it are still read", "work" in title(l_bad)),
+    ], t_bi + t_bad)
+
+    bad = [label for label, ok in ALL if not ok]
+    print()
+    if bad:
+        print(f"FAILED: {len(bad)} of {len(ALL)}")
+        return 1
+    print(f"all {len(ALL)} sr-plot fixtures pass")
+    return 0
+
+
+if __name__ == "__main__":
+    if "--selftest" in sys.argv[1:]:
+        sys.exit(_selftest(sys.argv[1:]))
+    try:
+        rc = main()
+    except KeyboardInterrupt:
+        # a read may still be running (local waits up to 65 s): leave now,
+        # without joining it the way the interpreter's exit would
+        sys.stdout.flush()
+        sys.stderr.write("\n")
+        sys.stderr.flush()
+        os._exit(130)
+    sys.exit(rc)

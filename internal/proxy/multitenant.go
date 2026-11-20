@@ -113,7 +113,11 @@ func (m *MultiTenant) Handler(fallback http.Handler) http.Handler {
 			// The account-upload flow POSTs the global reload endpoint from
 			// loopback after installing files; reload instantiated tenants too so
 			// tenant uploads become visible without a restart. Gated on loopback
-			// like the endpoint itself so a rejected caller triggers no work.
+			// like the endpoint itself so a rejected caller triggers no work --
+			// and on the same browser and Host checks the endpoint's own gate
+			// applies (PATCHES §29), since this runs BEFORE that gate: a bare
+			// loopback test let a cross-site page reload every tenant while the
+			// global reload behind it was refused.
 			m.reloadTenantAccounts(r.Context())
 		}
 		fallback.ServeHTTP(w, r)
@@ -269,8 +273,9 @@ func tenantCredentialAllows(key tenant.Key, path, method string) bool {
 	if path == "/_subrouter/account-status" ||
 		path == "/_subrouter/usage-status" {
 		// Reading status is part of using the pool. A POST to account-status
-		// forces a credential refresh for every account, which is account
-		// management.
+		// forces a credential refresh of every account in the tenant
+		// (AccountRef.Statuses with forceRefresh), which is account
+		// management, so it needs ManageAccounts (upstream #374, PATCHES §29).
 		if method == http.MethodGet {
 			return key.Allows(tenant.CapabilityUse) ||
 				key.Allows(tenant.CapabilityManageAccounts)
@@ -385,9 +390,13 @@ func (m *MultiTenant) newTenantServer(ctx context.Context, t tenant.Tenant) (*Se
 	server.CacheFlight = newSingleFlight()
 	// Reaching a tenant handler already proves possession of the tenant key,
 	// so the tenant-visible _subrouter read endpoints need no admin token.
+	// tenantControlAuthorized carries that delegation into authorizeAdmin
+	// explicitly, rather than leaning on its tokenless fallback (which the
+	// blanked AdminToken below would otherwise trigger).
 	server.AdminToken = ""
 	server.AccountImportToken = ""
 	server.tenantAccountImportAuthorized = true
+	server.tenantControlAuthorized = true
 	// Token usage is an operator view of the global pool; tenants neither
 	// share nor persist into it.
 	server.TokenUsage = nil

@@ -74,3 +74,26 @@ func TestHealthReportsRecoveryCountersAndRolloutMetadata(t *testing.T) {
 		t.Fatalf("recovery counters = %+v", body.Recovery)
 	}
 }
+
+// A Claude Code status line script reads warm_idle_seconds to show
+// when a session goes unlinked, and falls back to 70 minutes when the key is
+// missing or is not a top-level integer from 60 to 86400 (PATCHES §67).
+func TestHealthReportsTheWarmIdleWindowTheStatusLineReads(t *testing.T) {
+	ref := NewAccountRef(accounts.CodexStore{Dir: t.TempDir()}, nil, nil)
+	ref.claudeStore = agentclaude.Store{Dir: t.TempDir()}
+	req := httptest.NewRequest(http.MethodGet, "/_subrouter/health", nil)
+	req.RemoteAddr = "127.0.0.1:4321"
+	resp := httptest.NewRecorder()
+	Server{AccountRef: ref}.Handler().ServeHTTP(resp, req)
+	var body map[string]json.RawMessage
+	if err := json.Unmarshal(resp.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode health: %v (%s)", err, resp.Body.String())
+	}
+	raw, ok := body["warm_idle_seconds"]
+	if !ok {
+		t.Fatalf("health has no top-level warm_idle_seconds: %s", resp.Body.String())
+	}
+	if string(raw) != "3600" {
+		t.Fatalf("warm_idle_seconds = %s, want the integer 3600", raw)
+	}
+}

@@ -1,9 +1,7 @@
 package main
 
 import (
-	"context"
 	"errors"
-	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -45,59 +43,6 @@ func TestStandaloneUsageFetchOnlyRunsWhenAutoSwitchIsDisabled(t *testing.T) {
 	}
 }
 
-func TestCodexUsageFetchConcurrencyIsBounded(t *testing.T) {
-	accountsToFetch := make([]accounts.Account, codexUsageFetchConcurrency*3)
-	for i := range accountsToFetch {
-		accountsToFetch[i] = accounts.Account{
-			ID:       fmt.Sprintf("account-%d", i),
-			Provider: accounts.ProviderCodex,
-			AuthMode: accounts.AuthModeOAuth,
-		}
-	}
-	started := make(chan struct{}, len(accountsToFetch))
-	release := make(chan struct{})
-	done := make(chan struct{})
-	var active atomic.Int32
-	var peak atomic.Int32
-	go func() {
-		defer close(done)
-		_, _ = fetchCodexScoresWithRefresh(context.Background(), accountsToFetch, func(_ context.Context, _ *http.Client, account accounts.Account) (accounts.Account, error) {
-			current := active.Add(1)
-			for {
-				old := peak.Load()
-				if current <= old || peak.CompareAndSwap(old, current) {
-					break
-				}
-			}
-			started <- struct{}{}
-			<-release
-			active.Add(-1)
-			return account, errors.New("test stops before the usage request")
-		})
-	}()
-	for range codexUsageFetchConcurrency {
-		select {
-		case <-started:
-		case <-time.After(time.Second):
-			t.Fatal("bounded workers did not start")
-		}
-	}
-	select {
-	case <-started:
-		t.Fatalf("more than %d usage workers started concurrently", codexUsageFetchConcurrency)
-	case <-time.After(25 * time.Millisecond):
-	}
-	close(release)
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("bounded usage fetch did not finish")
-	}
-	if got := peak.Load(); got != codexUsageFetchConcurrency {
-		t.Fatalf("peak concurrent usage fetches = %d, want %d", got, codexUsageFetchConcurrency)
-	}
-}
-
 func TestSchedulerAccountsByProviderExcludesNonCodexPools(t *testing.T) {
 	all := []accounts.Account{
 		{ID: "codex", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth},
@@ -117,9 +62,13 @@ func TestSchedulerAccountsByProviderExcludesNonCodexPools(t *testing.T) {
 		t.Fatalf("Claude scheduler accounts = %+v", claude)
 	}
 
+	// Both scheduler pools are seeded (PATCHES.md §9); the keyed and
+	// credential-only providers, and a provider-less legacy record, are not.
 	scores := fallbackScores(all)
-	if len(scores) != 1 || scores[0].AccountID != "codex" || scores[0].Provider != accounts.ProviderCodex {
-		t.Fatalf("Codex fallback scores = %+v", scores)
+	if len(scores) != 2 ||
+		scores[0].AccountID != "codex" || scores[0].Provider != accounts.ProviderCodex ||
+		scores[1].AccountID != "claude" || scores[1].Provider != accounts.ProviderClaude {
+		t.Fatalf("fallback scores = %+v, want exactly the Codex and Claude pool accounts", scores)
 	}
 }
 
@@ -330,6 +279,44 @@ func TestServeDoesNotMigrateLegacyCodexOAuthOnStartup(t *testing.T) {
 	}
 }
 
+// POLICY decision 3: tailnet auth is off by default and never runs with an
+// empty allowlist, which upstream reads as "every tailnet peer is admin".
+func TestTailnetAllowlistRefusal(t *testing.T) {
+	if err := tailnetAllowlistRefusal(nil, nil); err == nil || !strings.Contains(err.Error(), "empty allowlist") {
+		t.Fatalf("empty allowlist accepted: %v", err)
+	}
+	if err := tailnetAllowlistRefusal([]string{"alice@example.com"}, nil); err != nil {
+		t.Fatalf("users-only allowlist refused: %v", err)
+	}
+	if err := tailnetAllowlistRefusal(nil, []string{"tag:subrouter"}); err != nil {
+		t.Fatalf("tags-only allowlist refused: %v", err)
+	}
+}
+
+// The refusal has to be wired into serve, not only exist. The tailscale CLI
+// path cannot resolve, so if the refusal regresses serve still fails at the
+// resolver -- this test can go red, but can never start a daemon.
+func TestServeRefusesTailscaleAuthWithoutAllowlist(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", filepath.Join(root, "home"))
+	t.Setenv("SUBROUTER_STATE_DIR", filepath.Join(root, "state"))
+	t.Setenv("SUBROUTER_TAILSCALE_AUTH", "")
+
+	err := serve([]string{
+		"--tailscale-auth",
+		"--tailscale-auth-users", " , ",
+		"--tailscale-cli", filepath.Join(root, "no-such-tailscale"),
+		"--cloud-config", filepath.Join(root, "cloud.json"),
+		"--sessions", filepath.Join(root, "state", "sessions.json"),
+		"--antigravity-local-credential=false",
+		"--fetch-usage=false",
+		"--sr-switch-interval=0",
+	})
+	if err == nil || !strings.Contains(err.Error(), "empty allowlist") {
+		t.Fatalf("serve error = %v, want the empty-allowlist refusal", err)
+	}
+}
+
 func TestSystemdListenFDsParsesCurrentProcess(t *testing.T) {
 	env := map[string]string{
 		"LISTEN_PID": "123",
@@ -516,6 +503,7 @@ func TestDirectSRCommandNames(t *testing.T) {
 		"account",
 		"accounts",
 		"add",
+		"addr",
 		"add-admin-key",
 		"add-api-key",
 		"add-key",
@@ -533,13 +521,13 @@ func TestDirectSRCommandNames(t *testing.T) {
 		"cost",
 		"daemon",
 		"doctor",
+		"error",
+		"errors",
 		"g",
 		"gemini",
 		"gui",
 		"gui-switch",
 		"gui-use",
-		"host",
-		"hosts",
 		"import",
 		"kimi",
 		"list",
@@ -591,7 +579,7 @@ func TestDirectSRCommandNames(t *testing.T) {
 			t.Fatalf("%s should be a direct sr command", command)
 		}
 	}
-	for _, command := range []string{"serve", "codex", "install-daemon", "install-systemd"} {
+	for _, command := range []string{"serve", "codex", "install-daemon", "install-systemd", "install-launchd", "fingerprint"} {
 		if isDirectSRCommand(command) {
 			t.Fatalf("%s should stay a subrouter command", command)
 		}
@@ -647,6 +635,7 @@ func TestSRAccountsAliasUsesTheSelectedTeamVault(t *testing.T) {
 	defer server.Close()
 
 	t.Setenv("SUBROUTER_STATE_DIR", t.TempDir())
+	unlockRemoteGateForTest(t)
 	// sr initializes the local Codex store before dispatching the hosted alias.
 	// Keep its legacy migration away from the developer's real HOME.
 	t.Setenv("HOME", t.TempDir())

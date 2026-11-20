@@ -432,6 +432,11 @@ func TestNativeProxyAccountSelectionIsProviderScopedAndFailsClosed(t *testing.T)
 }
 
 func TestTeamNativeProxyLaunchUsesBrokerForPooledAndPinnedQwen(t *testing.T) {
+	// Team credential storage is a remote feature: on a keyless machine the
+	// PATCHES 17 gate resolves Local whatever cloud.json says, the team refusal
+	// never fires, and the launch would exec whatever `kimi` is on the
+	// developer's PATH. State the unlock.
+	unlockRemoteGateForTest(t)
 	localStore := accounts.CodexStore{Dir: filepath.Join(t.TempDir(), "local-state", "codex", "accounts")}
 	initializeLocalDataTestStore(t, localStore)
 	var accountRequests atomic.Int32
@@ -621,6 +626,9 @@ func TestTeamNativeProxyQwenChild(t *testing.T) {
 }
 
 func TestRemoteTenantNativeProxyAuthenticatesPreflightAndRelayWithoutExposingKeyToChild(t *testing.T) {
+	// A box path: on a keyless machine the PATCHES 17 gate ignores servers.json
+	// and the remote selection entirely, so this upstream test states the unlock.
+	unlockRemoteGateForTest(t)
 	var preflights atomic.Int32
 	var routedRequests atomic.Int32
 	remote := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
@@ -1022,6 +1030,9 @@ func TestNativeProxyRejectsUnattestedLocalAuthorityBeforeInventoryOrToken(t *tes
 }
 
 func TestNativeProxyServerUsesHostedAuthorityWithoutLegacyRegistry(t *testing.T) {
+	// A box path: on a keyless machine the PATCHES 17 gate ignores servers.json
+	// and the remote selection entirely, so this upstream test states the unlock.
+	unlockRemoteGateForTest(t)
 	cloudPath := filepath.Join(t.TempDir(), "cloud.json")
 	t.Setenv("SUBROUTER_CLOUD_CONFIG", cloudPath)
 	if err := broker.SaveConfig(cloudPath, broker.Config{

@@ -469,6 +469,12 @@ func (s Server) requireSessionLeaseAdmin(next func(http.ResponseWriter, *http.Re
 		// Loopback remains usable for local self-hosting. Every network caller
 		// must present a configured admin token, even when other legacy admin
 		// endpoints are running in permissive mode.
+		//
+		// This gate granted loopback on its own, beside authorizeAdmin, so it
+		// needs the same browser and Host checks spelled out (PATCHES §29):
+		// a cross-site page or a rebinding one is refused before anything
+		// else, and loopback trust means a local client that named this
+		// machine.
 		if reason := s.adminRequestRejection(r); reason != "" {
 			http.Error(w, reason, http.StatusForbidden)
 			return
@@ -528,7 +534,7 @@ func (s Server) handleSessionLeases(w http.ResponseWriter, r *http.Request) {
 	}
 	var pendingSessionCommit bool
 	var placementReservation *selectacct.PlacementReservation
-	account, sessionKey, _, err := s.accountForSessionProviderWithOptions(
+	account, sessionKey, _, _, err := s.accountForSessionProviderWithOptions(
 		provider,
 		agentTypeForProviderSession(request.Agent, provider),
 		routingKey,
@@ -571,9 +577,14 @@ func (s Server) handleSessionLeases(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "no account is available for the requested lease", http.StatusServiceUnavailable)
 		return
 	}
-	if account.ID != selectedAccountID && s.SchedulerRef != nil {
+	if account.ID != selectedAccountID && s.SchedulerRef != nil && placementReservation != nil {
 		// Terminal credential refresh can replace the chosen account. Move
 		// the pending debit to the account the lease will actually persist.
+		// Selection fills placementReservation only where it reserves
+		// (upstream #651/#655); this fork's selection keeps its live debits
+		// on NoteRouted and leaves it nil, so a lease debits nothing at
+		// creation, as before the merge -- the same guard the request
+		// handler applies.
 		placementReservation.Release()
 		placementReservation = nil
 		_, placementReservation, err = pickAndReserveRoutingAccount(r.Context(), s.scheduler(), s.SchedulerRef, []accounts.Account{account})

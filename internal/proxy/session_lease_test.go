@@ -271,6 +271,50 @@ func TestCodexSessionLeaseSkipsTerminalRefreshFailure(t *testing.T) {
 	}
 }
 
+// A lease whose sticky account refreshes to Anthropic's account_on_hold is
+// issued on another account, the session moved to it and the held account
+// marked (PATCHES §35.2). Before §35 the refusal was not a verdict
+// refreshSelectedAccount failed over on, so the lease request got a 503.
+func TestClaudeSessionLeaseSkipsAnAccountOnHold(t *testing.T) {
+	sessionStore := newSessionStore(t)
+	routingKey := sessionLeaseRoutingKey(sessionLeaseRequest{
+		OrganizationID: "organization-1", WorkspaceID: "workspace-1", ConversationID: "conversation-1",
+		InvocationID: "invocation-1", AgentSessionID: "agent-session-1", Agent: "pi",
+	}, accounts.ProviderClaude, "claude-sonnet-4-5")
+	if _, err := sessionStore.Put("pi", routingKey, "held@example.com", ""); err != nil {
+		t.Fatal(err)
+	}
+	server := Server{
+		Accounts: []accounts.Account{
+			{ID: "held@example.com", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "held-token"},
+			{ID: "healthy@example.com", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "healthy-token"},
+		},
+		Sessions:      sessionStore,
+		Scheduler:     selectacct.NewScheduler(nil),
+		SchedulerRef:  selectacct.NewSchedulerRef(selectacct.NewScheduler(nil)),
+		sessionLeases: newSessionLeaseStore(),
+		AdminToken:    "service-admin-token",
+		MaxBodyBytes:  1024,
+		RefreshAccountFn: func(_ context.Context, account accounts.Account) (accounts.Account, error) {
+			if account.ID == "held@example.com" {
+				return account, errors.New(`Claude OAuth refresh failed: 403 Forbidden: {"error": {"type": "account_on_hold"}}`)
+			}
+			return account, nil
+		},
+	}
+
+	lease, _ := issueSessionLease(t, server.Handler(), "claude", "anthropic/claude-sonnet-4-5")
+	if lease.Assignment.AccountID != "healthy@example.com" {
+		t.Fatalf("lease account = %q, want healthy@example.com", lease.Assignment.AccountID)
+	}
+	if assignment, ok := sessionStore.Get("pi", routingKey); !ok || assignment.AccountID != "healthy@example.com" {
+		t.Fatalf("sticky assignment = %+v, want healthy account", assignment)
+	}
+	if !server.SchedulerRef.Get().Exhausted(accounts.ProviderClaude, "held@example.com") {
+		t.Fatal("the account on hold was not marked")
+	}
+}
+
 func TestIdempotentSessionLeaseReplacesLeaseAfterTerminalAccountFailure(t *testing.T) {
 	request := sessionLeaseRequest{
 		OrganizationID: "organization-1", WorkspaceID: "workspace-1", ConversationID: "conversation-1",

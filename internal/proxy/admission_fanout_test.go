@@ -32,7 +32,7 @@ func TestTrafficReportsPerSessionFanOutWithoutTheSessionID(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	control := &admissionControl{limit: 1, queueCap: 4, buckets: make(map[admissionKey]*admissionBucket)}
+	control := testAdmissionControl(1, 4)
 	handler := Server{
 		Sessions:       store,
 		ClaudeUpstream: mustParseURL(t, upstream.URL),

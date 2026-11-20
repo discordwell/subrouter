@@ -1458,7 +1458,14 @@ func (s Server) streamBedrockResponse(w http.ResponseWriter, resp *http.Response
 
 // flushingCopy streams src to the client, flushing after each chunk, and
 // mirrors the bytes to sink (used for usage parsing) when sink is non-nil.
-func flushingCopy(w http.ResponseWriter, src io.Reader, sink io.Writer) {
+//
+// It returns src's read error when that is what ended the copy early: never
+// io.EOF, the normal end, and nil when the client write failed -- a client
+// that went away is not a broken source. Callers that ignore it lose the only
+// sign that the client got a truncated body: the Bedrock, Azure Codex and
+// Fable relays still do, and end a broken stream cleanly and unlogged
+// (PATCHES §33, residual risks).
+func flushingCopy(w http.ResponseWriter, src io.Reader, sink io.Writer) error {
 	flusher, _ := w.(http.Flusher)
 	buf := make([]byte, 32*1024)
 	for {
@@ -1468,14 +1475,17 @@ func flushingCopy(w http.ResponseWriter, src io.Reader, sink io.Writer) {
 				_, _ = sink.Write(buf[:n])
 			}
 			if _, writeErr := w.Write(buf[:n]); writeErr != nil {
-				return
+				return nil
 			}
 			if flusher != nil {
 				flusher.Flush()
 			}
 		}
+		if readErr == io.EOF {
+			return nil
+		}
 		if readErr != nil {
-			return
+			return readErr
 		}
 	}
 }

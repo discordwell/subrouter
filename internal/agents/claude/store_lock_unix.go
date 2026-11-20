@@ -81,10 +81,7 @@ func (l *profileRegistryLock) Close() error {
 // lockProfileCredential serializes one profile's rotating OAuth credential
 // across goroutines and overlapping supervisor worker generations.
 func lockProfileCredential(ctx context.Context, instancePath string) (*profileCredentialLock, error) {
-	if resolved, err := filepath.EvalSymlinks(instancePath); err == nil {
-		instancePath = resolved
-	}
-	path := filepath.Clean(instancePath) + ".credentials.lock"
+	path := profileCredentialLockPath(instancePath)
 	releaseProcess, err := lockProfileCredentialProcess(ctx, path)
 	if err != nil {
 		return nil, err
@@ -141,10 +138,7 @@ type profileRefreshLock struct {
 // long-running refresh never blocks an unrelated ImportProfileCredential
 // call on the same profile.
 func lockProfileRefresh(ctx context.Context, instancePath string) (*profileRefreshLock, error) {
-	if resolved, err := filepath.EvalSymlinks(instancePath); err == nil {
-		instancePath = resolved
-	}
-	path := filepath.Clean(instancePath) + ".refresh.lock"
+	path := profileRefreshLockPath(instancePath)
 	releaseProcess, err := lockProfileCredentialProcess(ctx, path)
 	if err != nil {
 		return nil, err

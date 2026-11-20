@@ -523,7 +523,7 @@ func TestKimiSelectionRefreshesOAuthUsageScoresBeforePicking(t *testing.T) {
 		},
 	}
 	request := httptest.NewRequest(http.MethodPost, "/kimi/v1/messages", strings.NewReader(`{"model":"kimi-for-coding","messages":[]}`))
-	account, _, _, err := server.accountForSessionProvider(accounts.ProviderKimi, "kimi", "kimi-score-refresh", request)
+	account, _, _, _, err := server.accountForSessionProvider(accounts.ProviderKimi, "kimi", "kimi-score-refresh", request)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1022,7 +1022,7 @@ func (*progressiveReadCloser) Close() error { return nil }
 
 func TestNonStreamingCommitWrapperDoesNotReadAhead(t *testing.T) {
 	upstream := &progressiveReadCloser{blocked: make(chan struct{})}
-	body := newSessionCommitEOFReadCloser(upstream, func() error { return nil })
+	body := newSessionCommitEOFReadCloser(upstream, func() error { return nil }, nil)
 	result := make(chan struct {
 		n   int
 		err error

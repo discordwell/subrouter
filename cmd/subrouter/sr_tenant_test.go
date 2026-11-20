@@ -20,6 +20,7 @@ const testTenantKey = "srt_0123456789abcdef0123456789abcdef"
 func TestSRServerAddStoresTenantKey(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	unlockRemoteGateForTest(t)
 	store := accounts.DefaultCodexStore()
 
 	var out bytes.Buffer
@@ -57,6 +58,7 @@ func TestSRServerAddStoresTenantKey(t *testing.T) {
 func TestSRServerAddRejectsMalformedTenantKey(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	unlockRemoteGateForTest(t)
 	var out bytes.Buffer
 	runner := srRunner{store: accounts.DefaultCodexStore(), out: &out, errOut: &out}
 	err := runner.run(context.Background(), []string{
@@ -367,6 +369,7 @@ func TestWriteClaudeProxyEnvTenantKeySetsAuthToken(t *testing.T) {
 func TestSRTenantLocalCreateListRevoke(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	unlockRemoteGateForTest(t)
 	stateDir := filepath.Join(home, ".subrouter")
 	t.Setenv("SUBROUTER_STATE_DIR", stateDir)
 	store := accounts.CodexStore{Dir: filepath.Join(stateDir, "codex", "accounts")}

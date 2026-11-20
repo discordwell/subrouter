@@ -16,7 +16,15 @@ import (
 )
 
 func testAdmissionControl(limit, queueCap int) *admissionControl {
-	return &admissionControl{limit: limit, queueCap: queueCap, buckets: make(map[admissionKey]*admissionBucket)}
+	control := newAdmissionControl()
+	control.limits.Limit, control.limits.Queue = limit, queueCap
+	return control
+}
+
+func testAdmissionSpillControl(limit, queueCap, spillQueue int) *admissionControl {
+	control := testAdmissionControl(limit, queueCap)
+	control.limits.SpillQueue = spillQueue
+	return control
 }
 
 func TestAdmissionQueuesPhysicalAttemptsAndReleasesFIFO(t *testing.T) {
@@ -79,22 +87,73 @@ func TestAdmissionPauseHonorsProviderRetryAfterAndCancellation(t *testing.T) {
 	}
 }
 
-func TestAdmissionPauseUsesClaudeQuotaReset(t *testing.T) {
+// Upstream's TestAdmissionPauseUsesClaudeQuotaReset paused the bucket until
+// the quota reset (two minutes out there). In this fork the reset only bounds
+// the pause from above: the quota hold is the scheduler's exhaustion mark,
+// which a fresh reading (PATCHES §29.3b) or a reset claim (§46.4) can end,
+// so the admission pause is cut to admissionQuotaPauseMax -- still longer
+// than admissionPauseWaitMax, so the burst behind the 429 fails over at once.
+func TestAdmissionPauseUsesClaudeQuotaResetUpToTheCap(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		reset time.Duration
+		want  time.Duration
+	}{
+		// Upstream's case: two minutes out. (A reset sooner than a minute is
+		// raised to claudeExhaustionExpiryForPool's one-minute floor.)
+		{name: "reset two minutes out", reset: 2 * time.Minute, want: admissionQuotaPauseMax},
+		{name: "weekly reset days out", reset: 3 * 24 * time.Hour, want: admissionQuotaPauseMax},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			control := testAdmissionControl(1, 2)
+			key := admissionKeyFor(accounts.ProviderClaude, "account-a", "claude-opus-5-5")
+			now := time.Now().Truncate(time.Second)
+			header := http.Header{}
+			header.Set("Anthropic-Ratelimit-Unified-7d-Status", "rejected")
+			header.Set("Anthropic-Ratelimit-Unified-7d-Reset", formatInt64(now.Add(tc.reset).Unix()))
+			control.observe(key, http.StatusTooManyRequests, header, now)
+			got := control.buckets[key].pausedTil
+			if !got.Equal(now.Add(tc.want)) {
+				t.Fatalf("paused for %v, want %v", got.Sub(now), tc.want)
+			}
+			if got.Sub(now) <= admissionPauseWaitMax {
+				t.Fatalf("pause %v does not turn the burst away (wait max %v)", got.Sub(now), admissionPauseWaitMax)
+			}
+		})
+	}
+}
+
+// A reset ends the admission pause with the scheduler's marks: afterClaudeReset
+// clears both, so the reset account serves the next attempt instead of being
+// refused locally until the old reset (or the cap).
+func TestAfterClaudeResetEndsTheAdmissionPause(t *testing.T) {
 	control := testAdmissionControl(1, 2)
 	key := admissionKeyFor(accounts.ProviderClaude, "account-a", "claude-opus-5-5")
+	other := admissionKeyFor(accounts.ProviderClaude, "account-b", "claude-opus-5-5")
 	now := time.Now()
-	reset := now.Add(2 * time.Minute).Unix()
 	header := http.Header{}
-	header.Set("Anthropic-Ratelimit-Unified-5h-Status", "rejected")
-	header.Set("Anthropic-Ratelimit-Unified-5h-Reset", formatInt64(reset))
+	header.Set("Anthropic-Ratelimit-Unified-7d-Status", "rejected")
+	header.Set("Anthropic-Ratelimit-Unified-7d-Reset", formatInt64(now.Add(72*time.Hour).Unix()))
 	control.observe(key, http.StatusTooManyRequests, header, now)
-	paused := control.snapshot().Accounts[0].PausedUntil
-	if paused == "" {
-		t.Fatal("Claude quota rejection did not pause admission")
+	control.observe(other, http.StatusTooManyRequests, header, now)
+	if _, err := control.acquire(context.Background(), key); !errors.Is(err, errAdmissionPaused) {
+		t.Fatalf("acquire during the pause = %v, want errAdmissionPaused", err)
 	}
-	got, err := time.Parse(time.RFC3339, paused)
-	if err != nil || got.Before(now.Add(90*time.Second)) {
-		t.Fatalf("paused until %q, parse error=%v", paused, err)
+
+	// The re-read after the reset goes nowhere: the ref's client refuses it.
+	offline := &http.Client{Transport: admissionRoundTripFunc(func(*http.Request) (*http.Response, error) {
+		return nil, errors.New("offline test client")
+	})}
+	server := Server{admission: control, AccountRef: &AccountRef{client: offline}}
+	server.afterClaudeReset(context.Background(), accounts.Account{ID: "account-a", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "token-a"})
+
+	lease, err := control.acquire(context.Background(), key)
+	if err != nil {
+		t.Fatalf("acquire after the reset = %v, want a slot", err)
+	}
+	lease.release()
+	if !control.paused(other, time.Now()) {
+		t.Fatal("the reset cleared another account's pause")
 	}
 }
 
@@ -163,4 +222,23 @@ func (f admissionRoundTripFunc) RoundTrip(request *http.Request) (*http.Response
 
 func formatInt64(value int64) string {
 	return strconv.FormatInt(value, 10)
+}
+
+// The daemon builds its private and public handlers from separate copies of
+// one Server (cmd/subrouter: server.Handler(), server.PublicHandler()), and
+// each normalizes its own copy. A gate made per copy doubled every account's
+// concurrency limit and hid one listener's 429 pause from the other, and the
+// public listener carries the peer-forwarded turns. Both share the account
+// ref's gate.
+func TestBothListenersShareOneAdmissionGate(t *testing.T) {
+	server := Server{AccountRef: &AccountRef{}}
+	private, public := server.normalized(), server.normalized().publicSurfaceServer()
+	if private.admission == nil || private.admission != public.admission {
+		t.Fatalf("private gate %p, public gate %p: want one shared gate", private.admission, public.admission)
+	}
+	key := admissionKeyFor(accounts.ProviderClaude, "account-a", "claude-opus")
+	private.admission.pause(key, time.Now().Add(time.Minute))
+	if !public.admission.paused(key, time.Now()) {
+		t.Fatal("a pause recorded on the private listener is not seen by the public one")
+	}
 }

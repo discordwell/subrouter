@@ -353,6 +353,23 @@ func (r srRunner) healRemoteServerContext(ctx context.Context, store srServerSto
 	)
 }
 
+// healAdminServer is the heal before an ADMIN command that names its server
+// (`sr server status <name>`, `sr server sync <name>`, `--server <name>`):
+// off the tailnet the heal cannot find the node, and for an entry with a
+// public admin path the stored URL is as good as any, since the admin
+// request falls back through it (PATCHES §43.2). The warning is already
+// printed. Everything else -- `sr server use`, the default server a launch
+// resolves, tenant commands -- keeps failing on a failed heal.
+func (r srRunner) healAdminServer(ctx context.Context, store srServerStore, server srServerConfig) (srServerConfig, error) {
+	healed, err := r.healRemoteServerContext(ctx, store, server)
+	if err != nil {
+		if _, ok, _ := publicAdminFor(server); ok {
+			return server, nil
+		}
+	}
+	return healed, err
+}
+
 func tailscaleRepairError(warn io.Writer, server srServerConfig, err error) (srServerConfig, error) {
 	warnTailscaleRepair(warn, server, err)
 	return srServerConfig{}, tailscaleRepairFailure{serverName: server.Name, nodeID: server.TailscaleNodeID, cause: err}

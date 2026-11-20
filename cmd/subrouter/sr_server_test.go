@@ -26,6 +26,7 @@ import (
 func TestSRServerAddStoresGCPServer(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	unlockRemoteGateForTest(t)
 	store := accounts.DefaultCodexStore()
 
 	var out bytes.Buffer
@@ -56,6 +57,8 @@ func TestSRServerAddStoresGCPServer(t *testing.T) {
 func TestSRServerAddRejectsTenantKeyOverRemoteHTTP(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	// `sr server` and SUBROUTER_SERVER exist only on a keyed machine (PATCHES 17).
+	unlockRemoteGateForTest(t)
 	store := accounts.DefaultCodexStore()
 	runner := srRunner{store: store, out: io.Discard, errOut: io.Discard}
 	err := runner.run(context.Background(), []string{
@@ -74,6 +77,8 @@ func TestSRServerAddRejectsTenantKeyOverRemoteHTTP(t *testing.T) {
 func TestSRServerAddRejectsRemoteHTTPWhenPreservingTenantKey(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	// `sr server` and SUBROUTER_SERVER exist only on a keyed machine (PATCHES 17).
+	unlockRemoteGateForTest(t)
 	store := accounts.DefaultCodexStore()
 	runner := srRunner{store: store, out: io.Discard, errOut: io.Discard}
 	if err := runner.run(context.Background(), []string{
@@ -100,6 +105,8 @@ func TestSRServerAddRejectsRemoteHTTPWhenPreservingTenantKey(t *testing.T) {
 func TestSRServerAddAllowsOfflineTailscaleIdentityForTenantHTTP(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	// `sr server` and SUBROUTER_SERVER exist only on a keyed machine (PATCHES 17).
+	unlockRemoteGateForTest(t)
 	store := accounts.DefaultCodexStore()
 	runner := srRunner{store: store, out: io.Discard, errOut: io.Discard}
 	if err := runner.run(context.Background(), []string{
@@ -315,6 +322,7 @@ func TestSRServerStoreUpdateSerializesAcrossProcesses(t *testing.T) {
 func TestSRServerAddStoresAdminTokenForRemoteAdminEndpoints(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	unlockRemoteGateForTest(t)
 	store := accounts.DefaultCodexStore()
 
 	var out bytes.Buffer
@@ -343,6 +351,7 @@ func TestSRServerAddStoresAdminTokenForRemoteAdminEndpoints(t *testing.T) {
 func TestSRServerAddStoresScopedAccountImportToken(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	unlockRemoteGateForTest(t)
 	store := accounts.DefaultCodexStore()
 
 	var out bytes.Buffer
@@ -372,6 +381,7 @@ func TestSRServerStatusSendsAdminToken(t *testing.T) {
 	t.Setenv("COLUMNS", "200")
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	unlockRemoteGateForTest(t)
 	store := accounts.DefaultCodexStore()
 	serverHTTP := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		if got := req.Header.Get("Authorization"); got != "Bearer secret-token" {
@@ -385,8 +395,11 @@ func TestSRServerStatusSendsAdminToken(t *testing.T) {
 			http.Error(w, "unexpected path", http.StatusNotFound)
 			return
 		}
-		if req.URL.Query().Get("refresh") != "1" {
-			t.Errorf("usage status query = %q, want refresh=1", req.URL.RawQuery)
+		// Upstream asks for ?refresh=1 (a live provider sweep, #479/#544/#554).
+		// This fork reads the daemon's shared sweep cache: each sweep refreshes
+		// every account's token, and §44 refused extra sweep triggers.
+		if req.URL.RawQuery != "" {
+			t.Errorf("usage status query = %q, want the plain cached read", req.URL.RawQuery)
 		}
 		_ = json.NewEncoder(w).Encode([]remoteServerUsageStatus{{
 			ID: "acct@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth,
@@ -423,10 +436,13 @@ func TestSRServerStatusSendsAdminToken(t *testing.T) {
 	}
 }
 
-func TestRemoteSingleAccountStatusChecksLiveUsage(t *testing.T) {
+// Upstream's TestRemoteSingleAccountStatusChecksLiveUsage, adapted: in this
+// fork `sr status <account>` on a remote reads the daemon's shared sweep cache
+// with no ?refresh=1 (PATCHES §44, as in TestSRServerStatusSendsAdminToken).
+func TestRemoteSingleAccountStatusReadsTheSweepCache(t *testing.T) {
 	serverHTTP := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		if req.URL.Path != "/_subrouter/usage-status" || req.URL.Query().Get("refresh") != "1" {
-			t.Errorf("single-account status requested %s?%s instead of live quota", req.URL.Path, req.URL.RawQuery)
+		if req.URL.Path != "/_subrouter/usage-status" || req.URL.RawQuery != "" {
+			t.Errorf("single-account status requested %s?%s instead of the cached read", req.URL.Path, req.URL.RawQuery)
 		}
 		_ = json.NewEncoder(w).Encode([]remoteServerUsageStatus{{
 			ID: "acct@example.com", Email: "acct@example.com",
@@ -443,13 +459,14 @@ func TestRemoteSingleAccountStatusChecksLiveUsage(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !strings.Contains(out.String(), "acct@example.com") || !strings.Contains(out.String(), "80%") {
-		t.Fatalf("single-account status failed to show live quota: %s", out.String())
+		t.Fatalf("single-account status failed to show the account's quota: %s", out.String())
 	}
 }
 
 func TestSRServerAddPreservesExistingAdminTokenWhenUpdatingMetadata(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	unlockRemoteGateForTest(t)
 	store := accounts.DefaultCodexStore()
 
 	var out bytes.Buffer
@@ -488,6 +505,7 @@ func TestSRServerAddPreservesExistingAdminTokenWhenUpdatingMetadata(t *testing.T
 func TestSRServerAddAllowsURLOnlyServer(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	unlockRemoteGateForTest(t)
 	store := accounts.DefaultCodexStore()
 
 	var out bytes.Buffer
@@ -519,6 +537,7 @@ func TestSRServerAddAllowsURLOnlyServer(t *testing.T) {
 func TestSRServerUseSetsExplicitDefault(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	unlockRemoteGateForTest(t)
 	t.Setenv("CODEX_HOME", filepath.Join(home, "codex-home"))
 	store := accounts.DefaultCodexStore()
 
@@ -572,6 +591,7 @@ func TestSRServerUseSetsExplicitDefault(t *testing.T) {
 func TestSRServerUseLocalClearsDefaultAndWritesLocalCodexConfig(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	unlockRemoteGateForTest(t)
 	t.Setenv("CODEX_HOME", filepath.Join(home, "codex-home"))
 	store := accounts.DefaultCodexStore()
 	serverStore := defaultSRServerStore(store)
@@ -631,6 +651,7 @@ func TestSRServerUseLocalClearsDefaultAndWritesLocalCodexConfig(t *testing.T) {
 func TestSRRemoteUseCMUXLocalSelectsSharedCredentialsWithLocalEgress(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	unlockRemoteGateForTest(t)
 	t.Setenv("CODEX_HOME", filepath.Join(home, "codex-home"))
 	store := accounts.DefaultCodexStore()
 	serverStore := defaultSRServerStore(store)
@@ -737,6 +758,7 @@ func TestBuiltInCMUXRemoteUsesCanonicalProductionHostname(t *testing.T) {
 func TestSRDefaultOutputUsesDefaultRemoteServerStatus(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	unlockRemoteGateForTest(t)
 	store := accounts.DefaultCodexStore()
 	serverHTTP := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		if req.URL.Path == "/_subrouter/bedrock-cost" || req.URL.Path == "/_subrouter/azure-codex-cost" {
@@ -783,6 +805,7 @@ func TestSRDefaultOutputUsesDefaultRemoteServerStatus(t *testing.T) {
 func TestSRAddUsesDefaultRemoteServer(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	unlockRemoteGateForTest(t)
 	store := accounts.DefaultCodexStore()
 	remote := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		if req.URL.Path != serverAccountImportPath {
@@ -835,6 +858,7 @@ func TestSRAddUsesDefaultRemoteServer(t *testing.T) {
 func TestSRAddUsesExplicitRemoteServerWhileTeamStorageIsActive(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	unlockRemoteGateForTest(t)
 	t.Setenv("SUBROUTER_CODEX_SERVER", "gcp-staging")
 	cloudConfigPath := filepath.Join(t.TempDir(), "cloud.json")
 	t.Setenv("SUBROUTER_CLOUD_CONFIG", cloudConfigPath)
@@ -893,6 +917,7 @@ func TestSRAddUsesExplicitRemoteServerWhileTeamStorageIsActive(t *testing.T) {
 func TestSRListUsesDefaultRemoteServer(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	unlockRemoteGateForTest(t)
 	store := accounts.DefaultCodexStore()
 	serverHTTP := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		if req.URL.Path != "/_subrouter/accounts" {
@@ -956,6 +981,7 @@ func TestSRListUsesDefaultRemoteServer(t *testing.T) {
 func TestSRPickFailsWhenDefaultRemoteServerLacksUsageStatus(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	unlockRemoteGateForTest(t)
 	store := accounts.DefaultCodexStore()
 	serverHTTP := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		if req.URL.Path != "/_subrouter/usage-status" {
@@ -1032,6 +1058,8 @@ func TestSRServerEnvLocalKeepsCommandsLocal(t *testing.T) {
 func TestSRServerGenericEnvSelectsNamedServer(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	// `sr server` and SUBROUTER_SERVER exist only on a keyed machine (PATCHES 17).
+	unlockRemoteGateForTest(t)
 	t.Setenv("SUBROUTER_SERVER", "team")
 	t.Setenv("SUBROUTER_CODEX_SERVER", "local")
 	store := accounts.DefaultCodexStore()
@@ -1058,6 +1086,7 @@ func TestSRServerGenericEnvSelectsNamedServer(t *testing.T) {
 func TestSRSwitchDoesNotMutateLocalWhenDefaultRemoteServerSelected(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	unlockRemoteGateForTest(t)
 	store := accounts.DefaultCodexStore()
 	localAuth := testCodexAuth("local@example.com", "acct_local")
 	if err := accounts.WriteActiveCodexAuth(localAuth); err != nil {
@@ -1199,6 +1228,7 @@ func TestUsageRowsFromServerUsageStatusesPreservesProviderProbe(t *testing.T) {
 func TestSRServerRenameUpdatesDefault(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	unlockRemoteGateForTest(t)
 	store := accounts.DefaultCodexStore()
 
 	var out bytes.Buffer
@@ -1232,6 +1262,7 @@ func TestSRServerRenameUpdatesDefault(t *testing.T) {
 func TestSRServerLoginUploadsFreshAuthAndRestoresLocalChain(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	unlockRemoteGateForTest(t)
 	store := accounts.DefaultCodexStore()
 
 	oldLocal := testCodexAuth("bob@example.com", "acct_old_local")
@@ -1426,6 +1457,7 @@ func TestSRServerLoginRejectsUnexpectedEmailWithoutUpload(t *testing.T) {
 func TestSRServerSyncUploadsMissingLocalOAuthOnly(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	unlockRemoteGateForTest(t)
 	store := accounts.DefaultCodexStore()
 
 	active := testCodexAuth("active@example.com", "acct_active")
@@ -1526,6 +1558,7 @@ func TestSRServerSyncUploadsMissingLocalOAuthOnly(t *testing.T) {
 func TestSRServerSyncURLOnlyServerFailsBeforeOAuthWithoutProtectedImportCredential(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	unlockRemoteGateForTest(t)
 	store := accounts.DefaultCodexStore()
 	active := testCodexAuth("active@example.com", "acct_active")
 	fresh := testCodexAuth("alice@example.com", "acct_alice_fresh")
@@ -1588,6 +1621,7 @@ func TestSRServerSyncURLOnlyServerFailsBeforeOAuthWithoutProtectedImportCredenti
 func TestSRServerSyncDryRunDoesNotLogin(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	unlockRemoteGateForTest(t)
 	store := accounts.DefaultCodexStore()
 	if err := store.SaveStored(accounts.StoredCodexAccount{
 		Email:   "alice@example.com",
@@ -1671,6 +1705,7 @@ func TestSRServerSyncRetainsSelectedIDWhenDisplayEmailsMatch(t *testing.T) {
 func TestSRServerSyncPromptsForInvalidServerAccount(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	unlockRemoteGateForTest(t)
 	t.Setenv("FORCE_COLOR", "1")
 	store := accounts.DefaultCodexStore()
 	active := testCodexAuth("active@example.com", "acct_active")
@@ -1733,6 +1768,7 @@ func TestSRServerSyncPromptsForInvalidServerAccount(t *testing.T) {
 func TestSRServerInstallUsesPublicInstallerAndSystemdCommand(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	unlockRemoteGateForTest(t)
 	t.Setenv("TAILSCALE_AUTH_KEY", "tailscale-auth-test-secret")
 	store := accounts.DefaultCodexStore()
 
@@ -1749,7 +1785,7 @@ func TestSRServerInstallUsesPublicInstallerAndSystemdCommand(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := runner.run(context.Background(), []string{"server", "install", "community", "--version", "0.1.2"}); err != nil {
+	if err := runner.run(context.Background(), []string{"server", "install", "community", "--allow-upstream-release", "--version", "0.1.2"}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1811,6 +1847,7 @@ func TestSRServerInstallUsesPublicInstallerAndSystemdCommand(t *testing.T) {
 func TestSRServerLoginPreflightFailureDoesNotStartOAuth(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	unlockRemoteGateForTest(t)
 	store := accounts.DefaultCodexStore()
 	serverStore := defaultSRServerStore(store)
 	if err := serverStore.save(srServerFile{

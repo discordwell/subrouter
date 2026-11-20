@@ -33,6 +33,11 @@ var (
 	configuredMu        sync.RWMutex
 	configuredProviders []keyedProvider
 	configuredFrozen    bool
+	// configuredSignature fingerprints the declaration configuredProviders
+	// was built from (names, aliases, base URLs), so a frozen registry can
+	// tell an identical re-declaration -- which changes nothing any request
+	// could observe -- from a real change.
+	configuredSignature string
 )
 
 // reservedProviderNames are names and path segments owned by core or outer
@@ -57,10 +62,8 @@ var reservedProviderNames = map[string]bool{
 func ConfigureOpenAICompatibleProviders(declared []OpenAICompatibleProvider) error {
 	configuredMu.Lock()
 	defer configuredMu.Unlock()
-	if configuredFrozen {
-		return fmt.Errorf("openai-compatible providers cannot change after serving starts")
-	}
 	entries := make([]keyedProvider, 0, len(declared))
+	signatures := make([]string, 0, len(declared))
 	seen := map[string]bool{}
 	for _, item := range declared {
 		name := strings.ToLower(strings.TrimSpace(item.Name))
@@ -90,6 +93,7 @@ func ConfigureOpenAICompatibleProviders(declared []OpenAICompatibleProvider) err
 			}
 			seen[candidate] = true
 		}
+		signatures = append(signatures, strings.Join(names, ",")+"="+base.String())
 		entries = append(entries, keyedProvider{
 			Provider:   accounts.Provider(name),
 			PathPrefix: name,
@@ -106,7 +110,21 @@ func ConfigureOpenAICompatibleProviders(declared []OpenAICompatibleProvider) err
 		})
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].PathPrefix < entries[j].PathPrefix })
+	sort.Strings(signatures)
+	signature := strings.Join(signatures, "\n")
+	if configuredFrozen {
+		// Frozen means "cannot CHANGE": re-declaring exactly what is already
+		// routed is a no-op, not a change. One process may build a handler
+		// (which freezes) before a second startup path re-applies the same
+		// declaration -- every in-process test of serve after any handler
+		// build does exactly that.
+		if signature == configuredSignature {
+			return nil
+		}
+		return fmt.Errorf("openai-compatible providers cannot change after serving starts")
+	}
 	configuredProviders = entries
+	configuredSignature = signature
 	return nil
 }
 
@@ -126,6 +144,10 @@ func ResetOpenAICompatibleProvidersForTest() {
 	configuredMu.Lock()
 	configuredProviders = nil
 	configuredFrozen = false
+	// The fork's configuredSignature (an identical re-declaration after the
+	// freeze is a no-op) must reset too, or a reset-then-freeze test
+	// re-declaring the same providers would keep none routed.
+	configuredSignature = ""
 	configuredMu.Unlock()
 }
 

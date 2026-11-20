@@ -8,19 +8,28 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
-
-	"github.com/manaflow-ai/subrouter/internal/agents/claude"
-	"github.com/manaflow-ai/subrouter/internal/fsutil"
 )
 
-// Pooled Claude launches run in their own config directory, so Claude's
-// per-folder trust ("Do you trust the files in this folder?") granted in the
-// user's normal Claude never carried over, and every proxy launch asked
-// again. These flags are shared between the user's real .claude.json and the
-// proxy's: a flag the user accepted on either side is copied to the other.
-// Only true values move, and only into a side that has not decided that flag,
-// so no side gains trust the user did not grant and an explicit false (trust
-// revoked by hand) is never overwritten.
+// `sr claude proxy` runs Claude Code in its own config home
+// (claude-proxy/<hash>), and Claude keeps per-folder trust ("Do you trust the
+// files in this folder?") in that home's .claude.json. Trust the user granted
+// in their normal Claude never carried over, so every proxy home asked again
+// for every folder (upstream #430).
+//
+// Before a proxy launch, the flags the user accepted in their own .claude.json
+// are copied into the proxy home's. Only true values move, and only into a
+// project entry that has not decided that flag, so the proxy home gains no
+// trust the user did not grant and an explicit false there is never
+// overwritten.
+//
+// Adapted from upstream, which also copied trust accepted inside a proxy
+// session back into the user's own .claude.json after the launch. That write
+// is dropped: the user's .claude.json is what every plain `claude` session
+// reads and rewrites, and a change to what `sr claude` writes must never alter
+// plain `claude` launches (the client-config brick rule). The price is that a
+// folder trusted only inside a proxy session is asked about again in plain
+// `claude` and in other proxy homes; trusting it once in plain `claude` covers
+// every proxy home from its next launch.
 var claudeSharedProjectFlags = []string{
 	"hasTrustDialogAccepted",
 	"hasCompletedProjectOnboarding",
@@ -28,27 +37,15 @@ var claudeSharedProjectFlags = []string{
 	"hasClaudeMdExternalIncludesWarningShown",
 }
 
-// claudeConfigLockWait bounds how long sr waits for Claude's own lock on a
-// config file before leaving it alone for this launch.
+// claudeConfigLockWait bounds how long sr waits for the proxy home's
+// .claude.json lock before leaving the file alone for this launch.
 const claudeConfigLockWait = time.Second
 
 // claudeUserConfigPath is the .claude.json the user's normal Claude reads:
-// <config dir>/.claude.json for a custom CLAUDE_CONFIG_DIR, else
-// ~/.claude.json. The config dir is the caller's, as the default Claude store
-// resolves it, so a shell inside a pooled launch never names the proxy
-// directory as the user's config.
+// $CLAUDE_CONFIG_DIR/.claude.json when set, else ~/.claude.json.
 func claudeUserConfigPath() string {
-	shared := filepath.Clean(strings.TrimSpace(claude.DefaultStore().SharedStateDir))
-	explicit := strings.TrimSpace(os.Getenv("CLAUDE_CONFIG_DIR"))
-	if explicit != "" {
-		if abs, err := filepath.Abs(explicit); err == nil && filepath.Clean(abs) == shared {
-			// Claude keeps .claude.json inside any explicit CLAUDE_CONFIG_DIR,
-			// including an explicit ~/.claude.
-			return filepath.Join(shared, ".claude.json")
-		}
-	}
-	if shared != "." && shared != filepath.Clean(claude.DefaultClaudeConfigDir()) {
-		return filepath.Join(shared, ".claude.json")
+	if dir := strings.TrimSpace(os.Getenv("CLAUDE_CONFIG_DIR")); dir != "" {
+		return filepath.Join(dir, ".claude.json")
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -57,42 +54,29 @@ func claudeUserConfigPath() string {
 	return filepath.Join(home, ".claude.json")
 }
 
-// syncClaudeProjectTrust shares accepted project flags between the user's
-// config and a proxy config directory, in both directions. Failures are
-// returned for logging only; a launch never depends on this.
-func syncClaudeProjectTrust(userConfigPath, proxyConfigDir string) error {
+// syncClaudeProjectTrustToProxy copies the user's accepted project flags into
+// a proxy config home's .claude.json. It only reads userConfigPath. Failures
+// are returned for logging only; a launch never depends on this.
+func syncClaudeProjectTrustToProxy(userConfigPath, proxyConfigDir string) error {
 	if strings.TrimSpace(userConfigPath) == "" || strings.TrimSpace(proxyConfigDir) == "" {
 		return nil
 	}
 	proxyConfigPath := filepath.Join(proxyConfigDir, ".claude.json")
-	if sameClaudeConfigFile(userConfigPath, proxyConfigPath) {
+	if sameClaudePath(userConfigPath, proxyConfigPath) {
+		// A proxy home whose .claude.json is the user's (a hand-made link)
+		// already has every flag, and writing it would write the user's file.
 		return nil
 	}
-	userProjects, err := readClaudeAcceptedProjectFlags(userConfigPath)
+	accepted, err := readClaudeAcceptedProjectFlags(userConfigPath)
 	if err != nil {
 		return err
 	}
-	proxyProjects, err := readClaudeAcceptedProjectFlags(proxyConfigPath)
-	if err != nil {
-		return err
-	}
-	return errors.Join(
-		mergeClaudeAcceptedProjectFlags(proxyConfigPath, userProjects, true),
-		mergeClaudeAcceptedProjectFlags(userConfigPath, proxyProjects, false),
-	)
-}
-
-func sameClaudeConfigFile(a, b string) bool {
-	left, errLeft := os.Stat(a)
-	right, errRight := os.Stat(b)
-	if errLeft == nil && errRight == nil {
-		return os.SameFile(left, right)
-	}
-	return filepath.Clean(a) == filepath.Clean(b)
+	return mergeClaudeAcceptedProjectFlags(proxyConfigPath, accepted)
 }
 
 // readClaudeAcceptedProjectFlags returns, per project path, the shared flags
-// that are true. A missing file has no accepted flags.
+// that are true. A missing file has no accepted flags, and so does a file
+// whose "projects" is null.
 func readClaudeAcceptedProjectFlags(path string) (map[string][]string, error) {
 	body, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -118,21 +102,20 @@ func readClaudeAcceptedProjectFlags(path string) (map[string][]string, error) {
 	return out, nil
 }
 
-// mergeClaudeAcceptedProjectFlags sets each accepted flag in the config at
-// path, preserving every other field. createFile allows creating a missing
-// config; the user's own config is never created by sr.
-func mergeClaudeAcceptedProjectFlags(path string, accepted map[string][]string, createFile bool) error {
+// mergeClaudeAcceptedProjectFlags sets each accepted flag in the proxy home's
+// config at path, creating the file when missing and preserving every other
+// field byte for byte (values stay json.RawMessage). A link (a dotfile
+// manager) is written through, a file Claude holds locked is left alone, and
+// an unchanged file is not rewritten.
+func mergeClaudeAcceptedProjectFlags(path string, accepted map[string][]string) error {
 	if len(accepted) == 0 {
 		return nil
 	}
-	// A dotfile manager may link the config elsewhere; write through the link.
 	if resolved, err := filepath.EvalSymlinks(path); err == nil {
 		path = resolved
 	}
-	if createFile {
-		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-			return err
-		}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
 	}
 	release, locked := lockClaudeConfig(path)
 	if !locked {
@@ -142,12 +125,6 @@ func mergeClaudeAcceptedProjectFlags(path string, accepted map[string][]string, 
 	info, statErr := os.Stat(path)
 	body, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
-		if !createFile {
-			return nil
-		}
-		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-			return err
-		}
 		body = []byte("{}")
 	} else if err != nil {
 		return err
@@ -177,7 +154,7 @@ func mergeClaudeAcceptedProjectFlags(path string, accepted map[string][]string, 
 		}
 		for _, flag := range flags {
 			// Only fill a flag this side has never decided. An explicit
-			// false (for example trust revoked by hand) is left alone.
+			// false (trust revoked by hand) is left alone.
 			if _, decided := fields[flag]; !decided {
 				fields[flag] = json.RawMessage("true")
 				changed = true
@@ -201,13 +178,16 @@ func mergeClaudeAcceptedProjectFlags(path string, accepted map[string][]string, 
 	if statErr == nil {
 		mode = info.Mode().Perm()
 	}
-	return fsutil.WriteFileAtomic(path, append(out, '\n'), mode)
+	return writeFileAtomic(path, append(out, '\n'), mode)
 }
 
-// lockClaudeConfig takes the same <file>.lock directory lock Claude Code
-// (proper-lockfile) uses, so sr's read-modify-write never interleaves with
-// Claude's own saves. It reports false when the lock stays held, so sr skips
-// the write rather than race Claude. A lock older than a minute is stale.
+// lockClaudeConfig takes a <file>.lock directory lock, the proper-lockfile
+// convention upstream matched to Claude Code's own config saves (2.1.283
+// bundles proper-lockfile's lockSync; that it guards .claude.json is
+// upstream's reading, not re-verified here). Either way two `sr claude proxy`
+// launches sharing one proxy home never interleave their read-modify-write.
+// It reports false when the lock stays held, so sr skips the write rather
+// than race. A lock older than a minute is stale.
 func lockClaudeConfig(path string) (func(), bool) {
 	lockPath := path + ".lock"
 	deadline := time.Now().Add(claudeConfigLockWait)

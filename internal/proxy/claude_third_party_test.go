@@ -388,6 +388,60 @@ func TestClaudeThirdPartyExtraUsageKeyOnlySurvivesOuterReplay(t *testing.T) {
 	}
 }
 
+// The fork's give-up stages past the Fable chain -- the Opus substitution
+// (an OAuth account) and the peer pool (another organization's OAuth account,
+// and a hold) -- must not take a key-only request either: upstream #671 keeps
+// a refused third-party client on API keys, and upstream's give-up was the
+// Fable chain alone. A key's transient 429 used to fall into both.
+func TestClaudeThirdPartyKeyOnlyGiveUpNeverReachesOpusOrPeer(t *testing.T) {
+	server := Server{
+		Accounts: []accounts.Account{
+			{ID: "oauth-a", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "tok-a"},
+			{ID: "oauth-b", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "tok-b"},
+			{ID: "claude:key", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeAPIKey, Token: "tok-key"},
+		},
+		SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler(nil)),
+	}
+	stub := &stubRoundTripper{responses: func(req *http.Request) *http.Response {
+		if req.Header.Get("X-Api-Key") == "tok-key" {
+			header := http.Header{"Content-Type": []string{"application/json"}}
+			// Longer than admissionPauseWaitMax: no same-key retry.
+			header.Set("Retry-After", "30")
+			return &http.Response{StatusCode: http.StatusTooManyRequests, Header: header,
+				Body: io.NopCloser(strings.NewReader(`{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}`))}
+		}
+		return &http.Response{StatusCode: http.StatusBadRequest, Header: http.Header{},
+			Body: io.NopCloser(strings.NewReader(anthropicThirdPartyExtraUsageBody))}
+	}}
+	var stages []string
+	served := func(stage string) func(string) (*http.Response, bool) {
+		return func(reason string) (*http.Response, bool) {
+			stages = append(stages, stage+":"+reason)
+			return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: http.NoBody}, true
+		}
+	}
+	transport := usageLimitRetryTransport{
+		base: stub, server: &server, provider: accounts.ProviderClaude,
+		agent: "claude", session: "session-third-party-key-only-give-up", account: "oauth-a",
+		method: http.MethodPost, path: "/v1/messages", maxAttempts: 4,
+		budget:         newAttemptBudget(6),
+		sleep:          func(context.Context, time.Duration) error { return nil },
+		opusSubstitute: served("opus"),
+		remotePool:     served("remote"),
+	}
+	response, err := transport.RoundTrip(claudeThirdPartyOAuthRequest(t, "tok-a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if len(stages) != 0 {
+		t.Fatalf("key-only request reached %v; want no Opus or peer stage", stages)
+	}
+	if response.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("status %d; want the key's own 429", response.StatusCode)
+	}
+}
+
 // A transient throttle on the key is not the third-party refusal: it passes
 // through as a retryable 429, and the request still never reaches OAuth.
 func TestClaudeThirdPartyExtraUsageKeyTransient429PassesThrough(t *testing.T) {

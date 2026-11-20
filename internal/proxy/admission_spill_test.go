@@ -49,12 +49,7 @@ func newAdmissionSpillFixtureWith(t *testing.T, ids []string, respond func(w htt
 			fiveHour(10, now.Add(2*time.Hour)), sevenDay(10, now.Add(72*time.Hour)),
 		}))
 	}
-	f := &admissionSpillFixture{control: &admissionControl{
-		limit:      1,
-		queueCap:   4,
-		spillQueue: 1,
-		buckets:    make(map[admissionKey]*admissionBucket),
-	}}
+	f := &admissionSpillFixture{control: testAdmissionSpillControl(1, 4, 1)}
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
@@ -105,7 +100,7 @@ func (f *admissionSpillFixture) saturate(account string, waiters int) {
 	f.control.mu.Lock()
 	defer f.control.mu.Unlock()
 	bucket := f.control.bucketLocked(admissionKeyFor(accounts.ProviderClaude, account, "claude-opus"))
-	bucket.active = f.control.limit
+	bucket.active = bucket.limit
 	for range waiters {
 		bucket.waiters = append(bucket.waiters, &admissionWaiter{ready: make(chan struct{})})
 	}
@@ -158,8 +153,8 @@ func TestHandlerSpillsSaturatedStickyAccountToFreeAccount(t *testing.T) {
 
 func TestHandlerFullAdmissionQueueAnswersWithRetryAfter(t *testing.T) {
 	f := newAdmissionSpillFixture(t)
-	f.saturate("a@example.com", f.control.queueCap)
-	f.saturate("b@example.com", f.control.queueCap)
+	f.saturate("a@example.com", f.control.limits.Queue)
+	f.saturate("b@example.com", f.control.limits.Queue)
 
 	response := f.send(t, "session-pool-saturated")
 	if response.Code != http.StatusServiceUnavailable {
@@ -183,7 +178,7 @@ func TestHandlerFullAdmissionQueueAnswersWithRetryAfter(t *testing.T) {
 func TestAdmissionRetryAfterScalesWithQueueAndStaysBounded(t *testing.T) {
 	control := testAdmissionControl(6, 64)
 	for _, tc := range []struct{ waiters, want int }{{0, 1}, {6, 1}, {7, 2}, {18, 3}, {64, 5}} {
-		bucket := &admissionBucket{waiters: make([]*admissionWaiter, tc.waiters)}
+		bucket := &admissionBucket{limit: control.limits.Limit, waiters: make([]*admissionWaiter, tc.waiters)}
 		if got := control.retryAfterLocked(bucket); got != tc.want {
 			t.Errorf("waiters=%d: retry after %ds, want %ds", tc.waiters, got, tc.want)
 		}

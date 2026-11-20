@@ -563,6 +563,8 @@ func TestSelectedRemoteServerRepairsThroughTailscale(t *testing.T) {
 	t.Setenv(tailscaleBinaryEnv, binary)
 	t.Setenv("SUBROUTER_SERVER", "")
 	t.Setenv("SUBROUTER_CODEX_SERVER", "")
+	// Remote paths exist only on a keyed machine (PATCHES 17).
+	unlockRemoteGateForTest(t)
 	root := t.TempDir()
 	accountStore := accounts.CodexStore{Dir: filepath.Join(root, "accounts")}
 	store := defaultSRServerStore(accountStore)
@@ -586,6 +588,78 @@ func TestSelectedRemoteServerRepairsThroughTailscale(t *testing.T) {
 	}
 	if !strings.Contains(warnings.String(), "updated") {
 		t.Fatalf("warnings = %q", warnings.String())
+	}
+}
+
+// `sr claude move <n> <server>` and `sr claude remove <n> --server <server>`
+// resolve a NAMED server through resolveServer, which must heal a stale entry
+// exactly as the default path does. An entry with no node ID is not probed:
+// nothing here adds a default dependency on Tailscale.
+func TestResolveServerNamedEntryRepairsThroughTailscale(t *testing.T) {
+	healthy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(healthy.Close)
+	parsed, err := url.Parse(healthy.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, port, err := net.SplitHostPort(parsed.Host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	status, err := json.Marshal(tailscaleStatusDocument{Peer: map[string]tailscaleNodeStatus{
+		"peer": {ID: "node-stable", DNSName: "127.0.0.1.", Online: true},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	scratch := t.TempDir()
+	probed := filepath.Join(scratch, "probed")
+	binary := filepath.Join(scratch, "tailscale")
+	script := "#!/bin/sh\n: >> '" + probed + "'\nprintf '%s\\n' '" + strings.ReplaceAll(string(status), "'", "'\\''") + "'\n"
+	if err := os.WriteFile(binary, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(tailscaleBinaryEnv, binary)
+	t.Setenv("SUBROUTER_SERVER", "")
+	t.Setenv("SUBROUTER_CODEX_SERVER", "")
+	// Remote paths exist only on a keyed machine (PATCHES 17).
+	unlockRemoteGateForTest(t)
+	accountStore := accounts.CodexStore{Dir: filepath.Join(t.TempDir(), "accounts")}
+	store := defaultSRServerStore(accountStore)
+	team := srServerConfig{Name: "team", URL: "http://retired.invalid:" + port, TailscaleNodeID: "node-stable"}
+	plain := srServerConfig{Name: "plain", URL: "http://plain.invalid:" + port}
+	// Neither is the default: this is the explicit-name path only.
+	if err := store.save(srServerFile{Servers: []srServerConfig{team, plain}}); err != nil {
+		t.Fatal(err)
+	}
+	var warnings bytes.Buffer
+	runner := srRunner{store: accountStore, client: healthy.Client(), errOut: &warnings}
+
+	got, err := runner.resolveServer("plain")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.URL != plain.URL {
+		t.Fatalf("an entry with no node ID changed URL: %q", got.URL)
+	}
+	if _, err := os.Stat(probed); !os.IsNotExist(err) {
+		t.Fatalf("an entry with no node ID probed Tailscale: %v", err)
+	}
+
+	got, err = runner.resolveServer("team")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "http://127.0.0.1:" + port; got.URL != want {
+		t.Fatalf("named server URL = %q, want the healed %q", got.URL, want)
+	}
+	if !strings.Contains(warnings.String(), "updated") {
+		t.Fatalf("warnings = %q", warnings.String())
+	}
+	if saved, ok, err := store.find("team"); err != nil || !ok || saved.URL != got.URL {
+		t.Fatalf("the healed URL was not persisted: %+v ok=%v err=%v", saved, ok, err)
 	}
 }
 
@@ -681,6 +755,9 @@ func TestServerAddPreservesTailscaleIdentityForSameURLAndClearsItForReplacement(
 }
 
 func TestCodexDefaultTailscaleDiscoveryFailureFallsBackLocally(t *testing.T) {
+	// A box path: on a keyless machine the PATCHES 17 gate ignores servers.json
+	// and the remote selection entirely, so this upstream test states the unlock.
+	unlockRemoteGateForTest(t)
 	local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -714,6 +791,9 @@ func TestCodexDefaultTailscaleDiscoveryFailureFallsBackLocally(t *testing.T) {
 }
 
 func TestCodexRegistryErrorDoesNotFallBackLocally(t *testing.T) {
+	// A box path: on a keyless machine the PATCHES 17 gate ignores servers.json
+	// and the remote selection entirely, so this upstream test states the unlock.
+	unlockRemoteGateForTest(t)
 	local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))

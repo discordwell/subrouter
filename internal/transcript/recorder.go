@@ -798,8 +798,34 @@ func isSensitiveHeader(key string) bool {
 	case "authorization", "cookie", "set-cookie", "proxy-authorization", "x-api-key", "openai-api-key":
 		return true
 	default:
-		return false
+		return SensitiveName(key)
 	}
+}
+
+// sensitiveNameParts are name segments that mark a header or query parameter
+// as carrying a credential or an identity: X-Subrouter-Lease and the other
+// X-Subrouter-*-Token headers, Azure's api-key, X-Claude-Code-Ide-Authorization,
+// X-Subrouter-User-Email (recorded as user_hash instead). Whole segments only:
+// "tokens" in anthropic-ratelimit-*-tokens-* is a count and stays.
+var sensitiveNameParts = map[string]bool{
+	"authorization": true, "auth": true, "token": true, "secret": true,
+	"password": true, "passwd": true, "cookie": true, "credential": true,
+	"credentials": true, "key": true, "apikey": true, "lease": true,
+	"signature": true, "sig": true, "proof": true, "nonce": true,
+	"challenge": true, "email": true,
+}
+
+// SensitiveName reports whether a header or query parameter name looks like
+// it carries a credential, so its value must not be written to a transcript.
+func SensitiveName(name string) bool {
+	for _, part := range strings.FieldsFunc(strings.ToLower(name), func(r rune) bool {
+		return r == '-' || r == '_' || r == '.'
+	}) {
+		if sensitiveNameParts[part] {
+			return true
+		}
+	}
+	return false
 }
 
 var unsafeFilenameChars = regexp.MustCompile(`[^A-Za-z0-9._-]+`)

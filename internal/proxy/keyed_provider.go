@@ -538,17 +538,16 @@ func SchedulerAccounts(accountsIn []accounts.Account) []accounts.Account {
 	return out
 }
 
+// pickRoutingAccount is this daemon's own pick over candidates. It is the ONE
+// placement ranking with no peers (placeAcrossPools, PATCHES
+// §31 D7): this daemon's own pick and a deciding daemon's cross-pool pick are
+// the same function.
 func pickRoutingAccount(scheduler selectacct.Scheduler, candidates []accounts.Account) (accounts.Account, error) {
-	picked, err := scheduler.Pick(SchedulerAccounts(candidates))
+	placement, err := placeAcrossPools(scheduler, candidates, nil)
 	if err != nil {
 		return accounts.Account{}, err
 	}
-	for _, candidate := range candidates {
-		if candidate.ID == picked.ID && accountProviderFor(candidate.Provider) == picked.Provider {
-			return candidate, nil
-		}
-	}
-	return accounts.Account{}, fmt.Errorf("scheduler returned unknown account %q", picked.ID)
+	return placement.Account, nil
 }
 
 // pickAndReserveRoutingAccount keeps the original provider identity while the

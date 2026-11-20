@@ -54,7 +54,7 @@ func placementSelect(t *testing.T, server Server, sessionID string) accounts.Acc
 	if err != nil {
 		t.Fatal(err)
 	}
-	account, _, _, err := server.accountForSessionProvider(accounts.ProviderCodex, "codex", sessionID, req)
+	account, _, _, _, err := server.accountForSessionProvider(accounts.ProviderCodex, "codex", sessionID, req)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -108,7 +108,7 @@ func TestPlacementStatsEndpointsServeAdmins(t *testing.T) {
 	handler := server.Handler()
 
 	resp := httptest.NewRecorder()
-	handler.ServeHTTP(resp, loopbackAdminRequest(http.MethodGet, PlacementStatsPath, "127.0.0.1:31415", nil))
+	handler.ServeHTTP(resp, adminOriginRequest(http.MethodGet, PlacementStatsPath, "127.0.0.1:31415", nil))
 	if resp.Code != http.StatusOK {
 		t.Fatalf("placement-stats status = %d, body = %s", resp.Code, resp.Body.String())
 	}
@@ -124,7 +124,7 @@ func TestPlacementStatsEndpointsServeAdmins(t *testing.T) {
 	}
 
 	resp = httptest.NewRecorder()
-	handler.ServeHTTP(resp, loopbackAdminRequest(http.MethodGet, MetricsPath, "localhost:31415", nil))
+	handler.ServeHTTP(resp, adminOriginRequest(http.MethodGet, MetricsPath, "localhost:31415", nil))
 	if resp.Code != http.StatusOK {
 		t.Fatalf("metrics status = %d, body = %s", resp.Code, resp.Body.String())
 	}
@@ -163,7 +163,7 @@ func TestPlacementStatsEndpointsRejectNonAdminOrigins(t *testing.T) {
 		} {
 			t.Run(path+" "+test.name, func(t *testing.T) {
 				resp := httptest.NewRecorder()
-				handler.ServeHTTP(resp, loopbackAdminRequest(http.MethodGet, path, test.host, test.headers))
+				handler.ServeHTTP(resp, adminOriginRequest(http.MethodGet, path, test.host, test.headers))
 				if resp.Code != test.want {
 					t.Fatalf("status = %d, want %d; body = %s", resp.Code, test.want, resp.Body.String())
 				}

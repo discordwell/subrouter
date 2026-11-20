@@ -194,7 +194,8 @@ func azureCodexFallbackServer(t *testing.T, azureURL *url.URL, poolURL *url.URL,
 		Scheduler:     selectacct.NewScheduler(nil),
 		MaxBodyBytes:  1 << 20,
 		Logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
-		// The Azure diversion is under test, not the capacity retry before it.
+		// The Azure diversion is under test, not the capacity retry before it
+		// (upstream #389).
 		CodexOverloadFailover: withoutCapacityRetry(),
 		AzureCodex: &AzureCodexConfig{
 			Endpoints: []AzureCodexEndpoint{{
@@ -1784,6 +1785,7 @@ func TestAzureCodexPinsSurviveARestart(t *testing.T) {
 // peeked for an early response.failed. A non-2xx SSE body must name capacity
 // to count (codexCapacityBody decides), so an unrecognized failure code on a
 // 400 or 404 is never treated as a pool failure that reroutes to Azure.
+// Upstream #373, verbatim.
 func TestAzureCodexStreamFailureIgnoresNon2xxStreams(t *testing.T) {
 	body := "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"some_future_code\",\"message\":\"nope\"}}}\n\n"
 	for _, status := range []int{http.StatusBadRequest, http.StatusNotFound} {

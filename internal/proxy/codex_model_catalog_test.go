@@ -498,8 +498,11 @@ func TestCodexModelCatalogHonorsOAuthAccountPin(t *testing.T) {
 	if got := fetch(""); got != `{"models":[{"slug":"gpt-6-astra","tier":"priority"}]}` {
 		t.Fatalf("unpinned catalog = %s, want the shared catalog session unaffected by the pin", got)
 	}
-	if assignment, ok := store.Get("codex", codexPinnedModelCatalogSessionID("promax@example.com")); !ok || assignment.AccountID != "promax@example.com" {
-		t.Fatalf("pinned catalog assignment = %#v, %t; want promax@example.com", assignment, ok)
+	// A catalog GET is a side request, which places nothing in this fork,
+	// pinned or not (PATCHES §21): upstream #606 also writes the pinned
+	// catalog session's assignment.
+	if assignment, ok := store.Get("codex", codexPinnedModelCatalogSessionID("promax@example.com")); ok {
+		t.Fatalf("pinned catalog assignment = %#v; a side request must not place a session", assignment)
 	}
 	if assignment, ok := store.Get("codex", codexModelCatalogSessionID); !ok || assignment.AccountID != "pro@example.com" {
 		t.Fatalf("shared catalog assignment = %#v, %t; want pro@example.com", assignment, ok)

@@ -18,6 +18,20 @@ import (
 // Only when the same account keeps failing (CapacityStickyEvictFailures in a
 // row while the mark is live) does a sticky session move. The account's
 // first success on the model clears its marks for every tier.
+//
+// Fork note: this file is upstream manaflow-ai/subrouter's selectacct/capacity.go
+// (862a5a5, #382; unchanged through c9303d3), ported as written on the owner's
+// 2026-09-28 decision (PATCHES section 27). Before it the fork recorded a
+// capacity failure as a pool EXHAUSTION mark (MarkExhaustedUntil), which made
+// the account Evicted and moved every warm session on it after ONE failure --
+// the 70-minute warm rule's only exit. Capacity eviction is now the rule's
+// second, owner-approved exit, and it takes two consecutive failures. Only the
+// capacity parts are ported: upstream's sticky-retention floor and +10pp move
+// gate (keepConstrainedStickyAssignment's headroom branch) are deliberately
+// not, because the warm rule already decides retention and keeps the cache.
+// The 2026-11 upstream merge added upstream's later diagnostics, neither of
+// which changes routing: the mark's latest failure reason (#620) and the
+// placement-stats count of capacity marks (#388).
 
 // CapacityStickyEvictFailures is how many consecutive capacity failures on
 // one account+pool it takes before a sticky session leaves the account. One
@@ -236,8 +250,9 @@ func (r *SchedulerRef) CapacityMarkList() []CapacityMarkInfo {
 
 // WithCapacityMarks attaches one pool's capacity failure counts (ScoreKey to
 // consecutive failures). Marked accounts rank after unmarked ones of the
-// same selection tier and leave the placement spread band; nothing else in
-// the score changes.
+// same selection tier; nothing else in the score changes. (Upstream also ends
+// its placement spread band at a capacity-count change; the fork's Pick is
+// deterministic and has no spread band -- PATCHES section 10.)
 func (s Scheduler) WithCapacityMarks(marks map[string]int) Scheduler {
 	next := s
 	next.capacity = marks

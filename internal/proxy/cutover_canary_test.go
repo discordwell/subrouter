@@ -142,9 +142,9 @@ func TestCutoverCanaryLogEvidenceOmitsRawAccountIdentity(t *testing.T) {
 	)
 	var output bytes.Buffer
 	logger := slog.New(slog.NewJSONHandler(&output, nil))
-	logger.Info("proxy request", privacySafeCutoverRequestLogAttrs("codex", "selected-session", userEmailHash(accountIdentity), http.MethodPost, "/v1/responses", "provider.invalid", "127.0.0.1", "codex-test", markerHash)...)
+	logger.Info("proxy request", privacySafeCutoverRequestLogAttrs("codex", "selected-session", userEmailHash(accountIdentity), http.MethodPost, "/v1/responses", "provider.invalid", "127.0.0.1", "codex-test", markerHash, "alice")...)
 	line := output.String()
-	for _, want := range []string{`"msg":"proxy request"`, `"agent":"codex"`, `"session":"selected-session"`, `"cutover_marker_hash":"` + markerHash + `"`, `"time":`} {
+	for _, want := range []string{`"msg":"proxy request"`, `"agent":"codex"`, `"session":"selected-session"`, `"cutover_marker_hash":"` + markerHash + `"`, `"caller":"alice"`, `"time":`} {
 		if !strings.Contains(line, want) {
 			t.Fatalf("privacy-safe marker evidence missing %s: %s", want, line)
 		}
@@ -165,7 +165,9 @@ func TestSessionInventoryReportsExplicitActivity(t *testing.T) {
 	active := NewActiveSessions()
 	end := active.Begin("codex", "selected")
 	server := Server{Sessions: store, ActiveSessions: active}
-	request := httptest.NewRequest(http.MethodGet, "/_subrouter/sessions", nil)
+	// Loopback: /_subrouter/sessions is admin-only, and a tokenless remote
+	// caller is refused here (PATCHES.md section 12).
+	request := loopbackAdminRequest(http.MethodGet, "/_subrouter/sessions", nil)
 	response := httptest.NewRecorder()
 	server.Handler().ServeHTTP(response, request)
 	if response.Code != http.StatusOK {
@@ -181,7 +183,7 @@ func TestSessionInventoryReportsExplicitActivity(t *testing.T) {
 
 	end()
 	response = httptest.NewRecorder()
-	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/_subrouter/sessions", nil))
+	server.Handler().ServeHTTP(response, loopbackAdminRequest(http.MethodGet, "/_subrouter/sessions", nil))
 	var idleRows []sessionStatusForTest
 	if err := json.Unmarshal(response.Body.Bytes(), &idleRows); err != nil {
 		t.Fatal(err)

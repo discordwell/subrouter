@@ -105,11 +105,30 @@ func TestCodexPickerServerFollowsTheLaunchTarget(t *testing.T) {
 	if server, err := codexPickerServer(true, "http://100.64.0.1:31415/v1"); err != nil || server.Name != "local" || server.URL != "http://127.0.0.1:31999" {
 		t.Fatalf("local fallback server = %+v %v", server, err)
 	}
+	// Fork (PATCHES §17): servers.json is read only through the gated
+	// funnel, so a keyless machine never resolves -- nor sends the admin
+	// token of -- an entry left in it.
+	resetRemoteGateCache()
+	t.Cleanup(resetRemoteGateCache)
+	if server, err := codexPickerServer(false, "http://100.64.0.2:31415/v1"); err == nil {
+		t.Fatalf("keyless machine resolved remote %+v for the picker", server)
+	}
+	if _, ok := codexResolvedServer(false, "http://100.64.0.2:31415/v1"); ok {
+		t.Fatal("keyless machine resolved a registered remote for the launch ledger")
+	}
+	unlockRemoteGateForTest(t)
 	if server, err := codexPickerServer(false, "http://100.64.0.2:31415/v1"); err != nil || server.Name != "other" {
 		t.Fatalf("remote server = %+v %v", server, err)
 	}
 	if _, err := codexPickerServer(false, "http://10.9.9.9:1/v1"); err == nil || !strings.Contains(err.Error(), "SUBROUTER_CODEX_ACCOUNT_ID") {
 		t.Fatalf("unknown base URL = %v", err)
+	}
+	// The launch ledger records the server the launch resolved to, whatever
+	// SUBROUTER_SERVER (the Claude-maintenance spelling, §29.5) says: it used
+	// to record that variable's server, here "local", for a remote launch.
+	t.Setenv("SUBROUTER_SERVER", "local")
+	if server, ok := codexResolvedServer(false, "http://100.64.0.1:31415/v1"); !ok || server.Name != "team" {
+		t.Fatalf("ledger server = %+v %v, want team", server, ok)
 	}
 }
 
@@ -121,13 +140,16 @@ func TestCodexPickerRefusesNonTerminalStdin(t *testing.T) {
 	}
 }
 
+// Upstream checks this with --persist-capacity (#382), which this fork's
+// launcher does not take (PATCHES §27); --no-goal-resume is the launcher flag
+// that remains.
 func TestCodexAccountFlagParsedBeforeLauncherFlags(t *testing.T) {
-	options, rest, err := takeCodexAccountFlag([]string{"--account", "--", "--persist-capacity", "exec", "hi"})
+	options, rest, err := takeCodexAccountFlag([]string{"--account", "--", "--no-goal-resume", "exec", "hi"})
 	if err != nil || !options.pick {
 		t.Fatalf("%+v %v", options, err)
 	}
-	rest, persist := takeCodexPersistCapacityFlag(rest)
-	if !persist || !reflect.DeepEqual(rest, []string{"exec", "hi"}) {
-		t.Fatalf("--persist-capacity after --account -- not taken: %v %v", persist, rest)
+	rest, goalResume := takeCodexGoalResumeFlag(rest)
+	if goalResume || !reflect.DeepEqual(rest, []string{"exec", "hi"}) {
+		t.Fatalf("--no-goal-resume after --account -- not taken: %v %v", goalResume, rest)
 	}
 }

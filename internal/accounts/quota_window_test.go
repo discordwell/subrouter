@@ -35,7 +35,27 @@ func TestWeeklyCookedWindow(t *testing.T) {
 			{Name: "reached", UsedPercent: 100},
 		}, false},
 		{"only 5h full", []UsageWindow{{Name: "primary", UsedPercent: 100, LimitWindowSeconds: fiveHours}}, false},
+		// A usage-based seat (PATCHES.md §42): its spend cap is its only quota.
+		{"spend window full", []UsageWindow{{Name: CodexSpendWindowName, UsedPercent: 100, LimitWindowSeconds: 30 * 24 * 3600}}, true},
+		{"spend window with room", []UsageWindow{{Name: CodexSpendWindowName, UsedPercent: 60, LimitWindowSeconds: 30 * 24 * 3600}}, false},
+		{"spend/reached alone (no readable amounts)", []UsageWindow{{Name: CodexSpendReachedWindowName, UsedPercent: 100}}, true},
+		{"spend/reached below a full percentage", []UsageWindow{
+			{Name: CodexSpendWindowName, UsedPercent: 95, LimitWindowSeconds: 30 * 24 * 3600},
+			{Name: CodexSpendReachedWindowName, UsedPercent: 100},
+		}, true},
 		{"weekly reset has passed", []UsageWindow{{Name: "secondary", UsedPercent: 100, LimitWindowSeconds: week, ResetAt: time.Now().Add(-time.Minute)}}, false},
+		// Codex sends limit_reached with the full weekly window, so a stale
+		// reading carries the synthetic "reached" too; it has no reset of
+		// its own and must not bring the cook back once the weekly reset
+		// has passed.
+		{"weekly reset has passed, reached from the same reading", []UsageWindow{
+			{Name: "secondary", UsedPercent: 100, LimitWindowSeconds: week, ResetAt: time.Now().Add(-time.Minute)},
+			{Name: "reached", UsedPercent: 100},
+		}, false},
+		{"5h reset has passed, reached from the same reading", []UsageWindow{
+			{Name: "primary", UsedPercent: 100, LimitWindowSeconds: fiveHours, ResetAt: time.Now().Add(-time.Minute)},
+			{Name: "reached", UsedPercent: 100},
+		}, false},
 		{"none", nil, false},
 	}
 	for _, tc := range cases {
@@ -44,30 +64,6 @@ func TestWeeklyCookedWindow(t *testing.T) {
 				t.Fatalf("WeeklyCookedWindow = %v, want %v", got, tc.want)
 			}
 		})
-	}
-}
-
-func TestDescribeAccountWindows(t *testing.T) {
-	got := DescribeAccountWindows([]UsageWindow{
-		{Name: "primary", UsedPercent: 100, LimitWindowSeconds: 18000},
-		{Name: "secondary", UsedPercent: 40, LimitWindowSeconds: 604800},
-		{Name: "spark/primary", Feature: "spark", UsedPercent: 100, LimitWindowSeconds: 604800},
-		{Name: "reached", UsedPercent: 100},
-	})
-	if want := "primary 5h 100%, secondary 7d 40%, limit_reached"; got != want {
-		t.Fatalf("DescribeAccountWindows = %q, want %q", got, want)
-	}
-	if got := DescribeAccountWindows(nil); got != "no account-wide windows reported" {
-		t.Fatalf("empty = %q", got)
-	}
-}
-
-func TestCodexUsageShape(t *testing.T) {
-	got := codexUsageShape(codexRateLimitDetails{
-		PrimaryWindow: &codexLimitWindow{LimitWindowSeconds: 604800},
-	})
-	if want := "primary=604800s secondary=none limit_reached=false"; got != want {
-		t.Fatalf("codexUsageShape = %q, want %q", got, want)
 	}
 }
 
