@@ -39,6 +39,32 @@ func readSocket(conn *websocket.Conn) <-chan socketEvent {
 	return events
 }
 
+// readSocketOnceRelayed is readSocket, returning only once the subrouter's
+// relay reads conn. The dial returns at the 101, before the handler watches for
+// Retire, and a socket first watched after Retire owes its first turn. The
+// relay answers a ping only after the watch is set.
+func readSocketOnceRelayed(t *testing.T, conn *websocket.Conn) <-chan socketEvent {
+	t.Helper()
+	pong := make(chan struct{}, 1)
+	conn.SetPongHandler(func(string) error {
+		select {
+		case pong <- struct{}{}:
+		default:
+		}
+		return nil
+	})
+	events := readSocket(conn)
+	if err := conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(10*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-pong:
+	case <-time.After(10 * time.Second):
+		t.Fatal("no pong within 10s: the subrouter is not relaying the socket")
+	}
+	return events
+}
+
 func nextSocketEvent(t *testing.T, events <-chan socketEvent, what string) socketEvent {
 	t.Helper()
 	select {
@@ -90,7 +116,7 @@ func TestRetiringClosesAnIdleCodexWebSocketWith1012(t *testing.T) {
 
 	fresh := dialShutdownDrainSocket(t, subrouter.URL, "fresh-session")
 	defer fresh.Close()
-	freshEvents := readSocket(fresh)
+	freshEvents := readSocketOnceRelayed(t, fresh)
 	between := dialShutdownDrainSocket(t, subrouter.URL, "between-turns-session")
 	defer between.Close()
 	betweenEvents := readSocket(between)
