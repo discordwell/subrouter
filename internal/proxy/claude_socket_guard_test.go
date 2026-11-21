@@ -433,7 +433,7 @@ func TestClaudeSocketStreamsAnswersThrough(t *testing.T) {
 			var once sync.Once
 			done := func() { once.Do(func() { close(release) }) }
 			t.Cleanup(done)
-			rig := newSocketGuardRig(t, socketGuardOptions{upstream: func(w http.ResponseWriter, _ *http.Request) {
+			rig := newSocketGuardRig(t, socketGuardOptions{upstream: func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("Content-Type", "text/event-stream")
 				w.WriteHeader(http.StatusOK)
 				// The proxy holds a Claude stream until its first decisive
@@ -444,7 +444,8 @@ func TestClaudeSocketStreamsAnswersThrough(t *testing.T) {
 				w.(http.Flusher).Flush()
 				select {
 				case <-release:
-				case <-time.After(10 * time.Second):
+				case <-r.Context().Done():
+					return
 				}
 				_, _ = io.WriteString(w, "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
 			}})
@@ -452,7 +453,9 @@ func TestClaudeSocketStreamsAnswersThrough(t *testing.T) {
 			if listener == "socket" {
 				baseURL = rig.socket.URL
 			}
-			req, err := http.NewRequest(http.MethodPost, baseURL+"/v1/messages?beta=true",
+			ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+			defer cancel()
+			req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/v1/messages?beta=true",
 				strings.NewReader(`{"model":"claude-sonnet-4-5","max_tokens":16,"stream":true,"messages":[{"role":"user","content":"hi"}]}`))
 			if err != nil {
 				t.Fatal(err)
@@ -462,13 +465,12 @@ func TestClaudeSocketStreamsAnswersThrough(t *testing.T) {
 			req.Header.Set("User-Agent", "claude-cli/2.1.328 (external, cli)")
 			req.Header.Set("X-Claude-Code-Session-Id", "sess-stream")
 			req.Header.Set("Authorization", "Bearer "+ClaudeSocketPlaceholderToken)
-			// The upstream holds the stream open for 10 s unless released, and
-			// releases only after the client has read the first event: a
-			// writer that buffers (status line included) delivers it at 10 s.
-			sent := time.Now()
-			resp, err := (&http.Client{Timeout: 20 * time.Second}).Do(req)
+			// The upstream holds the stream open until the client has read the
+			// first event, so a writer that buffers (status line included)
+			// delivers nothing before the request's deadline ends it.
+			resp, err := http.DefaultClient.Do(req)
 			if err != nil {
-				t.Fatal(err)
+				t.Fatalf("no answer while the stream was open: %v", err)
 			}
 			defer resp.Body.Close()
 			if resp.StatusCode != http.StatusOK {
@@ -482,15 +484,12 @@ func TestClaudeSocketStreamsAnswersThrough(t *testing.T) {
 				}
 				close(lines)
 			}()
-			select {
-			case line := <-lines:
-				if line != "event: message_start" {
-					t.Fatalf("first line = %q", line)
-				}
-			case <-time.After(5 * time.Second):
+			line, ok := <-lines
+			if !ok {
+				t.Fatal("the first event never reached the client while the stream was open")
 			}
-			if took := time.Since(sent); took > 5*time.Second {
-				t.Fatalf("the first event reached the client %v after the request, not while the stream was open", took.Round(time.Millisecond))
+			if line != "event: message_start" {
+				t.Fatalf("first line = %q", line)
 			}
 			done()
 			var rest []string
