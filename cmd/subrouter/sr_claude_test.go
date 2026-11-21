@@ -2914,7 +2914,9 @@ func TestClaudeReauthThroughTheTUIWaitsForTheNewLogin(t *testing.T) {
 	}
 	writeProfileCredentialFile(t, store, "work", "earlier-access")
 
-	var out bytes.Buffer
+	// The TUI's output is copied into out by exec's goroutine while sr writes
+	// its own lines there.
+	var out lockedBuffer
 	runner := claudeRunner{store: store, in: strings.NewReader(""), out: &out, errOut: &out}
 	if err := runner.addOAuth(t.Context(), "work"); err != nil {
 		t.Fatalf("TUI re-auth: %v\n%s", err, out.String())
