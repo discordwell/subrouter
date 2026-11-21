@@ -2840,7 +2840,7 @@ func installScriptedClaudeCLI(t *testing.T, home, authLogin, tui string) {
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 }
 
-func writeProfileCredentialFile(t *testing.T, store claude.Store, name, accessToken string, mode os.FileMode) string {
+func writeProfileCredentialFile(t *testing.T, store claude.Store, name, accessToken string) {
 	t.Helper()
 	path := filepath.Join(store.ClaudeConfigDir(name), ".credentials.json")
 	body := `{"claudeAiOauth":{"accessToken":"` + accessToken + `","refreshToken":"r","expiresAt":` +
@@ -2848,17 +2848,16 @@ func writeProfileCredentialFile(t *testing.T, store claude.Store, name, accessTo
 	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Chmod(path, mode); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.Chmod(path, 0o600) })
-	return path
 }
 
 // A re-auth tells the new login from the old one by its access token, so it
 // needs the old one. When the profile's store could not be read before the
 // login, a login saved elsewhere left the old credential in place and sr took
 // it for the new one. The re-auth now stops before the browser step.
+//
+// The credential path is a directory. The store refuses it (EISDIR) as it
+// refuses a file it may not read, and root cannot read it either, as it can a
+// mode-0 file. The hermetic test container runs as root.
 func TestClaudeReauthStopsWhenTheProfilesCredentialCannotBeRead(t *testing.T) {
 	claude.KeychainWithNoItemsForTest(t)
 	home := t.TempDir()
@@ -2868,7 +2867,6 @@ func TestClaudeReauthStopsWhenTheProfilesCredentialCannotBeRead(t *testing.T) {
 	installScriptedClaudeCLI(t, home,
 		"  [ \"$3\" = --help ] && exit 0\n"+
 			"  echo login >> '"+logPath+"'\n"+
-			"  chmod 600 \"$CLAUDE_CONFIG_DIR/.credentials.json\"\n"+
 			"  mkdir -p '"+elsewhere+"'\n"+
 			"  printf '{\"claudeAiOauth\":{\"accessToken\":\"fresh\"}}' > '"+elsewhere+"/.credentials.json'\n"+
 			"  exit 0",
@@ -2877,7 +2875,10 @@ func TestClaudeReauthStopsWhenTheProfilesCredentialCannotBeRead(t *testing.T) {
 	if _, err := store.CreateProfile("work"); err != nil {
 		t.Fatal(err)
 	}
-	credentialPath := writeProfileCredentialFile(t, store, "work", "earlier-access", 0)
+	credentialPath := filepath.Join(store.ClaudeConfigDir("work"), ".credentials.json")
+	if err := os.Mkdir(credentialPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
 
 	var out bytes.Buffer
 	runner := claudeRunner{store: store, in: strings.NewReader(""), out: &out, errOut: &out}
@@ -2887,15 +2888,11 @@ func TestClaudeReauthStopsWhenTheProfilesCredentialCannotBeRead(t *testing.T) {
 	if _, err := os.Stat(logPath); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("the browser login ran although the old credential could not be read: %v", err)
 	}
-	if err := os.Chmod(credentialPath, 0o600); err != nil {
-		t.Fatal(err)
-	}
 	if _, ok := store.FindProfile("work"); !ok {
 		t.Fatal("the existing profile was removed")
 	}
-	credential, err := store.ReadCredential(t.Context(), store.ClaudeConfigDir("work"))
-	if err != nil || credential == nil || credential.AccessToken != "earlier-access" {
-		t.Fatalf("existing profile's credential = %+v, err %v; want the one it held", credential, err)
+	if info, err := os.Lstat(credentialPath); err != nil || !info.IsDir() {
+		t.Fatalf("the unreadable credential was replaced: %v %v", info, err)
 	}
 }
 
@@ -2915,7 +2912,7 @@ func TestClaudeReauthThroughTheTUIWaitsForTheNewLogin(t *testing.T) {
 	if _, err := store.CreateProfile("work"); err != nil {
 		t.Fatal(err)
 	}
-	writeProfileCredentialFile(t, store, "work", "earlier-access", 0o600)
+	writeProfileCredentialFile(t, store, "work", "earlier-access")
 
 	// The TUI's output is copied into out by exec's goroutine while sr writes
 	// its own lines there.
@@ -2934,7 +2931,8 @@ func TestClaudeReauthThroughTheTUIWaitsForTheNewLogin(t *testing.T) {
 // When the login's credential cannot be read back, the new profile is kept,
 // since the login may be in it. The daemon had loaded the profile's creation,
 // with no credential, and reloads only on a new generation, so the kept
-// profile is published too.
+// profile is published too. The login leaves a directory where its credential
+// belongs, which the store refuses as root too.
 func TestClaudeAddKeptAfterAnUnreadableCredentialIsPublished(t *testing.T) {
 	claude.KeychainWithNoItemsForTest(t)
 	home := t.TempDir()
@@ -2945,15 +2943,13 @@ func TestClaudeAddKeptAfterAnUnreadableCredentialIsPublished(t *testing.T) {
 	installScriptedClaudeCLI(t, home,
 		"  [ \"$3\" = --help ] && exit 0\n"+
 			"  cp '"+generationPath+"' '"+atLogin+"'\n"+
-			"  printf '{\"claudeAiOauth\":{\"accessToken\":\"fresh\"}}' > \"$CLAUDE_CONFIG_DIR/.credentials.json\"\n"+
-			"  chmod 000 \"$CLAUDE_CONFIG_DIR/.credentials.json\"\n"+
+			"  mkdir \"$CLAUDE_CONFIG_DIR/.credentials.json\"\n"+
 			"  exit 0",
 		"exit 1")
 
 	var out bytes.Buffer
 	runner := claudeRunner{store: store, in: strings.NewReader(""), out: &out, errOut: &out}
 	err := runner.addOAuth(t.Context(), "work")
-	t.Cleanup(func() { _ = os.Chmod(filepath.Join(store.ClaudeConfigDir("work"), ".credentials.json"), 0o600) })
 	if err == nil || !strings.Contains(err.Error(), "was kept") {
 		t.Fatalf("add = %v; want the profile kept\n%s", err, out.String())
 	}
