@@ -14,13 +14,9 @@ import (
 	"github.com/manaflow-ai/subrouter/session"
 )
 
-// A stranded chat waits. On 2026-11-19 the building gateway refused new
-// connections for seconds to minutes at a time. A session warm on a box
-// account had its turn's dial to the box fail, and that same second the turn
-// went to a laptop account or another box account, each move a full
-// prompt-cache write: 892 rewrites in under two hours. A warm session now
-// waits for its own account under the hold, across the client's retries,
-// until the account answers or its box is found down (PATCHES §67).
+// A stranded chat waits. A warm session whose account cannot be reached
+// waits for it under the hold, across the client's retries, until the account
+// answers, its box is found down, or it gives up (PATCHES §67).
 
 // movableClock is the hold's clock (HoldPolicy.now). It stands still unless
 // the test moves it. reads counts the hold reading it, which every attempt
@@ -83,10 +79,15 @@ type warmPeerRig struct {
 
 func newWarmPeerRig(t *testing.T, policy *HoldPolicy, localSpent bool, failA func(n int64) error) *warmPeerRig {
 	t.Helper()
+	return newWarmPeerRigGated(t, policy, localSpent, failA, nil)
+}
+
+func newWarmPeerRigGated(t *testing.T, policy *HoldPolicy, localSpent bool, failA func(n int64) error, gate *admissionControl) *warmPeerRig {
+	t.Helper()
 	behind := eligibleBoxAccount("acct-a")
 	behind.Score.Headroom, behind.Score.WeeklyHeadroom, behind.Score.WeeklyRemaining = 0.5, 0.5, 0.5
 	boxA := newContractBox(t, behind)
-	boxB := newContractBox(t, eligibleBoxAccount("acct-b"))
+	boxB := newContractBox(t, fourRefugeeBoxAccount("acct-b"))
 	dialsA := cutPeer(t, boxA.pool, failA)
 	cutPeer(t, boxB.pool, func(int64) error { return nil })
 	local := new(atomic.Int64)
@@ -98,9 +99,16 @@ func newWarmPeerRig(t *testing.T, policy *HoldPolicy, localSpent bool, failA fun
 		},
 		exhausted: localSpent,
 		peers:     []*RemotePool{boxA.pool, boxB.pool},
+		admission: gate,
 	})
 	holdOn(t, boxA.pool, "hold-session", "acct-a")
 	return &warmPeerRig{holdRig: rig, boxA: boxA, boxB: boxB, dialsA: dialsA, local: local}
+}
+
+func fourRefugeeBoxAccount(id string) boxAccount {
+	account := eligibleBoxAccount(id)
+	account.Score.Headroom, account.Score.WeeklyHeadroom, account.Score.WeeklyRemaining = 0.45, 0.45, 0.45
+	return account
 }
 
 // answeredByAcctA checks the client got acct-a's answer from box A, and that
@@ -666,7 +674,7 @@ func TestPeersUnreachableHoldIsUnchangedByTheWarmWait(t *testing.T) {
 	}
 }
 
-// A turn answered starts the stranded chat's hour over (PATCHES §67, R8). On
+// A turn answered starts the stranded chat's hour over (PATCHES §67). On
 // the box, a chat answered at 12:46 and again at 13:36, then stranded at
 // 14:31, waits until 14:36, an hour after the later answer. On the local
 // upstream the later answer comes half a minute after the first, inside the
@@ -725,22 +733,33 @@ func TestAnAnsweredTurnStartsTheHourOver(t *testing.T) {
 	})
 }
 
-// A run ends only when one of the session's turns is answered, so a session
-// that never comes back would keep its run, and its answered time, for the
-// life of the daemon. Both are swept as ActiveSessions sweeps lastSeen.
+// A run ends when one of the session's turns is answered or the chat gives
+// up, so a session that never comes back would keep its run, its answered
+// time and its chain of held turns for the life of the daemon. Runs and
+// answered times are swept as ActiveSessions sweeps lastSeen, and a chain once
+// it has had no held attempt for its gap.
 func TestStrandedRunsAreBounded(t *testing.T) {
 	policy := strandedPolicy(nil)
 	policy.runs = map[string]strandedRun{}
 	stale := time.Now().Add(-2 * lastSeenRetention)
 	for i := 0; i < lastSeenSweepThreshold+10; i++ {
-		policy.runs[fmt.Sprintf("claude:stale-%d", i)] = strandedRun{began: stale, since: stale}
+		policy.runs[fmt.Sprintf("claude:stale-%d", i)] = strandedRun{began: stale}
 	}
-	now := time.Now()
-	if at := policy.strandedGiveUpAt("claude:live", now, time.Time{}); !at.Equal(now.Add(DefaultStrandedGiveUp)) {
-		t.Fatalf("a stranded session's first hold gives up at %v, want %v", at, now.Add(DefaultStrandedGiveUp))
-	}
+	policy.localWarm("claude:live", false)
 	if len(policy.runs) != 1 {
 		t.Fatalf("runs = %d after the sweep, want only the live session's", len(policy.runs))
+	}
+	now := time.Now()
+	policy.chains = map[string]session.HeldChain{}
+	ended := now.Add(-policy.chainGap())
+	for i := 0; i < lastSeenSweepThreshold+10; i++ {
+		policy.chains[fmt.Sprintf("claude:stale-%d", i)] = session.HeldChain{Since: ended, Last: ended}
+	}
+	if chain := policy.heldAttempt("claude:live", now); !chain.Since.Equal(now) {
+		t.Fatalf("a stranded session's first held attempt starts the chain %+v, want one from %v", chain, now)
+	}
+	if len(policy.chains) != 1 {
+		t.Fatalf("chains = %d after the sweep, want only the live session's", len(policy.chains))
 	}
 	policy.answeredAt = map[string]time.Time{}
 	for i := 0; i < lastSeenSweepThreshold+10; i++ {

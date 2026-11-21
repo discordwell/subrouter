@@ -129,6 +129,7 @@ type SchedulerRef struct {
 	// placement counts where work actually went since process start
 	// (upstream #388); it has its own lock (see placement_stats.go).
 	placement placementStats
+	pace      paceTracker
 }
 
 func NewSchedulerRef(scheduler Scheduler) *SchedulerRef {
@@ -156,6 +157,9 @@ func (r *SchedulerRef) Get() Scheduler {
 	// drop the table that lets an email-keyed holdout find a codex-owner id.
 	if r.accountAliases != nil {
 		scheduler = scheduler.withAccountAliasMap(r.accountAliases)
+	}
+	if paces := r.pace.snapshot.Load(); paces != nil {
+		scheduler = scheduler.withPaces(*paces)
 	}
 	return scheduler
 }
@@ -734,6 +738,7 @@ func (r *SchedulerRef) setLockedForScoreKeys(scheduler Scheduler, scoreKeys map[
 	}
 	r.scored = true
 	r.bumpScoreRevisionLocked()
+	r.pace.observeScores(r.scheduler)
 }
 
 // AdvanceAccountGeneration invalidates refresh work computed from an older
@@ -1842,6 +1847,7 @@ func (r *SchedulerRef) finishRefreshLocked(scheduler Scheduler, update bool) {
 		// is still the old one, so its debits still apply.
 		r.routedSinceRefresh = nil
 		r.bumpScoreRevisionLocked()
+		r.pace.observeScores(r.scheduler)
 	}
 	r.updatedAt = time.Now()
 	r.scored = true

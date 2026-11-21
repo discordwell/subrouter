@@ -217,8 +217,8 @@ func TestAWarmBoxSessionRidesOutAGatewayBlipOnItsAccount(t *testing.T) {
 
 // A box that is really down. Its dials time out while this machine opens new
 // connections elsewhere, the upstream or box B, during each strike. The
-// opening blames the box as before: every hold on it ends, and its warm
-// session moves at once.
+// opening blames the box, and hold-session is placed as a refugee and served
+// by another account at once.
 func TestADownBoxIsBlamedWhenThisMachineOpensNewConnections(t *testing.T) {
 	for _, tc := range []struct {
 		name      string

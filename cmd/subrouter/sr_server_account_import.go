@@ -233,17 +233,7 @@ var tenantPathErrorPattern = regexp.MustCompile(`/t/[^/?#\s"']+`)
 
 func redactServerRequestError(err error, server srServerConfig) error {
 	message := err.Error()
-	secrets := []string{
-		strings.TrimSpace(server.TenantKey),
-		strings.TrimSpace(server.AccountImportToken),
-		strings.TrimSpace(server.AdminToken),
-		strings.TrimSpace(server.PublicAdminToken),
-		strings.TrimSpace(server.ProxyToken),
-	}
-	if parsed, parseErr := url.Parse(strings.TrimSpace(server.URL)); parseErr == nil {
-		secrets = append(secrets, tenantKeyFromURL(parsed))
-	}
-	for _, secret := range secrets {
+	for _, secret := range server.secrets() {
 		if secret == "" {
 			continue
 		}

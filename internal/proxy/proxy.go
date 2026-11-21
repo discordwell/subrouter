@@ -198,12 +198,15 @@ type Server struct {
 	OutageSpill *OutageSpillPolicy
 	// PeerDownGrace is how long a peer must answer nothing, on any
 	// connection, while this machine is online, before its breaker finds it
-	// down and ends every hold on it (remotePoolBreaker.failure, PATCHES
-	// §67). Zero turns off only that rule: an opening gateway attribution and
-	// §54 blame on the peer finds it down. serve sets it
+	// down (remotePoolBreaker.failure, PATCHES §67). Finding it down ends no
+	// hold: each chat held there is placed as a refugee on its next turn. Zero
+	// turns off only the silence rule: the peer is then found down at the first
+	// opening that gateway attribution and §54 blame on it. serve sets it
 	// (DefaultPeerDownGrace).
 	PeerDownGrace time.Duration
-	AdminToken    string
+	// refugeeSlotsOverride replaces refugeeSlotsFor's cap.
+	refugeeSlotsOverride func(peer, account, poolModel string) int
+	AdminToken           string
 	// AllowUnauthenticatedAdmin is no longer consulted by authorizeAdmin.
 	// Owner decision 8 (2026-09 upstream merge, round 2) took upstream's
 	// tokenless fallback: with no AdminToken and no AccountImportToken
@@ -515,6 +518,11 @@ func (a *ActiveSessions) Begin(agentType, sessionID string) func() {
 		}
 		a.counts[key]--
 	}
+}
+
+// markSeen stamps the session seen now, with no turn in flight.
+func (a *ActiveSessions) markSeen(agentType, sessionID string) {
+	a.Begin(agentType, sessionID)()
 }
 
 const (
@@ -1035,7 +1043,8 @@ type AccountRef struct {
 	// ref (see sharedAdmission): the private and the public listener each
 	// build their handler from their own copy of Server, and one account's
 	// concurrency limit and 429 pause must hold across both.
-	admission atomic.Pointer[admissionControl]
+	admission      atomic.Pointer[admissionControl]
+	activeSessions atomic.Pointer[ActiveSessions]
 }
 
 // sharedAdmission returns the ref's admission gate, creating it on first use.
@@ -1051,6 +1060,17 @@ func (r *AccountRef) sharedAdmission() *admissionControl {
 	}
 	r.admission.CompareAndSwap(nil, newAdmissionControl())
 	return r.admission.Load()
+}
+
+func (r *AccountRef) sharedActiveSessions() *ActiveSessions {
+	if r == nil {
+		return NewActiveSessions()
+	}
+	if active := r.activeSessions.Load(); active != nil {
+		return active
+	}
+	r.activeSessions.CompareAndSwap(nil, NewActiveSessions())
+	return r.activeSessions.Load()
 }
 
 func (r *AccountRef) qwenRoot() string {
@@ -4227,7 +4247,7 @@ func (s Server) normalized() Server {
 	}
 	s.CredentialBroker = normalizedCredentialBroker(s.CredentialBroker)
 	if s.ActiveSessions == nil {
-		s.ActiveSessions = NewActiveSessions()
+		s.ActiveSessions = s.AccountRef.sharedActiveSessions()
 	}
 	if s.admission == nil {
 		s.admission = s.AccountRef.sharedAdmission()
@@ -8055,7 +8075,9 @@ func (s Server) proxyHandler() http.Handler {
 		// can hand this request to the peer checks it.
 		peerAllowed := !noRetry && !forcedAccountSelection
 
-		if s.Lifecycle != nil && s.Lifecycle.Quiesced() {
+		// A hold's retry was admitted against a quiesce by the hold
+		// (holdRetry), which a quiesce ends with the answer it kept.
+		if s.Lifecycle != nil && s.Lifecycle.Quiesced() && !holdRetry(r) {
 			http.Error(w, "subrouter is quiesced", http.StatusServiceUnavailable)
 			return
 		}
@@ -8063,12 +8085,14 @@ func (s Server) proxyHandler() http.Handler {
 			http.Error(w, "subrouter is draining", http.StatusServiceUnavailable)
 			return
 		}
-		endProxyRequest, admitted := s.Lifecycle.TryBeginProxyRequest()
-		if !admitted {
-			http.Error(w, "subrouter is quiesced", http.StatusServiceUnavailable)
-			return
+		if !holdRetry(r) {
+			endProxyRequest, admitted := s.Lifecycle.TryBeginProxyRequest()
+			if !admitted {
+				http.Error(w, "subrouter is quiesced", http.StatusServiceUnavailable)
+				return
+			}
+			defer endProxyRequest()
 		}
-		defer endProxyRequest()
 		// Claude Fable routing order: subscription pool (Max accounts) first, then
 		// AWS Bedrock, then the dedicated Anthropic API key. The fallback stages
 		// run when the pool gives up (usageLimitRetryTransport exhausts failover)
@@ -8244,6 +8268,8 @@ func (s Server) proxyHandler() http.Handler {
 					err = fmt.Errorf("requested account %q is unavailable", forcedAccountID)
 				}
 			}
+		} else if peerAllowed && s.resumeWaitingRefugee(w, r, requestProvider, requestPoolModel, sessionAgentType, sessionID, peerHoldMode, turn) {
+			return
 		} else if peerAllowed && s.serveHeldTurn(w, r, requestProvider, requestPoolModel, sessionAgentType, sessionID, peerHoldMode, turn) {
 			// This conversation is already being served by a peer, on the
 			// ACCOUNT it was sent for (P4): the held turn names that account
@@ -8253,8 +8279,9 @@ func (s Server) proxyHandler() http.Handler {
 			// back and cold-cache it. The hold ends only on a FORCED switch
 			// (classifyAccountSwitch): the account is evicted or refused, or the
 			// peer declines (its pool is spent) -- or when the session idles
-			// past remotePoolDelegationTTLFor, or is placed as a refugee from a
-			// peer found down (PATCHES §54, §67).
+			// past remotePoolDelegationTTLFor, is placed as a refugee from a
+			// peer found down, or gives up stranded (unlinkStranded) (PATCHES
+			// §54, §67).
 			// A turn the peer cannot take now waits for its account until the
 			// peer is found down, and is then a refugee (strandedOnPeer,
 			// PATCHES §67); a client cancel serves this one turn locally and
@@ -8372,7 +8399,8 @@ func (s Server) proxyHandler() http.Handler {
 			// eviction, so the session keeps its account: this one turn is
 			// served by the peer WITHOUT a hold if it can take it, and otherwise
 			// fails retryably. Running the no-account chain below instead would
-			// hand the session to the peer with a 70m hold (or bill Bedrock).
+			// hand the session to the peer with an hour-long hold (or bill
+			// Bedrock).
 			//
 			// The turn leaves a measured account for a reason nothing else
 			// records, so it is named here and on the decision line: the line
@@ -8571,17 +8599,22 @@ func (s Server) proxyHandler() http.Handler {
 						"reason", reason,
 						"error", err)
 				}
-				// Local cannot serve and no peer could be asked: a peer that
-				// comes back can serve it, so the hold (PATCHES §58) waits. A
-				// peer that answered means the pool really is out, and that
-				// 503 goes out at once. A hold that ends answers 502 instead
-				// of this 503: a spent pool's carries its next reset as
-				// Retry-After, which Claude Code shows to the user and stops on.
-				if peerAllowed && !sideChannel && r.Context().Err() == nil && s.peersUnreachable(r, turn) {
-					noteHoldable(r.Context(), holdMark{status: http.StatusServiceUnavailable, reason: "peers_unreachable:" + reason,
-						agent: sessionAgentType, session: sessionID, giveUp502: true})
-				}
 				w.Header().Set(subrouterReasonHeader, reason)
+				// Local cannot serve and no peer could be asked: a peer that
+				// comes back can serve it, so the hold (PATCHES §58) waits, as
+				// for a stranded chat (PATCHES §67), and gives up an hour
+				// after its first held turn. However it ends, the client gets
+				// a 502 Claude Code retries, not this 503, whose Retry-After is
+				// the pool's reset. A peer that answered means the pool really
+				// is out, and the 503 goes out at once: like a client that
+				// left, it ends the chat's chain of held turns.
+				if peerAllowed && !sideChannel && heldByAHold(r) {
+					if r.Context().Err() == nil && s.peersUnreachable(r, turn) {
+						holdStranded(w, r, waitsForABox, sessionAgentType, sessionID, "", "", "peers_unreachable:"+reason, "no account can serve this turn and no peer could be reached")
+						return
+					}
+					s.endHeldChain(holdMark{agent: sessionAgentType, session: sessionID, stranded: waitsForABox})
+				}
 				writeAccountSelectionUnavailable(w, err)
 				return
 			}
@@ -9137,10 +9170,9 @@ func (s Server) proxyHandler() http.Handler {
 					s.writeTargetedAdmissionRejected(w, err, accounts.Account{ID: rejected.ID, Provider: requestProvider}, requestPoolModel)
 					return
 				}
-				// A full queue drains in seconds, so the hold (PATCHES §58)
-				// waits for a slot instead of answering 503: on 2026-11-19
-				// sessions piled onto one local account got 1,731 of those
-				// (PATCHES §67). A paused account still fails fast.
+				// A full queue drains in seconds, so the hold (PATCHES §58, §67)
+				// waits for a slot instead of answering 503. A paused account
+				// still fails fast.
 				if errors.Is(err, errAdmissionQueueFull) && !errors.Is(err, errAdmissionPaused) {
 					noteHoldable(r.Context(), holdMark{status: http.StatusServiceUnavailable, reason: admissionReasonQueueFull,
 						agent: sessionAgentType, session: sessionID, account: rejected.ID})
@@ -9165,7 +9197,7 @@ func (s Server) proxyHandler() http.Handler {
 					switch {
 					case !peerAllowed:
 					case s.waitsForItsUpstream(r, sessionAgentType, sessionID, oneTurnHoldMode, crossPool.keptWarm()):
-						mark.reason, mark.stranded = "warm_wait:"+mark.reason, true
+						mark.reason, mark.stranded = "warm_wait:"+mark.reason, waitsForItsCache
 					case s.spillUnreachableTurn(w, r, proxyRequest, requestProvider, requestPoolModel,
 						sessionAgentType, sessionID, oneTurnHoldMode, turn, account.ID, cause):
 						return
@@ -10200,6 +10232,15 @@ func codexWebSocketTurnFinished(body, head []byte) bool {
 	return codexWebSocketResponseFinished(body)
 }
 
+// codexWebSocketTurnCompleted is codexWebSocketResponseCompleted for a message
+// that may not have been inspected (codexWebSocketTurnFinished).
+func codexWebSocketTurnCompleted(body, head []byte) bool {
+	if body == nil {
+		return strings.EqualFold(webSocketEventType(head), "response.completed")
+	}
+	return codexWebSocketResponseCompleted(body)
+}
+
 // webSocketEventType reads a JSON event's top-level "type" from the head of a
 // message that may be cut short. It returns "" when the head is not a JSON
 // object, or ends before the type does.
@@ -10273,6 +10314,9 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 	// once per write interval, the cost the HTTP sticky path pays per turn.
 	// Only the upstream_to_client goroutine sets or reads touchPending.
 	touchPending := false
+	// A response.completed is a turn answered (noteAnswered), recorded like
+	// touchPending once it has been delivered.
+	answeredPending := false
 	// The finished turn's lifecycle release, held like touchPending until the
 	// finishing frame has been delivered (webSocketModelState.complete).
 	// Only the upstream_to_client goroutine sets or reads it.
@@ -10452,6 +10496,7 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 					}
 					s.clearAccountCapacity(accountID, webSocketTurnModel(modelState, poolModel))
 				}
+				answeredPending = codexWebSocketTurnCompleted(body, head)
 				if codexWebSocketTurnFinished(body, head) {
 					finishCodexTurn()
 					// A turn's capacity count ends with the turn.
@@ -10577,6 +10622,10 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 			touchPending = false
 			s.touchSessionBestEffort(agentType, sessionID)
 		}
+		if answeredPending && err == nil {
+			s.noteAnswered(agentType, sessionID)
+		}
+		answeredPending = false
 		if err != nil {
 			// A region retry covers capacity failures only: an upstream drop
 			// or refusal still reaches the client as before.
@@ -12730,7 +12779,8 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 		// inside its owner's holdout, where no session may start), start on the
 		// scheduler's current recommendation instead of failing the pooled
 		// launch before a request.
-		if ok && !scheduler.Evicted(schedulerAccountProvider(preferred.Provider), preferred.ID) && !credentialStoreNotAnswering(preferred) {
+		if ok && !scheduler.Evicted(schedulerAccountProvider(preferred.Provider), preferred.ID) &&
+			!scheduler.QueueClosed(schedulerAccountProvider(preferred.Provider), preferred.ID) && !credentialStoreNotAnswering(preferred) {
 			picked = &preferred
 		}
 	}
@@ -12896,16 +12946,24 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 	return account, sessionID, assignment.UserEmail, capacity, nil
 }
 
-// selectionRefusesAccount is selection's one hard refusal: an OAuth account
-// whose Claude window is spent, or (any provider) one inside its owner's
-// holdout. Everything softer is a ranking hint, never a gate.
 func selectionRefusesAccount(provider accounts.Provider, scheduler selectacct.Scheduler, account accounts.Account) bool {
 	if account.AuthMode != accounts.AuthModeOAuth {
 		return false
 	}
 	scoreProvider := schedulerAccountProvider(account.Provider)
 	return (provider == accounts.ProviderClaude && scheduler.Exhausted(scoreProvider, account.ID)) ||
-		scheduler.InHoldout(scoreProvider, account.ID)
+		scheduler.InHoldout(scoreProvider, account.ID) || scheduler.QueueClosed(scoreProvider, account.ID)
+}
+
+func withoutClosedQueues(scheduler selectacct.Scheduler, candidates []accounts.Account) []accounts.Account {
+	var out []accounts.Account
+	for _, account := range candidates {
+		if account.AuthMode == accounts.AuthModeOAuth && scheduler.QueueClosed(schedulerAccountProvider(account.Provider), account.ID) {
+			continue
+		}
+		out = append(out, account)
+	}
+	return out
 }
 
 // placeableAccounts is the candidate set for a NEW placement -- a session with
@@ -13100,13 +13158,12 @@ func (s Server) logStickyReuse(agentType, sessionID string, account accounts.Acc
 // never goes cold and only a genuinely dormant one does. Caches are isolated
 // between organisations and each pool account is its own organisation, so a
 // migration is always a total cache miss rather than a partial one. It is the
-// hour itself, with no margin (owner, 2026-11-19: "I'd rather they go
-// unlinked at 60"): this idle clock starts when a turn ends and the cache's
-// clock at that turn's cache read, so a session idle an hour here has a cache
-// at least an hour old. Measured: no expiry miss in 335 one-hour pairs up to 58
-// minutes (PATCHES §67). A stranded chat gives up on the same clock
-// (DefaultStrandedGiveUp).
-const warmSessionIdleTTL = 60 * time.Minute
+// hour itself, with no margin: this idle clock starts when a turn ends and the
+// cache's clock at that turn's cache read, so a session idle an hour here has a
+// cache at least an hour old (PATCHES §67). A stranded chat gives up after the
+// same length (DefaultStrandedGiveUp), counted from its last answered turn:
+// its held attempts restart this clock.
+const warmSessionIdleTTL = session.WarmSessionWindow
 
 // sessionIdle reports how long a session (either provider) has gone without a
 // locally served turn. known=false means there is no evidence either way, which
@@ -13355,7 +13412,10 @@ func (s Server) migrateIdleSessionAcross(agentType, sessionID string, account ac
 	// session already holds is one of the candidates, so the winner is never
 	// worse-tiered than where it sits today. That leaves one case worth
 	// refusing: a pool where everything is spent, where the move buys nothing.
-	if scheduler.Evicted(schedulerAccountProvider(best.Provider), best.ID) {
+	// A closed winner is refused the same way: the session would arrive there
+	// as a new one, and a closed queue takes none.
+	if scheduler.Evicted(schedulerAccountProvider(best.Provider), best.ID) ||
+		scheduler.QueueClosed(schedulerAccountProvider(best.Provider), best.ID) {
 		return false
 	}
 	if s.Logger != nil {
@@ -14088,10 +14148,15 @@ func (s Server) retryAccount(ctx context.Context, provider accounts.Provider, ag
 		s.refreshUsageScoresForRequest(ctx)
 	}
 	// WithReserves for the same reason as oauthRetryAccount.
-	scheduler := s.scheduler().WithReserves(s.AccountReserves)
+	scheduler := s.scheduler().WithReserves(s.AccountReserves).
+		WithClosedAccounts(s.admissionGate().closedAccounts())
 	if s.Sessions != nil {
 		scheduler = scheduler.WithSessionCounts(SchedulerSessionCounts(s.Sessions)).
 			WithLiveSessionCounts(SchedulerActiveSessionCounts(s.Sessions, s.ActiveSessions))
+	}
+	untried = withoutClosedQueues(scheduler, untried)
+	if len(untried) == 0 {
+		return accounts.Account{}, fmt.Errorf("no untried %s accounts with an open admission queue", provider)
 	}
 	// A failover is a placement: prefer an account whose store answers, but
 	// never at the price of the Evicted refusal below (placeableAccounts).
@@ -15368,7 +15433,11 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 		// slot. Stickiness stays put: moving it would move the whole fan-out
 		// and its hot spot. The sticky account stays out of tried: it never
 		// answered, so a later quota failover may still come back to it.
-		if next, lease, ok := t.admissionSpill(req.Context(), accountID, tried); ok {
+		// A failover moves the pin only where commitSuccessfulFailover will:
+		// a Claude transient 429 serves its one turn and keeps the pin, so a
+		// spill after it lands no session.
+		carriesMove := t.commitFirstSuccess || (quotaFailedOver && !transientFailoverKeepsPin(t.provider, t.commitFirstSuccess, firstLeave))
+		if next, lease, ok := t.admissionSpill(req.Context(), accountID, tried, spilledFrom == "" && carriesMove); ok {
 			nextReq, replayErr := a.replay(replayReq, &next)
 			if replayErr != nil {
 				lease.release()
@@ -15413,14 +15482,19 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 		if admissionRejected(err) && a.replayable() && req.Context().Err() == nil &&
 			attempt < maxAttempts && t.server != nil {
 			tried[accountID] = struct{}{}
+			queueFull := errors.Is(err, errAdmissionQueueFull) && !errors.Is(err, errAdmissionPaused)
+			keepsPin := queueFull && (spilledFrom != "" || (!quotaFailedOver && !t.commitFirstSuccess))
 			var next accounts.Account
 			var pickErr error
-			if claudeThirdPartyKeyOnly {
+			switch {
+			case claudeThirdPartyKeyOnly:
 				var ok bool
 				if next, ok = t.server.claudeAPIKeyRetryCandidate(req.Context(), t.poolModel, tried); !ok {
 					return claudeThirdPartyExtraUsageResponse(nil, attemptReq), nil
 				}
-			} else {
+			case keepsPin:
+				next, pickErr = t.server.oauthOverflowCandidate(req.Context(), t.provider, t.poolModel, tried, t.fableFallback != nil)
+			default:
 				next, pickErr = t.server.oauthRetryCandidate(req.Context(), t.provider, t.agent, t.session, t.userEmail, t.poolModel, tried, t.fableFallback != nil, false)
 			}
 			if pickErr == nil {
@@ -15445,7 +15519,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 					// the pin stays (PATCHES §20, P8). Upstream also moves a
 					// session after admissionOverflowMoveAfter overflows in a
 					// row; here a busy account is never an eviction.
-					if errors.Is(err, errAdmissionQueueFull) && !errors.Is(err, errAdmissionPaused) {
+					if queueFull {
 						t.server.admission.noteQueueFullOverflow(admissionSessionKey{agent: t.agent, session: t.session}, accountID)
 						// A move selection already started (commitFirstSuccess)
 						// still commits to the account that serves (§25).
@@ -16051,7 +16125,10 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 // account's admission queue is long: the least-loaded Claude subscription
 // account of the same auth mode that would admit it now and has headroom for
 // the pool model. It returns false to keep the request where it is.
-func (t usageLimitRetryTransport) admissionSpill(ctx context.Context, accountID string, tried map[string]struct{}) (accounts.Account, *admissionLease, bool) {
+// movesSession is a spill that takes a pending move with it, so it lands the
+// session itself and must skip a closed queue as any placement does; a spill
+// that leaves the pin where it is may still land on one.
+func (t usageLimitRetryTransport) admissionSpill(ctx context.Context, accountID string, tried map[string]struct{}, movesSession bool) (accounts.Account, *admissionLease, bool) {
 	s := t.server
 	if s == nil || s.admission == nil || s.CredentialBroker != nil || t.provider != accounts.ProviderClaude ||
 		t.attempt == nil || !t.attempt.replayable() {
@@ -16074,7 +16151,8 @@ func (t usageLimitRetryTransport) admissionSpill(ctx context.Context, accountID 
 	// read 0, the holdout was inert, and the held-out account -- idle, since
 	// selection starts nothing on it, so the least loaded -- was the first
 	// target a fanned-out session's overflow found.
-	scheduler := s.withCapacityMarks(s.scheduler().ForModel(t.poolModel).WithReserves(s.AccountReserves), t.provider, t.poolModel, codexServiceTierFromContext(ctx))
+	scheduler := s.withCapacityMarks(s.scheduler().ForModel(t.poolModel).WithReserves(s.AccountReserves).
+		WithClosedAccounts(s.admissionGate().closedAccounts()), t.provider, t.poolModel, codexServiceTierFromContext(ctx))
 	now := time.Now()
 	skip := map[string]struct{}{}
 	for {
@@ -16102,6 +16180,9 @@ func (t usageLimitRetryTransport) admissionSpill(ctx context.Context, accountID 
 			// request on the account, so it must not be either.
 			if (candidate.AuthMode == accounts.AuthModeOAuth && scheduler.Evicted(candidateProvider, candidate.ID)) ||
 				!scheduler.UsableForStickySession(candidateProvider, candidate.ID) {
+				continue
+			}
+			if movesSession && candidate.AuthMode == accounts.AuthModeOAuth && scheduler.QueueClosed(candidateProvider, candidate.ID) {
 				continue
 			}
 			free, load := s.admission.freeLoad(admissionKeyFor(candidateProvider, candidate.ID, t.poolModel))
@@ -16908,7 +16989,9 @@ func (s Server) oauthRetryAccount(ctx context.Context, provider accounts.Provide
 // their protocol-specific success boundary.
 //
 // Candidates exclude EVICTED OAuth accounts (spent, or inside the owner's
-// holdout) -- the fork's filter, which upstream dropped in ddb8744. The HTTP
+// holdout) -- the fork's filter, which upstream dropped in ddb8744 -- and
+// accounts whose admission queue is closed, since the session arrives there
+// as a new one (PATCHES §72). The HTTP
 // usage failover alone takes the narrow part of ddb8744 back, after this has
 // nothing left: oauthRecoveryProbeCandidate. The final
 // bool is accepted for call-site compatibility and ignored: it armed upstream's
@@ -16917,6 +17000,18 @@ func (s Server) oauthRetryAccount(ctx context.Context, provider accounts.Provide
 // is not taken: a replacement is debited with NoteRouted when it is used, as
 // selection's pick is (PATCHES §26).
 func (s Server) oauthRetryCandidate(ctx context.Context, provider accounts.Provider, agentType, sessionID, userEmail, poolModel string, tried map[string]struct{}, oauthOnly, _ bool) (accounts.Account, error) {
+	return s.oauthCandidate(ctx, provider, poolModel, tried, oauthOnly, false)
+}
+
+// oauthOverflowCandidate is oauthRetryCandidate for one request a full
+// admission queue turned away while its session keeps its pin. Like
+// admissionSpill it may land on an account whose queue is closed: the session
+// does not arrive there.
+func (s Server) oauthOverflowCandidate(ctx context.Context, provider accounts.Provider, poolModel string, tried map[string]struct{}, oauthOnly bool) (accounts.Account, error) {
+	return s.oauthCandidate(ctx, provider, poolModel, tried, oauthOnly, true)
+}
+
+func (s Server) oauthCandidate(ctx context.Context, provider accounts.Provider, poolModel string, tried map[string]struct{}, oauthOnly, overflow bool) (accounts.Account, error) {
 	allCandidates := filterAccountsForProvider(s.accountListContext(ctx), provider)
 	if len(allCandidates) == 0 {
 		return accounts.Account{}, fmt.Errorf("no %s accounts available", provider)
@@ -16931,7 +17026,8 @@ func (s Server) oauthRetryCandidate(ctx context.Context, provider accounts.Provi
 	for {
 		// WithReserves: a failover pick must see the holdout like selection does,
 		// or a 429 walks the session straight into the owner's reserve.
-		scheduler := s.scheduler().ForModel(poolModel).WithReserves(s.AccountReserves)
+		scheduler := s.scheduler().ForModel(poolModel).WithReserves(s.AccountReserves).
+			WithClosedAccounts(s.admissionGate().closedAccounts())
 		// Capacity marks of the caller's tier (every tier when it did not
 		// say): a failover replacement avoids accounts shedding the model.
 		scheduler = s.withCapacityMarks(scheduler, provider, poolModel, codexServiceTierFromContext(ctx))
@@ -16965,6 +17061,9 @@ func (s Server) oauthRetryCandidate(ctx context.Context, provider accounts.Provi
 				continue
 			}
 			candidates = append(candidates, account)
+		}
+		if !overflow {
+			candidates = withoutClosedQueues(scheduler, candidates)
 		}
 		// A live controller cooldown is stronger evidence than a stale score.
 		// Do not spend replay attempts on accounts the controller has
@@ -17686,7 +17785,8 @@ func (s Server) selectionSchedulerFrom(base selectacct.Scheduler, poolModel, mac
 	}
 	return scheduler.
 		WithReserves(s.AccountReserves).
-		WithMachine(machineID, s.MachinePolicy)
+		WithMachine(machineID, s.MachinePolicy).
+		WithClosedAccounts(s.admissionGate().closedAccounts())
 }
 
 // selectionScheduler is selectionSchedulerFrom against the current base.

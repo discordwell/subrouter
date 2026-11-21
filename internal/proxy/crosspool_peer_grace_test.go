@@ -58,7 +58,7 @@ func TestEverySessionADownBoxHeldIsPlacedAsARefugeeOnItsNextTurn(t *testing.T) {
 			t.Errorf("%s: still held on the box found down after it was placed", sessionID)
 		}
 	}
-	placed := len(e2eLogLines(laptop.logs, refugeePlacedMessage))
+	placed := len(awaitLogLines(t, laptop.logs, refugeePlacedMessage, 3))
 	if placed != 3 {
 		t.Fatalf("%d placement lines, want one for each chat the box held", placed)
 	}

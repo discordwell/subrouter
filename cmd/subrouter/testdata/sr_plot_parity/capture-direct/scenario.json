@@ -1,0 +1,22 @@
+{
+ "now": "2026-11-19T13:01:36Z",
+ "utc_offset_seconds": -21600,
+ "zone": "America/Chicago",
+ "lines": 40,
+ "local": {
+  "body": "local.json"
+ },
+ "peer_view": {
+  "body": "peers.json"
+ },
+ "boxes": [
+  {
+   "name": "boxa",
+   "body": "box-boxa.json"
+  },
+  {
+   "name": "boxb",
+   "body": "box-boxb.json"
+  }
+ ]
+}

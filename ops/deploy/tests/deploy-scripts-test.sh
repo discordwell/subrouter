@@ -2576,6 +2576,33 @@ run_route_stub_deploy() { run_route_as "$ROUTE_SH" CLAUDE_ROUTE_DEPLOY="$C/deplo
 route_serve_job() { write_serve_plist "$RPLIST" "$H"; cp "$RPLIST" "$C/plist.orig"; load_plist "$RPLIST"; : > "$C/launchd/supervisor"; }
 expect_plist_unchanged() { cmp -s "$C/plist.orig" "$RPLIST" && ok || bad "the plist changed"; }
 plist_env() { "$PY3" -c 'import plistlib, sys; print((plistlib.load(open(sys.argv[1], "rb")).get("EnvironmentVariables") or {}).get(sys.argv[2], ""))' "$RPLIST" "$1"; }
+# The claude shim as claude-route's own write_shim writes it, in front of a real
+# claude that prints its environment.
+route_shim_setup() {
+  route_setup
+  mkdir -p "$C/real"; printf '#!/bin/bash\nenv\n' > "$C/real/claude"; chmod 755 "$C/real/claude"
+  sed '/^case "${1:-status}" in/,$d' "$ROUTE_SH" > "$C/route-lib.sh"
+  SHIM="$H/.claude-route/bin/claude"
+  env -i PATH="$C/bin:/usr/bin:/bin" HOME="$H" CLAUDE_ROUTE_HOME="$H/.claude-route" \
+    "$LAPTOP_BASH" -c 'source "$1"; write_shim "$2"' _ "$C/route-lib.sh" "$SHIM"
+  PROFILE="$H/.subrouter/codex/claude/work"
+}
+run_shim() { # env-assignments... -- shim args...
+  local envs=()
+  while [ $# -gt 0 ] && [ "$1" != -- ]; do envs+=("$1"); shift; done
+  [ $# -gt 0 ] && shift
+  run_sandboxed PATH="$H/.claude-route/bin:$C/real:$C/bin:/usr/bin:/bin" HOME="$H" TMPDIR="$C/tmp" \
+    CLAUDE_ROUTE_HOME="$H/.claude-route" CLAUDE_ROUTE_SOCKET="$H/.subrouter/claude.sock" \
+    FAKE_LOG="$C/log" FAKE_RUNNING="$C/launchd/running" FAKE_LAUNCHD="$C/launchd" \
+    FAKE_CLAUDE_SOCKET="$H/.subrouter/claude.sock" ${envs[@]+"${envs[@]}"} -- "$SHIM" "$@"
+}
+# Pool mode with the daemon's Claude socket answering. `[ -S ]` needs only the
+# file; it is bound from its own directory, since the full path can pass the
+# 104 bytes a socket address holds.
+route_shim_pool() {
+  echo pool > "$H/.claude-route/mode"
+  "$PY3" -c 'import os, socket, sys; os.chdir(sys.argv[1]); socket.socket(socket.AF_UNIX).bind("claude.sock")' "$H/.subrouter"
+}
 
 echo "== claude-route"
 
@@ -2680,12 +2707,7 @@ if begin route-plain-copy-says-where-the-scripts-are; then
 fi
 
 if begin route-shims-keep-max-retries; then
-  route_setup
-  mkdir -p "$C/real"; printf '#!/bin/bash\nenv\n' > "$C/real/claude"; chmod 755 "$C/real/claude"
-  sed '/^case "${1:-status}" in/,$d' "$ROUTE_SH" > "$C/route-lib.sh"
-  SHIM="$H/.claude-route/bin/claude"
-  env -i PATH="$C/bin:/usr/bin:/bin" HOME="$H" CLAUDE_ROUTE_HOME="$H/.claude-route" \
-    "$LAPTOP_BASH" -c 'source "$1"; write_shim "$2"' _ "$C/route-lib.sh" "$SHIM"
+  route_shim_setup
   grep -q MAX_RETRIES "$SHIM" && bad "the shim names CLAUDE_CODE_MAX_RETRIES" || ok
   for route in off pool; do
     run_sandboxed PATH="$H/.claude-route/bin:$C/real:$C/bin:/usr/bin:/bin" HOME="$H" TMPDIR="$C/tmp" \
@@ -2698,6 +2720,92 @@ if begin route-shims-keep-max-retries; then
   env -i PATH=/usr/bin:/bin HOME="$H" CLAUDE_CODE_MAX_RETRIES=15 CLAUDE_CODE_EFFORT_LEVEL=high \
     "$LAPTOP_BASH" -c 'source "$1"; build_launch_env; printf "%s\n" "${CLEAN[@]}"' _ "$C/route-lib.sh" > "$C/out"
   expect_out "CLAUDE_CODE_EFFORT_LEVEL"; expect_no_out "CLAUDE_CODE_MAX_RETRIES"
+  finish
+fi
+
+if begin route-login-keeps-the-profile-store; then
+  # sr claude addr runs `claude auth login` with CLAUDE_CONFIG_DIR at the
+  # profile. In pool mode the shim pointed Claude Code's credential store at
+  # its login-less one, so the login landed there and the profile had none.
+  route_shim_setup; route_shim_pool
+  run_shim CLAUDE_ROUTE_DRYRUN=1 CLAUDE_CONFIG_DIR="$PROFILE" -- auth login
+  expect_rc 0; expect_line "route=credentials"
+  run_shim CLAUDE_CONFIG_DIR="$PROFILE" -- auth login --claudeai
+  expect_rc 0; expect_line "CLAUDE_CONFIG_DIR=$PROFILE"; expect_line "CLAUDE_ROUTE_ACTIVE=credentials"
+  expect_no_out "CLAUDE_SECURESTORAGE_CONFIG_DIR="; expect_no_out "CLAUDE_CODE_OAUTH_TOKEN="; expect_no_out "ANTHROPIC_UNIX_SOCKET="
+  grep -q " route=credentials" "$H/.claude-route/launch.log" && ok || bad "launch.log lacks route=credentials"
+  expect_no_log "^curl"
+  finish
+fi
+
+if begin route-login-in-a-pool-session-drops-the-pool; then
+  # The same login from a pooled session's shell, whose environment holds the
+  # parent shim's route: listed in CLAUDE_ROUTE_SET, and not.
+  route_shim_setup; route_shim_pool
+  for set in "ANTHROPIC_BASE_URL ANTHROPIC_UNIX_SOCKET CLAUDE_CODE_OAUTH_TOKEN CLAUDE_SECURESTORAGE_CONFIG_DIR ENABLE_CLAUDEAI_MCP_SERVERS ANTHROPIC_CUSTOM_HEADERS CLAUDE_CODE_PROMPT_CACHE_TTL" ""; do
+    run_shim CLAUDE_ROUTE_SET="$set" CLAUDE_ROUTE_ACTIVE=pool ANTHROPIC_BASE_URL=http://api.anthropic.com \
+      ANTHROPIC_UNIX_SOCKET="$H/.subrouter/claude.sock" CLAUDE_CODE_OAUTH_TOKEN=ssh-placeholder \
+      CLAUDE_SECURESTORAGE_CONFIG_DIR="$H/.claude-route/securestorage" ENABLE_CLAUDEAI_MCP_SERVERS=0 \
+      "ANTHROPIC_CUSTOM_HEADERS=X-Subrouter-Agent: claude" CLAUDE_CODE_PROMPT_CACHE_TTL=1h CLAUDE_CONFIG_DIR="$PROFILE" -- auth login
+    expect_rc 0; expect_line "CLAUDE_CONFIG_DIR=$PROFILE"; expect_line "CLAUDE_ROUTE_ACTIVE=credentials"
+    for k in ANTHROPIC_BASE_URL ANTHROPIC_UNIX_SOCKET CLAUDE_CODE_OAUTH_TOKEN CLAUDE_SECURESTORAGE_CONFIG_DIR ENABLE_CLAUDEAI_MCP_SERVERS ANTHROPIC_CUSTOM_HEADERS CLAUDE_ROUTE_SET; do
+      expect_no_out "$k="
+    done
+  done
+  finish
+fi
+
+if begin route-login-off-keeps-the-profile-store; then
+  # off drops a CLAUDE_CONFIG_DIR inside ~/.subrouter. A login that lost it
+  # would land in your own login's store.
+  route_shim_setup
+  for route in off ""; do
+    run_shim CLAUDE_ROUTE="$route" CLAUDE_CONFIG_DIR="$PROFILE" -- auth login
+    expect_rc 0; expect_line "CLAUDE_CONFIG_DIR=$PROFILE"; expect_line "CLAUDE_ROUTE_ACTIVE=credentials"
+  done
+  finish
+fi
+
+if begin route-every-credential-command-routes-credentials; then
+  route_shim_setup; route_shim_pool
+  for cmd in setup-token /login login "auth status"; do
+    run_shim CLAUDE_ROUTE_DRYRUN=1 CLAUDE_CONFIG_DIR="$PROFILE" -- $cmd
+    expect_rc 0; expect_line "route=credentials"
+  done
+  for cmd in logout "auth logout"; do
+    run_shim CLAUDE_ROUTE_DRYRUN=1 -- $cmd
+    expect_rc 0; expect_line "route=credentials"
+  done
+  finish
+fi
+
+if begin route-logout-of-a-pool-profile-is-refused; then
+  # The credentials route keeps a pool profile's config dir, so a logout from a
+  # shell that points at one would sign the pool's account out.
+  route_shim_setup; route_shim_pool
+  for route in "" off pool; do
+    for cmd in "auth logout" logout; do
+      run_shim CLAUDE_ROUTE="$route" CLAUDE_CONFIG_DIR="$PROFILE" -- $cmd
+      expect_rc 2
+      grep -q "sign out the pool profile" "$C/out" && ok || bad "refusal does not say it would sign a pool profile out"
+      expect_no_out "CLAUDE_ROUTE_ACTIVE="
+    done
+  done
+  run_shim CLAUDE_CODE_CONFIG_DIR="$PROFILE" -- auth logout
+  expect_rc 2
+  finish
+fi
+
+if begin route-plain-pool-launch-keeps-the-pool-store; then
+  # Only a credential command as $1 leaves the pool: a plain launch, and a
+  # prompt that says login, keep the login-less store.
+  route_shim_setup; route_shim_pool
+  for args in "-p hi" "-p login"; do
+    run_shim -- $args
+    expect_rc 0; expect_line "CLAUDE_ROUTE_ACTIVE=pool"
+    expect_line "CLAUDE_SECURESTORAGE_CONFIG_DIR=$H/.claude-route/securestorage"
+    expect_line "ANTHROPIC_UNIX_SOCKET=$H/.subrouter/claude.sock"; expect_line "CLAUDE_CODE_OAUTH_TOKEN=ssh-placeholder"
+  done
   finish
 fi
 

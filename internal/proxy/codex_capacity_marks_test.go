@@ -314,8 +314,7 @@ func TestCodexWebSocketCapacityMarkKeepsSessionOnAccount(t *testing.T) {
 	if _, err := server.Sessions.Put("codex", "ws-capacity", "codex-account-0", ""); err != nil {
 		t.Fatal(err)
 	}
-	proxy := httptest.NewServer(server.Handler())
-	defer proxy.Close()
+	proxy := newProxyTestServer(t, server.Handler())
 	wsURL := "ws" + strings.TrimPrefix(proxy.URL, "http") + "/backend-api/codex/responses"
 	create := `{"type":"response.create","model":"gpt-6-astra","service_tier":"priority"}`
 
@@ -720,8 +719,7 @@ func TestCodexWebSocketSessionLeavesPersistentlySheddingAccountWithoutModelHeade
 	if _, err := server.Sessions.Put("codex", "ws-shed", "codex-account-0", ""); err != nil {
 		t.Fatal(err)
 	}
-	proxy := httptest.NewServer(server.Handler())
-	defer proxy.Close()
+	proxy := newProxyTestServer(t, server.Handler())
 	wsURL := "ws" + strings.TrimPrefix(proxy.URL, "http") + "/backend-api/codex/responses"
 	create := `{"type":"response.create","model":"gpt-6-astra"}`
 	turn := func() string {

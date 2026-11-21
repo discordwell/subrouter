@@ -137,6 +137,10 @@ func newGatewayRig(t *testing.T) *gatewayRig {
 
 // newShapedGatewayRig is the rig with heldA sessions held on box A's one
 // account, heldB on box B's first, and box B's accounts named.
+// fourRefugeesWeeklyUsed is a week 55% used: 45% left takes floor(45/10) = 4
+// refugees (Score.refugeeCap), the legacy count these rigs were written for.
+const fourRefugeesWeeklyUsed = 55
+
 func newShapedGatewayRig(t *testing.T, heldA, heldB int, bAccounts ...string) *gatewayRig {
 	t.Helper()
 	now := time.Now()
@@ -145,10 +149,10 @@ func newShapedGatewayRig(t *testing.T, heldA, heldB int, bAccounts ...string) *g
 	a := newE2EBox(t, map[string]string{"a-acct": e2eUsage(now, 10, 3*time.Hour, 30, 100*time.Hour)})
 	bUsage := map[string]string{}
 	for _, account := range bAccounts {
-		bUsage[account] = e2eUsage(now, 10, 3*time.Hour, 30, 100*time.Hour)
+		bUsage[account] = e2eUsage(now, 10, 3*time.Hour, fourRefugeesWeeklyUsed, 100*time.Hour)
 	}
 	b := newE2EBox(t, bUsage)
-	rig.laptop = newE2ELaptop(t, map[string]string{"owner": e2eUsage(now, 10, 3*time.Hour, 20, 120*time.Hour)}, nil)
+	rig.laptop = newE2ELaptop(t, map[string]string{"owner": e2eUsage(now, 10, 3*time.Hour, fourRefugeesWeeklyUsed, 120*time.Hour)}, nil)
 	aPool, bPool := e2eTwoPeers(t, rig.laptop, a, b, false)
 	local := &http.Transport{
 		DialContext:         gw.wrap((&net.Dialer{Timeout: 5 * time.Second}).DialContext, false),
@@ -516,8 +520,7 @@ func (rig *gatewayRig) waitHeld(what string, results <-chan gatewayTurn, cond fu
 // (the warm wait) and are served by the account their session is held on. Each box's
 // breaker opens and keeps every hold, because no new connection gets through
 // to anywhere (gateway attribution); nothing reaches
-// owner, and no connection opens. Before §67 the second strike found the
-// box down, because the laptop's own pooled answers said it was online.
+// owner, and no connection opens.
 func TestGatewayE1NewDialsRefusedWhileOpenConnectionsAnswerMovesNothing(t *testing.T) {
 	rig := newGatewayRig(t)
 	rig.warm(3, 2)
@@ -837,7 +840,7 @@ func (rig *gatewayRig) answeredBefore(what string, box *gatewayBox, n int64, res
 // two minutes after box A last served each a turn. A routed subagent's turns
 // carry no cache_control, a 5 minute cache; a main thread's carry a one-hour
 // one. Neither moves when its cache or seven minutes run out: box A is not
-// found down, so both wait for a-acct (PATCHES §67, R1), and a-acct serves
+// found down, so both wait for a-acct (PATCHES §67), and a-acct serves
 // both once the gateway lets dials through.
 func TestGatewayE8NeitherChatMovesWhenItsPromptCacheRunsOut(t *testing.T) {
 	rig := newGatewayRig(t)
@@ -934,7 +937,7 @@ func TestGatewayE6TenRefugeesGoFourToEachOfBoxBsAccountsThenToTheOwner(t *testin
 	if got := countPlaces(places); fmt.Sprint(got) != fmt.Sprint(want) {
 		t.Fatalf("refugees placed %v, want %v; logs:\n%s", got, want, rig.laptop.logs.String())
 	}
-	for _, line := range e2eLogLines(rig.laptop.logs, refugeePlacedMessage) {
+	for _, line := range awaitLogLines(t, rig.laptop.logs, refugeePlacedMessage, len(turns)) {
 		if line["origin"] != a.pool.name()+"/"+a.account {
 			t.Errorf("placement line %v, want origin %s/%s", line, a.pool.name(), a.account)
 		}
@@ -1017,7 +1020,7 @@ func TestGatewayE7WithEveryAccountFullTheRefugeesWaitUntilASlotFrees(t *testing.
 // E9: box A silent for 12 minutes and blamed, short of the grace. Its chat's
 // turn waits; at the hold's 8 minutes the client gets one 502, and its retry
 // waits again. The box answers at 12 minutes and a-acct serves the turn, and
-// no refugee is placed (PATCHES §67, R2).
+// no refugee is placed (PATCHES §67).
 func TestGatewayE9ABoxSilentShortOfTheGraceKeepsItsChatAcrossTheClientsRetry(t *testing.T) {
 	rig := newGatewayRig(t)
 	rig.warm(2, 2)
@@ -1048,7 +1051,7 @@ func TestGatewayE9ABoxSilentShortOfTheGraceKeepsItsChatAcrossTheClientsRetry(t *
 
 // E10: the same chat with box A silent past the grace. It is placed as a
 // refugee on the first held attempt after the box is found down: the held
-// request itself is answered, by box B (PATCHES §67, R1).
+// request itself is answered, by box B (PATCHES §67).
 func TestGatewayE10ABoxSilentPastTheGracePlacesItsWaitingChat(t *testing.T) {
 	rig := newGatewayRig(t)
 	rig.warm(2, 2)
@@ -1057,11 +1060,17 @@ func TestGatewayE10ABoxSilentPastTheGracePlacesItsWaitingChat(t *testing.T) {
 	if got.Status != http.StatusOK || got.Peer != b.pool.name() || got.ServedBy != b.account {
 		t.Fatalf("status %d served by %q on %q; want the held request placed on %s", got.Status, got.ServedBy, got.Peer, b.account)
 	}
-	placed := e2eLogLines(rig.laptop.logs, refugeePlacedMessage)
+	// The attempt whose strike found box A down placed the chat: box B holds
+	// it marked, so it took a slot there.
+	hold, held := b.pool.delegations.lookup(session.ScopedSessionKey("claude", a.sessions[0]), time.Now())
+	if !held || hold.Account != b.account || hold.Refugee == nil || hold.Refugee.Origin != a.pool.name()+"/"+a.account {
+		t.Fatalf("hold on box B = %+v (held %v), want a refugee from %s/%s on %s", hold, held, a.pool.name(), a.account, b.account)
+	}
+	placed := awaitLogLines(t, rig.laptop.logs, refugeePlacedMessage, 1)
 	if len(placed) != 1 || placed[0]["session"] != a.sessions[0] || len(rig.peerDowns()) != 1 {
 		t.Fatalf("placement lines %v, peer_down lines %v; want box A found down and this chat placed once", placed, rig.peerDowns())
 	}
-	ended := e2eLogLines(rig.laptop.logs, "proxy hold ended")
+	ended := awaitLogLines(t, rig.laptop.logs, "proxy hold ended", 1)
 	if len(ended) != 1 || ended[0]["outcome"] != "answered" {
 		t.Fatalf("hold-ended lines %v; want the one hold answered by the placement", ended)
 	}
@@ -1071,8 +1080,9 @@ func TestGatewayE10ABoxSilentPastTheGracePlacesItsWaitingChat(t *testing.T) {
 // (shape N, so box A is never blamed). Before the hour every hold ends in a
 // 502 and the turns land back in holds;
 // at the hour exactly one answer is the 503 with Retry-After: 3600 and the
-// stranded_gave_up reason, and the chat is unlinked: its next turn is placed
-// as a new session and served, with no hold (PATCHES §67, R8).
+// stranded_gave_up reason, and the chat waits for room: its next turn, with
+// box A still not answering, is placed as a refugee on box B, which its open
+// connections still reach, with no hold (PATCHES §67).
 func TestGatewayE11AChatStrandedPastTheHourGivesUp(t *testing.T) {
 	rig := newGatewayRig(t)
 	rig.warm(2, 2)
@@ -1104,8 +1114,12 @@ func TestGatewayE11AChatStrandedPastTheHourGivesUp(t *testing.T) {
 		t.Fatalf("at the hour: status %d Retry-After %q reason %q; want 503, 3600, stranded_gave_up", got.Status, got.Header.Get("Retry-After"), got.Header.Get(subrouterReasonHeader))
 	}
 	holds := len(e2eLogLines(rig.laptop.logs, "proxy hold started"))
-	if next := rig.turn(chat); next.Status != http.StatusOK {
-		t.Fatalf("the turn after the give-up: status %d; want it placed as a new session and served", next.Status)
+	b := rig.boxes[1]
+	if next := rig.turn(chat); next.Status != http.StatusOK || next.Peer != b.pool.name() {
+		t.Fatalf("the turn after the give-up: status %d on %q; want it placed on box B and served", next.Status, next.Peer)
+	}
+	if hold, held := b.pool.delegations.lookup(session.ScopedSessionKey("claude", chat), time.Now()); !held || hold.Refugee == nil {
+		t.Fatalf("hold on box B after the give-up = %+v (held %v); want it placed as a refugee, not as a cold session", hold, held)
 	}
 	if n := len(e2eLogLines(rig.laptop.logs, "proxy hold started")); n != holds {
 		t.Fatalf("the turn after the give-up started a hold")

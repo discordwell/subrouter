@@ -387,15 +387,15 @@ func TestNewSessionVerdictNamesTheBurndownCause(t *testing.T) {
 		want  NewSessionVerdict
 	}{
 		{"early burndown", resetScore("a", 0.12, 0.24, now.Add(72*time.Hour), held), 0,
-			NewSessionVerdict{Eligible: true, Reason: VerdictBurndown, Burndown: true, AllowedSessions: 2, BurndownCause: BurndownCauseReset}},
+			NewSessionVerdict{Eligible: true, Reason: VerdictBurndown, Burndown: true, AllowedSessions: 2, BurndownCause: BurndownCauseReset, RefugeeCap: refugeeCapOf(1)}},
 		{"early burndown at its cap", resetScore("a", 0.12, 0.24, now.Add(72*time.Hour), held), 2,
-			NewSessionVerdict{Reason: VerdictAtCap, AtCap: true, LiveSessions: 2, AllowedSessions: 2, BurndownCause: BurndownCauseReset}},
+			NewSessionVerdict{Reason: VerdictAtCap, AtCap: true, LiveSessions: 2, AllowedSessions: 2, BurndownCause: BurndownCauseReset, RefugeeCap: refugeeCapOf(1)}},
 		{"the 24h roll", resetScore("a", 0.30, 0.30, now.Add(16*time.Hour), time.Time{}), 0,
-			NewSessionVerdict{Eligible: true, Reason: VerdictBurndown, Burndown: true, AllowedSessions: 4, BurndownCause: BurndownCauseRoll}},
+			NewSessionVerdict{Eligible: true, Reason: VerdictBurndown, Burndown: true, AllowedSessions: 4, BurndownCause: BurndownCauseRoll, RefugeeCap: refugeeCapOf(9)}},
 		{"a holder inside its 24h roll", resetScore("a", 0.12, 0.20, now.Add(16*time.Hour), held), 0,
-			NewSessionVerdict{Eligible: true, Reason: VerdictBurndown, Burndown: true, AllowedSessions: 2, BurndownCause: BurndownCauseRoll}},
+			NewSessionVerdict{Eligible: true, Reason: VerdictBurndown, Burndown: true, AllowedSessions: 2, BurndownCause: BurndownCauseRoll, RefugeeCap: refugeeCapOf(3)}},
 		{"a holder with most of its week", resetScore("a", 0.30, 0.60, now.Add(72*time.Hour), held), 0,
-			NewSessionVerdict{Eligible: true, Reason: VerdictEligible}},
+			NewSessionVerdict{Eligible: true, Reason: VerdictEligible, RefugeeCap: refugeeCapOf(3)}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got := NewScheduler([]Score{tc.score}).

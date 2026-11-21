@@ -2200,6 +2200,20 @@ func (r claudeRunner) addOAuth(ctx context.Context, name string) error {
 		return loginErr
 	}
 
+	// A re-auth's login is told from what the profile held by its access
+	// token, so the old one must be known before the browser step. A profile
+	// this command created holds nothing yet (PATCHES §73).
+	var earlier *claude.CredentialInfo
+	if name != "" && !createdProfile {
+		if earlier, err = r.store.ReadCredential(ctx, claudeConfigDir); err != nil {
+			return fmt.Errorf("could not read profile %q's credential before the login, so a new login could not be told from the old one: %w. Nothing was started or changed; try again", name, err)
+		}
+	}
+	landed := func(credential *claude.CredentialInfo) bool {
+		return credential != nil && credential.AccessToken != "" &&
+			(earlier == nil || credential.AccessToken != earlier.AccessToken)
+	}
+
 	// The bare `claude` TUI needs a controlling terminal. Without one it
 	// silently degrades into `--print` mode and dies on the empty prompt, so
 	// `sr add claude` only ever worked when a human typed it into a terminal.
@@ -2223,15 +2237,40 @@ func (r claudeRunner) addOAuth(ctx context.Context, name string) error {
 		cmd.Stdout = r.out
 		cmd.Stderr = r.errOut
 		cmd.Env = claude.EnvForConfigDir(claudeConfigDir)
-		exitErr, autoClosed := r.runClaudeUntilCredential(ctx, cmd, claudeConfigDir)
+		exitErr, autoClosed := r.runClaudeUntilCredential(ctx, cmd, claudeConfigDir, landed)
 		if exitErr != nil && !autoClosed {
 			return discard(fmt.Errorf("Claude login did not complete: %w", exitErr))
 		}
 	}
 
-	status, err := claude.AuthStatusForPath(ctx, claudePath, claudeConfigDir)
-	if err != nil || status == nil || !status.LoggedIn {
-		return discard(errors.New("login was not completed"))
+	// The verdict is the profile's own credential, new since the login started,
+	// never `claude auth status`: a claude that saves the login to another
+	// store answers logged in all the same, as the claude-route shim did from
+	// its placeholder token (PATCHES §73).
+	credential, err := r.store.ReadCredential(ctx, claudeConfigDir)
+	if err != nil {
+		// No rollback: the login may be in the very store that did not answer.
+		if name == "" {
+			return fmt.Errorf("could not read the new login's credential to confirm it: %w. Nothing was registered, and %s was kept, since the login may be in it", err, tempDir)
+		}
+		keptErr := fmt.Errorf("could not read profile %q's credential to confirm the login: %w. The profile was kept, since the login may be in it: check it with 'sr claude list', and remove it with 'sr claude remove %s' if it shows no login", name, err, name)
+		// A worker loaded the profile's creation, with no credential, and
+		// reloads only on a new generation.
+		if _, publishErr := r.publishProfileCompletion(ctx); publishErr != nil {
+			return errors.Join(keptErr, fmt.Errorf("publish the kept profile: %w", publishErr))
+		}
+		return keptErr
+	}
+	if !landed(credential) {
+		return discard(fmt.Errorf("login finished but was saved outside this profile's credential store (%s). The usual cause is CLAUDE_SECURESTORAGE_CONFIG_DIR in the environment, or a claude wrapper on PATH (%s) that sets it", claudeConfigDir, claudePath))
+	}
+	// auth status only names the account and its plan.
+	status, _ := claude.AuthStatusForPath(ctx, claudePath, claudeConfigDir)
+	if status == nil || !status.LoggedIn {
+		if name == "" {
+			return discard(errors.New("login landed, but 'claude auth status' could not name the account; run 'sr claude addr <name>'"))
+		}
+		status = &claude.AuthStatus{}
 	}
 	if r.afterAuthVerified != nil {
 		r.afterAuthVerified()
@@ -2709,7 +2748,7 @@ func (w *claudeLoginURLEcho) Write(p []byte) (int, error) {
 	return n, err
 }
 
-func (r claudeRunner) runClaudeUntilCredential(ctx context.Context, cmd *exec.Cmd, claudeConfigDir string) (error, bool) {
+func (r claudeRunner) runClaudeUntilCredential(ctx context.Context, cmd *exec.Cmd, claudeConfigDir string, landed func(*claude.CredentialInfo) bool) (error, bool) {
 	if err := cmd.Start(); err != nil {
 		return err, false
 	}
@@ -2726,7 +2765,7 @@ func (r claudeRunner) runClaudeUntilCredential(ctx context.Context, cmd *exec.Cm
 			return err, true
 		case <-ticker.C:
 			credential, _ := r.store.ReadCredential(ctx, claudeConfigDir)
-			if credential == nil || credential.AccessToken == "" {
+			if !landed(credential) {
 				continue
 			}
 			fmt.Fprintln(r.errOut, "\nLogin detected; closing Claude...")
@@ -3210,6 +3249,11 @@ func claudeLaunchSettingsJSON(configDir string, env map[string]string) ([]byte, 
 		// later session reads and writes back to the user's default profile.
 		authoritative["CLAUDE_CONFIG_DIR"] = configDir
 		authoritative["CLAUDE_CODE_CONFIG_DIR"] = configDir
+		// Claude Code reads an empty one as the bare `Claude Code-credentials`
+		// item, the user's own login, whatever CLAUDE_CONFIG_DIR says. The
+		// profile's directory names the item CLAUDE_CONFIG_DIR alone would.
+		// With no configDir, empty and absent are the same default store.
+		authoritative["CLAUDE_SECURESTORAGE_CONFIG_DIR"] = configDir
 	}
 	for key, value := range env {
 		authoritative[key] = value

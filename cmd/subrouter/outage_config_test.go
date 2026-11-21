@@ -13,8 +13,7 @@ import (
 // Sticky DNS and the outage spill (PATCHES §59) and the peer-down grace
 // (PATCHES §67): variable > default, "0" is off, and a variable that does not
 // parse keeps the default with a warning instead of stopping the daemon.
-// SUBROUTER_PEER_HOLD_WAIT, the 2-minute wait the warm wait replaced, is read
-// no more.
+// SUBROUTER_PEER_HOLD_WAIT is ignored.
 func TestResolveOutageSettings(t *testing.T) {
 	defaults := outageSettings{stickyDNSMaxAge: proxy.DefaultStickyDNSMaxAge, spillRate: proxy.DefaultOutageSpillRate, spillBurst: proxy.DefaultOutageSpillBurst, peerDownGrace: 15 * time.Minute}
 	for _, tc := range []struct {
@@ -102,8 +101,8 @@ func TestOutageSettingsApply(t *testing.T) {
 }
 
 // PATCHES §67: the peer-down grace says at start which way it runs, and warns
-// when it is as long as a peer hold's idle bound, because a hold lapses first
-// and the grace then never ends one.
+// when it is as long as a peer hold's idle bound, because the holds then lapse
+// before the peer can be found down.
 func TestPeerDownGraceStartLine(t *testing.T) {
 	t.Cleanup(func() { proxy.SetStickyDNSMaxAge(proxy.DefaultStickyDNSMaxAge) })
 	for _, tc := range []struct {
@@ -129,8 +128,7 @@ func TestPeerDownGraceStartLine(t *testing.T) {
 	}
 }
 
-// PATCHES §67: the warm wait replaced the peer hold wait, which no start
-// line mentions any more.
+// PATCHES §67: no start line names the peer hold wait.
 func TestNoStartLineNamesThePeerHoldWait(t *testing.T) {
 	t.Cleanup(func() { proxy.SetStickyDNSMaxAge(proxy.DefaultStickyDNSMaxAge) })
 	var logs bytes.Buffer

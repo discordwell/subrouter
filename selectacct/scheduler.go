@@ -142,6 +142,12 @@ type Score struct {
 	// and both rank at 1x. Set on the account score; its model pools inherit
 	// it (inheritAccountFacts). A peer's arrives published.
 	FableSpent float64
+	// Pace is the account's measured weekly burn (PATCHES §72), set by
+	// measuredScore from the pace table SchedulerRef.Get attaches. Zero is
+	// unmeasured, and so is every Remote score: a peer's allowance is read
+	// from its verdict.
+	Pace        Pace
+	queueClosed bool
 
 	// weeklyDebit and shortDebit are what ApplyLiveDebit took off
 	// WeeklyHeadroom and ShortHeadroom (after its 0.01 floor); zero when
@@ -243,6 +249,8 @@ type Scheduler struct {
 	// Haiku call, and it must not pin a session that will run Fable to an
 	// account whose Fable is spent.
 	nonFableClaudeTurn bool
+	paces              map[string]Pace
+	closedAccounts     map[string]bool
 }
 
 // MachineView answers the two machine-scoped questions selection needs, without
@@ -632,6 +640,16 @@ func (s Scheduler) WithLiveSessionCounts(counts map[string]int) Scheduler {
 	return next
 }
 
+// WithClosedAccounts attaches the local accounts, keyed by ScoreKey, whose
+// admission queue is closed: they take no new session and no refugee, and
+// every session already on them stays. The map must not be mutated
+// afterwards.
+func (s Scheduler) WithClosedAccounts(closed map[string]bool) Scheduler {
+	next := s
+	next.closedAccounts = closed
+	return next
+}
+
 // ForModel narrows scoring to a model's dedicated quota pool when one exists.
 // If the model maps to no known pool (the common case: regular models), the
 // base scheduler is returned unchanged so account-wide quota is used. When a
@@ -845,6 +863,12 @@ func (s Scheduler) Evicted(provider account.Provider, accountID string) bool {
 	return s.score(provider, accountID).evicted()
 }
 
+// QueueClosed reports whether the account's admission queue is closed to new
+// sessions and refugees (PATCHES §72). Never a reason to move a session.
+func (s Scheduler) QueueClosed(provider account.Provider, accountID string) bool {
+	return s.score(provider, accountID).queueClosed
+}
+
 // InHoldout reports whether an account's weekly budget has reached its
 // owner's holdout.
 func (s Scheduler) InHoldout(provider account.Provider, accountID string) bool {
@@ -884,7 +908,7 @@ func selectionTier(acct account.Account, score Score, now time.Time, allowEndgam
 	// A holdout account ranks with the exhausted ones: when nothing is
 	// routable, Pick falls back to this tier, and starting a session inside
 	// the owner's holdout is exactly what the holdout forbids.
-	if acct.AuthMode == account.AuthModeOAuth && !score.evicted() {
+	if acct.AuthMode == account.AuthModeOAuth && !score.evicted() && !score.queueClosed {
 		return 2
 	}
 	if acct.AuthMode == account.AuthModeOAuth {
@@ -1116,6 +1140,10 @@ func (s Scheduler) measuredScore(provider account.Provider, accountID string) Sc
 	if s.liveSessionCounts != nil {
 		score.LiveSessions = countFor(s.liveSessionCounts, key, accountID)
 	}
+	if s.paces != nil {
+		score.Pace = s.paces[key]
+	}
+	score.queueClosed = s.closedAccounts[key]
 	if s.reserves != nil {
 		score.Reserve = s.reserveFor(provider, accountID)
 		if score.reserveReleased(time.Now()) {
@@ -1302,6 +1330,9 @@ func (s Score) routableForNewSession(now time.Time, allowEndgame bool) bool {
 	if verdict, ok := s.peerVerdict(); ok {
 		return verdict.Eligible
 	}
+	if s.queueClosed {
+		return false
+	}
 	return s.usableForNewSession() || (allowEndgame && s.endgameDrainEligible(now))
 }
 
@@ -1361,7 +1392,7 @@ func (s Score) endgameDrainEligible(now time.Time) bool {
 		// Claude account with no 5h reading has no 5h meter here (ShortHeadroom
 		// 1), so it drains to its weekly wall, where exhausted() stops it.
 		s.drainInputs().ShortHeadroom >= MinShortHeadroomFloor &&
-		s.LiveSessions < s.endgameAllowedSessions() &&
+		s.LiveSessions < s.endgameAllowedSessions(now) &&
 		!s.belowWeeklyReserve()
 }
 
@@ -1389,7 +1420,7 @@ func (s Score) endgameAtCap(now time.Time) bool {
 	if verdict, ok := s.peerVerdict(); ok {
 		return verdict.AtCap
 	}
-	return s.inBurndownWindow(now) && s.LiveSessions >= s.endgameAllowedSessions()
+	return s.inBurndownWindow(now) && s.LiveSessions >= s.endgameAllowedSessions(now)
 }
 
 // endgameUrgency is how fast an account's weekly roll is arriving: the
@@ -1484,39 +1515,8 @@ func (s Score) drainInputs() Score {
 	return s
 }
 
-// endgameAllowedSessions is the drain-mode concurrency taper (PATCHES §10,
-// §41, §55): ceil(spendable / step), between 1 and claudeEndgameMaxSessions,
-// on the drain's inputs (drainInputs).
-func (s Score) endgameAllowedSessions() int {
-	s = s.drainInputs()
-	// Spendable is what the drain may still spend: above the owner's holdout,
-	// where belowWeeklyReserve stops it. Sized on the whole of WeeklyHeadroom,
-	// the glide ended at zero rather than at the reserve -- a reserved account
-	// a few points above its holdout carried the full ceiling past it until
-	// the next refresh, and inHoldout then evicted every one of those warm
-	// sessions at once. An unknown week (zero) keeps the floor of one, as
-	// before.
-	spendable := s.WeeklyHeadroom
-	if s.Reserve > 0 && spendable > 0 {
-		spendable = math.Max(0, spendable-s.Reserve)
-	}
-	allowed := int(math.Ceil(spendable / claudeEndgameSessionStep))
-	if allowed < 1 {
-		allowed = 1
-	}
-	if allowed > claudeEndgameMaxSessions {
-		allowed = claudeEndgameMaxSessions
-	}
-	// Slots beyond the first need a 5h window that survives them. The drain
-	// admits an account past usableForNewSession's burn projection (only the
-	// short floor applies), which is right for its final task and wrong for a
-	// dogpile: when the 5h window is already projected to run dry, the week
-	// cannot drain faster than that window lets it, so every extra session
-	// only brings the 5h wall sooner and is forced off mid-turn when it lands.
-	if allowed > 1 && !s.shortBurnSustainable() {
-		allowed = 1
-	}
-	return allowed
+func (s Score) endgameAllowedSessions(now time.Time) int {
+	return s.allowance(now).Sessions
 }
 
 func (s Score) evicted() bool {

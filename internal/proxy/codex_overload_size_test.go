@@ -326,8 +326,7 @@ func TestCodexWebSocketOverloadRerouteRespectsConversationSize(t *testing.T) {
 			if _, err := server.Sessions.Put("codex", "ws-size", "codex-account-0", ""); err != nil {
 				t.Fatal(err)
 			}
-			proxy := httptest.NewServer(server.Handler())
-			defer proxy.Close()
+			proxy := newProxyTestServer(t, server.Handler())
 			wsURL := "ws" + strings.TrimPrefix(proxy.URL, "http") + "/backend-api/codex/responses"
 			conn, response, err := websocket.DefaultDialer.Dial(wsURL, http.Header{"Session-Id": []string{"ws-size"}})
 			if err != nil {

@@ -79,7 +79,7 @@ func TestAdmissionSpillNeverLandsInTheOwnersHoldout(t *testing.T) {
 			getBody: func() (io.ReadCloser, error) { return io.NopCloser(strings.NewReader("{}")), nil },
 		}
 		transport := usageLimitRetryTransport{server: &f.server, provider: accounts.ProviderClaude, poolModel: "claude-opus", attempt: attempt}
-		next, lease, ok := transport.admissionSpill(context.Background(), "a@example.com", map[string]struct{}{})
+		next, lease, ok := transport.admissionSpill(context.Background(), "a@example.com", map[string]struct{}{}, false)
 		lease.release()
 		return next, ok
 	}

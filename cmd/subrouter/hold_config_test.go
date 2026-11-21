@@ -92,8 +92,7 @@ func TestHoldSettingsPolicy(t *testing.T) {
 // PATCHES §67: serve says at start how long a stranded chat's holds last
 // and what the variable's 0 turns off, and warns when the give-up is longer
 // than the warm window, which would unlink a stranded chat first.
-// SUBROUTER_WARM_WAIT, the window the owner's rework removed, is read no
-// more.
+// SUBROUTER_WARM_WAIT is ignored.
 func TestStrandedGiveUpStartLine(t *testing.T) {
 	for _, tc := range []struct {
 		name     string

@@ -191,7 +191,7 @@ func TestMeasuredInputsSkipReservedCodexAndPeers(t *testing.T) {
 	setMeasuredInputsForTest(t, true)
 	now := time.Now()
 	twin := drainFixture(now, 0.30, 10*time.Hour, 0.90, 2*time.Hour)
-	if got := ApplyLiveDebit(twin, 10).endgameAllowedSessions(); got != 4 {
+	if got := ApplyLiveDebit(twin, 10).endgameAllowedSessions(time.Now()); got != 4 {
 		t.Fatalf("calibration: the in-scope twin allows %d with 10 debits, want the measured ladder's 4", got)
 	}
 	for name, mutate := range map[string]func(*Score){
@@ -203,7 +203,7 @@ func TestMeasuredInputsSkipReservedCodexAndPeers(t *testing.T) {
 		score := twin
 		mutate(&score)
 		working := ApplyLiveDebit(score, 10)
-		if got, want := working.endgameAllowedSessions(), legacyEndgameAllowedSessions(working); got != want {
+		if got, want := working.endgameAllowedSessions(time.Now()), legacyEndgameAllowedSessions(working); got != want {
 			t.Errorf("%s: allowed %d, want the debited ladder's %d", name, got, want)
 		}
 	}
@@ -217,11 +217,11 @@ func TestMeasuredInputsClampReadsTheMeasuredFiveHour(t *testing.T) {
 	// 0.125 to the reset.
 	score := ApplyLiveDebit(drainFixture(now, 0.60, 20*time.Hour, 0.50, time.Hour), 20)
 	setMeasuredInputsForTest(t, false)
-	if got := score.endgameAllowedSessions(); got != 1 {
+	if got := score.endgameAllowedSessions(time.Now()); got != 1 {
 		t.Fatalf("switch off: allowed %d, want 1 by the clamp on the debited 5h", got)
 	}
 	setMeasuredInputsForTest(t, true)
-	if got := score.endgameAllowedSessions(); got != 4 {
+	if got := score.endgameAllowedSessions(time.Now()); got != 4 {
 		t.Fatalf("switch on: allowed %d, want 4 on the measured 5h", got)
 	}
 }
@@ -250,6 +250,7 @@ func TestMeasuredInputsCoverTheFablePool(t *testing.T) {
 // Codex, with and without live debits.
 func TestEndgameAllowanceSwitchOffIsToday(t *testing.T) {
 	setMeasuredInputsForTest(t, false)
+	setPacedAllowanceForTest(t, false)
 	rng := rand.New(rand.NewSource(55))
 	now := time.Now()
 	for i := 0; i < 5000; i++ {
@@ -279,7 +280,7 @@ func TestEndgameAllowanceSwitchOffIsToday(t *testing.T) {
 			score.Reserve = []float64{0.05, 0.10, 0.20}[rng.Intn(3)]
 		}
 		working := ApplyLiveDebit(score, rng.Intn(31))
-		if got, want := working.endgameAllowedSessions(), legacyEndgameAllowedSessions(working); got != want {
+		if got, want := working.endgameAllowedSessions(time.Now()), legacyEndgameAllowedSessions(working); got != want {
 			t.Fatalf("switch off: allowed %d, pre-§55 %d: %+v", got, want, working)
 		}
 	}

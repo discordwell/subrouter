@@ -108,9 +108,9 @@ Raw `windows` names differ by provider (Claude `5h`/`7d`/`oauth-apps-weekly`, pl
 
 ## 16. The daemon falls through to a peer pool
 
-With `SUBROUTER_REMOTE_POOL` set, the daemon forwards to a peer pool, so a client pointed at `127.0.0.1` can spill mid-session. Local stays preferred: a forward happens only at a give-up point (Hook A at the handler's 503, Hook B after §11's Opus stage). The forward carries `X-Subrouter-Session` so the peer keeps its own sticky assignment, and this side remembers the delegation until the peer declines a model turn. It sends the client-facing path, not `pathForUpstream`'s rewrite, which turns Codex `/backend-api/wham/tasks` into `/wham/tasks`. `X-Subrouter-Agent` is load-bearing: without it the peer defaults to Codex. A 2 s dial bounds unreachability, and the breaker opens on the second consecutive failure because an idle tailnet link drops its first packet; a peer 429/503 clears it but still unpins the session. Loops stop on `X-Pool-Hop` (an `X-Subrouter-*` name would be stripped). Lease and broker modes never forward. §54/§67: an opening ends holds only when attributable to the peer and after the down grace; meanwhile a held turn waits if the peer answered within the hold wait, and is otherwise served locally with the hold kept.
+With `SUBROUTER_REMOTE_POOL` set, the daemon forwards to a peer pool, so a client pointed at `127.0.0.1` can spill mid-session. Local stays preferred: a forward happens only at a give-up point (Hook A at the handler's 503, Hook B after §11's Opus stage). The forward carries `X-Subrouter-Session` so the peer keeps its own sticky assignment, and this side remembers the delegation until the peer declines a model turn. It sends the client-facing path, not `pathForUpstream`'s rewrite, which turns Codex `/backend-api/wham/tasks` into `/wham/tasks`. `X-Subrouter-Agent` is load-bearing: without it the peer defaults to Codex. A 2 s dial bounds unreachability, and the breaker opens on the second consecutive failure because an idle tailnet link drops its first packet; a peer 429/503 clears it but still unpins the session. Loops stop on `X-Pool-Hop` (an `X-Subrouter-*` name would be stripped). Lease and broker modes never forward. §54/§67: an opening ends no hold. A peer is found down only when the opening is attributable to it and it has answered nothing for the down grace; a held chat waits for its peer until then, and is then placed as a refugee.
 
-- Knobs: `SUBROUTER_REMOTE_POOL` (unset: off), `SUBROUTER_PEER_DOWN_GRACE` (15 minutes), `SUBROUTER_PEER_HOLD_WAIT` (2 minutes)
+- Knobs: `SUBROUTER_REMOTE_POOL` (unset: off), `SUBROUTER_PEER_DOWN_GRACE` (15 minutes); `SUBROUTER_PEER_HOLD_WAIT` is no longer read (§67)
 - Code: `internal/proxy/remote_pool.go`, `internal/proxy/proxy.go`, `cmd/subrouter/main.go`
 - Related: amended by §54 and §67.
 
@@ -154,11 +154,11 @@ Owner rule, 2026-09-24: a warm session (a turn in flight, or its last turn withi
 - Warm sessions spilled to the peer on 5h burn projections (437 warm moves). Warm Claude sessions now get no score on the sticky path.
 - One Esc marked the pool exhausted (2,725 marks for 10m, each cascading over the pool). A refresh with no verdict (`refreshFailureIsTransient`) now marks nothing; the turn is served once by the peer or fails as a 502 with `X-Subrouter-Transient`.
 - Holdout leaks closed. `Scheduler.Evicted` / `InHoldout` are the one verdict, judged on the measured week (`Score.WeeklyRemaining`), failing open on a reading from before the roll.
-- Peer holds survive cancels and blips, last 70m from turn end, and persist to `peer-holds.json`. A decline clears the hold; a breaker opening clears all holds (since §54 only an opening attributable to the peer, since §67 only after the grace).
+- Peer holds survive cancels and blips, last 70m from turn end, and persist to `peer-holds.json`. A decline clears the hold; a breaker opening cleared all holds (since §54 only an opening attributable to the peer; since §67 none: a chat held on a peer found down is placed as a refugee on its next turn).
 - After a restart, an unseen session counts as warm for one idle bound.
 - Failover marks the account that actually answered.
 
-Gap: `sr auto-switch` and tenant/broker leases rank without reserves; a bare (headerless) 429 still fails the turn over (the rebind is settled for Claude by §31 and for Codex by 35.1; a Codex burst ranks its account last without evicting, 35.3). §67: a peer is down only after an opening attributable to it (§54) plus 15 minutes of silence, and every session it held then re-ranks as a forced switch on its next turn. §60: no holdout in the last day before the weekly roll.
+Gap: `sr auto-switch` and tenant/broker leases rank without reserves; a bare (headerless) 429 still fails the turn over (the rebind is settled for Claude by §31 and for Codex by 35.1; a Codex burst ranks its account last without evicting, 35.3). §67: a peer is down only after an opening attributable to it (§54) plus 15 minutes of silence, and every session it held is then placed as a refugee on its next turn. §60: no holdout in the last day before the weekly roll.
 
 - Code: `refreshSelectedAccount`, `Scheduler.Evicted`, `serveRemotePoolOneTurn`
 - Related: amended by §54 and §67; §21 extends it to Codex; see §60.
@@ -403,11 +403,10 @@ that peer account until a newer body and the ranking recomputes, with at most `r
 (2) failed peer attempts per turn, an unreachable peer included, then local. A cached verdict (60 s or newer)
 of evicted, dead or gone, a refusal, or a legacy decline ends a hold; a warm held session below the floor or
 at the cap stays. A breaker opening ends a hold only when this machine can attribute it to the peer
-(`peer_down`, §54; any other opening is `transient/peer_unattributed`), and since §67 only once the peer has
-answered nothing for the grace; every other session it held then re-ranks as forced on its next turn too.
-Since §67 a held turn whose request never left, or whose peer's breaker is open, waits for the peer while it
-answered within `SUBROUTER_PEER_HOLD_WAIT`, and a held turn whose peer's breaker is open is never ranked onto
-another peer. `classifyAccountSwitch` is the one forced vs transient table (17 rows; 21 since §54), and
+(`peer_down`, §54; any other opening is `transient/peer_unattributed`). Since §67 no opening ends a hold: a
+held model turn whose peer cannot be reached waits for it under the hold until it answers, or until it is
+found down (attributable, and silent for the grace), and is then placed as a refugee (§67.3, §67.4). It is
+never ranked onto another peer. `classifyAccountSwitch` is the one forced vs transient table (17 rows; 21 since §54), and
 `commitSuccessfulFailover` commits only a forced move: after a limited-not-spent 429 a
 Claude session keeps its account (`transientFailoverKeepsPin`), and a move already under way
 (`commitFirstSuccess`) commits as §25 says. Inside local failover a forced switch runs the one ranking over
@@ -437,7 +436,7 @@ retention floor now gates only the keyless `codex:fallback` bucket. Left open: t
 failover still commits a local alternate, a targeted Codex turn sets no capacity mark, and a peer served
 through the transport-level stage is answered with local stamps (`X-Subrouter-Pool: local`).
 
-- Knobs: `SUBROUTER_REMOTE_POOLS_FILE` (unset; the four `SUBROUTER_REMOTE_POOL*` variables configure one peer named by its URL host). The file is gated by `remote.key`, mode 0600, at most 64 KiB and 16 peers, and fails closed: one bad entry arms no peers, and the single-peer variables are never a fallback. `SUBROUTER_PEER_HOLD_WAIT` (§67; see the hold rule above)
+- Knobs: `SUBROUTER_REMOTE_POOLS_FILE` (unset; the four `SUBROUTER_REMOTE_POOL*` variables configure one peer named by its URL host). The file is gated by `remote.key`, mode 0600, at most 64 KiB and 16 peers, and fails closed: one bad entry arms no peers, and the single-peer variables are never a fallback.
 - Code: `internal/proxy/target_placement.go`, `selectacct/new_session_verdict.go` (`Scheduler.NewSessionVerdict`), `internal/proxy/remote_pool_target.go`
 - Related: §41 amends the draining-tier order. §54 and §67 amend when a breaker opening ends a hold. §35 settles Codex transient failover (keeps the pin; the capacity switch, two failures in a row, commits).
 
@@ -1160,15 +1159,15 @@ then read `peer_down=` on that line. Deploy the laptop; the box has no peer.
 
 - Knobs: `SUBROUTER_PEER_DOWN_GRACE` (§67; 15 minutes; holds kept as `why=within_grace` until the peer
   answered nothing that long; any peer answer restarts it; `0` restores §54's timing),
-  `SUBROUTER_PEER_HOLD_WAIT` (§67; while the breaker is open a held model turn waits for a peer that
-  answered within it, and is never ranked onto another peer)
+  `SUBROUTER_PEER_HOLD_WAIT` (no longer read: since §67 a held turn waits for its peer until it is
+  found down)
 - Code: `internal/proxy/remote_pool_egress.go` (`localEgress`, `whyNotThePeers`, `noRoute`),
   `internal/proxy/remote_pool.go` (`remotePoolBreaker.failure`, `holdUntil`),
   `internal/proxy/account_switch.go` (`PeerOutageUnattributed`)
 - Related: replaces §20's clear-all on breaker-open for an opening this machine cannot attribute. §67
   amends it with the grace (on 2026-11-19 a gateway refusing new connections made a live box read down 2
-  to 4 s after it answered). §67 (67.5) supersedes the bystander rule: each ended hold logs
-  `source=breaker` and its session re-ranks forced.
+  to 4 s after it answered). §67 (67.2) supersedes the bystander rule: a peer found
+  down ends no hold.
 
 ## 55. The drain's session cap reads the measured meters, not the live debit
 
@@ -1643,74 +1642,186 @@ and the laptop.
 
 - Code: `internal/accounts/codex_usage.go` (`CodexUsageStatusError`, `CodexAccessTokenRejectedAsExpired`), `internal/accounts/codex_auth.go` (`RefreshStoredIfRejected`), `internal/proxy/proxy.go` (`AccountRef.fetchCodexUsageDetails`)
 
-## 67. A box is found down only after 15 silent minutes; turns wait for their box or a queue slot
+## 67. A box is found down only after it answers nothing for 15 minutes; until then a chat waits for its account across retries; then it is a refugee, spread across the other boxes and on the laptop only when no other box can take it; it gives up after an hour and resumes when room appears
 
-A peer box is found down only after it answers nothing for 15 minutes (the grace G). Why: on
-2026-11-19 the building's gateway refused new connections for seconds to minutes while open
-ones kept working, and the laptop found a box down six times, each 2 to 4 s after it last
-answered. Each trip ended every hold on the box and left its sessions on the local account
-`owner`, whose admission gate (6 in flight, 64 queued) answered 1,731 turns `503 upstream
-admission queue is full`, 506 of them after the network had recovered. Cause: §54 counted an
-answer on a pooled keep-alive connection as this machine being online, so a box whose new
-dials failed read as down at the second strike. The owner: "it needs to wait for a while
-before marking the boxes dead. at least 5 min b/c cache. probably longer". Owner decisions,
-2026-11-19: G is 15 minutes, the hold wait W is 2 minutes, §67.3 to §67.6 are adopted,
-and the rest is deferred (listed below). 15 minutes is about
-three times that day's longest real silence while traffic flowed (one day of data) and past the 5-minute subagent
-cache, so moving a subagent costs nothing more. It is also `remotePoolCarryTTL` and
-`remotePoolDecisionBodyMaxAge`, so a box stops ranking for new sessions when it is found
-down for held ones. A main thread's 1-hour cache would need about 60 minutes. That is the
-70-minute hold lapse (P9), so a box would in effect never be found down. That is the owner's
-"probably longer", and it is deferred.
+**Why.** On 2026-11-19 the building's gateway refused new connections for seconds to
+minutes while connections already open kept working. The laptop found a box down six
+times, each 2 to 4 s after that box had last answered. Each time it ended every hold on
+the box and left its sessions on the laptop's one local Claude account, whose admission
+gate (6 in flight, 64 queued) answered 1,731 turns `503 upstream admission queue is full`,
+506 of them after the network had recovered. Cause: §54 counted an answer on a pooled
+keep-alive connection as this machine being online, so a box whose new dials failed read
+as down at the second strike.
 
-§67.1: the silence runs from the latest of the peer's last answer of any kind
-(`lastAnswerAt`, usage bodies included), the first counted strike since (`quietSince`), and
-this machine's `upSince`. A strike more than 5 minutes after the last
-(`remotePoolQuietGapMax`) restarts it. An opening §54 attributes to the peer keeps every
-hold while the silence is under G (`why=within_grace`). The first one at or past G is
-`peer_down`. A usage body restarts the silence and leaves the strike count and cooldown
-alone. The breaker's times are not persisted. The holds-kept line gains `quiet_for_ms` and
-`grace_ms`. §67.2: a peer found down logs `remote pool hold ended` with `reason=peer_down
-kind=forced source=breaker` once per hold it ends. §67.3: a held turn whose box's
-breaker is open is served locally (`turn.stayLocal`), not ranked onto the other box or
-spilled by §59, because a win there cleared the hold. The no-account chain does not read
-`stayLocal`, so a spent local pool still reaches the other peers. §67.4: a held turn
-whose forward never left (`NeverSent`) or whose box's breaker is open gets `503` with
-`Retry-After: 1` and `X-Subrouter-Reason: peer_wait` (`waitForHeldPeer`), so the §58 hold
-reruns it on the same box. It waits only while the box answered within W, the hold has room,
-the client is there and the daemon is not draining. Otherwise the turn is served locally and
-the hold is kept. A sent forward is never held for the box, so the box never sees a turn twice.
-Websocket upgrades and side requests are unchanged. §67.5: each hold a down box ends
-marks its session (`markForcedRerank`) until that hold's `Until`, so its next turn re-ranks
-across every pool (`session_state=forced`) without that box. The tripping turn takes its own
-mark and does not move twice. A re-rank by mark drops legacy peers (`targetedOnly`). Nothing
-moves a session back when its box returns. §67.6: a non-targeted turn on an unpaused
-account refused for a full queue (`errAdmissionQueueFull`) is held until a slot frees,
-within the hold's 8-minute deadline and caps (256 requests, 512 MiB). Websocket upgrades,
-peer-forwarded turns, the public listener, `X-Subrouter-No-Retry`, and a turn the hold has
-no slot for still get the 503.
+**The owner's decisions (2026-11-19).**
 
-Unchanged on purpose: the breaker constants (2 strikes, 30 s cooldown, 2 s dial, 30 s header
-bound, §21's one-strike-per-blip dedupe; raising them was the dropped alternative), §54's
-attribution rules, `peer-holds.json`, the warm rule, the 70-minute hold lapse (P9), which
-caps the grace, and §58's one strike per held attempt (the grace is time, not strikes). A
-dead box costs up to G before its sessions move, and a main thread on it loses its 1-hour
-cache. A turn waiting on a full queue holds one of the hold's 256 slots, and each attempt
-still logs `replayable upstream request exhausted`, so that line now counts attempts, not
-503s. Older bug: a sent forward whose local serve fails transiently goes to the peer again
-(`remotePoolTurn` is per attempt). Deferred (the owner): a tiebreak
-at grace expiry from fresh dials failing to other destinations, a ~60-minute main-thread
-grace and moving sessions back, queue overflow to a peer and tuning 6/64, one half-open
-probe after each cooldown, spilling a held turn to the other box (§59 bars it), a hold for
-Codex websocket turns and a shorter 30 s Codex websocket dial, persisting the breaker, and
-HTTP/2 to the peers. Dropped: more strikes or a longer cooldown, an active network probe,
-and a grace counted from the start of a flaky period (it would have tripped at 15 minutes on
-11/19 too, as S flapped from 06:43 to 07:49). Deploy: the laptop needs this build, as the
-daemon with peers. On the box only §67.6 applies, to turns on its private listener. Not
-deployed by this change.
+- Before a box is marked dead: "it needs to wait for a while before marking the boxes
+  dead. at least 5 min b/c cache. probably longer". The grace G is 15 minutes.
+- D1, the cap: "any given home chat can only take 4 refugees". "Home" is the account
+  that receives them. A refugee is a chat stranded because its box could not be reached.
+- D2, overflow: "then they're just left, and they keep trying subrouter."
+- D3, the order, as amended the same evening (R9): "Okay, we have two boxes. Can we have
+  refugees try to go to the other box first? Can we have refugees try to go to any other
+  accounts first? Have them be a fucking diaspora, because the only reason I'm able to
+  have only one account is because they don't all fucking come here. I'm like
+  Switzerland, so see if we can do it that way." Refugees spread across the other boxes,
+  the laptop last, and only when no other box can take them.
+- D4, no return: "if they return, then that's like bussing cash twice ... No returning.
+  Connections try to drain normally."
+- The limit and the wait: "there is a limit to total number of refugees; hold for
+  longer". A chat moves only when its box is found down.
+- The give-up: "claude code should give up just after an hour, because cache". The
+  unlink: "I'd rather they go unlinked at 60" (R8).
+- Resuming (R9): "it's not so bad if a refugee stops and is then restarted if we have to
+  hard reset a box ... If this is a scenario where, say, I have one agent on computer, 12
+  agents on box, and I'm at my hard cap, we should still be able to resume the refugees
+  when the box has space." And: "Or when the new box comes back up again is what I
+  mean."
 
-- Knobs: `SUBROUTER_PEER_DOWN_GRACE` (Go duration, default `15m`; `0` is §54 as it stood, where two failed forwards find a peer down; an unreadable or negative value is logged and the default used; 70 minutes or more logs a Warn, since holds lapse first), `SUBROUTER_PEER_HOLD_WAIT` (parsed the same way, default `2m`, kept well under the hold's 8-minute deadline; `0` turns the wait off), `SUBROUTER_HOLD_DEADLINE` (`0` turns the hold off, and with it §67.4 and §67.6). Set in the LaunchAgent plist and applied by `RELOAD=1 deploy/macos/deploy-laptop.sh <binary>`. No flag. §67.2, §67.3 and §67.5 have no switch; deploy the previous build. Rollback is safe: `peer-holds.json` is unchanged and the breaker is not persisted.
-- Code: `internal/proxy/remote_pool.go` (`remotePoolBreaker`, `endHoldsOnPeerDown`), `internal/proxy/remote_pool_decide.go` (`waitForHeldPeer`), `cmd/subrouter/outage_config.go`
+**What.**
+
+- **67.1, a box is found down only when two rules agree.** Gateway attribution blames
+  the box: this machine has completed a new connection since the outage began. And the
+  box has answered nothing, on any connection, for G. Any answer restarts G: a response
+  of any status to a forward or a websocket dial, or a usage body. A strike more than 5
+  minutes after the last restarts the silence too, so a sleep or an idle spell is not
+  silence. An opening that fails either rule keeps the holds and says why
+  (`no_new_connection`, `within_grace`, or §54's reasons). The box stays found down until
+  it answers anything.
+- **67.2, a box found down ends no hold.** It logs `remote pool peer found down; its
+  chats are placed as refugees on their next turns`. A hold ends only when its chat is
+  placed (67.4), gives up (67.5) or goes cold (an hour with no turn). New and cold
+  sessions skip a box whose breaker is open, as before; they are not refugees.
+- **67.3, a stranded chat waits for its account.** A model turn of a chat held on a box
+  that cannot reach it (the dial failed, the breaker is open, or an earlier attempt may
+  be running there) is held (§58) and run again on the same account
+  (`reason=warm_wait:...`). At the hold's 8-minute deadline it answers 502, which Claude
+  Code retries, and the retry is held again, until the box answers or is found down. A
+  chat warm on the local account whose upstream cannot be dialed waits the same way and
+  is never spilled to a box. A turn a box may be running is never sent there again. A
+  stranded Codex websocket upgrade is answered 502, and its HTTPS fallback is held.
+- **67.4, refugees.** On the first held attempt after its box is found down, a chat is a
+  refugee (`placeRefugee`, `spreadRefugee`):
+  - Every placeable account on every box but its own competes: targetable, eligible by
+    its box's verdict, and not refused, declined or failed this turn. The account with
+    the most free refugee slots takes it; the shared comparator breaks ties. Free slots
+    are the account's cap less the warm refugees this daemon holds there. A claim counts
+    again under the hold table's lock, so racing refugees cannot overfill an account. It
+    claims only while the account holds no more refugees than when it was chosen;
+    otherwise every account left is counted again and the one with the most free slots
+    is taken, so racing refugees spread too.
+  - A local account takes it only when every other box is found down, was asked and has
+    every account full, refused or declined, or is not an option (closed to this caller,
+    ignoring targets, or no forward possible). Local accounts are ordered the same way.
+  - Any other box that cannot be asked right now (its breaker open, a failed dial, a turn
+    it may be running, a transient answer, its usage unknown) keeps the chat on its home
+    hold as `refugee_overflow`, retried on every held attempt. It is placed on that box
+    once it answers, or on the laptop once that box is found down too.
+  - The cap is `refugeeSlotsFor(peer, account, poolModel)`: the refugee cap the account's
+    owner publishes (§72), or 4 with none. It may be any value from 0 up; an account with
+    no free slot is full. Every read of it goes through that method: the box claim, the
+    local placement, the sort and the log lines.
+  - The mark (origin `box/account`, placed at) is persisted with the hold in
+    `peer-holds.json` or with the assignment in `sessions.json`, so a restart keeps every
+    count. A slot frees when its refugee goes cold, an hour after its last turn. The move
+    is permanent (D4).
+  - With no room anywhere the chat keeps its hold and waits (D2). Each held attempt tries
+    again, so it is placed when a slot frees, or served at home when its box answers.
+  - One turn of a chat places it at a time. While it does, the chat's home hold is
+    cleared during each forward, and the claim on the account it tries is pending until
+    that account answers. Another turn of the chat that comes meanwhile would read its
+    local pin and be served on the laptop, unmarked and uncapped. It is held instead
+    (`refugee_placing`), and its next attempt follows the chat where the placement put
+    it, or places it.
+  - Log lines: `refugee placed` with `to_peer`, `to_account`, `refugees` (with this one),
+    `refugee_slots` and `free_slots` (before this one); `refugee not placed; the chat
+    keeps its hold and waits` with `why` (`boxes_full` or `box_unreachable:<box>`) and
+    `laptop_free_slots`.
+- **67.5, the give-up, and resuming.** A stranded chat's chain of holds gives up an hour
+  after its last answered turn (`SUBROUTER_STRANDED_GIVE_UP`, the warm window by
+  default; `0` is no limit), or, for a spent pool's chat waiting for a box, an hour after
+  its first held turn. "Answered" is a model turn whose 2xx, or whose websocket
+  `response.completed`, the client got from an account's upstream. The give-up answer is
+  `503`, `Retry-After: 3600`, `X-Subrouter-Reason: stranded_gave_up`, which Claude Code
+  shows at once. The hold reads the give-up again after each backoff, so a turn of the
+  same chat answered meanwhile is not undone. The chain is kept with the session's
+  assignment, so the next process carries it on; one the store cannot save is kept by
+  the running process.
+  - A chat whose cache was on a box then keeps its assignment marked waiting
+    (`Assignment.Waiting`: the box, its account, and when). Whenever it is restarted, its
+    next turn goes home first. Once that box's breaker lets a request through, found down
+    or not, as a held turn's does, a forward targeted at its account serves the turn
+    there, which takes no slot. A box back from an outage reads as found down until
+    something reaches it, and this forward reaches it. Otherwise the turn is placed as in
+    67.4, and a home box that is not found down but cannot be asked right now keeps the
+    laptop out, as any other box does. When nothing places it (every account full, or a
+    box that cannot be asked yet) it gets the same 503 at once, with no hold, and stops
+    again. While the record lasts the chat is not placed as a cold session. The record
+    ends when a box serves the turn, home included, whatever the box answers; when a
+    local account takes it; or when a turn is answered. Otherwise it lasts until its
+    assignment is deleted or pruned (the store keeps 512 assignments, dropping the least
+    recently used one older than 70 minutes first). A record the store cannot save is
+    kept by the running process, and a new process places the chat's next turn as a new
+    session.
+  - A chat on the local account is unlinked, and its next turn is placed as a new
+    session.
+  - A refugee placed on a local account is stamped seen there, so selection serves it on
+    that pin even when it has been idle past the warm window.
+- **67.6, a full admission queue holds the turn.** A non-targeted turn on an unpaused
+  account refused for a full queue is held until a slot frees, within the hold's deadline
+  and caps.
+- **Every stranded hold answers 502 however it ends** (its deadline, a cap, a drain or a
+  shutdown); only the give-up answers 503. No hold falls through to the spent pool's 503
+  with a long `Retry-After`, which Claude Code shows at once, and none rewrites a 429, a
+  529 or a 401.
+
+**What a user sees.**
+
+- *New connections refused, open ones working.* Turns on open connections are answered
+  as before. A turn that needs a new dial waits and is answered by the same account.
+  Nothing moves.
+- *A box silent, short of 15 minutes.* Its chats' turns wait, a 502 every 8 minutes that
+  Claude Code retries, and are served by their own accounts when it answers.
+- *A box dead past 15 minutes.* Its chats spread across the other boxes' accounts, the
+  emptiest first, each up to its cap, and reach the laptop only once no other box can take
+  them. They stay where they were placed.
+- *Another box unreachable too, but not found down.* The chats wait on their home holds
+  and the laptop takes none until that box answers or is found down.
+- *An hour without an answer.* The chat gets one 503 its client shows. Restarted, it goes
+  home if its box answers, or wherever there is room, or gets the 503 again at once. Its
+  own box up but not answering yet keeps it off the laptop.
+
+**Residual risks.** A chat on a dead box pays up to 15 minutes before it moves. A slot
+stays taken up to an hour after a blip. A box that is never struck (no forward ever
+reaches it, and its usage was never read) is never found down, so its refugees wait for
+it until the give-up. A box account's count lives in `peer-holds.json` and a local one's
+in `sessions.json`. A waiting record created for a chat with no local assignment names no
+account, so the pool board's orphan prune removes it. With the hold off, a turn that comes
+while another turn of its chat is being placed is not held, and is served as before. Two
+turns of a waiting chat restarted at the same moment may each be placed.
+
+**Open owner options.** An uncapped overflow move before the hold deadline (declined under
+D2); a refugee activity window shorter than the warm window; `subagentPromptCacheTtl=1h`;
+whether brand-new sessions (a workflow relaunching a dead agent under a new session id)
+should prefer another box over the laptop during an outage: they keep the new-session
+ranking, where a box account must be twice as good on weekly pace
+(`selectacct.LocalPreferenceRatio`) to beat a local one, so they usually land on the
+laptop; and how a waiting record ends besides an answered turn.
+
+**Switch.** `SUBROUTER_PEER_DOWN_GRACE` (Go duration, default `15m`; `0` turns off only
+the silence rule), `SUBROUTER_STRANDED_GIVE_UP` (default the warm window; `0` is no
+limit; set above the warm window it logs a Warn at start), `SUBROUTER_HOLD_DEADLINE`
+(`0` turns the hold off: a stranded chat moves as before this entry, and a refugee with
+no room gets a 502 at once). Refugee placement, the spread and the waiting record have no
+switch; deploy the previous build. A rollback is safe: the refugee mark, the answered
+time, the held chain and the waiting record are optional fields that an older build
+ignores.
+
+- Code: `internal/proxy/refugee.go`, `hold.go`, `remote_pool.go` (`remotePoolBreaker`,
+  `claimRefugee`, `refugeesOn`), `remote_pool_decide.go` (`serveHeldTurn`,
+  `strandedOnPeer`, `rankedPeers`), `session/store.go` (`Refugee`, `PutRefugee`,
+  `RefugeesByAccount`, `HeldChain`, `Waiting`, `Wait`, `EndWait`),
+  `cmd/subrouter/hold_config.go` and `outage_config.go`.
 
 ## 68. A peer named in `SUBROUTER_PEER_TAILNET` is dialed over Tailscale first
 
@@ -1871,3 +1982,255 @@ A session is held on one account, and its subagents share its session id, so one
 - Log: `claude subagent fable served as opus on pinned account` (`path` = `pre_send`, `after_refusal` or `local_pin`), `claude subagent fable as opus not served on pinned account`, and an INFO line when a served turn leaves a hold another turn moved.
 - Code: `internal/proxy/claude_subagent_fable.go`, `serveHeldTurn` and `serveHeldAttempt` (`remote_pool_decide.go`), the guarded hold clear and set in `forwardToPeer` (`remote_pool.go`), the handler's local-pin call (`proxy.go`). Tests: `internal/proxy/subagent_fable_pin_test.go`.
 - Related: pairs with turning off §65's Fable-spent preference on the laptop, which steered Opus sessions onto Fable-spent accounts and so made §71's case the usual one.
+
+## 72. A burndown account behind pace takes more sessions, each account caps its refugees by its week, and a full queue takes no new session
+
+Owner, 2026-11-19: "No token should be wasted ... we want to be as token efficient as possible,
+and we want to be using everything." An account that rolls its week with headroom left has
+wasted that headroom. An account that runs dry before its roll strands every session on it, and
+each one pays a full cache rewrite to move. That day the laptop's own account went from 0% to
+96% of its week in about 9 hours. A box account had 31% left 2.5 hours before its roll, with 4
+sessions allowed and 1 live.
+
+**The paced allowance.** Inside the burndown window (the 24 hours before the roll, or a reset
+holder's early burndown, §56) the session allowance is no longer a fixed taper of at most 4.
+The owning daemon computes it from the account's measured burn:
+
+```
+needed  = spendable / hours to the roll / burn per live session
+allowed = max(taper, min(ceil(needed), ceiling))   when ceil(needed) > taper
+allowed = taper                                    otherwise
+```
+
+`spendable` and the taper are what they were (§41, §55): weekly headroom above the owner's
+reserve, and ceil(spendable / 0.0625) between 1 and 4. The 5h brake still holds an account
+whose 5h window cannot sustain more sessions at 1. `ceiling` is 20 by default
+(`SUBROUTER_PACED_SESSION_CEILING`), counted over one account's live sessions on all its
+models, since the live count is keyed by provider and account. Outside the burndown window
+nothing new caps an ordinary session.
+
+Owner, 2026-11-20, after a box account rolled with 17% of its week unspent while the taper held
+it at 3 sessions: "this is fucking stupid it needs to count time left as well." So the raise
+applies whenever the time left needs more sessions than the taper allows, not only above 4. An
+account with no measured burn yet uses 0.015 of a week per live session-hour, the middle of the
+2026-11-19 figures, instead of falling back to the taper. At 17% with 1.5 hours left that is
+0.17 / 1.5 / 0.015 = 7.56, so 8, not 3. The default needs a `Fresh` reading, since a restored
+seed or a reading whose fetch keeps failing may be hours old. It also needs a 5h window: with
+no 5h timing the 5h brake cannot act, and in the endgame sim's s5 (no `five_hour` bucket) the
+default took 6.50 forced moves per drain over 24 seeds, past §62's accepted 5.0. Such an account
+keeps the taper until its burn is measured. A measured burn still raises it.
+
+The allowance is a target, not a switch. The brief proposed raising it only while the projected
+waste at the current burn was above a threshold. A throwaway simulation of both (one account,
+Poisson session arrivals of 8 or 30 an hour lasting 45 minutes or 2 hours, 1.5 points per
+session-hour, a 1-hour burn window) showed the switch snapping back to 4 as soon as the account
+caught up, so it rolled with about the threshold unspent: 4 to 5 points in every high-demand
+case. The target left 0 to 2.9 points.
+
+Owner: lowering the allowance "just does not allow new sessions on." It feeds the drain tier,
+the at-cap demotion, `new_session.eligible` and the targeted 409, and nothing else. `Evicted`
+and `CapacityEvicting` stay the only ways a warm session leaves an account.
+`TestLoweringThePacedAllowanceMovesNoWarmSession` holds eleven live sessions at a raised cap of
+11, lowers it to 4, and checks that every warm turn is served where it was.
+
+**Backpressure.** A Claude 429 that is not a quota rejection means Anthropic is pushing back,
+and more sessions would only wait: it holds the account at its taper for 15 minutes. A wait in
+our own admission queue is not backpressure: the gate tunes itself up (§70), and a real backlog
+closes the account to new sessions (below).
+
+**Measurement.** `SchedulerRef` keeps a burn tracker per local Claude account, fed by every
+fresh usage reading it publishes and by a 30-second sampler of the sessions with a request the
+admission gate has admitted. A request waiting in the queue spends nothing, so it is not live
+here; counting it would read the burn per session low and raise an account whose gate is
+already full. Over a 2-hour window it reads the burn per hour and the burn per live
+session-hour. It needs at least 30 minutes of readings and half a session-hour, and otherwise
+borrows the burn per session-hour of this daemon's other accounts, and otherwise uses the
+default above. The tracker lives in memory, so after a restart every account runs on the
+default until 30 minutes of readings exist. Each change to an account's
+allowance logs `paced allowance` with its inputs: `needed`, `burn_per_live`, `burn_source`,
+`burn_now`, `spendable`, `hours_to_roll`, `projected_waste`, `danger` (projected waste above
+`SUBROUTER_PACE_WASTE_THRESHOLD`) and `live_sessions`. In this patch `danger` gates nothing.
+
+**The refugee cap.** Owner: "If we have one account and it takes 20 refugees, they immediately
+drop it to zero, and then they switch twice ... We basically forced a double move when a single
+move could have done." A refugee should go dark (close, or let its cache lapse) before it
+drains the account it moved to. Each account's cap on warm refugees is now the owner's formula,
+in points of its week left above its reserve:
+
+```
+normal:   floor(points / 10)
+burndown: max(normal, floor(points * 24 / (5 * hours to the roll)))
+```
+
+At 24 hours that is points / 5; at 12 hours with 20 points left it is 8. The formula assumes
+a refugee spends about 5% of a week over about 20 hours, with a 2x margin outside burndown. It
+has no floor, so an account with 9 points left takes none. It has no ceiling: near the roll the
+owner wants the account spent, and the admission gate still limits requests in flight. The cap
+reads the meter as last measured, without this daemon's per-request debit, which on a reserved
+account can read a busy half-minute 0.36 of a week low.
+
+The owner computes the cap and publishes it as `new_session.refugee_cap` for the account and
+for each quota pool. The Fable pool's cap reads its binding meter, the lower of the Fable meter
+and the week. A peer places refugees up to the published cap; a daemon from before this patch
+publishes none, which reads as 4. The count stays one per account across models. Every read of
+the cap goes through `refugeeSlotsFor(peer, account, poolModel)`. To calibrate the 5% and 20 hours,
+each refugee that goes dark logs `refugee went dark` once, with its lifetime, its account's
+points at first sight and now, the account's average live sessions over the stay, and
+`est_session_burn_pct`.
+
+**A full queue takes no new session.** Owner (§70): once an account's admission queue on any
+model holds `closed_queue` waiters, "this one will not take more." The account takes no new
+session and no refugee until the queue drains below it:
+- its verdict is `queue_closed`, not eligible, never evicted, with a refugee cap of 0;
+- a peer's targeted new session gets 409 `queue_closed`;
+- local selection refuses it outright, with no fallback onto it, and a session with nowhere
+  else to go gets the pool-exhausted 503;
+- a failed-over session, or an admission spill that carries a move, never lands on it. A spill
+  after a Claude transient 429 carries no move, since that failover keeps the pin.
+
+Its warm sessions stay, queue, and still spill one request at a time to another account as
+before. A session idle past the warm window moves to an open account that outranks it, since
+its cache is cold anyway; when no open account outranks it, it stays and queues. The closure
+is account-wide, because one Claude Code session runs several models. The scheduler reads it
+live on every build, so it opens and closes with the queue. `closed_queue: 0` in
+`admission.json` turns it off without a restart; `SUBROUTER_PACED_ALLOWANCE` does not.
+
+**One in-flight tracker for both listeners.** The private and public listeners each normalized
+their own `Server` copy and so kept separate `ActiveSessions`. A box's public listener, the one
+peers read and target, counted only peer-forwarded turns in its live sessions, its taper and
+its targeted at-cap refusal. Its own clients, who come in through the private listener and
+multi-tenant routes, were invisible to it. `AccountRef` now shares one tracker the way it shares
+the admission gate.
+
+**The trade.** `TestPacedAllowanceTradeTable` (`-paced-trade-table`, skipped otherwise) runs
+every endgame sim scenario under the taper and five forms of the raise: the default burn all
+drain with ceil, nearest or floor; and the true burn measured after 30 minutes with ceil or
+nearest. It prices a forced move at 0.05 points. Over 24 seeds the shipped raise spends a net
+7.9 ± 0.65 points more than the taper across the 13 rows (1.7 on the sim's own ten). The five
+forms differ from each other by at most 0.35 points. It is not free in moves: on s1b at the
+central rates every form adds 4.5 to 7.6 forced moves per drain, all at the weekly or 5h wall,
+which is past the 4.0 the owner accepted for §55. No new bound guards that: it is the owner's
+call. `TestEndgameSimulation` keeps §55, §60 and §62 priced with the raise off.
+`TestThePacedAllowanceSpendsWhatTheTaperForfeits` checks that the raise cuts the forfeit at the
+roll. On an account with a 5h meter, where a 5h window is a sixth of the week as at the sim's
+central rates, no allowance can spend 17% in the last 3 hours: the 5h window walls first. The
+account that rolled with 17% unspent on 2026-11-20 had no 5h meter, only its weekly windows. Demand
+and the taper held it back, and that is the case a measured burn raises.
+
+Owner, 2026-11-20, asked whether an account with no 5h meter may be raised on its measured
+burn, at 5.6 forced moves per drain against the 5.0 accepted: "yes". The account that rolled
+with 17% unspent was that case. The s1b moves past §55's 4.0 are the same trade on an account
+that has a 5h meter, and are taken as accepted with it. The owner gave no answer on raising
+before the last day, so the raise stays inside the burndown window.
+
+Owner, 2026-11-20, on the paced ceiling: "should be 20" / "to start". The default is 20 in code,
+so every daemon takes it with no env edit, and `SUBROUTER_PACED_SESSION_CEILING` still sets 1
+to 64. The 6 it replaces came from unverified community reports of a throttle at about 6
+concurrent sessions; that day one box account ran 18 to 23 Opus requests at once with no 429s.
+A non-quota 429 still holds the account at 4 for 15 minutes.
+
+At ceiling 20 the trade table moves only on the table-only s6 rows. The shipped raise nets 8.9
+± 0.80 points over the taper across the 13 rows, against the 7.9 ± 0.65 accepted at 6, and 1.00
+± 0.30 more paired by seed. At the central rates s6b forfeits 3.71 points instead of 4.39 for
+7.58 forced moves per drain instead of 6.21, and s6a 16.19 instead of 16.71 for 7.71 instead of
+5.29, the added moves all at the 5h wall. The sim's ten rows, s1b and s5 included, and the §55,
+§60 and §62 guards are unchanged to the digit: no new session reaches the draining account
+while it holds 6 or more live sessions in burndown, so demand bounds them, not the ceiling. No
+row reaches 20; the most live sessions on the draining account is 14.
+
+Still open for the owner, each chosen by the implementer and flagged:
+- the refugee cap rounds down in both modes;
+- it reads points above the owner's reserve;
+- in burndown it takes the larger of the two forms, so a reset holder days out never drops below normal;
+- the queue closure is account-wide rather than per model;
+- the default burn of 0.015 per live session-hour;
+- the raise stays inside the burndown window.
+
+- Knobs: `SUBROUTER_PACED_ALLOWANCE` (unset is on; 0 keeps the taper of at most 4 and 4 refugees an account, and leaves the closed queue on), `SUBROUTER_PACED_SESSION_CEILING` (1 to 64, default 20, live sessions per account across all models), `SUBROUTER_PACE_WASTE_THRESHOLD` (points of the week, default 5; the `danger` log field only), `closed_queue` in `admission.json` (§70; 0 turns the closed queue off, live)
+- Code: `selectacct/pace.go` (`allowance`, `refugeeCap`, `paceTracker`), `selectacct/new_session_verdict.go` (`RefugeeCap`, `VerdictQueueClosed`), `selectacct/scheduler.go`, `selectacct/scheduler_ref.go`, `internal/proxy/pace_sampler.go`, `internal/proxy/refugee_pace.go`, `internal/proxy/refugee_dark.go`, `internal/proxy/admission.go` (`noteBackpressure`, `closedAccounts`), `internal/proxy/refugee.go` (`refugeeSlotsFor`), `internal/proxy/proxy.go` (`sharedActiveSessions`, `selectionSchedulerFrom`), `cmd/subrouter/main.go`
+
+## 73. A Claude login through `sr` lands in the profile's own credential store, and `sr` checks it there
+
+`sr claude addr <name>` (also `login` and `add --oauth`) could save the login outside the
+profile and still print `Added Claude profile`. The profile then had no credential (`has no
+access token`), and `sr claude move` had nothing to move. Seen on the laptop in pool mode.
+
+Claude Code (2.1.329, measured and read from its source) names its credential store after
+`CLAUDE_SECURESTORAGE_CONFIG_DIR` when it is set, ahead of `CLAUDE_CONFIG_DIR`: the Keychain
+item `Claude Code-credentials-<first 8 hex of sha256(dir)>` on macOS, `<dir>/.credentials.json`
+elsewhere. An empty value names the bare `Claude Code-credentials` item, the user's own login.
+In pool mode the claude-route shim exports it for every launch, at its login-less store
+(`~/.claude-route/securestorage`). `sr` runs the `claude` on PATH, which is the shim, so the
+login went to the shim's store. `sr` then asked `claude auth status`, which through the shim
+answers `loggedIn: true` for any profile, from the shim's placeholder token. `sr` also passed
+an inherited `CLAUDE_SECURESTORAGE_CONFIG_DIR` to every Claude it started, so `sr` run inside a
+pooled session did the same without the shim.
+
+The rules:
+- `CLAUDE_SECURESTORAGE_CONFIG_DIR` is a routing key (`claude.RoutingEnvKeys`). It is stripped
+  from every Claude child's environment and dropped from the user's settings and `--settings`.
+  A managed profile's launch settings set it to the profile's directory, which names the item
+  `CLAUDE_CONFIG_DIR` alone names. A direct launch sets it empty, which with no
+  `CLAUDE_CONFIG_DIR` is the same default store. It is never empty beside a profile.
+- An OAuth add's verdict is the profile's own credential, read through the store. It must hold
+  an access token, and on a re-auth not the one the profile held before. `claude auth status`
+  only names the account and its plan. When the store holds no new credential, the add says the
+  login was saved outside the profile's store and names `CLAUDE_SECURESTORAGE_CONFIG_DIR` or a
+  `claude` wrapper on PATH as the likely cause. It rolls back a profile it created, and a
+  profile that already existed keeps what it held. When the store cannot be read
+  (`ErrCredentialUnchecked` or any other read error), nothing is rolled back, since the login
+  may be in the store that did not answer, and the kept profile is published so the daemon
+  reloads it. A re-auth reads the profile's old credential before the browser step. When that
+  read fails, the re-auth stops there, since a login saved elsewhere would leave the old token
+  looking new. The
+  older TUI login path (Claude builds without `claude auth login`) waits for the same new
+  token before it closes Claude.
+- The shim gives a credential command (`$1` is `auth`, `login`, `logout`, `setup-token` or
+  `/login`) the route `credentials`. It undoes what a parent shim set (`CLAUDE_ROUTE_SET`),
+  drops the rest of the route as `off` does, and keeps `CLAUDE_CONFIG_DIR` even inside
+  `~/.subrouter`. It beats the mode file, `CLAUDE_ROUTE` and a route already in the environment,
+  asks the daemon nothing, and is logged and printed by `CLAUDE_ROUTE_DRYRUN=1` like any other
+  route. A route word still comes first. Every other launch is unchanged. Installed shims take
+  it at the next `claude-route install`.
+- Because that route keeps a pool profile's directory, `claude auth logout` (or `claude logout`)
+  with `CLAUDE_CONFIG_DIR` or `CLAUDE_CODE_CONFIG_DIR` inside `~/.subrouter` is refused: it would
+  sign the pool's account out. Your own login's logout runs with neither set.
+- `claude-route status` says whether the shim's login-less store holds a login (`pool store:`).
+  A login there is one an older shim routed to it. It must be moved to its profile before
+  the item is deleted, since it may be the only copy.
+
+Not done: `sr claude run`'s preflight still asks `claude auth status`. With both fixes it reads
+the profile's own login through the shim, and a wrong answer there ends in a launch that shows
+it is not logged in, not in a lost login.
+
+- Code: `internal/agents/claude/store.go` (`claudeRoutingEnvKeys`), `cmd/subrouter/sr_claude.go`
+  (`addOAuth`, `claudeLaunchSettingsJSON`), `ops/bin/claude-route` (the shim's `credentials`
+  route, `drop_subrouter`)
+- Tests: `TestClaudeAddLandsInTheProfileStoreDespiteAnInheritedSecureStorageDir`,
+  `TestClaudeAddFailsWhenTheLoginLandsInAnotherStore`,
+  `TestProxyClaudeLaunchSettingsNeutralizeHostilePersistedRouting`,
+  `TestClaudeReauthStopsWhenTheProfilesCredentialCannotBeRead`,
+  `TestClaudeReauthThroughTheTUIWaitsForTheNewLogin`,
+  `TestClaudeAddKeptAfterAnUnreadableCredentialIsPublished`
+  (`cmd/subrouter/sr_claude_test.go`), and the `route-login-`, `route-every-credential-command-`,
+  `route-logout-of-a-pool-profile-` and `route-plain-pool-launch-` cases in
+  `ops/deploy/tests/deploy-scripts-test.sh`
+
+## 74. CI runs the full suite only when someone starts it
+
+Every push to a pull request and every merge ran the unit tests, five cross-compiles and the Docker
+profiles: nine jobs a push, for a project whose only deployments are its owner's laptop and boxes. A
+change is already tested where it is built (`deploy/docker/test.sh`), and a deploy is checked by
+`deploy-laptop.sh` against the live routes. A bad merge costs a fix, not an outage, and one flaky test
+on main no longer stops every other change from landing. The owner: "we were probably doing way too
+much CI".
+
+§74.1 `ci.yml` takes `workflow_dispatch`. The classifier reports `code=false` for every other event, so
+a pull request, a merge group and a push to main run "Public check" and the "Build, vet, test" gate
+alone, and the gate passes on the skipped jobs as it does for a docs-only change. Start the full suite
+with `gh workflow run ci.yml --ref <branch>`; there the classifier runs everything.
+
+§74.2 To gate merges again once the project has users, delete the classifier's `workflow_dispatch`
+early exit.
+
+- Code: `.github/workflows/ci.yml` (`on.workflow_dispatch`, the `changes` job's first lines)

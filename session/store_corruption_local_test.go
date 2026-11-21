@@ -45,7 +45,7 @@ func TestNewStoreStartsOnZeroLengthStoreLeftByPowerLoss(t *testing.T) {
 // crash), but loadLocked also runs on every Get, Put, Touch and CompareAndPut of
 // a running daemon. Starting empty there would drop every warm session's
 // assignment, so each one's next turn would be re-picked cold: a move that is
-// not an eviction, which the 70-minute warm rule (PATCHES.md sections 20-21)
+// not an eviction, which the hour-long warm rule (PATCHES.md sections 20-21)
 // forbids. A running daemon's own in-memory assignments are the newest state
 // anyone has, so it keeps them and writes them back over the quarantined file.
 func TestCorruptionAfterStartKeepsInMemoryAssignments(t *testing.T) {

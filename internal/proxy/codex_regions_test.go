@@ -419,8 +419,7 @@ func TestCodexRegionsPinnedSessionWebSocketDialsThroughEgress(t *testing.T) {
 	local := newRegionPool(t, "local", always(true))
 	fra := newRegionPool(t, "fra", always(false))
 	rig := newRegionRig(t, local, fra)
-	proxy := httptest.NewServer(rig.server.Handler())
-	defer proxy.Close()
+	proxy := newProxyTestServer(t, rig.server.Handler())
 
 	if status, body := codexEgressPost(t, proxy.URL, "pinned-ws"); status != http.StatusOK || !strings.Contains(body, "served-from-fra") {
 		t.Fatalf("http turn status=%d body=%s, want Frankfurt", status, body)
@@ -480,8 +479,7 @@ func TestCodexRegionsRegionRetryRedialSkipsDeadEgress(t *testing.T) {
 	server := codexEgressServer(t, local.url, []*url.URL{deadURL, regionProxy(t, "tyo", tyo.url, &tyoCalls)}, 1)
 	server.CodexCapacityEventsPath = filepath.Join(t.TempDir(), "events.jsonl")
 	server.codexWebSocketTurnRetryDelay = noTurnRetryDelay
-	proxy := httptest.NewServer(server.Handler())
-	defer proxy.Close()
+	proxy := newProxyTestServer(t, server.Handler())
 
 	for index := range 4 {
 		conn := dialRegionWebSocket(t, proxy.URL, fmt.Sprintf("dead-egress-%d", index))
@@ -575,8 +573,7 @@ func TestCodexRegionsNonAutonomousTurnServedFromNextRegion(t *testing.T) {
 	fra := newRegionPool(t, "fra", always(false))
 	rig := newRegionRig(t, local, fra)
 	rig.server.codexWebSocketTurnRetryDelay = noTurnRetryDelay
-	proxy := httptest.NewServer(rig.server.Handler())
-	defer proxy.Close()
+	proxy := newProxyTestServer(t, rig.server.Handler())
 
 	conn := dialRegionWebSocket(t, proxy.URL, "desktop-1")
 	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gpt-6-astra","input":[]}`)); err != nil {

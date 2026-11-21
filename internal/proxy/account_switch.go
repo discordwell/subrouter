@@ -51,7 +51,6 @@ type accountSwitch struct {
 	Reason string
 }
 
-// peerDownSwitch is a peer found down: every hold on it ends.
 var peerDownSwitch = accountSwitch{switchForced, "peer_down"}
 
 // accountSwitchEvidence is everything a caller observed about one attempt on

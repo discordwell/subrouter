@@ -201,6 +201,23 @@ type srServerConfig struct {
 	PublicAdminToken string `json:"publicAdminToken,omitempty"`
 }
 
+// secrets is every credential this entry holds, trimmed, for scrubbing error
+// text. A credential field added to srServerConfig belongs here;
+// TestServerConfigSecretsNamesEveryCredential fails until it is.
+func (s srServerConfig) secrets() []string {
+	secrets := []string{
+		strings.TrimSpace(s.TenantKey),
+		strings.TrimSpace(s.AccountImportToken),
+		strings.TrimSpace(s.AdminToken),
+		strings.TrimSpace(s.PublicAdminToken),
+		strings.TrimSpace(s.ProxyToken),
+	}
+	if parsed, err := url.Parse(strings.TrimSpace(s.URL)); err == nil {
+		secrets = append(secrets, tenantKeyFromURL(parsed))
+	}
+	return secrets
+}
+
 // peerAddresses returns this server's addresses in PREFERENCE ORDER, tailnet
 // first.
 //
@@ -1770,7 +1787,7 @@ func (r srRunner) fetchServerUsageStatusesAt(ctx context.Context, server srServe
 	if res.StatusCode == http.StatusNotFound || res.StatusCode == http.StatusMethodNotAllowed {
 		return nil, false, via, nil
 	}
-	return nil, true, via, fmt.Errorf("server usage status failed: %s", res.Status)
+	return nil, true, via, &adminStatusError{lead: "server usage status failed: ", code: res.StatusCode, status: res.Status}
 }
 
 // serverHeading is "Server: home (http://100.64.0.9:31415)", or, when the

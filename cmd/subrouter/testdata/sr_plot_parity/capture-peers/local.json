@@ -1,0 +1,38 @@
+[
+ {
+  "provider": "codex",
+  "id": "acct1293",
+  "auth_mode": "oauth",
+  "auth_checked": true,
+  "auth_valid": true,
+  "sweep_cut": true,
+  "error": "context deadline exceeded"
+ },
+ {
+  "provider": "claude",
+  "id": "acct8338",
+  "auth_mode": "oauth",
+  "auth_checked": true,
+  "auth_valid": true,
+  "windows": [
+   {
+    "Name": "7d",
+    "UsedPercent": 0,
+    "LimitWindowSeconds": 604800,
+    "ResetAfterSeconds": 577824
+   },
+   {
+    "Name": "extra",
+    "UsedPercent": 0,
+    "LimitWindowSeconds": 0,
+    "ResetAfterSeconds": 0
+   },
+   {
+    "Name": "oauth-apps-weekly",
+    "UsedPercent": 0,
+    "LimitWindowSeconds": 604800,
+    "ResetAfterSeconds": 577824
+   }
+  ]
+ }
+]

@@ -54,7 +54,7 @@ const (
 
 	// A counted strike more than this after the previous one starts the
 	// peer's silence again (PATCHES §67): in between nothing was sent to the
-	// peer, or this Mac slept, and nobody observed it being silent.
+	// peer, or this machine slept, and nobody observed it being silent.
 	remotePoolQuietGapMax = 5 * time.Minute
 
 	// This sits on the request path, so a dead remote must cost a bounded
@@ -172,16 +172,18 @@ func remotePoolDelegationTTLFor(agentType string) time.Duration {
 	return warmSessionIdleTTL
 }
 
-// PeerHoldIdleTTL is how long a peer hold lasts with no turn. A peer-down
-// grace this long or longer never ends a hold: the hold lapses first.
+// PeerHoldIdleTTL is how long a peer hold lasts with no turn. With a
+// peer-down grace this long or longer, a silent peer's holds lapse before it
+// can be found down, and its chats go cold instead of being placed as
+// refugees.
 const PeerHoldIdleTTL = warmSessionIdleTTL
 
 // DefaultPeerDownGrace is serve's Server.PeerDownGrace. Past 5 min every
 // routed subagent's prompt cache on the box has expired, so moving it costs
-// nothing more. 15 min is also remotePoolCarryTTL and
-// remotePoolDecisionBodyMaxAge: a box silent this long is found down for its
-// held sessions when it stops ranking for new ones (PATCHES §67).
-const DefaultPeerDownGrace = 15 * time.Minute
+// nothing more. A box silent this long is found down for its held sessions
+// when it stops ranking for new ones (remotePoolDecisionBodyMaxAge, PATCHES
+// §67).
+const DefaultPeerDownGrace = remotePoolCarryTTL
 
 // RemotePool is the configured peer daemon. A nil *RemotePool disables the
 // whole feature, which is what keeps it inert for everyone who has not opted in.
@@ -1205,8 +1207,10 @@ type remotePoolBreaker struct {
 	// on a forward or a websocket dial, whatever the status, or a usage body
 	// (PATCHES §67).
 	lastAnswerAt time.Time
-	// quietSince is when the first counted strike since that answer was
-	// sent; zero while the peer answers. Both are wall-clock times.
+	// quietSince is when the silence began: the first counted strike since
+	// that answer, or the first after a gap over remotePoolQuietGapMax; zero
+	// while the peer answers. Both are wall-clock times, so a sleep shows as a
+	// gap.
 	quietSince time.Time
 	// down: the last opening found the peer down, and it has not answered
 	// since (PATCHES §67).
@@ -1332,9 +1336,9 @@ func (b *remotePoolBreaker) quietForLocked(now time.Time, egress egressView) tim
 // series is kept for the strikes that re-decide it, which come a cooldown or
 // more after it.
 //
-// With a grace, an opening that rule would blame on the peer still keeps
-// the holds (within_grace) until the peer has been silent for the grace
-// (quietFor; PATCHES §67). A gateway that refuses new connections while
+// With a grace, an opening that rule would blame on the peer does not find it
+// down (within_grace) until the peer has been silent for the grace (quietFor;
+// PATCHES §67). A gateway that refuses new connections while
 // open ones keep working looks like a dead peer to those rules, because
 // this machine's own pooled answers count as it being online, and the
 // peer's answers on its open connections restart the grace instead.
@@ -1537,6 +1541,11 @@ type remotePoolDelegation struct {
 	// was found down (placeRefugee, PATCHES §67). Persisted with the hold, so
 	// a restart keeps the account's refugee count.
 	Refugee *session.Refugee `json:",omitempty"`
+	// AnsweredAt is when one of the session's model turns was last answered
+	// (Server.noteAnswered), the stranded give-up's clock: a chat a box holds
+	// has no local assignment to keep it, so the hold carries it to the next
+	// worker (PATCHES §67).
+	AnsweredAt time.Time `json:",omitzero"`
 	// claim is non-zero while the entry is only a forward's pre-claim (see
 	// claim): the peer has not served the session yet. A set or touch -- the
 	// peer serving it -- confirms the entry and zeroes this. Unexported, so
@@ -1665,28 +1674,47 @@ func (d *remotePoolDelegations) setServedLocked(key string, now time.Time, ttl t
 		}
 	}
 	entry := remotePoolDelegation{Until: holdUntil(now, ttl), Account: account, Peer: peer, Targeted: targeted}
-	if prev, ok := d.entries[key]; ok && strings.EqualFold(prev.Account, account) {
-		entry.Refugee = prev.Refugee
+	if prev, ok := d.entries[key]; ok {
+		entry.AnsweredAt = prev.AnsweredAt
+		if strings.EqualFold(prev.Account, account) {
+			entry.Refugee = prev.Refugee
+		}
 	}
+	d.entries[key] = entry
+	d.dirty = true
+}
+
+// answered records at as the session's last answered turn on its live hold,
+// pending claim included, and creates none.
+func (d *remotePoolDelegations) answered(key string, at time.Time) {
+	if key == "" {
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	entry, ok := d.entries[key]
+	if !ok || time.Now().After(entry.Until) || !at.After(entry.AnsweredAt) {
+		return
+	}
+	entry.AnsweredAt = at.Round(0)
 	d.entries[key] = entry
 	d.dirty = true
 }
 
 // claimRefugee is claimTarget for a refugee (placeRefugee): it claims the
 // session for account, marked, only while account holds fewer than slots
-// live refugees other than this session. The count and the claim happen
-// under one lock, so two placements cannot both take the last slot; a pending
-// refugee claim counts, which is what reserves the slot. held is the
-// account's refugees with this one, or without it when full.
-func (d *remotePoolDelegations) claimRefugee(key string, now time.Time, ttl time.Duration, peer, account string, mark session.Refugee, slots int) (id uint64, held int) {
+// live refugees other than this session, and no more than counted, the
+// refugees the caller counted there when it chose account. The count and the
+// claim happen under one lock, so two placements cannot both take the last
+// slot; a pending refugee claim counts, which is what reserves the slot. An
+// account that gained a refugee since the caller counted may no longer have
+// the most free slots, so the caller counts again. held is the account's
+// refugees with this one, or without it when not claimed.
+func (d *remotePoolDelegations) claimRefugee(key string, now time.Time, ttl time.Duration, peer, account string, mark session.Refugee, slots, counted int) (id uint64, held int) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	for other, entry := range d.entries {
-		if other != key && entry.Refugee != nil && strings.EqualFold(entry.Account, account) && !now.After(entry.Until) {
-			held++
-		}
-	}
-	if held >= slots {
+	held = d.refugeesOnLocked(key, account, now)
+	if held >= slots || held > counted {
 		return 0, held
 	}
 	if d.entries == nil {
@@ -1696,6 +1724,24 @@ func (d *remotePoolDelegations) claimRefugee(key string, now time.Time, ttl time
 	d.entries[key] = remotePoolDelegation{Until: holdUntil(now, ttl), Account: account, Peer: peer, Refugee: &mark, claim: d.lastClaim}
 	d.dirty = true
 	return d.lastClaim, held + 1
+}
+
+// refugeesOn is how many live refugees other than the session key account
+// holds: the count claimRefugee checks, read without claiming.
+func (d *remotePoolDelegations) refugeesOn(key, account string, now time.Time) int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.refugeesOnLocked(key, account, now)
+}
+
+func (d *remotePoolDelegations) refugeesOnLocked(key, account string, now time.Time) int {
+	held := 0
+	for other, entry := range d.entries {
+		if other != key && entry.Refugee != nil && strings.EqualFold(entry.Account, account) && !now.After(entry.Until) {
+			held++
+		}
+	}
+	return held
 }
 
 // restore puts back a hold a refugee's failed placement cleared, unless the
@@ -1852,12 +1898,12 @@ func (s Server) logHoldsKept(pool *RemotePool, agentType, sessionID string, err 
 		"quiet_for_ms", pool.breaker.quietFor(now, pool.egress.view()).Milliseconds(), "grace_ms", s.PeerDownGrace.Milliseconds())
 }
 
-// logPeerDown is the line for a peer found down. Its holds stay: each chat
-// held there is placed as a refugee on its next turn, at most
-// refugeeSlots to an account, or keeps its hold and waits (PATCHES §67, D1,
-// D2). Before, every hold ended here and every chat moved at once.
 const peerFoundDownMessage = "remote pool peer found down; its chats are placed as refugees on their next turns"
 
+// logPeerDown is the line for a peer found down. Its holds stay: each chat
+// held there is placed as a refugee on its next turn, within the cap of the
+// account it goes to (refugeeSlotsFor), or keeps its hold and waits (PATCHES
+// §67, D1, D2).
 func (s Server) logPeerDown(pool *RemotePool, agentType, sessionID string) {
 	if s.Logger == nil {
 		return
@@ -1870,7 +1916,7 @@ func (s Server) logPeerDown(pool *RemotePool, agentType, sessionID string) {
 	}
 	s.Logger.Warn(peerFoundDownMessage,
 		"remote", pool.name(), "agent", agentType, "session", sessionID,
-		"held", held, "refugee_slots", refugeeSlots)
+		"held", held)
 }
 
 func (d *remotePoolDelegations) clear(key string) {
@@ -2121,9 +2167,10 @@ func (s Server) forwardToPeer(pool *RemotePool, r *http.Request, agentType, sess
 		// One failed round trip is a blip, not an eviction: the hold survives
 		// and this turn falls through. The breaker opening on an outage this
 		// machine can attribute to the peer is the peer being DOWN: each chat
-		// held there is a refugee on its next turn (placeRefugee), and its
-		// hold ends only when it is placed (PATCHES §67). An opening that is
-		// not attributed to the peer keeps every hold, and keptWhy says why:
+		// held there is a refugee on its next turn (placeRefugee), and keeps its
+		// hold until it is placed, gives up (unlinkStranded) or idles out
+		// (PATCHES §67). An opening that is not attributed to the peer keeps
+		// every hold, and keptWhy says why:
 		// no_route, no_answer, network_back_mid_strike, no_new_connection, or
 		// one_strike_since_back when only one strike has been sent since this
 		// machine came back (whyNotThePeers, failure; PATCHES §54), or
@@ -2224,8 +2271,8 @@ func (s Server) forwardToPeer(pool *RemotePool, r *http.Request, agentType, sess
 	out := peerForwardOutcome{Resp: resp, Served: true, Status: resp.StatusCode, ServedAccount: served}
 	// Every caller relays a served answer to the client, the handler's and
 	// the transport stage's alike (PATCHES §71). Only a 2xx is one of the
-	// session's turns answered: a relayed 5xx is held and asked again
-	// (PATCHES §67).
+	// session's turns answered: a relayed 500, 502, 503 or 504 is held and
+	// asked again (holdableUpstreamStatus, PATCHES §67).
 	noteExchangeServed(r.Context(), exchangeServed{route: "peer", peer: pool.name(), peerAcct: served})
 	if !sideRequest && resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		s.noteAnswered(agentType, sessionID)
@@ -2680,9 +2727,14 @@ func (s Server) serveWebSocketToPeer(w http.ResponseWriter, r *http.Request, poo
 	}
 	relay := func(direction string, src, dst *websocket.Conn) {
 		endFinishedTurn := func() {}
+		completed := false
+		notesAnswers := direction == "upstream_to_client" && mode != remotePoolHoldReadOnly
 		observeTurn := func(messageType int, body, head []byte) error {
 			if direction == "upstream_to_client" {
 				turns.noteUpstream()
+			}
+			if notesAnswers {
+				completed = messageType == websocket.TextMessage && codexWebSocketTurnCompleted(body, head)
 			}
 			if !countTurns || messageType != websocket.TextMessage {
 				return observe(messageType, body, head)
@@ -2701,6 +2753,10 @@ func (s Server) serveWebSocketToPeer(w http.ResponseWriter, r *http.Request, poo
 		}
 		for {
 			err := s.forwardWebSocketMessage(r.Context(), agentType, sessionID, direction, src, dst, observeTurn)
+			if completed && err == nil {
+				s.noteAnswered(agentType, sessionID)
+			}
+			completed = false
 			endFinishedTurn()
 			endFinishedTurn = func() {}
 			if errors.Is(err, errWebSocketTurnRefused) {

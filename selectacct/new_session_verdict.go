@@ -1,6 +1,8 @@
 package selectacct
 
 import (
+	"encoding/json"
+	"strconv"
 	"time"
 
 	"github.com/manaflow-ai/subrouter/account"
@@ -36,6 +38,10 @@ const (
 	VerdictShortFloor     = "short_floor"
 	VerdictBelowReserve   = "below_reserve"
 	VerdictBurnProjection = "burn_projection"
+	// VerdictQueueClosed is an account whose admission queue on some model
+	// holds closed_queue waiters (PATCHES §72): no new session and no refugee
+	// until it drains. Its warm sessions stay and queue.
+	VerdictQueueClosed = "queue_closed"
 )
 
 // NewSessionVerdict is one daemon's answer, for one of its own accounts, to
@@ -86,6 +92,51 @@ type NewSessionVerdict struct {
 	// absent: absent is "not in the window", which is also all a daemon from
 	// before PATCHES §56 could have meant.
 	BurndownCause string `json:"burndown_cause,omitempty"`
+	// RefugeeCap is how many warm refugees the account takes (PATCHES §72),
+	// computed by its owner on its own score (Score.refugeeCap). A peer
+	// places refugees on it up to this cap. Absent, from a daemon older than
+	// §72, it reads as unpublished.
+	RefugeeCap RefugeeCap `json:"refugee_cap"`
+}
+
+// RefugeeCap is a published refugee cap that remembers whether it was
+// published at all: 0 is a cap (an account nearly drained takes no refugee),
+// and absence is a daemon too old to publish one. Comparable, so a verdict
+// read off the wire equals the one its owner computed.
+type RefugeeCap struct {
+	Slots     int
+	Published bool
+}
+
+// Or is the cap, or legacy when none was published.
+func (c RefugeeCap) Or(legacy int) int {
+	if !c.Published {
+		return legacy
+	}
+	return c.Slots
+}
+
+// MarshalJSON writes the cap as a number, or null when unpublished.
+func (c RefugeeCap) MarshalJSON() ([]byte, error) {
+	if !c.Published {
+		return []byte("null"), nil
+	}
+	return strconv.AppendInt(nil, int64(c.Slots), 10), nil
+}
+
+// UnmarshalJSON reads a number as a published cap; null is unpublished, and
+// an absent key never reaches here.
+func (c *RefugeeCap) UnmarshalJSON(data []byte) error {
+	if string(data) == "null" {
+		*c = RefugeeCap{}
+		return nil
+	}
+	var slots int
+	if err := json.Unmarshal(data, &slots); err != nil {
+		return err
+	}
+	*c = RefugeeCap{Slots: slots, Published: true}
+	return nil
 }
 
 // NewSessionVerdict evaluates the verdict on this scheduler's working view of
@@ -95,9 +146,9 @@ type NewSessionVerdict struct {
 // verdict is exactly as narrow as routing.
 //
 // The eligibility DECISION is usableForNewSession / endgameDrainEligible /
-// endgameAtCap / evicted; the reason for an ineligible, non-evicted,
-// not-capped account is a label for which clause of usableForNewSession
-// refused it, read in that function's own order.
+// endgameAtCap / evicted / a closed admission queue; the reason for an
+// ineligible, non-evicted, not-capped, open account is a label for which
+// clause of usableForNewSession refused it, read in that function's own order.
 func (s Scheduler) NewSessionVerdict(provider account.Provider, accountID string, now time.Time) NewSessionVerdict {
 	score := s.score(provider, accountID)
 	verdict := NewSessionVerdict{
@@ -108,13 +159,19 @@ func (s Scheduler) NewSessionVerdict(provider account.Provider, accountID string
 		BurndownCause: score.BurndownCause(now),
 	}
 	if score.inBurndownWindow(now) {
-		verdict.AllowedSessions = score.endgameAllowedSessions()
+		verdict.AllowedSessions = score.endgameAllowedSessions(now)
+	}
+	verdict.RefugeeCap = RefugeeCap{Slots: score.refugeeCap(now), Published: true}
+	if published, ok := score.peerVerdict(); ok {
+		verdict.RefugeeCap = published.RefugeeCap
 	}
 	switch {
 	case score.exhausted():
 		verdict.Reason = VerdictExhausted
 	case score.inHoldout():
 		verdict.Reason = VerdictHoldout
+	case score.queueClosed:
+		verdict.Reason = VerdictQueueClosed
 	case verdict.AtCap:
 		verdict.Reason = VerdictAtCap
 	case verdict.Burndown:

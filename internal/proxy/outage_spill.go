@@ -85,9 +85,7 @@ func (p *OutageSpillPolicy) take() bool {
 // from a peer, for this turn only. r is the handler's request; its body went
 // to the failed attempt with proxyRequest, so the peer is sent the client's
 // bytes from proxyRequest.GetBody. It reports whether the client was answered;
-// otherwise nothing was written, and the caller answers as before. A chat warm
-// on this account is never spilled: it waits for the upstream
-// (waitsForItsUpstream).
+// otherwise nothing was written, and the caller answers as before.
 func (s Server) spillUnreachableTurn(w http.ResponseWriter, r, proxyRequest *http.Request, provider accounts.Provider, poolModel, agentType, sessionID string, mode remotePoolHoldMode, turn *remotePoolTurn, accountID, cause string) bool {
 	policy := s.OutageSpill
 	if !policy.enabled() || turnStaysLocal(turn) || !s.peerForwardingAllowed(r) || !restoreSpillBody(r, proxyRequest) {

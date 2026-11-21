@@ -113,7 +113,7 @@ func (h holdSettings) policy(logger *slog.Logger) *proxy.HoldPolicy {
 				logger.Info("stranded give-up is off: a chat whose account cannot be reached waits for it across retries with no limit; 0 turns off only the limit",
 					"env", strandedGiveUpEnv)
 			} else {
-				logger.Info("stranded give-up is on: a chat whose account cannot be reached waits for it across retries until this long after its last answered turn, then gets 503 Retry-After 3600 (stranded_gave_up) and is unlinked",
+				logger.Info("stranded give-up is on: a chat whose account cannot be reached waits for it across retries until this long after its last answered turn, then gets 503 Retry-After 3600 (stranded_gave_up); a chat a box held then waits for room, and any other is unlinked",
 					"stranded_give_up", policy.GiveUp.String(), "env", strandedGiveUpEnv)
 				if policy.GiveUp > proxy.PeerHoldIdleTTL {
 					logger.Warn("stranded give-up is longer than the warm window: a stranded chat goes unlinked first and its turn is placed cold",

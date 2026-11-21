@@ -156,8 +156,8 @@ func TestClaudeEndgameTaperSpillsWhenBusy(t *testing.T) {
 	// Fill each account to ITS OWN allowance rather than a hardcoded count:
 	// the taper step sizes that allowance, so a literal here silently stops
 	// meaning "at cap" the moment the step is retuned.
-	eg1Cap := base.score(eg1.Provider, "eg1").endgameAllowedSessions()
-	eg2Cap := base.score(eg2.Provider, "eg2").endgameAllowedSessions()
+	eg1Cap := base.score(eg1.Provider, "eg1").endgameAllowedSessions(time.Now())
+	eg2Cap := base.score(eg2.Provider, "eg2").endgameAllowedSessions(time.Now())
 	eg1Busy := base.WithLiveSessionCounts(map[string]int{"eg1": eg1Cap})
 	if got := pickID(t, eg1Busy, "eg1", "eg2", "normal"); got != "eg2" {
 		t.Fatalf("eg1-at-cap pick = %q, want spill to the next endgame account", got)
@@ -244,7 +244,7 @@ func TestClaudeAtCapEndgameDemotedBelowSteady(t *testing.T) {
 	// At its allowance it is capped and must lose to the steady account
 	// despite ~8x the pace. Read the allowance rather than restating it: it is
 	// a function of the taper step, not a constant.
-	cap := base.score(endgame.Provider, "endgame").endgameAllowedSessions()
+	cap := base.score(endgame.Provider, "endgame").endgameAllowedSessions(time.Now())
 	capped := base.WithLiveSessionCounts(map[string]int{"endgame": cap})
 	if got := pickID(t, capped, "steady", "endgame"); got != "steady" {
 		t.Fatalf("at-cap pick = %q, want the steady account", got)

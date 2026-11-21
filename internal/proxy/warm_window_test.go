@@ -10,14 +10,13 @@ import (
 	"time"
 )
 
-// A stranded chat waits (PATCHES §67, owner, 2026-11-19). A chat whose
-// account cannot be reached waits for it under the hold, across the client's
-// retries, until the account answers, whatever is left of its prompt cache.
-// A chat held on a box becomes a refugee only once the box is found down; a
-// chat on the local account never moves. Whatever a hold answers at its
-// deadline or its caps is a status Claude Code retries: 2.1.328 shows a 503
-// whose Retry-After is over 60 s to the user and stops, which is how the
-// 11/19 agents died on "retry after 5400s".
+// A stranded chat waits (PATCHES §67). A chat whose account cannot be reached
+// waits for it under the hold, across the client's retries, until the account
+// answers or the chat gives up an hour after its last answered turn. A chat
+// held on a box becomes a refugee only once the box is found down; a chat on
+// the local account stays there until it gives up. Whatever a hold answers at
+// its deadline or its caps is a status Claude Code retries: it shows a 503
+// whose Retry-After is over 60 s to the user and stops.
 
 // holdTurnBody is the body rig.turn sends: no cache_control, so a 5 minute
 // prompt cache.
@@ -150,7 +149,7 @@ func awaitHeld(t *testing.T, rig *holdRig, policy *HoldPolicy, answer <-chan cli
 // A subagent served by acct-a at 12:46:42 has a 5 minute cache there. Its box
 // stops answering and its next turn waits for acct-a past the cache's end and
 // past seven minutes, because the box is not found down: the end of a window
-// no longer moves a chat (PATCHES §67, R1). acct-a serves it once the box
+// no longer moves a chat (PATCHES §67). acct-a serves it once the box
 // answers.
 func TestAChatHeldOnABoxWaitsPastItsPromptCacheUntilTheBoxAnswers(t *testing.T) {
 	clock := newMovableClock(warmWaitStart)
@@ -188,7 +187,7 @@ func TestAChatHeldOnABoxWaitsPastItsPromptCacheUntilTheBoxAnswers(t *testing.T) 
 
 // The same for a chat on the laptop's own account: its upstream cannot be
 // dialed, and it waits past its cache and past seven minutes, and is never
-// spilled to the box, which needs the same network (PATCHES §67, R4).
+// spilled to the box, which needs the same network (PATCHES §67).
 func TestAChatOnTheLocalAccountWaitsPastItsPromptCacheAndIsNeverSpilled(t *testing.T) {
 	clock := newMovableClock(warmWaitStart)
 	policy := strandedPolicy(clock)
@@ -248,7 +247,7 @@ func findDown(t *testing.T, pool *RemotePool) {
 
 // A chat whose box was found down is a refugee: its turn is placed at once,
 // on box B, with the breaker open and after its cooldown, when the next dial
-// is refused too (PATCHES §67, R1). A box that answers again after it was
+// is refused too (PATCHES §67). A box that answers again after it was
 // found down is waited for again on the next blip.
 func TestAChatOnABoxFoundDownIsPlacedAsARefugeeAtOnce(t *testing.T) {
 	for _, tc := range []struct {
@@ -432,27 +431,125 @@ func TestEveryHoldAnswersAtItsDeadlineWithAStatusClaudeCodeRetries(t *testing.T)
 // request and the spent pool's 503 with Retry-After: 5400 are both answers
 // Claude Code would not retry the same way, and the held turn gets neither.
 func TestADrainEndsAStrandedHoldWithA502(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		heldOnA bool
+	}{
+		{"a chat held on a box", true},
+		{"a spent pool's turn no box could be asked for", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			lifecycle := NewLifecycle()
+			policy := strandedPolicy(nil)
+			boxA := newContractBox(t, eligibleBoxAccount("acct-a"))
+			cutPeer(t, boxA.pool, func(int64) error { return refusedFailure() })
+			rig := newHoldRig(t, holdRigOptions{hold: policy, upstream: noLocalUpstream(t), exhausted: true,
+				peers: []*RemotePool{boxA.pool}, lifecycle: lifecycle})
+			if tc.heldOnA {
+				holdOn(t, boxA.pool, "hold-session", "acct-a")
+			}
+			answer := rig.sendAsync(t, holdTurnBody)
+			awaitHeld(t, rig, policy, answer, "the stranded wait")
+			resp, err := http.Post(rig.daemon.URL+"/_subrouter/drain", "application/json", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusOK || !lifecycle.Draining() {
+				t.Fatalf("calibration: drain status = %d draining = %v", resp.StatusCode, lifecycle.Draining())
+			}
+			got := <-answer
+			rig.settle(t, 2)
+			retryable(t, got, http.StatusBadGateway)
+			if !strings.Contains(rig.logs.String(), "outcome=draining") {
+				t.Fatalf("want the hold ended by the drain; logs:\n%s", rig.logs.String())
+			}
+		})
+	}
+}
+
+// A quiesce (POST /_subrouter/quiesce, a deploy's loopback stop) also ends a
+// stranded hold with the 502 it kept, and runs no attempt after it: a quiesce
+// admits nothing new, a hold's retry included. The hold's backoff is a second
+// or more, so the quiesce comes while it waits.
+func TestAQuiesceEndsAStrandedHoldWithA502AndRunsNoAttemptAfterIt(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		heldOnA bool
+	}{
+		{"a chat held on a box", true},
+		{"a spent pool's turn no box could be asked for", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			lifecycle := NewLifecycle()
+			policy := strandedPolicy(nil)
+			policy.baseBackoff, policy.maxBackoff = 2*time.Second, 2*time.Second
+			boxA := newContractBox(t, eligibleBoxAccount("acct-a"))
+			dials := cutPeer(t, boxA.pool, func(int64) error { return refusedFailure() })
+			rig := newHoldRig(t, holdRigOptions{hold: policy, upstream: noLocalUpstream(t), exhausted: true,
+				peers: []*RemotePool{boxA.pool}, lifecycle: lifecycle})
+			if tc.heldOnA {
+				holdOn(t, boxA.pool, "hold-session", "acct-a")
+			}
+			answer := rig.sendAsync(t, holdTurnBody)
+			awaitHeld(t, rig, policy, answer, "the stranded wait")
+			e2eRewindCooldown(boxA.pool)
+			before := dials.Load()
+			resp, err := http.Post(rig.daemon.URL+"/_subrouter/quiesce", "application/json", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusOK || !lifecycle.Quiesced() {
+				t.Fatalf("calibration: quiesce status = %d quiesced = %v", resp.StatusCode, lifecycle.Quiesced())
+			}
+			got := <-answer
+			rig.settle(t, 2)
+			retryable(t, got, http.StatusBadGateway)
+			if after := dials.Load() - before; after != 0 {
+				t.Fatalf("box A was dialed %d times after the quiesce, want no attempt after it; logs:\n%s", after, rig.logs.String())
+			}
+			if active := lifecycle.ActiveProxyRequests(); active != 0 {
+				t.Fatalf("%d proxy requests still counted active after the hold ended", active)
+			}
+			if !strings.Contains(rig.logs.String(), "outcome=quiesced") {
+				t.Fatalf("want the hold ended by the quiesce; logs:\n%s", rig.logs.String())
+			}
+		})
+	}
+}
+
+// A quiesce that comes as a hold's retry starts does not turn that retry
+// away: the hold admitted it first, so it runs, and the hold ends with the
+// 502 it kept. The proxy's fault hook, which runs before the quiesce gate,
+// quiesces at that moment.
+func TestAHoldsRetryAdmittedBeforeAQuiesceRunsAndTheHoldEndsWithA502(t *testing.T) {
 	lifecycle := NewLifecycle()
+	var activeAtRetry atomic.Int64
+	injectedProxyFault = func(r *http.Request) bool {
+		if holdRetry(r) && !lifecycle.Quiesced() {
+			activeAtRetry.Store(lifecycle.ActiveProxyRequests())
+			lifecycle.Quiesce()
+		}
+		return false
+	}
+	t.Cleanup(func() { injectedProxyFault = nil })
 	policy := strandedPolicy(nil)
 	boxA := newContractBox(t, eligibleBoxAccount("acct-a"))
 	cutPeer(t, boxA.pool, func(int64) error { return refusedFailure() })
 	rig := newHoldRig(t, holdRigOptions{hold: policy, upstream: noLocalUpstream(t), exhausted: true,
 		peers: []*RemotePool{boxA.pool}, lifecycle: lifecycle})
 	holdOn(t, boxA.pool, "hold-session", "acct-a")
-	answer := rig.sendAsync(t, holdTurnBody)
-	awaitHeld(t, rig, policy, answer, "the stranded wait")
-	resp, err := http.Post(rig.daemon.URL+"/_subrouter/drain", "application/json", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusOK || !lifecycle.Draining() {
-		t.Fatalf("calibration: drain status = %d draining = %v", resp.StatusCode, lifecycle.Draining())
-	}
-	got := <-answer
-	rig.settle(t, 2)
+	got := <-rig.sendAsync(t, holdTurnBody)
+	rig.settle(t, 1)
 	retryable(t, got, http.StatusBadGateway)
-	if !strings.Contains(rig.logs.String(), "outcome=draining") {
-		t.Fatalf("want the hold ended by the drain; logs:\n%s", rig.logs.String())
+	if !lifecycle.Quiesced() || !strings.Contains(rig.logs.String(), "outcome=draining") {
+		t.Fatalf("calibration: quiesced = %v; want the retry run and the hold ended after it; logs:\n%s", lifecycle.Quiesced(), rig.logs.String())
+	}
+	if n := activeAtRetry.Load(); n != 1 {
+		t.Fatalf("%d proxy requests counted active as the retry started, want the retry itself: a quiesce waits for what it counts", n)
+	}
+	if active := lifecycle.ActiveProxyRequests(); active != 0 {
+		t.Fatalf("%d proxy requests still counted active after the hold ended", active)
 	}
 }

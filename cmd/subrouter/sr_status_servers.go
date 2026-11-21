@@ -41,6 +41,9 @@ type remoteAccountSection struct {
 	// via is which of a servers.json entry's paths answered: its private
 	// URL, or its public admin path when that URL was out of reach (§43.2).
 	via serverAdminVia
+	// link is the peer as parsed from the local daemon's peer view; zero for a
+	// servers.json section.
+	link peerLink
 }
 
 // remoteAccountFetch is the background load of every section. done closes
@@ -128,60 +131,158 @@ func remoteAccountSectionsEnabled() bool {
 	}
 }
 
-// startRemoteAccountSections begins loading every configured server's usage,
-// and the local daemon's view of its peers, so the box costs no extra wall
-// clock beside the local token refresh. It returns nil when nothing remote may
-// be shown, and a fetch that renders nothing when nothing was found, which
-// keeps the output byte-identical on machines that hold only local accounts.
-func (r srRunner) startRemoteAccountSections(ctx context.Context) *remoteAccountFetch {
-	if !remoteAccountSectionsEnabled() || !remoteUnlocked() {
-		return nil
+// poolPlan is what a command may read beyond this machine, decided before any
+// read starts. It keeps the gate facts as they were published, so a command
+// that says why something was not read never works a gate out again.
+type poolPlan struct {
+	// serversOff is SR_STATUS_SERVERS turned off: nothing beyond this machine
+	// is read, whatever the key says.
+	serversOff bool
+	key        remoteGateVerdict
+	// servers are the boxes to read, in the store's order. Empty when the
+	// plan is not open.
+	servers []srServerConfig
+	// serversErr is servers.json failing to load. No box is read; the
+	// daemon's peer view still is.
+	serversErr error
+}
+
+func (p poolPlan) open() bool { return !p.serversOff && p.key.unlocked }
+
+// planPoolRead applies the gates in the order every pool reader applies them.
+// It is the only place that order is written down.
+func (r srRunner) planPoolRead() poolPlan {
+	if !remoteAccountSectionsEnabled() {
+		return poolPlan{serversOff: true, key: remoteGate()}
+	}
+	key := remoteGate()
+	if !key.unlocked {
+		return poolPlan{key: key}
 	}
 	servers, err := r.configuredRemoteServers()
 	if err != nil {
 		// An unreadable servers.json must not stop the local table from
 		// rendering; `sr remote -v` is where that failure belongs. The
 		// daemon's peers do not depend on it, so they are still read.
-		servers = nil
+		return poolPlan{key: key, serversErr: err}
 	}
-	fetch := &remoteAccountFetch{servers: len(servers), done: make(chan struct{})}
+	return poolPlan{key: key, servers: servers}
+}
+
+// serverUsageRead is one servers.json section's usage-status read, before
+// anyone decides how to show it.
+type serverUsageRead struct {
+	server    srServerConfig
+	statuses  []remoteServerUsageStatus
+	available bool // false: the server predates usage-status
+	via       serverAdminVia
+	err       error
+}
+
+func (read serverUsageRead) section(program string) remoteAccountSection {
+	section := remoteAccountSection{server: read.server, via: read.via}
+	switch {
+	case read.err != nil:
+		section.err = read.err
+	case !read.available:
+		section.err = fmt.Errorf(
+			"server is too old to report usage; upgrade it or run %s server status %s",
+			program, read.server.Name)
+	default:
+		section.rows = usageRowsFromServerUsageStatuses(read.statuses)
+		section.keys = usageAccountKeys(read.statuses)
+	}
+	return section
+}
+
+// poolRead is every remote read of one command, raw: each planned server in
+// plan order, and the local daemon's peer view as fetchLocalPeerView
+// returned it.
+type poolRead struct {
+	boxes          []serverUsageRead
+	peers          []proxy.PeerUsageView
+	peersAvailable bool
+	peersErr       error
+}
+
+func (read poolRead) boxSections(program string) []remoteAccountSection {
+	sections := make([]remoteAccountSection, len(read.boxes))
+	for i, box := range read.boxes {
+		sections[i] = box.section(program)
+	}
+	return sections
+}
+
+// poolBudgets bounds each read on its own. A zero budget adds no deadline,
+// leaving the caller's ctx as the only bound.
+type poolBudgets struct {
+	box      time.Duration
+	peerView time.Duration
+}
+
+// poolReadRef names one read of readPool: a box by its index in the
+// servers readPool was given, or peerViewRef.
+type poolReadRef int
+
+const peerViewRef poolReadRef = -1
+
+// readPool makes every remote read at once and waits for all of them. Each
+// read fills only its own slot, so the order in which reads finish cannot
+// change the result. done, when not nil, is called once per read as it
+// finishes, from that read's goroutine.
+func (r srRunner) readPool(ctx context.Context, servers []srServerConfig, budgets poolBudgets, done func(poolReadRef)) poolRead {
+	finished := func(ref poolReadRef) {
+		if done != nil {
+			done(ref)
+		}
+	}
+	read := poolRead{boxes: make([]serverUsageRead, len(servers))}
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		peerCtx, cancel := withReadBudget(ctx, budgets.peerView)
+		defer cancel()
+		read.peers, read.peersAvailable, read.peersErr = fetchLocalPeerView(r, peerCtx)
+		finished(peerViewRef)
+	})
+	for i, server := range servers {
+		wg.Go(func() {
+			boxCtx, cancel := withReadBudget(ctx, budgets.box)
+			defer cancel()
+			box := serverUsageRead{server: server}
+			box.statuses, box.available, box.via, box.err = r.fetchServerUsageStatusesVia(boxCtx, server)
+			read.boxes[i] = box
+			finished(poolReadRef(i))
+		})
+	}
+	wg.Wait()
+	return read
+}
+
+func withReadBudget(ctx context.Context, budget time.Duration) (context.Context, context.CancelFunc) {
+	if budget <= 0 {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, budget)
+}
+
+// startRemoteAccountSections begins loading every configured server's usage,
+// and the local daemon's view of its peers, so the box costs no extra wall
+// clock beside the local token refresh. It returns nil when nothing remote may
+// be shown, and a fetch that renders nothing when nothing was found, which
+// keeps the output byte-identical on machines that hold only local accounts.
+func (r srRunner) startRemoteAccountSections(ctx context.Context) *remoteAccountFetch {
+	plan := r.planPoolRead()
+	if !plan.open() {
+		return nil
+	}
+	fetch := &remoteAccountFetch{servers: len(plan.servers), done: make(chan struct{})}
 	go func() {
 		defer close(fetch.done)
 		fetchCtx, cancel := context.WithTimeout(ctx, remoteAccountSectionTimeout)
 		defer cancel()
-		sections := make([]remoteAccountSection, len(servers))
-		var peers []proxy.PeerUsageView
-		var peersAvailable bool
-		var peersErr error
-		var wg sync.WaitGroup
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			peers, peersAvailable, peersErr = fetchLocalPeerView(r, fetchCtx)
-		}()
-		for i, server := range servers {
-			i, server := i, server
-			sections[i].server = server
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				usage, available, via, err := r.fetchServerUsageStatusesVia(fetchCtx, server)
-				sections[i].via = via
-				switch {
-				case err != nil:
-					sections[i].err = err
-				case !available:
-					sections[i].err = fmt.Errorf(
-						"server is too old to report usage; upgrade it or run %s server status %s",
-						r.programOrSubrouter(), server.Name)
-				default:
-					sections[i].rows = usageRowsFromServerUsageStatuses(usage)
-					sections[i].keys = usageAccountKeys(usage)
-				}
-			}()
-		}
-		wg.Wait()
-		fetch.sections, fetch.notes = withPeerSections(sections, peers, peersAvailable, peersErr)
+		read := r.readPool(fetchCtx, plan.servers, poolBudgets{}, nil)
+		fetch.sections, fetch.notes = withPeerSections(
+			read.boxSections(r.programOrSubrouter()), read.peers, read.peersAvailable, read.peersErr)
 	}()
 	return fetch
 }
@@ -314,7 +415,7 @@ func (r srRunner) fetchLocalPeerUsage(ctx context.Context) ([]proxy.PeerUsageVie
 	}
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
 		_, _ = io.Copy(io.Discard, res.Body)
-		return nil, false, fmt.Errorf("it answered %s", res.Status)
+		return nil, false, &adminStatusError{lead: "it answered ", code: res.StatusCode, status: res.Status}
 	}
 	var view proxy.PeersUsageStatus
 	if err := json.NewDecoder(res.Body).Decode(&view); err != nil {
@@ -322,6 +423,17 @@ func (r srRunner) fetchLocalPeerUsage(ctx context.Context) ([]proxy.PeerUsageVie
 	}
 	return view.Peers, true, nil
 }
+
+// adminStatusError is a read that reached a daemon and got a status it cannot
+// use. The code is kept as data so a caller can name the status without
+// parsing the message.
+type adminStatusError struct {
+	lead   string
+	code   int
+	status string
+}
+
+func (e *adminStatusError) Error() string { return e.lead + e.status }
 
 // withPeerSections appends a section for every daemon peer that is not a box
 // already on screen, and returns the notes to print after the sections.
@@ -347,9 +459,8 @@ func withPeerSections(sections []remoteAccountSection, peers []proxy.PeerUsageVi
 	}
 	servers := sections[:len(sections):len(sections)]
 	var notes []string
-	for _, peer := range peers {
-		section := peerAccountSection(peer)
-		if server := section.sameBoxAs(servers); server != "" {
+	for _, section := range peerSections(servers, peers) {
+		if server := section.link.sameAs; server != "" {
 			if section.linkErr != "" {
 				notes = append(notes, fmt.Sprintf(
 					"This machine's peer link to %s is failing (%s); its accounts are shown above under %s.",
@@ -365,6 +476,40 @@ func withPeerSections(sections []remoteAccountSection, peers []proxy.PeerUsageVi
 // peerUnreachable prefixes a peer read that failed.
 const peerUnreachable = "unreachable from this machine's daemon: "
 
+// peerLinkState is what the local daemon holds for a peer.
+type peerLinkState uint8
+
+const (
+	// peerLinkNone is a servers.json section, not a peer.
+	peerLinkNone peerLinkState = iota
+	// peerLinkBodiless: no body (accounts absent or null).
+	peerLinkBodiless
+	// peerLinkUndecodable: a body that is not a list of accounts.
+	peerLinkUndecodable
+	// peerLinkLastGood: a body, but the daemon's latest read of the peer failed.
+	peerLinkLastGood
+	// peerLinkCurrent: the body the daemon's latest read returned.
+	peerLinkCurrent
+)
+
+// peerLink is a peer as parsed, before the table cooks it into rows and
+// sentences.
+type peerLink struct {
+	state peerLinkState
+	// statuses is the decoded body: set for peerLinkLastGood and
+	// peerLinkCurrent.
+	statuses []remoteServerUsageStatus
+	// measuredAt is the parsed as_of whenever it parses, current or not;
+	// section.asOf is set only when the body is not current.
+	measuredAt time.Time
+	// reason is the daemon's error for the peer, scrubbed, with no prefix and
+	// no default: "" when the daemon gave none.
+	reason string
+	// sameAs names the servers.json section this peer is, or "". Only
+	// peerSections sets it.
+	sameAs string
+}
+
 func peerAccountSection(peer proxy.PeerUsageView) remoteAccountSection {
 	section := remoteAccountSection{
 		server:      srServerConfig{Name: peer.Name, URL: peer.URL},
@@ -373,8 +518,10 @@ func peerAccountSection(peer proxy.PeerUsageView) remoteAccountSection {
 	// The daemon already takes the peer's URL out of its errors; a tenant
 	// path is scrubbed again here so no daemon build can put one on screen.
 	reason := tenantPathErrorPattern.ReplaceAllString(strings.TrimSpace(peer.Error), "/t/[redacted]")
+	section.link.reason = reason
 	accounts := bytes.TrimSpace(peer.Accounts)
 	if len(accounts) == 0 || bytes.Equal(accounts, []byte("null")) {
+		section.link.state = peerLinkBodiless
 		if reason == "" {
 			reason = "no reading yet"
 		}
@@ -383,17 +530,24 @@ func peerAccountSection(peer proxy.PeerUsageView) remoteAccountSection {
 	}
 	var usage []remoteServerUsageStatus
 	if err := json.Unmarshal(accounts, &usage); err != nil {
+		section.link.state = peerLinkUndecodable
 		section.err = fmt.Errorf("peer usage did not decode: %v", err)
 		return section
 	}
+	section.link.statuses = usage
 	section.rows = usageRowsFromServerUsageStatuses(usage)
 	section.keys = usageAccountKeys(usage)
 	measured, err := time.Parse(time.RFC3339, peer.AsOf)
 	dated := err == nil
+	if dated {
+		section.link.measuredAt = measured
+	}
+	section.link.state = peerLinkCurrent
 	switch {
 	case !peer.Reachable:
 		// The daemon's latest read failed: these rows are its last good body,
 		// whatever their stamp says.
+		section.link.state = peerLinkLastGood
 		section.linkErr = reason
 		if section.linkErr == "" {
 			section.linkErr = "its latest read failed"
@@ -405,6 +559,18 @@ func peerAccountSection(peer proxy.PeerUsageView) remoteAccountSection {
 		section.asOf = peer.AsOf
 	}
 	return section
+}
+
+// peerSections parses every peer once and stamps which servers.json section
+// it is. It is the only caller of sameBoxAs, so every command that shows the
+// pool reaches one answer about which peer is which box.
+func peerSections(boxes []remoteAccountSection, peers []proxy.PeerUsageView) []remoteAccountSection {
+	sections := make([]remoteAccountSection, len(peers))
+	for i, peer := range peers {
+		sections[i] = peerAccountSection(peer)
+		sections[i].link.sameAs = sections[i].sameBoxAs(boxes)
+	}
+	return sections
 }
 
 // sameBoxAs names the rendered servers.json section this peer is, or "" when

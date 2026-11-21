@@ -540,8 +540,7 @@ func TestProxyRecordsWebSocketTurnLatencyAndStop(t *testing.T) {
 		MaxBodyBytes: 1 << 20,
 		TokenUsage:   recorder,
 	}.Handler()
-	subrouter := httptest.NewServer(handler)
-	defer subrouter.Close()
+	subrouter := newProxyTestServer(t, handler)
 
 	wsURL := "ws" + strings.TrimPrefix(subrouter.URL, "http") + "/v1/responses"
 	conn, response, err := websocket.DefaultDialer.Dial(wsURL, http.Header{ClientNameHeader: []string{"leos-mbp"}})

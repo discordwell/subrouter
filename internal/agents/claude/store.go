@@ -3964,6 +3964,11 @@ var claudeRoutingEnvKeys = []string{
 	"ANTHROPIC_UNIX_SOCKET",
 	"CLAUDE_CONFIG_DIR",
 	"CLAUDE_CODE_CONFIG_DIR",
+	// Claude Code (2.1.329) names its credential store after this one ahead
+	// of CLAUDE_CONFIG_DIR, so an inherited value sends a profile's login,
+	// status and refreshes to another store. The claude-route shim exports
+	// one in every pooled session. PATCHES §73.
+	"CLAUDE_SECURESTORAGE_CONFIG_DIR",
 	"CLAUDE_CODE_OAUTH_TOKEN",
 	"CLAUDE_CODE_API_KEY",
 	"CLAUDE_CODE_AUTH_TOKEN",

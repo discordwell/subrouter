@@ -46,7 +46,8 @@ func TestNewSessionVerdictAgreesWithPickPredicates(t *testing.T) {
 		}
 		sched := NewScheduler([]Score{score}).
 			WithReserves(reserves).
-			WithLiveSessionCounts(map[string]int{ScoreKey(account.ProviderClaude, "a"): rng.Intn(6)})
+			WithLiveSessionCounts(map[string]int{ScoreKey(account.ProviderClaude, "a"): rng.Intn(6)}).
+			WithClosedAccounts(map[string]bool{ScoreKey(account.ProviderClaude, "a"): rng.Intn(4) == 0})
 		got := sched.NewSessionVerdict(account.ProviderClaude, "a", now)
 		s := sched.score(account.ProviderClaude, "a")
 		if got.Burndown != s.endgameDrainEligible(now) || got.AtCap != s.endgameAtCap(now) || got.Evicted != s.evicted() {

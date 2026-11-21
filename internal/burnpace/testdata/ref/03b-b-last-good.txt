@@ -1,0 +1,34 @@
+
+  subrouter · 7d burn pace · local + box.example via peer link, last good as of 10m ago Thu 07:01
+  ────────────────────────────────────────────────────────────────────────────────────────────────
+  box.example is a last-good reading — this machine's daemon cannot reach it now (dial tcp
+    203.0.113.7:31416: i/o timeout)
+  HOME NOT READ (No route to host) — box.example (peer link) is in the numbers; if that is home,
+    nothing is missing
+
+  claude   0.70×  ▕█████████████▍     ╎                                              ▏  ceil 1.76×
+  codex    0.22×  ▕████               ╎                                              ▏  ceil 2.15×
+                   0×                 1×                                         3.5×
+                   5 accounts across local + box.example (peer link) · 1 held on both, counted once
+
+  ceiling · next 168h   claude, 4 accounts
+  3.5×┤                                                                 █▃                        
+      │                       ▆▂                                        ░░█▄▁                     
+  3.0×┤                       ░░▇▄▁                                     ░░░░░▅▃                   
+      │                       ░░░░░▆▄▂                                  ░░░░░░░█▅▃                
+  2.5×┤                       ░░░░░░░░▇▅▃▁                   ▆▄▂        ░░░░░░░░░░█▆▄▂            
+      │                 ▁     ░░░░░░░░░░░░▇▆▄▃▁              ░░░█▆▄▃▁   ░░░░░░░░░░░░░░█▇▅▃▂       
+  2.0×┤ ▁               ░▇▆▅▃▂░░░░░░░░░░░░░░░░░█▆▅▄▂▁        ░░░░░░░░█▇▅░░░░░░░░░░░░░░░░░░░█▇▆▄▃▂▁
+      │ ░█▇▆▅▄▃▂▁       ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░█▇▆▅▄▃▂▁░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+  1.5×┤ ░░░░░░░░░█▇▇▆▅▅▄░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+      │ ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+  1.0×└───────────────────────────────────────────────────────────────────────────────────────────
+        Thu                      Sat                      Mon                       Wed
+  (codex ceiling not charted)
+
+  unspent · expiring soonest
+  b-one                            40%  in  29.8h
+  l-one                            50%  in  40.0h
+  shared-codex                     90%  in  90.0h
+  home's servers.json address is down (No route to host); a peer link stood in, see above
+

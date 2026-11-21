@@ -227,6 +227,13 @@ var requiredCases = []string{
 	"route-link-finds-the-scripts-in-the-checkout",
 	"route-plain-copy-says-where-the-scripts-are",
 	"route-shims-keep-max-retries",
+	// A credential command manages the store its own environment names (PATCHES §73).
+	"route-login-keeps-the-profile-store",
+	"route-login-in-a-pool-session-drops-the-pool",
+	"route-login-off-keeps-the-profile-store",
+	"route-every-credential-command-routes-credentials",
+	"route-logout-of-a-pool-profile-is-refused",
+	"route-plain-pool-launch-keeps-the-pool-store",
 	// sr-triage: rc-file exports by name only, probes bounded without
 	// timeout(1), the install found off PATH (§48).
 	"triage-rc-exports-names-only",

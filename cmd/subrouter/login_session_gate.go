@@ -23,6 +23,10 @@ import (
 //   - help; `sr status`, bare `sr` and `sr <selector>`, which read this
 //     machine's rows from its daemon here (sr_status_daemon_view.go), with no
 //     prompt and nothing numbered to switch to;
+//   - `sr plot`: reads this machine's rows and its peer view from its daemon
+//     over loopback with no credential, and each servers.json box the way
+//     `sr status` reads it; it only prints. No Keychain, no refresh, no
+//     launchd;
 //   - `sr list` and `sr trace`: Codex store files (on a legacy machine the
 //     selected server's list, over its pinned path);
 //   - `sr remote [-v|list|current]`, `sr server [list|current]`: servers.json;
@@ -84,7 +88,7 @@ func srVerbAllowedInEndedSession(args []string) bool {
 		sub = args[1]
 	}
 	switch args[0] {
-	case "help", "-h", "--help", "status", "list", "ls", "trace", "breadcrumbs", "why", "doctor":
+	case "help", "-h", "--help", "status", "plot", "list", "ls", "trace", "breadcrumbs", "why", "doctor":
 		return true
 	case "remote", "remotes":
 		return oneOf(sub, "", "-v", "list", "ls", "current", "default", "help", "-h", "--help")
@@ -251,6 +255,17 @@ func commandExit(w io.Writer, prefix string, err error) int {
 		fmt.Fprintln(w, err)
 		return 2
 	}
+	var quiet quietFailure
+	if errors.As(err, &quiet) {
+		return 1
+	}
 	fmt.Fprintln(w, prefix+":", err)
 	return 1
 }
+
+// quietFailure is exit 1 for a command whose own output has already said why
+// it failed, so a "subrouter: ..." line would say it twice. what is never
+// printed by commandExit.
+type quietFailure struct{ what string }
+
+func (e quietFailure) Error() string { return e.what }

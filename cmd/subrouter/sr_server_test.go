@@ -123,6 +123,33 @@ func TestSRServerAddAllowsOfflineTailscaleIdentityForTenantHTTP(t *testing.T) {
 	}
 }
 
+// A credential field that secrets leaves out passes through every redaction of
+// a server's error text.
+func TestServerConfigSecretsNamesEveryCredential(t *testing.T) {
+	var server srServerConfig
+	fields := reflect.ValueOf(&server).Elem()
+	var credentials []string
+	for i := range fields.NumField() {
+		field := fields.Type().Field(i)
+		if !field.IsExported() || field.Type.Kind() != reflect.String {
+			continue
+		}
+		if name := field.Name; strings.HasSuffix(name, "Token") || strings.HasSuffix(name, "Key") || strings.HasSuffix(name, "Secret") {
+			fields.Field(i).SetString("credential-of-" + name)
+			credentials = append(credentials, name)
+		}
+	}
+	if len(credentials) < 5 {
+		t.Fatalf("found only %q; the scan no longer sees the credential fields", credentials)
+	}
+	secrets := server.secrets()
+	for _, name := range credentials {
+		if !slices.Contains(secrets, "credential-of-"+name) {
+			t.Errorf("srServerConfig.%s is a credential that secrets() leaves out", name)
+		}
+	}
+}
+
 func TestServerControlRequestsNeverFollowRedirects(t *testing.T) {
 	var redirected atomic.Int32
 	destination := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {

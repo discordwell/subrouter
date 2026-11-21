@@ -32,11 +32,11 @@ const UserEmailRetention = 30 * 24 * time.Hour
 // yesterday, which the 512-entry prune then read as the oldest in the store.
 const sessionActivityWriteInterval = 10 * time.Minute
 
-// warmSessionWindow is how long after its last turn a session is still warm:
-// the upstream prompt-cache lifetime, the same 60 minutes as the proxy's
-// warmSessionIdleTTL (PATCHES.md sections 20, 21 and 67), which covers Codex
-// and Claude sessions alike. Keep the two in step.
-const warmSessionWindow = 60 * time.Minute
+// WarmSessionWindow is how long after its last turn a session is still warm:
+// the upstream prompt-cache lifetime (PATCHES.md sections 20, 21 and 67), for
+// Codex and Claude sessions alike. The proxy's warm rule reads it
+// (warmSessionIdleTTL).
+const WarmSessionWindow = 60 * time.Minute
 
 // WarmAssignmentRetention is the age below which the MaxRetainedAssignments
 // prune never drops an assignment. A warm session moves only when its account
@@ -45,7 +45,7 @@ const warmSessionWindow = 60 * time.Minute
 // persisted UpdatedAt lags the last turn by up to that much. If more than
 // MaxRetainedAssignments assignments are warm at once, the store keeps them
 // all: the bound yields to the warm rule, never the other way round.
-const WarmAssignmentRetention = warmSessionWindow + sessionActivityWriteInterval
+const WarmAssignmentRetention = WarmSessionWindow + sessionActivityWriteInterval
 
 // answeredWriteInterval coalesces NoteAnswered's writes, as
 // sessionActivityWriteInterval does Touch's: a session answered every few
@@ -68,6 +68,46 @@ type Assignment struct {
 	// chain of holds that moves to another process keeps it. It lags the
 	// last answer by less than answeredWriteInterval.
 	AnsweredAt time.Time `json:"answered_at,omitzero"`
+	// Held is the session's chain of held turns while it waits for a box
+	// (PATCHES §67), kept here so the next process carries it on. Zero is no
+	// chain.
+	Held HeldChain `json:"held_chain,omitzero"`
+	// Waiting is set when the chat gave up waiting for the box its cache was
+	// on (PATCHES §67): its next turn goes home, is placed as a refugee, or
+	// gets the give-up again. An answered turn or a new placement ends it.
+	Waiting *Waiting `json:"waiting,omitempty"`
+}
+
+// Waiting is a chat's home while it waits for room: the box its cache was
+// on, that box's account, and when it gave up.
+type Waiting struct {
+	Peer    string    `json:"peer"`
+	Account string    `json:"account"`
+	Since   time.Time `json:"since"`
+}
+
+// HeldChain is a stranded chat's chain of held turns: Claude Code resends
+// each 502 a hold answers within seconds, so its held attempts come close
+// together. Since is the chain's first held turn, which its give-up counts
+// from, and Last its latest held attempt. Both are on the wall clock.
+type HeldChain struct {
+	Since time.Time `json:"since"`
+	Last  time.Time `json:"last"`
+}
+
+// IsZero reports no chain.
+func (c HeldChain) IsZero() bool {
+	return c.Since.IsZero()
+}
+
+// HeldAt is the chain after a held attempt at now: c carried on, or a new
+// chain from now when c has had no held attempt for gap or there is none.
+func (c HeldChain) HeldAt(now time.Time, gap time.Duration) HeldChain {
+	now = now.Round(0)
+	if c.IsZero() || now.Sub(c.Last) >= gap {
+		return HeldChain{Since: now, Last: now}
+	}
+	return HeldChain{Since: c.Since, Last: now}
 }
 
 // Refugee marks a chat placed on an account because the box its prompt
@@ -155,7 +195,7 @@ func (s *Store) Put(agentType, sessionID, accountID, userEmail string) (Assignme
 		UpdatedAt: now,
 	}
 	if existing, ok := s.data[key]; ok {
-		assignment.CreatedAt, assignment.AnsweredAt = existing.CreatedAt, existing.AnsweredAt
+		assignment.CreatedAt, assignment.AnsweredAt, assignment.Held = existing.CreatedAt, existing.AnsweredAt, existing.Held
 		if assignment.UserEmail == "" {
 			assignment.UserEmail = existing.UserEmail
 		}
@@ -168,10 +208,11 @@ func (s *Store) Put(agentType, sessionID, accountID, userEmail string) (Assignme
 	return assignment, s.saveLocked()
 }
 
-// PutRefugee places a session on accountID as a refugee from origin, unless
+// PutRefugee places a session on accountID as a refugee, with mark, unless
 // accountID already holds slots refugees that count (counts): the count and
 // the write happen under one lock, so two placements cannot both take the
-// last slot. held is the account's refugees with this one.
+// last slot. held is the account's refugees, this one included when it is
+// placed.
 func (s *Store) PutRefugee(agentType, sessionID, accountID string, mark Refugee, slots int, counts func(Assignment) bool) (held int, placed bool, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -189,11 +230,7 @@ func (s *Store) PutRefugee(agentType, sessionID, accountID string, mark Refugee,
 	}
 	stickySessionID := StickySessionID(normalizedAgent, sessionID)
 	key := ScopedSessionKey(normalizedAgent, stickySessionID)
-	for other, assignment := range s.data {
-		if other != key && assignment.Refugee != nil && assignment.AccountID == accountID && counts(assignment) {
-			held++
-		}
-	}
+	held = s.refugeesLocked(key, counts)[accountID]
 	if held >= slots {
 		return held, false, nil
 	}
@@ -207,11 +244,30 @@ func (s *Store) PutRefugee(agentType, sessionID, accountID string, mark Refugee,
 		Refugee:   &mark,
 	}
 	if existing, ok := s.data[key]; ok {
-		assignment.CreatedAt, assignment.UserEmail, assignment.AnsweredAt = existing.CreatedAt, existing.UserEmail, existing.AnsweredAt
+		assignment.CreatedAt, assignment.UserEmail, assignment.AnsweredAt, assignment.Held = existing.CreatedAt, existing.UserEmail, existing.AnsweredAt, existing.Held
 	}
 	s.data[key] = assignment
 	s.pruneLocked()
 	return held + 1, true, s.saveLocked()
+}
+
+// RefugeesByAccount is, per account, the refugees counts accepts other than
+// the session named: the count PutRefugee checks, read without placing.
+func (s *Store) RefugeesByAccount(agentType, sessionID string, counts func(Assignment) bool) map[string]int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.reloadBestEffortLocked()
+	return s.refugeesLocked(ScopedSessionKey(agentType, sessionID), counts)
+}
+
+func (s *Store) refugeesLocked(except string, counts func(Assignment) bool) map[string]int {
+	held := map[string]int{}
+	for key, assignment := range s.data {
+		if key != except && assignment.Refugee != nil && counts(assignment) {
+			held[assignment.AccountID]++
+		}
+	}
+	return held
 }
 
 // Touch records recent use of an existing sticky assignment. Updates are
@@ -248,14 +304,18 @@ func (s *Store) Touch(agentType, sessionID string) (Assignment, bool, error) {
 }
 
 // NoteAnswered records that one of an existing assignment's model turns was
-// answered at at. The write is skipped while the stored AnsweredAt is less
-// than answeredWriteInterval older, or later (another process answered one
-// since).
+// answered at at, which ends its chain of held turns and its wait. The write
+// is skipped while the stored AnsweredAt is less than answeredWriteInterval
+// older, or later (another process answered one since), unless a chain or a
+// wait is stored.
 func (s *Store) NoteAnswered(agentType, sessionID string, at time.Time) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	key := ScopedSessionKey(agentType, sessionID)
-	if assignment, ok := s.data[key]; ok && at.Sub(assignment.AnsweredAt) < answeredWriteInterval {
+	due := func(assignment Assignment) bool {
+		return at.Sub(assignment.AnsweredAt) >= answeredWriteInterval || !assignment.Held.IsZero() || assignment.Waiting != nil
+	}
+	if assignment, ok := s.data[key]; ok && !due(assignment) {
 		return nil
 	}
 	lock, err := lockSessionStore(s.path)
@@ -267,10 +327,119 @@ func (s *Store) NoteAnswered(agentType, sessionID string, at time.Time) error {
 		return err
 	}
 	assignment, ok := s.data[key]
-	if !ok || at.Sub(assignment.AnsweredAt) < answeredWriteInterval {
+	if !ok || !due(assignment) {
 		return nil
 	}
-	assignment.AnsweredAt = at.UTC()
+	if at.After(assignment.AnsweredAt) {
+		assignment.AnsweredAt = at.UTC()
+	}
+	assignment.Held, assignment.Waiting = HeldChain{}, nil
+	s.data[key] = assignment
+	return s.saveLocked()
+}
+
+// Wait marks a session as waiting for room, with home: its assignment keeps
+// its account, or, with none, gets one that names no account. Its chain of
+// held turns ends.
+func (s *Store) Wait(agentType, sessionID string, home Waiting) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	lock, err := lockSessionStore(s.path)
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+	if err := s.loadLocked(); err != nil {
+		return err
+	}
+	normalizedAgent := NormalizeAgentType(agentType)
+	if normalizedAgent == "" {
+		normalizedAgent = "codex"
+	}
+	stickySessionID := StickySessionID(normalizedAgent, sessionID)
+	key := ScopedSessionKey(normalizedAgent, stickySessionID)
+	now := time.Now().UTC()
+	assignment, ok := s.data[key]
+	if !ok {
+		assignment = Assignment{AgentType: normalizedAgent, SessionID: stickySessionID, CreatedAt: now}
+	}
+	home.Since = home.Since.UTC()
+	assignment.UpdatedAt, assignment.Held, assignment.Waiting = now, HeldChain{}, &home
+	s.data[key] = assignment
+	s.pruneLocked()
+	return s.saveLocked()
+}
+
+// NoteHeld records a held attempt at now of an existing assignment's chain
+// (HeldChain.HeldAt) and returns the assignment with it. ok is false, and
+// nothing is written, for a session with no assignment. A new chain is
+// written at once; a later attempt only once the stored Last is
+// answeredWriteInterval older, so the stored Last lags by less than that.
+func (s *Store) NoteHeld(agentType, sessionID string, now time.Time, gap time.Duration) (assignment Assignment, ok bool, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	lock, err := lockSessionStore(s.path)
+	if err != nil {
+		return Assignment{}, false, err
+	}
+	defer lock.Close()
+	if err := s.loadLocked(); err != nil {
+		return Assignment{}, false, err
+	}
+	key := ScopedSessionKey(agentType, sessionID)
+	assignment, ok = s.data[key]
+	if !ok {
+		return Assignment{}, false, nil
+	}
+	stored := assignment.Held
+	assignment.Held = stored.HeldAt(now, gap)
+	if assignment.Held.Since.Equal(stored.Since) && assignment.Held.Last.Sub(stored.Last) < answeredWriteInterval {
+		return assignment, true, nil
+	}
+	s.data[key] = assignment
+	return assignment, true, s.saveLocked()
+}
+
+// EndHeld ends an existing assignment's chain of held turns.
+func (s *Store) EndHeld(agentType, sessionID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	lock, err := lockSessionStore(s.path)
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+	if err := s.loadLocked(); err != nil {
+		return err
+	}
+	key := ScopedSessionKey(agentType, sessionID)
+	assignment, ok := s.data[key]
+	if !ok || assignment.Held.IsZero() {
+		return nil
+	}
+	assignment.Held = HeldChain{}
+	s.data[key] = assignment
+	return s.saveLocked()
+}
+
+// EndWait ends an existing assignment's wait for room: the chat was placed.
+func (s *Store) EndWait(agentType, sessionID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	lock, err := lockSessionStore(s.path)
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+	if err := s.loadLocked(); err != nil {
+		return err
+	}
+	key := ScopedSessionKey(agentType, sessionID)
+	assignment, ok := s.data[key]
+	if !ok || assignment.Waiting == nil {
+		return nil
+	}
+	assignment.Waiting = nil
 	s.data[key] = assignment
 	return s.saveLocked()
 }
@@ -310,7 +479,7 @@ func (s *Store) CompareAndPut(agentType, sessionID, expectedAccountID, accountID
 		CreatedAt: existing.CreatedAt,
 		UpdatedAt: now,
 	}
-	assignment.AnsweredAt = existing.AnsweredAt
+	assignment.AnsweredAt, assignment.Held = existing.AnsweredAt, existing.Held
 	if assignment.UserEmail == "" {
 		assignment.UserEmail = existing.UserEmail
 	}
@@ -569,7 +738,7 @@ func (s *Store) saveLocked() error {
 // proxied request does), Put, Touch and CompareAndPut of a running daemon.
 // Starting empty there would drop every warm session's assignment, so each
 // one's next turn would be re-picked cold: a move that is not an eviction,
-// which the 70-minute warm rule (PATCHES.md sections 20, 21 and 28) forbids.
+// which the hour-long warm rule (PATCHES.md sections 20, 21 and 28) forbids.
 // A running daemon's in-memory assignments are the newest state anyone still
 // has, so it keeps them and writes them over the torn file instead.
 //

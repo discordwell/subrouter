@@ -54,19 +54,22 @@ import (
 // chunked request body, one larger than replayablePostMaxBodyBytes, a caller
 // the proxy refuses, or anything on the public listener.
 //
-// A stranded chat rides the hold (PATCHES §67). A chat whose prompt cache is
-// on a box that cannot be reached, or on this daemon's own upstream when that
-// cannot be dialed, used to move the moment the dial failed, and each move
-// rewrote its whole context into a cold cache: on 2026-11-19 a building
-// gateway that refused new connections for seconds to minutes cost 892
-// rewrites in under two hours. Such an attempt is now held and run again on
-// the same account. A hold that ends first -- its deadline, no room, a drain
-// -- answers the 502 it kept, which Claude Code retries, and the retry is held
-// again: the chat waits across requests until its account answers, or until
-// its box is found down and it is placed as a refugee (placeRefugee). The
-// chain of holds ends GiveUp after the chat's last answered turn, when the
-// prompt cache it waits for has gone cold, with a 503 Claude Code shows at
-// once, and the chat is unlinked: its next turn is placed as a new session.
+// A stranded chat rides the hold (PATCHES §67). An attempt on the account its
+// prompt cache is on -- a box that cannot be reached, or this daemon's own
+// upstream that cannot be dialed -- is held and run again on that account
+// instead of moving the chat to a cold cache. A hold that ends first -- its
+// deadline, no room, a drain -- answers the 502 it kept, which Claude Code
+// retries, and the retry is held again: the chat waits across requests until
+// its account answers, or until its box is found down and it is placed as a
+// refugee (placeRefugee). The chain of holds ends GiveUp after the chat's last
+// answered turn with a 503 Claude Code shows at once (unlinkStranded): a chat
+// a box held then waits for room, and any other is unlinked, so its next turn
+// is placed as a new session. A spent pool's chat waits for a box instead,
+// and its chain ends GiveUp after its first held turn (strandedWait). A
+// chain (session.HeldChain) also ends when one of the chat's model turns is
+// answered, when a hold of it ends with an answer the client does not send
+// again (a box's own 503, a client that left), and after a hold's deadline
+// and 2 minutes with no held attempt.
 
 const (
 	// DefaultHoldDeadline is serve's default: under Claude Code's
@@ -81,16 +84,20 @@ const (
 	// hold keeps it for longer, so this is what bounds the extra memory.
 	DefaultHoldMaxBytes int64 = 512 << 20
 	// DefaultStrandedGiveUp is how long after its last answered turn a
-	// stranded chat's chain of holds lasts (owner, 2026-11-19: "claude code
-	// should give up just after an hour, because cache"): the warm window, so
-	// the chat gives up when it would go unlinked, and the give-up answer
-	// wins over placing it cold.
+	// stranded chat's chain of holds lasts: the warm window. By then the prompt
+	// cache it waits for is cold and a box chat's peer hold has lapsed, so the
+	// give-up answer comes before an attempt that would place it cold.
 	DefaultStrandedGiveUp = warmSessionIdleTTL
 	// strandedRetryAfter is the give-up answer's Retry-After. Claude Code
 	// shows a 503 whose Retry-After is over 60 s at once and does not retry
 	// it.
 	strandedRetryAfter   = "3600"
 	strandedGaveUpReason = "stranded_gave_up"
+	// heldChainSlack is how long past a hold's deadline a chain of held
+	// turns lasts with no held attempt (HoldPolicy.chainGap). An attempt can
+	// run until the deadline before it fails, and Claude Code resends the
+	// 502 within seconds, so a longer silence is a chat that stopped.
+	heldChainSlack = 2 * time.Minute
 
 	holdBaseBackoff = time.Second
 	holdMaxBackoff  = 30 * time.Second
@@ -107,7 +114,7 @@ type HoldPolicy struct {
 	Deadline    time.Duration
 	MaxRequests int
 	MaxBytes    int64
-	// GiveUp ends a stranded chat's chain of holds (strandedGiveUpAt). Zero
+	// GiveUp ends a stranded chat's chain of holds (noteStrandedAttempt). Zero
 	// is no limit.
 	GiveUp time.Duration
 
@@ -125,10 +132,26 @@ type HoldPolicy struct {
 	// answeredAt is when each session's last model turn was answered in this
 	// process, exact where the session store's AnsweredAt is coalesced.
 	answeredAt map[string]time.Time
+	// chains is the chain of held turns of each stranded session the session
+	// store has no assignment for (Server.noteStrandedAttempt). One with an
+	// assignment keeps its chain there, so the next process carries it on;
+	// one without starts over in a new process.
+	chains map[string]session.HeldChain
+	// placing is each chat a turn is placing as a refugee right now
+	// (Server.placeRefugee), with the box and account its cache was on.
+	placing map[string]strandedHome
+	// waiting is the wait for room of each chat that gave up on its box
+	// (Server.unlinkStranded) when the session store could not save it. A
+	// restart starts it over.
+	waiting map[string]session.Waiting
 }
 
+// strandedHome is the box and account a stranded chat's cache is on.
+type strandedHome struct{ peer, account string }
+
 // strandedRun is a session's run of failed attempts, by scoped session key:
-// from its first failure until one of its model turns is answered. Claude
+// from its first failure until one of its model turns is answered or it gives
+// up (forget). Claude
 // Code sends a request the hold answered again, so the run belongs to the
 // session, not to a request.
 type strandedRun struct {
@@ -138,9 +161,6 @@ type strandedRun struct {
 	// once, because every attempt stamps the session as seen: a new session's
 	// second attempt would read as warm.
 	warmHere bool
-	// since is the run's first held turn of a stranded chat: the give-up's
-	// clock for a session with no answered turn on record. Zero until then.
-	since time.Time
 }
 
 // NewHoldPolicy returns the policy serve runs with, or nil (holding off) for
@@ -272,32 +292,51 @@ func (p *HoldPolicy) placedHere(sessionKey string) {
 	p.runs[sessionKey] = run
 }
 
-// strandedGiveUpAt is when the stranded session's chain of holds ends:
-// GiveUp after its last answered turn, the later of this process's record and
-// persisted (another process's), or, with neither, after its first held turn
-// since, which is now when this is that turn. Zero is no limit.
-func (p *HoldPolicy) strandedGiveUpAt(sessionKey string, now, persisted time.Time) time.Time {
-	if p.GiveUp <= 0 {
-		return time.Time{}
-	}
+// lastAnswered is when the session's last model turn was answered: the
+// later of this process's record and persisted (another process's).
+func (p *HoldPolicy) lastAnswered(sessionKey string, persisted time.Time) time.Time {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	run := p.runLocked(sessionKey, now, false)
-	if run.since.IsZero() {
-		run.since = now
-		p.runs[sessionKey] = run
-	}
-	start := run.since
 	if answered := p.answeredAt[sessionKey]; answered.After(persisted) {
-		persisted = answered
+		return answered
 	}
-	if !persisted.IsZero() {
-		start = persisted
-	}
-	return start.Add(p.GiveUp)
+	return persisted
 }
 
-// answered ends the session's run: one of its model turns was answered at at.
+// chainGap is how long a chain of held turns lasts with no held attempt.
+func (p *HoldPolicy) chainGap() time.Duration {
+	return p.Deadline + heldChainSlack
+}
+
+// heldAttempt records a held attempt at now of the chain this process keeps
+// for the session, and returns it.
+func (p *HoldPolicy) heldAttempt(sessionKey string, now time.Time) session.HeldChain {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.chains) > lastSeenSweepThreshold {
+		for key, chain := range p.chains {
+			if now.Sub(chain.Last) >= p.chainGap() {
+				delete(p.chains, key)
+			}
+		}
+	}
+	if p.chains == nil {
+		p.chains = map[string]session.HeldChain{}
+	}
+	chain := p.chains[sessionKey].HeldAt(now, p.chainGap())
+	p.chains[sessionKey] = chain
+	return chain
+}
+
+// endChain ends the chain this process keeps for the session.
+func (p *HoldPolicy) endChain(sessionKey string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	delete(p.chains, sessionKey)
+}
+
+// answered ends the session's run, its chain and its wait: one of its model
+// turns was answered at at.
 func (p *HoldPolicy) answered(sessionKey string, at time.Time) {
 	if p == nil {
 		return
@@ -305,6 +344,8 @@ func (p *HoldPolicy) answered(sessionKey string, at time.Time) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	delete(p.runs, sessionKey)
+	delete(p.chains, sessionKey)
+	delete(p.waiting, sessionKey)
 	if len(p.answeredAt) > lastSeenSweepThreshold {
 		for key, answered := range p.answeredAt {
 			if at.Sub(answered) > lastSeenRetention {
@@ -318,6 +359,81 @@ func (p *HoldPolicy) answered(sessionKey string, at time.Time) {
 	p.answeredAt[sessionKey] = at
 }
 
+// beginPlacing records that a turn is placing the session as a refugee from
+// home, and reports false when another turn is placing it already. With
+// holding off every turn places, as no turn can wait for another.
+func (p *HoldPolicy) beginPlacing(sessionKey string, home strandedHome) bool {
+	if !p.enabled() {
+		return true
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if _, placing := p.placing[sessionKey]; placing {
+		return false
+	}
+	if p.placing == nil {
+		p.placing = map[string]strandedHome{}
+	}
+	p.placing[sessionKey] = home
+	return true
+}
+
+// endPlacing records that the turn placing the session is done.
+func (p *HoldPolicy) endPlacing(sessionKey string) {
+	if !p.enabled() {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	delete(p.placing, sessionKey)
+}
+
+// placingFrom reports whether a turn is placing the session as a refugee,
+// and from which home.
+func (p *HoldPolicy) placingFrom(sessionKey string) (strandedHome, bool) {
+	if !p.enabled() {
+		return strandedHome{}, false
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	home, placing := p.placing[sessionKey]
+	return home, placing
+}
+
+// wait keeps the session's wait for room, which the session store could not.
+func (p *HoldPolicy) wait(sessionKey string, home session.Waiting) {
+	if !p.enabled() {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.waiting == nil {
+		p.waiting = map[string]session.Waiting{}
+	}
+	p.waiting[sessionKey] = home
+}
+
+// waitingFor is the session's wait for room this process keeps.
+func (p *HoldPolicy) waitingFor(sessionKey string) (session.Waiting, bool) {
+	if !p.enabled() {
+		return session.Waiting{}, false
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	home, ok := p.waiting[sessionKey]
+	return home, ok
+}
+
+// endWait ends the session's wait for room this process keeps.
+func (p *HoldPolicy) endWait(sessionKey string) {
+	if !p.enabled() {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	delete(p.waiting, sessionKey)
+}
+
 // forget drops what the policy knows of a session that gave up: its next
 // turn starts as a new session's.
 func (p *HoldPolicy) forget(sessionKey string) {
@@ -325,15 +441,40 @@ func (p *HoldPolicy) forget(sessionKey string) {
 	defer p.mu.Unlock()
 	delete(p.runs, sessionKey)
 	delete(p.answeredAt, sessionKey)
+	delete(p.chains, sessionKey)
+	delete(p.waiting, sessionKey)
 }
 
 // holdStranded marks the attempt as a stranded chat's (PATCHES §67) and
-// answers it 502: the hold runs it again on the same account, and a client
-// the hold does not carry retries it.
-func holdStranded(w http.ResponseWriter, r *http.Request, agentType, sessionID, account, reason, message string) {
+// answers it 502: the hold runs it again, and a client the hold does not
+// carry retries it. peer is the box the account is on, "" for a local one.
+func holdStranded(w http.ResponseWriter, r *http.Request, wait strandedWait, agentType, sessionID, peer, account, reason, message string) {
 	noteHoldable(r.Context(), holdMark{status: http.StatusBadGateway, reason: reason,
-		agent: agentType, session: sessionID, account: account, stranded: true})
+		agent: agentType, session: sessionID, peer: peer, account: account, stranded: wait})
 	http.Error(w, message, http.StatusBadGateway)
+}
+
+// strandedWait is what a stranded chat's chain of holds waits for. It sets
+// the give-up's clock (Server.noteStrandedAttempt) and what the give-up says.
+type strandedWait int
+
+const (
+	notStranded strandedWait = iota
+	// waitsForItsCache: the account its prompt cache is on (a box that
+	// cannot be reached, its local upstream), or a refugee slot. It gives up
+	// an hour after its last answered turn, when that cache is cold.
+	waitsForItsCache
+	// waitsForABox: no account here can serve it and no box could be asked
+	// (a spent pool). Its own account is spent, so no cache is at stake, and
+	// it gives up an hour after its first held turn.
+	waitsForABox
+)
+
+func (wait strandedWait) gaveUpMessage() string {
+	if wait == waitsForABox {
+		return "subrouter: no account here could serve this chat, and no box could be reached for over an hour"
+	}
+	return "subrouter: the account this chat's prompt cache is on could not be reached for over an hour; its cache is cold"
 }
 
 // holdMark is what the code that saw a transient failure says about it.
@@ -344,11 +485,12 @@ type holdMark struct {
 	reason  string
 	agent   string
 	session string
+	// peer is the box a stranded chat's account is on, "" for this daemon's
+	// own: a chat whose box it gave up on waits for room (unlinkStranded).
+	peer    string
 	account string
-	// stranded: a chat waiting for the account its prompt cache is on, or
-	// for a refugee slot. Its chain of holds gives up (strandedGiveUpAt).
-	stranded  bool
-	giveUp502 bool
+	// stranded: a chat's wait whose chain of holds gives up, or notStranded.
+	stranded strandedWait
 }
 
 // holdAttempt rides one attempt's request context. The handler's failure
@@ -373,9 +515,10 @@ func heldByAHold(r *http.Request) bool {
 	return ok && attempt != nil
 }
 
-// holdRetry reports an attempt the hold makes after the request's first: a
-// drain turns away new requests, not this one, which the attempt's failure
-// then ends with the answer the hold kept (PATCHES §67).
+// holdRetry reports an attempt the hold makes after the request's first. The
+// hold admitted it against a quiesce (holdOnTransientFailure), and a drain
+// turns away new requests, not this one, which the attempt's failure then
+// ends with the answer the hold kept (PATCHES §67).
 func holdRetry(r *http.Request) bool {
 	attempt, ok := r.Context().Value(holdAttemptKey{}).(*holdAttempt)
 	return ok && attempt != nil && attempt.retry
@@ -661,12 +804,14 @@ func holdAttemptRequest(r *http.Request, body []byte, hasBody bool, attempt *hol
 	return req
 }
 
-// runHoldAttempt serves one attempt. A handler that aborts (http.ErrAbortHandler)
-// while its response is still swallowed -- an upstream error body that broke
-// mid-copy -- has written nothing to the client, so the abort is kept for
-// the give-up and the attempt can still be retried. Any other panic, or an
-// abort after the client has bytes, propagates as it always did.
-func runHoldAttempt(next http.Handler, w *holdWriter, r *http.Request) (aborted bool) {
+// runHoldAttempt serves one attempt, and then ends its admission. A handler
+// that aborts (http.ErrAbortHandler) while its response is still swallowed --
+// an upstream error body that broke mid-copy -- has written nothing to the
+// client, so the abort is kept for the give-up and the attempt can still be
+// retried. Any other panic, or an abort after the client has bytes,
+// propagates as it always did.
+func runHoldAttempt(next http.Handler, w *holdWriter, r *http.Request, endAdmission func()) (aborted bool) {
+	defer endAdmission()
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			if recovered == http.ErrAbortHandler && w.state == holdSwallowed {
@@ -729,10 +874,13 @@ func (s Server) holdOnTransientFailure(next http.Handler) http.Handler {
 			}
 		}()
 		mayRun := &mayRunPeers{}
+		// The handler admits the first attempt; the hold admits each retry
+		// before it runs it (below).
+		endAdmission := func() {}
 		for attemptNo := 1; ; attemptNo++ {
 			attempt := &holdAttempt{mayRun: mayRun, retry: attemptNo > 1}
 			hw := newHoldWriter(w, r.Context(), attempt)
-			aborted := runHoldAttempt(next, hw, holdAttemptRequest(r, body, hasBody, attempt))
+			aborted := runHoldAttempt(next, hw, holdAttemptRequest(r, body, hasBody, attempt), endAdmission)
 			if hw.state != holdSwallowed {
 				if hw.state == holdPending {
 					// The handler returned without writing: net/http's
@@ -753,10 +901,7 @@ func (s Server) holdOnTransientFailure(next http.Handler) http.Handler {
 			}
 			last = hw.mark
 			now := policy.clock()
-			var giveUpAt time.Time
-			if last.stranded {
-				giveUpAt = s.strandedGiveUpAt(last.agent, last.session, now)
-			}
+			giveUpAt := s.noteStrandedAttempt(last, now)
 			attemptDeadline := deadline
 			if !giveUpAt.IsZero() && giveUpAt.Before(deadline) {
 				attemptDeadline = giveUpAt
@@ -801,25 +946,33 @@ func (s Server) holdOnTransientFailure(next http.Handler) http.Handler {
 				if remaining := attemptDeadline.Sub(policy.clock()); wait > remaining {
 					wait = remaining
 				}
+				var admitted bool
 				switch {
 				case !sleepForRetry(r.Context(), wait):
 					giveUp = "client_canceled"
-				case s.strandedGaveUp(last, policy.clock()):
-					// Before another attempt: the session goes unlinked at
-					// the same hour, and the attempt would place it cold.
+				case s.noteAttemptAndGaveUp(last, policy.clock()):
+					// Read after the sleep, not from giveUpAt: a turn of the
+					// chat answered during the sleep ends the chain.
 					giveUp = strandedGaveUpReason
 				default:
-					continue
+					// Admitted here, in one step with a quiesce, and not by
+					// the handler's gate: a quiesce admits no attempt after
+					// it, and the hold ends with the answer it kept.
+					if endAdmission, admitted = s.Lifecycle.TryBeginProxyRequest(); admitted {
+						continue
+					}
+					giveUp = "quiesced"
 				}
 			}
+			if giveUp == "client_canceled" {
+				// The client left and does not send the turn again.
+				s.endHeldChain(last)
+			}
 			if giveUp == strandedGaveUpReason {
-				// The chain of holds is over: the client gets a 503 it shows
-				// at once, and the session is unlinked, so its next turn is
-				// placed as a new session (PATCHES §67).
-				s.unlinkStranded(last.agent, last.session)
+				s.unlinkStranded(last)
 				w.Header().Set("Retry-After", strandedRetryAfter)
 				w.Header().Set(subrouterReasonHeader, strandedGaveUpReason)
-				http.Error(w, "subrouter: the account this chat's prompt cache is on could not be reached for over an hour; its cache is cold", http.StatusServiceUnavailable)
+				http.Error(w, last.stranded.gaveUpMessage(), http.StatusServiceUnavailable)
 				s.logStrandedGaveUp(r, last, attemptNo, policy.GiveUp)
 				if release != nil {
 					s.logHoldEnded(r, first, last, giveUp, http.StatusServiceUnavailable, attemptNo, heldSince)
@@ -833,9 +986,6 @@ func (s Server) holdOnTransientFailure(next http.Handler) http.Handler {
 				// is over 60 s at once, and the kept failure can be that 503.
 				status = http.StatusBadGateway
 				http.Error(w, "subrouter is shutting down; retry", status)
-			case last.giveUp502 && giveUp != "client_canceled":
-				status = http.StatusBadGateway
-				http.Error(w, "subrouter could not reach an account in time; retry", status)
 			default:
 				// Give up: the client gets the failure the hold kept -- the same
 				// status, headers and body it would have had without the hold.
@@ -853,8 +1003,9 @@ func (s Server) holdOnTransientFailure(next http.Handler) http.Handler {
 }
 
 // logHoldEnded is the hold's second line: how it ended (answered, deadline,
-// client_canceled, draining), the status the client got, and how long it
-// was held, which is from the first failure, not from the request's arrival.
+// client_canceled, draining, quiesced), the status the client got, and how
+// long it was held, which is from the first failure, not from the request's
+// arrival.
 func (s Server) logHoldEnded(r *http.Request, first, last holdMark, outcome string, status, attempts int, heldSince time.Time) {
 	if s.Logger == nil {
 		return
@@ -879,14 +1030,20 @@ func (s Server) logStrandedGaveUp(r *http.Request, last holdMark, attempts int, 
 }
 
 // noteAnswered records that one of the session's model turns was answered:
-// a turn whose 2xx the client gets from an account's upstream, which is the
-// stranded give-up's clock (PATCHES §67). With no give-up nothing reads it.
+// a turn whose 2xx, or whose websocket response.completed, the client gets
+// from an account's upstream, which is the stranded give-up's clock (PATCHES
+// §67), and which ends the session's chain of held turns. With no give-up
+// nothing reads it. The time is on the wall clock (noteStrandedAttempt).
 func (s Server) noteAnswered(agentType, sessionID string) {
 	if !s.Hold.enabled() || s.Hold.GiveUp <= 0 {
 		return
 	}
-	at := s.Hold.clock()
-	s.Hold.answered(session.ScopedSessionKey(agentType, sessionID), at)
+	at := s.Hold.clock().Round(0)
+	key := session.ScopedSessionKey(agentType, sessionID)
+	s.Hold.answered(key, at)
+	for _, peer := range s.peers() {
+		peer.delegations.answered(key, at)
+	}
 	if s.Sessions == nil {
 		return
 	}
@@ -896,40 +1053,106 @@ func (s Server) noteAnswered(agentType, sessionID string) {
 	}
 }
 
-// strandedGiveUpAt is HoldPolicy.strandedGiveUpAt with the answered time the
-// session store keeps for the session.
-func (s Server) strandedGiveUpAt(agentType, sessionID string, now time.Time) time.Time {
-	var persisted time.Time
+// noteStrandedAttempt records a held attempt at now of the stranded chat the
+// mark names, in its chain of held turns (session.HeldChain), and returns
+// when that chain gives up. A wait for a box counts from the chain's first
+// held turn. A wait for its cache counts from the latest answered time kept
+// for the session: this process's, its local assignment's or its box
+// hold's; with none, from the chain's first held turn. Zero is no limit, and
+// so is an attempt that is not a stranded chat's.
+//
+// The session store keeps the chain of a session it has an assignment for,
+// so the next worker carries it on; this process keeps any other's, and one
+// the store could not save, which a restart starts over. The chain is on the
+// wall clock, as a box hold's lapse is (holdUntil): a laptop sleep stops the
+// monotonic clock on darwin, and the give-up must still come before the
+// lapse.
+func (s Server) noteStrandedAttempt(mark holdMark, now time.Time) time.Time {
+	if mark.stranded == notStranded || s.Hold.GiveUp <= 0 {
+		return time.Time{}
+	}
+	key := session.ScopedSessionKey(mark.agent, mark.session)
+	var chain session.HeldChain
+	var answered time.Time
+	stored := false
 	if s.Sessions != nil {
-		if assignment, ok := s.Sessions.Get(agentType, sessionID); ok {
-			persisted = assignment.AnsweredAt
+		assignment, ok, err := s.Sessions.NoteHeld(mark.agent, mark.session, now, s.Hold.chainGap())
+		if err != nil && s.Logger != nil {
+			s.Logger.Warn("stranded chat's chain of held turns not saved; this process keeps it, and a new process starts it over",
+				"agent", mark.agent, "session", mark.session, "error", err)
+		}
+		// A chain the store could not save is gone at the next attempt's
+		// reload, so this process keeps it.
+		chain, answered, stored = assignment.Held, assignment.AnsweredAt, ok && err == nil
+	}
+	if !stored {
+		chain = s.Hold.heldAttempt(key, now)
+	}
+	if mark.stranded == waitsForABox {
+		return chain.Since.Add(s.Hold.GiveUp)
+	}
+	for _, peer := range s.peers() {
+		if hold, ok := peer.delegations.lookup(key, time.Now()); ok && hold.AnsweredAt.After(answered) {
+			answered = hold.AnsweredAt
 		}
 	}
-	return s.Hold.strandedGiveUpAt(session.ScopedSessionKey(agentType, sessionID), now, persisted)
+	if answered = s.Hold.lastAnswered(key, answered); !answered.IsZero() {
+		return answered.Add(s.Hold.GiveUp)
+	}
+	return chain.Since.Add(s.Hold.GiveUp)
 }
 
-// strandedGaveUp reports a stranded attempt whose chain of holds is over.
-func (s Server) strandedGaveUp(mark holdMark, now time.Time) bool {
-	if !mark.stranded {
-		return false
-	}
-	giveUpAt := s.strandedGiveUpAt(mark.agent, mark.session, now)
+// noteAttemptAndGaveUp records a held attempt at now of the stranded chat the mark
+// names (noteStrandedAttempt) and reports whether its chain has given up.
+func (s Server) noteAttemptAndGaveUp(mark holdMark, now time.Time) bool {
+	giveUpAt := s.noteStrandedAttempt(mark, now)
 	return !giveUpAt.IsZero() && !now.Before(giveUpAt)
 }
 
-// unlinkStranded unlinks a session that gave up, as an hour idle does: no
-// peer hold and no local assignment, a refugee's slot freed with them. Its
-// held attempts kept it seen, so nothing else would.
-func (s Server) unlinkStranded(agentType, sessionID string) {
-	key := session.ScopedSessionKey(agentType, sessionID)
+// endHeldChain ends the chain of held turns of the stranded chat the mark
+// names: a hold of it ended with an answer the client does not retry.
+func (s Server) endHeldChain(mark holdMark) {
+	if mark.stranded == notStranded || s.Hold.GiveUp <= 0 {
+		return
+	}
+	s.Hold.endChain(session.ScopedSessionKey(mark.agent, mark.session))
+	if s.Sessions == nil {
+		return
+	}
+	if err := s.Sessions.EndHeld(mark.agent, mark.session); err != nil && s.Logger != nil {
+		s.Logger.Warn("stranded chat's chain of held turns not ended; its next held turn carries it on",
+			"agent", mark.agent, "session", mark.session, "error", err)
+	}
+}
+
+// unlinkStranded drops what a session that gave up holds: its peer holds,
+// and with them a refugee's slot. Its held attempts kept it seen, so it would
+// not go cold on its own. A chat whose cache was on a box keeps its
+// assignment, marked waiting for room with that box and account as its home
+// (resumeWaitingRefugee); when the store cannot save that, this process
+// keeps it. Any other is unlinked from its local account: its next turn is
+// placed as a new session.
+func (s Server) unlinkStranded(mark holdMark) {
+	key := session.ScopedSessionKey(mark.agent, mark.session)
 	s.clearHoldElsewhere(key, nil)
 	s.Hold.forget(key)
 	if s.Sessions == nil {
 		return
 	}
-	if _, err := s.Sessions.Delete(agentType, sessionID); err != nil && s.Logger != nil {
+	if mark.peer != "" {
+		home := session.Waiting{Peer: mark.peer, Account: mark.account, Since: s.Hold.clock()}
+		if err := s.Sessions.Wait(mark.agent, mark.session, home); err != nil {
+			s.Hold.wait(key, home)
+			if s.Logger != nil {
+				s.Logger.Warn("stranded session's wait for room not saved; this process keeps it, and a new process places its next turn as a new session",
+					"agent", mark.agent, "session", mark.session, "error", err)
+			}
+		}
+		return
+	}
+	if _, err := s.Sessions.Delete(mark.agent, mark.session); err != nil && s.Logger != nil {
 		s.Logger.Warn("stranded session not unlinked from its account; its next turn keeps it",
-			"agent", agentType, "session", sessionID, "error", err)
+			"agent", mark.agent, "session", mark.session, "error", err)
 	}
 }
 

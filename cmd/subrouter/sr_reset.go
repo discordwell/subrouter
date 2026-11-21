@@ -545,9 +545,8 @@ func (r srRunner) pickSmartResetCandidateRemote(ctx context.Context, server srSe
 		return "", err
 	}
 	rows := usageRowsFromServerUsageStatuses(statuses)
-	// Rows come back in display order. The candidate sort below compares
-	// weekly waits alone, so input order settles a tie. Re-rank first so a
-	// tie does not turn on account names.
+	// Rows come back in display order. Re-rank first so a tie in weekly wait
+	// goes to the ranking, not to account names.
 	sortUsageRowsWithinHeadings(rows, usageRowRankLess)
 	type cand struct {
 		email      string
@@ -573,7 +572,7 @@ func (r srRunner) pickSmartResetCandidateRemote(ctx context.Context, server srSe
 	if len(candidates) == 0 {
 		return "", nil
 	}
-	sort.Slice(candidates, func(i, j int) bool {
+	sort.SliceStable(candidates, func(i, j int) bool {
 		return candidates[i].resetAfter > candidates[j].resetAfter
 	})
 	return candidates[0].email, nil

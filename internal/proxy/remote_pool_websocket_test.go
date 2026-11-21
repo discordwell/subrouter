@@ -636,7 +636,7 @@ func TestALocalWebSocketUpgradeNamesItsAccount(t *testing.T) {
 // answered 502 (PATCHES §67): Codex 0.170.0 retries a 502 upgrade for about
 // 7 s and then falls back to HTTPS, whose turns the hold carries. The turn is
 // never moved to the other box or served locally, where it would land with no
-// refugee mark and no slot before its box is found down (R1, D1), or come
+// refugee mark and no slot before its box is found down (D1), or come
 // back to the box on its next turn (D4).
 func TestAStrandedCodexWebSocketTurnIsAnswered502UntilItsBoxIsFoundDown(t *testing.T) {
 	for _, tc := range []struct {

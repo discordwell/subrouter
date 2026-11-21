@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/manaflow-ai/subrouter/selectacct"
 )
 
 const (
@@ -216,7 +217,8 @@ type admissionControl struct {
 	buckets  map[admissionKey]*admissionBucket
 	sessions map[admissionSessionKey]*admissionSession
 	// logger takes limit changes; unset is slog.Default().
-	logger atomic.Pointer[slog.Logger]
+	logger       atomic.Pointer[slog.Logger]
+	backpressure map[string]time.Time
 }
 
 type admissionLease struct {
@@ -751,6 +753,7 @@ func (a *admissionControl) observe(key admissionKey, status int, header http.Hea
 			if until.IsZero() {
 				until = now.Add(claudeTransientThrottleFallback)
 			}
+			a.noteBackpressure(key, now)
 		}
 	}
 	if until.IsZero() {
@@ -915,4 +918,70 @@ func admissionKeyFor(provider accounts.Provider, accountID, model string) admiss
 		model = "default"
 	}
 	return admissionKey{provider: provider, account: accountID, model: model}
+}
+
+// noteBackpressure records a non-quota 429 on the account for the paced
+// allowance (PATCHES §72). A wait at this gate is not one: the gate tunes its
+// own limit (§70), and a closed queue is the hard stop for a backlog.
+func (a *admissionControl) noteBackpressure(key admissionKey, at time.Time) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	scoreKey := selectacct.ScoreKey(schedulerAccountProvider(key.provider), key.account)
+	if !at.After(a.backpressure[scoreKey]) {
+		return
+	}
+	if a.backpressure == nil {
+		a.backpressure = make(map[string]time.Time)
+	}
+	a.backpressure[scoreKey] = at
+}
+
+func (a *admissionControl) backpressureTimes() map[string]time.Time {
+	if a == nil {
+		return nil
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	out := make(map[string]time.Time, len(a.backpressure))
+	for key, at := range a.backpressure {
+		out[key] = at
+	}
+	return out
+}
+
+// admittedSessionCounts is, per account keyed by ScoreKey, the sessions with
+// at least one admitted request in flight. A request waiting in the queue
+// burns nothing, so it is not live.
+func (a *admissionControl) admittedSessionCounts() map[string]int {
+	if a == nil {
+		return nil
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	counts := map[string]int{}
+	for who, entry := range a.sessions {
+		if entry.active > 0 && entry.account != "" {
+			counts[selectacct.ScoreKey(providerForStoredSession(who.agent), entry.account)]++
+		}
+	}
+	return counts
+}
+
+func (a *admissionControl) closedAccounts() map[string]bool {
+	if a == nil {
+		return nil
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	var out map[string]bool
+	for key, bucket := range a.buckets {
+		if key.account == "" || !a.closedLocked(bucket) {
+			continue
+		}
+		if out == nil {
+			out = map[string]bool{}
+		}
+		out[selectacct.ScoreKey(schedulerAccountProvider(key.provider), key.account)] = true
+	}
+	return out
 }

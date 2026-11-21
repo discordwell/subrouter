@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/proxy"
 )
@@ -22,6 +23,16 @@ func captureStdout(t *testing.T, fn func() error) (string, error) {
 	if err != nil {
 		t.Fatalf("pipe: %v", err)
 	}
+	// The pipe is read while fn prints: fn blocks once the pipe is full.
+	type capture struct {
+		out []byte
+		err error
+	}
+	captured := make(chan capture, 1)
+	go func() {
+		out, err := io.ReadAll(read)
+		captured <- capture{out, err}
+	}()
 	saved := os.Stdout
 	os.Stdout = write
 	runErr := fn()
@@ -29,11 +40,40 @@ func captureStdout(t *testing.T, fn func() error) (string, error) {
 	if err := write.Close(); err != nil {
 		t.Fatalf("close write end: %v", err)
 	}
-	out, err := io.ReadAll(read)
-	if err != nil {
-		t.Fatalf("read captured output: %v", err)
+	got := <-captured
+	if got.err != nil {
+		t.Fatalf("read captured output: %v", got.err)
 	}
-	return string(out), runErr
+	return string(got.out), runErr
+}
+
+// A command can print more than a pipe holds: at most 64 KiB on Linux and
+// macOS, and 8 KiB on Linux once a user's pipes pass fs.pipe-user-pages-soft,
+// as they do in the Docker test harness on a busy machine. `sr plot`'s
+// page is about 26 KiB, and with nothing reading the pipe it blocked on the
+// full pipe until the test binary timed out.
+func TestCaptureStdoutTakesMoreThanAPipeHolds(t *testing.T) {
+	page := strings.Repeat("burn pace row\n", 1<<16)
+	stdout := os.Stdout
+	captured := make(chan string, 1)
+	go func() {
+		out, _ := captureStdout(t, func() error {
+			_, err := io.WriteString(os.Stdout, page)
+			return err
+		})
+		captured <- out
+	}()
+	select {
+	case out := <-captured:
+		if out != page {
+			t.Fatalf("captured %d bytes, want the %d printed", len(out), len(page))
+		}
+	case <-time.After(30 * time.Second):
+		// The print is still blocked on the full pipe, so the test binary's
+		// own report goes to the real stdout instead.
+		os.Stdout = stdout
+		t.Fatalf("a %d-byte print did not finish in 30 s: captureStdout reads nothing until the command returns", len(page))
+	}
 }
 
 // The pin an operator pastes into a peer must be the pin the daemon actually

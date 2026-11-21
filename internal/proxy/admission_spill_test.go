@@ -193,12 +193,12 @@ func TestAdmissionSpillReservesItsTargetSoConcurrentSpillsSpread(t *testing.T) {
 	transport := usageLimitRetryTransport{server: &server, provider: accounts.ProviderClaude, poolModel: "claude-opus"}
 	transport.attempt = &upstreamAttempt{server: &server, provider: accounts.ProviderClaude, poolModel: "claude-opus",
 		getBody: func() (io.ReadCloser, error) { return io.NopCloser(strings.NewReader("{}")), nil }}
-	first, firstLease, ok := transport.admissionSpill(context.Background(), "a@example.com", map[string]struct{}{})
+	first, firstLease, ok := transport.admissionSpill(context.Background(), "a@example.com", map[string]struct{}{}, false)
 	if !ok {
 		t.Fatal("first spill found no account")
 	}
 	defer firstLease.release()
-	second, secondLease, ok := transport.admissionSpill(context.Background(), "a@example.com", map[string]struct{}{})
+	second, secondLease, ok := transport.admissionSpill(context.Background(), "a@example.com", map[string]struct{}{}, false)
 	if !ok {
 		t.Fatalf("second spill found no account; the first took %s", first.ID)
 	}

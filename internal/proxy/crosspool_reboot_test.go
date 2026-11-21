@@ -75,7 +75,7 @@ func e2eWriteHolds(t *testing.T, path, peer string, holds map[string]string, tar
 // e2eRestartedLaptop is a laptop process that has just started: the holds come
 // off disk exactly as PersistHolds loads them (without its 15 s flush ticker,
 // which the tests run by hand), it has no peer usage body yet, and every
-// session it has not seen reads warm on its local pin (uptime under 70 min).
+// session it has not seen reads warm on its local pin (uptime under an hour).
 func e2eRestartedLaptop(t *testing.T, box *e2eBox, local map[string]string, holdsPath string, pins map[string]string) (*e2eLaptop, *RemotePool) {
 	t.Helper()
 	pool := box.newPool()
@@ -421,7 +421,7 @@ func TestE2EAfterTheRebootABoxThatStaysDownIsStillFoundDown(t *testing.T) {
 	if onDisk := heldOnDisk(t, holdsPath); len(onDisk) != len(e2eRebootHolds())-1 {
 		t.Fatalf("peer-holds.json lists %v after the box was found down; want the holds it kept", onDisk)
 	}
-	placed := e2eLogLines(laptop.logs, refugeePlacedMessage)
+	placed := awaitLogLines(t, laptop.logs, refugeePlacedMessage, 1)
 	if len(placed) != 1 || placed[0]["session"] != rebootSixE {
 		t.Fatalf("placement lines %v, want 46ee's turn placed as a refugee", placed)
 	}

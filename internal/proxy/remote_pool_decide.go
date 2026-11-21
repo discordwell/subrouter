@@ -65,7 +65,7 @@ type remotePoolTargetKey struct{ Peer, Account string }
 
 // newRemotePoolTurn starts one attempt's cross-pool state. The peers that may
 // be running the request carry over from its earlier hold attempts (PATCHES
-// §58).
+// §67).
 func newRemotePoolTurn(ctx context.Context) *remotePoolTurn {
 	return &remotePoolTurn{failed: map[remotePoolTargetKey]string{}, downPeers: map[string]bool{}, unsentPeers: map[string]bool{},
 		mayRun: holdMayRun(ctx)}
@@ -139,6 +139,14 @@ func (t *remotePoolTurn) peerUsable(s Server, p *RemotePool, r *http.Request) bo
 		t.mu.Unlock()
 	}
 	return false
+}
+
+// unreached reports a peer this turn could not ask: its request never left
+// (an open breaker, a failed dial), or it may be running it.
+func (t *remotePoolTurn) unreached(peer string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.unsentPeers[peer] || t.mayRun.has(peer)
 }
 
 func (t *remotePoolTurn) peerDown(peer string) bool {
@@ -278,26 +286,7 @@ func placeAcrossPools(scheduler selectacct.Scheduler, local []accounts.Account, 
 		}
 		return crossPoolPlacement{Local: true, Account: account, HasLocal: true}, nil
 	}
-	// The peers compete in the request's scheduler provider, so their scores
-	// and their placeholder accounts share one ScoreKey space with the local
-	// candidates. (The old two-candidate decider's lesson: a score filed under
-	// one provider and looked up under another reads as the optimistic default.)
-	provider := accounts.Provider("")
-	if len(local) > 0 {
-		provider = accountProviderFor(local[0].Provider)
-	}
-	merged := scheduler
-	candidates := SchedulerAccounts(local)
-	byID := make(map[string]int, len(peers))
-	for i, peer := range peers {
-		id := crossPoolCandidateID(peer.Peer.name(), peer.Account)
-		score := peer.Score
-		score.AccountID, score.Provider, score.Remote = id, provider, true
-		merged = merged.WithScore(score)
-		candidates = append(candidates, accounts.Account{ID: id, Provider: provider, AuthMode: accounts.AuthModeOAuth})
-		byID[id] = i
-	}
-	ranked, err := merged.Explain(candidates)
+	ranked, byID, err := explainAcrossPools(scheduler, local, peers)
 	if err != nil || len(ranked) == 0 {
 		return crossPoolPlacement{}, err
 	}
@@ -331,6 +320,31 @@ func placeAcrossPools(scheduler selectacct.Scheduler, local []accounts.Account, 
 		out.Local = true
 	}
 	return out, nil
+}
+
+// explainAcrossPools ranks local and peer candidates in one list, best first.
+// byID maps each peer candidate's ranked ID to its index in peers.
+func explainAcrossPools(scheduler selectacct.Scheduler, local []accounts.Account, peers []crossPoolCandidate) (ranked []selectacct.Explanation, byID map[string]int, err error) {
+	// The peers compete in the request's scheduler provider, so their scores
+	// and their placeholder accounts share one ScoreKey space with the local
+	// candidates.
+	provider := accounts.Provider("")
+	if len(local) > 0 {
+		provider = accountProviderFor(local[0].Provider)
+	}
+	merged := scheduler
+	candidates := SchedulerAccounts(local)
+	byID = make(map[string]int, len(peers))
+	for i, peer := range peers {
+		id := crossPoolCandidateID(peer.Peer.name(), peer.Account)
+		score := peer.Score
+		score.AccountID, score.Provider, score.Remote = id, provider, true
+		merged = merged.WithScore(score)
+		candidates = append(candidates, accounts.Account{ID: id, Provider: provider, AuthMode: accounts.AuthModeOAuth})
+		byID[id] = i
+	}
+	ranked, err = merged.Explain(candidates)
+	return ranked, byID, err
 }
 
 // matchPickedAccount maps the scheduler's winner back to the full local
@@ -564,6 +578,23 @@ func (c *crossPoolRanking) rankPeersOnly() (crossPoolPlacement, error) {
 	return c.rank(selectacct.NewScheduler(nil), nil, "")
 }
 
+// rankedPeers is every peer candidate left in this turn, best first.
+func (c *crossPoolRanking) rankedPeers() []crossPoolCandidate {
+	peers, _, _ := c.peerCandidates()
+	if len(peers) == 0 {
+		return nil
+	}
+	ranked, byID, err := explainAcrossPools(selectacct.NewScheduler(nil), nil, peers)
+	if err != nil {
+		return nil
+	}
+	out := make([]crossPoolCandidate, 0, len(ranked))
+	for _, entry := range ranked {
+		out = append(out, peers[byID[entry.Account.ID]])
+	}
+	return out
+}
+
 // placeForSession is where selection ranks. ranking nil is this daemon's own
 // pool alone.
 //
@@ -579,6 +610,12 @@ func (s Server) placeForSession(scheduler selectacct.Scheduler, local []accounts
 		return placeAcrossPools(scheduler, local, nil)
 	}
 	return ranking.rank(scheduler, local, state)
+}
+
+// verdictsCurrent reports a usage body read at at that is young enough for
+// its verdicts to rank at now; a body with no time is read as of now.
+func verdictsCurrent(at, now time.Time) bool {
+	return at.IsZero() || now.Sub(at) <= remotePoolDecisionBodyMaxAge
 }
 
 // remotePoolDecisionBodyMaxAge is how old a verdict body may be and still
@@ -632,12 +669,12 @@ func (p *RemotePool) decisionCandidates(snapshot AdminSnapshot, provider, poolMo
 	// in every ranking, hours after its week rolled. Past
 	// remotePoolDecisionBodyMaxAge (the peer's own last-good horizon) the
 	// body ranks nothing: this peer is unmeasured, as if it had not answered.
+	if !verdictsCurrent(snapshot.At, now) {
+		return nil, 0, false
+	}
 	bodyAt := snapshot.At
 	if bodyAt.IsZero() {
 		bodyAt = now
-	}
-	if now.Sub(bodyAt) > remotePoolDecisionBodyMaxAge {
-		return nil, 0, false
 	}
 	poolKey := selectacct.ModelKey(poolModel)
 	var out []crossPoolCandidate
@@ -1208,8 +1245,11 @@ func (s Server) transportStageAcrossPools(r *http.Request, ranking *crossPoolRan
 // (PATCHES §20). A TRANSIENT failure keeps the hold. A model turn the peer
 // cannot take -- the breaker is open, the dial failed, or the peer may be
 // running it already -- waits for its account until the peer is found down,
-// and is then placed as a refugee (strandedOnPeer, PATCHES §67); one the peer
+// and is then placed as a refugee, or the chat gives up (noteStrandedAttempt)
+// (strandedOnPeer, PATCHES §67); one the peer
 // answered but could not serve is served locally this once (turn.stayLocal).
+// A model turn of a chat another turn is placing as a refugee, with no hold
+// or only that placement's pending claim, waits for it (waitForPlacement).
 //
 // A hold with no account (set by a peer too old to name it) or on a peer that
 // publishes no verdicts is forwarded untargeted, exactly as before. With no
@@ -1222,12 +1262,16 @@ func (s Server) transportStageAcrossPools(r *http.Request, ranking *crossPoolRan
 func (s Server) serveHeldTurn(w http.ResponseWriter, r *http.Request, provider accounts.Provider, poolModel, agentType, sessionID string, mode remotePoolHoldMode, turn *remotePoolTurn) bool {
 	key := session.ScopedSessionKey(agentType, sessionID)
 	p, hold, ok := s.peerHold(key)
+	if from, placing := s.Hold.placingFrom(key); placing && mode == remotePoolHoldSet && (!ok || hold.claim != 0) {
+		waitForPlacement(w, r, agentType, sessionID, from)
+		return true
+	}
 	if !ok {
 		return false
 	}
 	if !s.peerForwardingAllowed(r) || !s.peerOpenTo(p, r) {
 		// Not this caller's to spend: this turn is served locally and the hold
-		// is left as it is, as before.
+		// is left as it is.
 		return false
 	}
 	if turn.mayRun.has(p.name()) {
@@ -1333,11 +1377,13 @@ func (s Server) serveHeldTurn(w http.ResponseWriter, r *http.Request, provider a
 // session the peer served is a stranded chat (PATCHES §67): it is held, and
 // the hold (PATCHES §58) runs it again there instead of moving it to a cold
 // cache, across the client's retries, until the peer answers or is found
-// down. Then it is a refugee (placeRefugee). A Codex websocket upgrade is
+// down, or the chat gives up (noteStrandedAttempt). Found down, it is a refugee
+// (placeRefugee). A Codex websocket upgrade is
 // never held, but its HTTP fallback is: Codex 0.170.0 retries a 502 upgrade
 // for about 7 s, then falls back to HTTPS (measured), so it is answered 502.
 // A side request, a session the peer has only been claimed for, or a turn no
-// hold carries (holding off) moves as before: ranked across every pool, or,
+// hold carries (holding off, or a request the hold cannot carry) moves:
+// ranked across every pool, or,
 // with keepLocal, served locally this once with the hold kept. It reports
 // whether it answered.
 func (s Server) strandedOnPeer(w http.ResponseWriter, r *http.Request, provider accounts.Provider, poolModel string, p *RemotePool, hold remotePoolDelegation, mode remotePoolHoldMode, agentType, sessionID, why string, turn *remotePoolTurn, keepLocal bool) bool {
@@ -1354,7 +1400,7 @@ func (s Server) strandedOnPeer(w http.ResponseWriter, r *http.Request, provider 
 		}
 		return false
 	}
-	holdStranded(w, r, agentType, sessionID, hold.Account, "warm_wait:"+why, "peer "+p.name()+" could not be reached")
+	holdStranded(w, r, waitsForItsCache, agentType, sessionID, p.name(), hold.Account, "warm_wait:"+why, "peer "+p.name()+" could not be reached")
 	return true
 }
 

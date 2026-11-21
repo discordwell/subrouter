@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -377,7 +379,7 @@ func TestRemoteKeyMustBePrivateAndNonEmpty(t *testing.T) {
 			if err := os.Chmod(path, testCase.mode); err != nil {
 				t.Fatal(err)
 			}
-			if got := resolveRemoteGate(&bytes.Buffer{}); got != testCase.want {
+			if got := resolveRemoteGate(&bytes.Buffer{}).unlocked; got != testCase.want {
 				t.Fatalf("resolveRemoteGate = %v, want %v", got, testCase.want)
 			}
 		})
@@ -387,7 +389,7 @@ func TestRemoteKeyMustBePrivateAndNonEmpty(t *testing.T) {
 func TestRemoteGateSaysNothingWhenNoKeyExists(t *testing.T) {
 	isolateGate(t)
 	var warn bytes.Buffer
-	if resolveRemoteGate(&warn) {
+	if resolveRemoteGate(&warn).unlocked {
 		t.Fatal("gate opened with no key")
 	}
 	// Naming the file to someone who has never had one is exactly the
@@ -395,4 +397,156 @@ func TestRemoteGateSaysNothingWhenNoKeyExists(t *testing.T) {
 	if warn.Len() != 0 {
 		t.Fatalf("locked machine advertised the key: %q", warn.String())
 	}
+}
+
+// A refused key is said on stderr, and the published verdict keeps why, so a
+// command can say on its own page why it read nothing beyond this machine
+// without working the gate out a second time.
+func TestRemoteGateKeepsWhyAKeyWasRefused(t *testing.T) {
+	const validKey = "0123456789abcdef0123456789abcdef\n"
+	writeKeyFile := func(body string, mode os.FileMode) func(*testing.T, string) {
+		return func(t *testing.T, path string) {
+			if err := os.WriteFile(path, []byte(body), mode); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(path, mode); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	cases := []struct {
+		name  string
+		plant func(*testing.T, string)
+		kind  remoteKeyRefusalKind
+		perm  os.FileMode
+		// warning has %[1]s for the key's path and %[2]v for the read error.
+		warning string
+	}{
+		{
+			name: "a directory",
+			plant: func(t *testing.T, path string) {
+				if err := os.Mkdir(path, 0o700); err != nil {
+					t.Fatal(err)
+				}
+			},
+			kind:    keyNotRegularFile,
+			warning: "subrouter: %[1]s is not a regular file; remote stays off\n",
+		},
+		{
+			name:    "mode 0644",
+			plant:   writeKeyFile(validKey, 0o644),
+			kind:    keyModeTooOpen,
+			perm:    0o644,
+			warning: "subrouter: %[1]s is mode 0644; chmod 600 it to enable remote\n",
+		},
+		{
+			name: "unreadable",
+			plant: func(t *testing.T, path string) {
+				// The harness runs as root, where no mode makes a regular file
+				// unreadable. /proc/self/mem is a 0600 regular file whose first
+				// page is unmapped, so reading it from the start fails.
+				if _, err := os.Stat("/proc/self/mem"); err != nil {
+					t.Skip("no /proc/self/mem to stand in for an unreadable key")
+				}
+				if err := os.Symlink("/proc/self/mem", path); err != nil {
+					t.Fatal(err)
+				}
+			},
+			kind:    keyUnreadable,
+			warning: "subrouter: cannot read %[1]s (%[2]v); remote stays off\n",
+		},
+		{
+			name:    "3 bytes",
+			plant:   writeKeyFile("abc\n", 0o600),
+			kind:    keyTooShort,
+			warning: "subrouter: %[1]s is too short to be a key; remote stays off\n",
+		},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			isolateGate(t)
+			path := remoteKeyPath()
+			if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			testCase.plant(t, path)
+
+			var warn bytes.Buffer
+			verdict := resolveRemoteGate(&warn)
+			if verdict.unlocked {
+				t.Fatal("a refused key opened the gate")
+			}
+			refusal := verdict.refusal
+			if refusal == nil {
+				t.Fatalf("the verdict does not say why the key was refused; stderr said %q", warn.String())
+			}
+			if refusal.kind != testCase.kind || refusal.path != path || refusal.perm != testCase.perm {
+				t.Fatalf("refusal = {kind %d, path %q, perm %04o}, want {kind %d, path %q, perm %04o}",
+					refusal.kind, refusal.path, refusal.perm, testCase.kind, path, testCase.perm)
+			}
+			if (refusal.err != nil) != (testCase.kind == keyUnreadable) {
+				t.Fatalf("refusal.err = %v for kind %d", refusal.err, refusal.kind)
+			}
+			want := fmt.Sprintf(testCase.warning, path, refusal.err)
+			if warn.String() != want {
+				t.Fatalf("stderr = %q, want %q", warn.String(), want)
+			}
+			if got := refusal.warning() + "\n"; got != want {
+				t.Fatalf("warning() = %q, want the line the gate printed, %q", got, want)
+			}
+
+			var published remoteGateVerdict
+			printed := captureProcessStderr(t, func() {
+				published = remoteGate()
+				remoteGate()
+			})
+			if published.unlocked || published.refusal == nil || published.refusal.kind != testCase.kind {
+				t.Fatalf("published verdict = %+v, want locked with kind %d", published, testCase.kind)
+			}
+			if printed != want {
+				t.Fatalf("the published gate printed %q to stderr, want %q once", printed, want)
+			}
+		})
+	}
+
+	t.Run("no key", func(t *testing.T) {
+		isolateGate(t)
+		var warn bytes.Buffer
+		if verdict := resolveRemoteGate(&warn); verdict.unlocked || verdict.refusal != nil || warn.Len() != 0 {
+			t.Fatalf("verdict = %+v, stderr = %q; want locked, no refusal, nothing printed", verdict, warn.String())
+		}
+	})
+	t.Run("a valid key", func(t *testing.T) {
+		isolateGate(t)
+		path := remoteKeyPath()
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		writeKeyFile(validKey, 0o600)(t, path)
+		var warn bytes.Buffer
+		if verdict := resolveRemoteGate(&warn); !verdict.unlocked || verdict.refusal != nil || warn.Len() != 0 {
+			t.Fatalf("verdict = %+v, stderr = %q; want unlocked, no refusal, nothing printed", verdict, warn.String())
+		}
+	})
+}
+
+// captureProcessStderr returns what fn wrote to os.Stderr, where the
+// published gate writes its warning.
+func captureProcessStderr(t *testing.T, fn func()) string {
+	t.Helper()
+	read, write, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	saved := os.Stderr
+	os.Stderr = write
+	fn()
+	os.Stderr = saved
+	_ = write.Close()
+	body, err := io.ReadAll(read)
+	_ = read.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(body)
 }

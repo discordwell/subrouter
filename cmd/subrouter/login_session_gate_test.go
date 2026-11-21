@@ -236,7 +236,7 @@ func TestEveryDirectVerbIsClassifiedForAnEndedSession(t *testing.T) {
 	sandboxHostConfig(t)
 	unlockRemoteGate(t)
 	allowedBare := map[string]bool{
-		"status": true, "list": true, "ls": true, "trace": true, "breadcrumbs": true, "why": true, "doctor": true,
+		"status": true, "plot": true, "list": true, "ls": true, "trace": true, "breadcrumbs": true, "why": true, "doctor": true,
 		"remote": true, "remotes": true, "server": true, "servers": true, "daemon": true,
 		// Bare, it prints its help (srRunner.tenant).
 		"tenant": true, "tenants": true,
@@ -471,6 +471,17 @@ func TestCommandExitStatus(t *testing.T) {
 	out.Reset()
 	if code := commandExit(&out, "cx", errors.New("boom")); code != 1 || out.String() != "cx: boom\n" {
 		t.Fatalf("other error: exit %d, printed %q; want 1 and \"cx: boom\"", code, out.String())
+	}
+}
+
+// A command whose page already says why it has no numbers exits 1 and adds
+// nothing on stderr, even when the failure is wrapped on its way out.
+func TestCommandExitPrintsNothingForAQuietFailure(t *testing.T) {
+	for _, err := range []error{errPlotNoNumbers, fmt.Errorf("sr: %w", errPlotNoNumbers)} {
+		var out bytes.Buffer
+		if code := commandExit(&out, "subrouter", err); code != 1 || out.Len() != 0 {
+			t.Fatalf("commandExit(%v): exit %d, printed %q; want 1 and nothing", err, code, out.String())
+		}
 	}
 }
 

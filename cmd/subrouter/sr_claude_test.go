@@ -19,6 +19,7 @@ import (
 	"reflect"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1140,6 +1141,7 @@ func TestProxyClaudeLaunchSettingsNeutralizeHostilePersistedRouting(t *testing.T
 	for _, key := range claudeRoutingEnvKeys {
 		hostile[key] = "hostile-" + strings.ToLower(key)
 	}
+	hostile["CLAUDE_SECURESTORAGE_CONFIG_DIR"] = "hostile-securestorage"
 	persistedBody, err := json.Marshal(map[string]any{
 		"theme": "dark",
 		"env":   hostile,
@@ -1180,8 +1182,11 @@ func TestProxyClaudeLaunchSettingsNeutralizeHostilePersistedRouting(t *testing.T
 		"ANTHROPIC_CUSTOM_HEADERS": "X-Subrouter-Agent: claude",
 		"CLAUDE_CONFIG_DIR":        configDir,
 		"CLAUDE_CODE_CONFIG_DIR":   configDir,
+		// Not empty: Claude Code reads an empty one as the bare
+		// `Claude Code-credentials` item, the user's own login (PATCHES §73).
+		"CLAUDE_SECURESTORAGE_CONFIG_DIR": configDir,
 	}
-	for _, key := range claudeRoutingEnvKeys {
+	for key := range hostile {
 		if got := effective[key]; got != want[key] {
 			t.Fatalf("effective routing setting %s = %q, want %q", key, got, want[key])
 		}
@@ -2571,8 +2576,10 @@ func TestPrepareClaudeLoginFastPathPreservesExistingChoices(t *testing.T) {
 // exec.LookPath("claude"), so this is enough to drive claudeRunner.add with no
 // real Claude install. The stub appends every invocation and the
 // CLAUDE_CONFIG_DIR it ran against to a log, which is what the isolation
-// assertions read. supportsAuthLogin models an older Claude that only offers
-// the interactive TUI.
+// assertions read. Each login mints a new access token, as a real one does,
+// so a re-auth is told from a login that never reached the profile.
+// supportsAuthLogin models an older Claude that only offers the interactive
+// TUI.
 func installFakeClaudeCLI(t *testing.T, home, email string, supportsAuthLogin bool) string {
 	t.Helper()
 	binDir := filepath.Join(home, "bin")
@@ -2592,7 +2599,7 @@ func installFakeClaudeCLI(t *testing.T, home, email string, supportsAuthLogin bo
 		"  if [ \"$3\" = --help ]; then exit 0; fi\n" +
 		"  printf 'login %s\\n' \"$CLAUDE_CONFIG_DIR\" >> \"$LOG\"\n" +
 		"  mkdir -p \"$CLAUDE_CONFIG_DIR\"\n" +
-		"  printf '{\"claudeAiOauth\":{\"accessToken\":\"tok\"}}' > \"$CLAUDE_CONFIG_DIR/.credentials.json\"\n" +
+		"  printf '{\"claudeAiOauth\":{\"accessToken\":\"tok-%s\"}}' \"$$\" > \"$CLAUDE_CONFIG_DIR/.credentials.json\"\n" +
 		"  exit 0\n" +
 		"fi\n" +
 		"if [ \"$1\" = auth ] && [ \"$2\" = status ]; then\n" +
@@ -2702,6 +2709,265 @@ func TestClaudeAddLeavesTheLiveClaudeConfigAlone(t *testing.T) {
 	}
 	if !after.ModTime().Equal(before.ModTime()) {
 		t.Fatalf("live credential was rewritten: mtime %s -> %s", before.ModTime(), after.ModTime())
+	}
+}
+
+const storeRuleLoginToken = "fresh-login-access"
+
+// installStoreRuleFakeClaudeCLI is a stub `claude` for where a login lands.
+// Its `auth login` saves the credential where Claude Code (2.1.329) does, in
+// ${CLAUDE_SECURESTORAGE_CONFIG_DIR:-$CLAUDE_CONFIG_DIR}, or always in
+// redirect when that is set, as a wrapper that exports the variable would.
+// Its `auth status` says logged in whatever the profile holds, as Claude Code
+// does through the claude-route shim's placeholder token.
+func installStoreRuleFakeClaudeCLI(t *testing.T, home, redirect string) {
+	t.Helper()
+	binDir := filepath.Join(home, "bin")
+	if err := os.MkdirAll(binDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	dir := `${CLAUDE_SECURESTORAGE_CONFIG_DIR:-$CLAUDE_CONFIG_DIR}`
+	if redirect != "" {
+		dir = "'" + redirect + "'"
+	}
+	script := "#!/bin/sh\n" +
+		"if [ \"$1\" = auth ] && [ \"$2\" = login ]; then\n" +
+		"  if [ \"$3\" = --help ]; then exit 0; fi\n" +
+		"  dir=" + dir + "\n" +
+		"  mkdir -p \"$dir\"\n" +
+		"  printf '{\"claudeAiOauth\":{\"accessToken\":\"" + storeRuleLoginToken + "\"}}' > \"$dir/.credentials.json\"\n" +
+		"  exit 0\n" +
+		"fi\n" +
+		"if [ \"$1\" = auth ] && [ \"$2\" = status ]; then\n" +
+		"  printf '{\"loggedIn\":true,\"authMethod\":\"oauth_token\"}'\n" +
+		"  exit 0\n" +
+		"fi\n" +
+		"exit 1\n"
+	if err := os.WriteFile(filepath.Join(binDir, "claude"), []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+// Claude Code names its credential store after CLAUDE_SECURESTORAGE_CONFIG_DIR
+// ahead of CLAUDE_CONFIG_DIR, and the claude-route shim exports one for every
+// pooled session. `sr claude addr` run there saved the login in that store
+// and the profile had none (PATCHES §73).
+func TestClaudeAddLandsInTheProfileStoreDespiteAnInheritedSecureStorageDir(t *testing.T) {
+	claude.KeychainWithNoItemsForTest(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	elsewhere := filepath.Join(home, "elsewhere")
+	t.Setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", elsewhere)
+	installStoreRuleFakeClaudeCLI(t, home, "")
+
+	store := claude.Store{Dir: filepath.Join(home, ".subrouter", "codex")}
+	var out bytes.Buffer
+	runner := claudeRunner{store: store, in: strings.NewReader(""), out: &out, errOut: &out}
+	if err := runner.addOAuth(t.Context(), "work"); err != nil {
+		t.Fatalf("add: %v\n%s", err, out.String())
+	}
+	credential, err := store.ReadCredential(t.Context(), store.ClaudeConfigDir("work"))
+	if err != nil || credential == nil || credential.AccessToken != storeRuleLoginToken {
+		t.Fatalf("profile credential = %+v, err %v; want the login's access token", credential, err)
+	}
+	if _, err := os.Stat(filepath.Join(elsewhere, ".credentials.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the login was saved to the inherited store too: %v", err)
+	}
+}
+
+// A `claude` on PATH that saves the login to another store still answers
+// `auth status` with logged in, and sr printed "Added Claude profile" over a
+// profile with no credential. The verdict is the profile's own credential: a
+// profile this command created is rolled back, and one that already existed
+// keeps what it held (PATCHES §73).
+func TestClaudeAddFailsWhenTheLoginLandsInAnotherStore(t *testing.T) {
+	for _, existing := range []bool{false, true} {
+		t.Run(fmt.Sprintf("existing=%v", existing), func(t *testing.T) {
+			claude.KeychainWithNoItemsForTest(t)
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			installStoreRuleFakeClaudeCLI(t, home, filepath.Join(home, "elsewhere"))
+			store := claude.Store{Dir: filepath.Join(home, ".subrouter", "codex")}
+			if existing {
+				if _, err := store.UpsertCredentialProfile("work", claude.CredentialInfo{
+					AccessToken: "earlier-access", RefreshToken: "earlier-refresh",
+					ExpiresAt: time.Now().Add(time.Hour).UnixMilli(),
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			var out bytes.Buffer
+			runner := claudeRunner{store: store, in: strings.NewReader(""), out: &out, errOut: &out}
+			err := runner.addOAuth(t.Context(), "work")
+			if err == nil || !strings.Contains(err.Error(), "CLAUDE_SECURESTORAGE_CONFIG_DIR") {
+				t.Fatalf("add = %v; want an error naming CLAUDE_SECURESTORAGE_CONFIG_DIR\n%s", err, out.String())
+			}
+			if _, registered := store.FindProfile("work"); registered != existing {
+				t.Fatalf("profile registered = %v after the failed add, want %v", registered, existing)
+			}
+			if existing {
+				credential, err := store.ReadCredential(t.Context(), store.ClaudeConfigDir("work"))
+				if err != nil || credential == nil || credential.AccessToken != "earlier-access" {
+					t.Fatalf("existing profile's credential = %+v, err %v; want the one it held", credential, err)
+				}
+			}
+		})
+	}
+}
+
+// installScriptedClaudeCLI puts a stub `claude` on PATH whose `auth status`
+// says logged in and whose other verbs run the given shell. The login verdict
+// never trusts `auth status` (PATCHES §73), so these tests decide what the
+// profile's own store holds through that shell alone.
+func installScriptedClaudeCLI(t *testing.T, home, authLogin, tui string) {
+	t.Helper()
+	binDir := filepath.Join(home, "bin")
+	if err := os.MkdirAll(binDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	script := "#!/bin/sh\n" +
+		"if [ \"$1\" = auth ] && [ \"$2\" = status ]; then\n" +
+		"  printf '{\"loggedIn\":true,\"authMethod\":\"oauth_token\"}'\n" +
+		"  exit 0\n" +
+		"fi\n" +
+		"if [ \"$1\" = auth ] && [ \"$2\" = login ]; then\n" + authLogin + "\nfi\n" +
+		tui + "\n"
+	if err := os.WriteFile(filepath.Join(binDir, "claude"), []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+func writeProfileCredentialFile(t *testing.T, store claude.Store, name, accessToken string, mode os.FileMode) string {
+	t.Helper()
+	path := filepath.Join(store.ClaudeConfigDir(name), ".credentials.json")
+	body := `{"claudeAiOauth":{"accessToken":"` + accessToken + `","refreshToken":"r","expiresAt":` +
+		strconv.FormatInt(time.Now().Add(time.Hour).UnixMilli(), 10) + `}}`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, mode); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(path, 0o600) })
+	return path
+}
+
+// A re-auth tells the new login from the old one by its access token, so it
+// needs the old one. When the profile's store could not be read before the
+// login, a login saved elsewhere left the old credential in place and sr took
+// it for the new one. The re-auth now stops before the browser step.
+func TestClaudeReauthStopsWhenTheProfilesCredentialCannotBeRead(t *testing.T) {
+	claude.KeychainWithNoItemsForTest(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	logPath := filepath.Join(home, "logins.log")
+	elsewhere := filepath.Join(home, "elsewhere")
+	installScriptedClaudeCLI(t, home,
+		"  [ \"$3\" = --help ] && exit 0\n"+
+			"  echo login >> '"+logPath+"'\n"+
+			"  chmod 600 \"$CLAUDE_CONFIG_DIR/.credentials.json\"\n"+
+			"  mkdir -p '"+elsewhere+"'\n"+
+			"  printf '{\"claudeAiOauth\":{\"accessToken\":\"fresh\"}}' > '"+elsewhere+"/.credentials.json'\n"+
+			"  exit 0",
+		"exit 1")
+	store := claude.Store{Dir: filepath.Join(home, ".subrouter", "codex")}
+	if _, err := store.CreateProfile("work"); err != nil {
+		t.Fatal(err)
+	}
+	credentialPath := writeProfileCredentialFile(t, store, "work", "earlier-access", 0)
+
+	var out bytes.Buffer
+	runner := claudeRunner{store: store, in: strings.NewReader(""), out: &out, errOut: &out}
+	if err := runner.addOAuth(t.Context(), "work"); err == nil {
+		t.Fatalf("re-auth with an unreadable profile credential succeeded\n%s", out.String())
+	}
+	if _, err := os.Stat(logPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the browser login ran although the old credential could not be read: %v", err)
+	}
+	if err := os.Chmod(credentialPath, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := store.FindProfile("work"); !ok {
+		t.Fatal("the existing profile was removed")
+	}
+	credential, err := store.ReadCredential(t.Context(), store.ClaudeConfigDir("work"))
+	if err != nil || credential == nil || credential.AccessToken != "earlier-access" {
+		t.Fatalf("existing profile's credential = %+v, err %v; want the one it held", credential, err)
+	}
+}
+
+// Claude builds without `auth login` log in through the TUI, which sr closes
+// once the login lands. On a re-auth the profile already held a credential, so
+// sr closed Claude at its first check, before the user could log in.
+func TestClaudeReauthThroughTheTUIWaitsForTheNewLogin(t *testing.T) {
+	claude.KeychainWithNoItemsForTest(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	installScriptedClaudeCLI(t, home, "  exit 1",
+		"trap 'exit 130' INT TERM\n"+
+			"sleep 3 & wait $!\n"+
+			"printf '{\"claudeAiOauth\":{\"accessToken\":\"tui-login\",\"refreshToken\":\"r2\"}}' > \"$CLAUDE_CONFIG_DIR/.credentials.json\"\n"+
+			"sleep 30 & wait $!")
+	store := claude.Store{Dir: filepath.Join(home, ".subrouter", "codex")}
+	if _, err := store.CreateProfile("work"); err != nil {
+		t.Fatal(err)
+	}
+	writeProfileCredentialFile(t, store, "work", "earlier-access", 0o600)
+
+	var out bytes.Buffer
+	runner := claudeRunner{store: store, in: strings.NewReader(""), out: &out, errOut: &out}
+	if err := runner.addOAuth(t.Context(), "work"); err != nil {
+		t.Fatalf("TUI re-auth: %v\n%s", err, out.String())
+	}
+
+	credential, err := store.ReadCredential(t.Context(), store.ClaudeConfigDir("work"))
+	if err != nil || credential == nil || credential.AccessToken != "tui-login" {
+		t.Fatalf("profile credential = %+v, err %v; want the TUI login's", credential, err)
+	}
+}
+
+// When the login's credential cannot be read back, the new profile is kept,
+// since the login may be in it. The daemon had loaded the profile's creation,
+// with no credential, and reloads only on a new generation, so the kept
+// profile is published too.
+func TestClaudeAddKeptAfterAnUnreadableCredentialIsPublished(t *testing.T) {
+	claude.KeychainWithNoItemsForTest(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	store := claude.Store{Dir: filepath.Join(home, ".subrouter", "codex")}
+	generationPath := filepath.Join(store.Dir, ".account-generation")
+	atLogin := filepath.Join(home, "generation-at-login")
+	installScriptedClaudeCLI(t, home,
+		"  [ \"$3\" = --help ] && exit 0\n"+
+			"  cp '"+generationPath+"' '"+atLogin+"'\n"+
+			"  printf '{\"claudeAiOauth\":{\"accessToken\":\"fresh\"}}' > \"$CLAUDE_CONFIG_DIR/.credentials.json\"\n"+
+			"  chmod 000 \"$CLAUDE_CONFIG_DIR/.credentials.json\"\n"+
+			"  exit 0",
+		"exit 1")
+
+	var out bytes.Buffer
+	runner := claudeRunner{store: store, in: strings.NewReader(""), out: &out, errOut: &out}
+	err := runner.addOAuth(t.Context(), "work")
+	t.Cleanup(func() { _ = os.Chmod(filepath.Join(store.ClaudeConfigDir("work"), ".credentials.json"), 0o600) })
+	if err == nil || !strings.Contains(err.Error(), "was kept") {
+		t.Fatalf("add = %v; want the profile kept\n%s", err, out.String())
+	}
+	if _, ok := store.FindProfile("work"); !ok {
+		t.Fatal("the kept profile is not registered")
+	}
+	before, err := os.ReadFile(atLogin)
+	if err != nil {
+		t.Fatalf("the stub did not see a generation at login: %v", err)
+	}
+	after, err := os.ReadFile(generationPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(before, after) {
+		t.Fatal("the kept profile was not published after the login")
 	}
 }
 

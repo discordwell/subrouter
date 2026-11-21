@@ -63,7 +63,7 @@ func TestTheLeaderIsStillDrainEligibleWhenItYields(t *testing.T) {
 	if !score.endgameDrainEligible(now) {
 		t.Fatalf("rolls-first stopped being drain-eligible at 1 live session; "+
 			"the handoff would be the cap, not the spread (allowed=%d)",
-			score.endgameAllowedSessions())
+			score.endgameAllowedSessions(time.Now()))
 	}
 }
 
@@ -94,7 +94,7 @@ func TestDrainingPairOffersTheFullCeilingEach(t *testing.T) {
 	total := 0
 	for _, id := range []string{"rolls-first", "rolls-later"} {
 		score := scheduler.score(rollsFirst.Provider, id)
-		allowed := score.endgameAllowedSessions()
+		allowed := score.endgameAllowedSessions(time.Now())
 		if allowed != claudeEndgameMaxSessions {
 			t.Errorf("%s allows %d endgame sessions, want the full ceiling of %d "+
 				"(weekly headroom %.3f)", id, allowed, claudeEndgameMaxSessions, score.WeeklyHeadroom)
@@ -113,7 +113,7 @@ func TestTaperStillGlidesAnEmptyingAccount(t *testing.T) {
 		headroom float64
 		want     int
 	}{{0.05, 1}, {0.10, 2}, {0.15, 3}, {0.50, 4}} {
-		got := Score{WeeklyHeadroom: tc.headroom}.endgameAllowedSessions()
+		got := Score{WeeklyHeadroom: tc.headroom}.endgameAllowedSessions(time.Now())
 		if got != tc.want {
 			t.Errorf("headroom %.2f allows %d sessions, want %d", tc.headroom, got, tc.want)
 		}
@@ -243,7 +243,7 @@ func TestTaperGlideEndsAtTheOwnersHoldout(t *testing.T) {
 		{"unreserved at the same level", 0.20, 0, 4},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got := Score{WeeklyHeadroom: tc.headroom, Reserve: tc.reserve}.endgameAllowedSessions()
+			got := Score{WeeklyHeadroom: tc.headroom, Reserve: tc.reserve}.endgameAllowedSessions(time.Now())
 			if got != tc.want {
 				t.Fatalf("headroom %.2f over reserve %.2f allows %d sessions, want %d",
 					tc.headroom, tc.reserve, got, tc.want)
@@ -302,7 +302,7 @@ func TestAHotShortWindowDrainsOneSessionAtATime(t *testing.T) {
 	if !hot.endgameDrainEligible(now) {
 		t.Fatal("calibration: the hot account must still drain its final task")
 	}
-	if got := hot.endgameAllowedSessions(); got != 1 {
+	if got := hot.endgameAllowedSessions(time.Now()); got != 1 {
 		t.Fatalf("hot 5h window allows %d drain sessions, want 1", got)
 	}
 	healthy := claudeScore("healthy", claudePoolWindows(20, 20, 5, fourDays, twoHours))
@@ -316,7 +316,7 @@ func TestAHotShortWindowDrainsOneSessionAtATime(t *testing.T) {
 	// A cool 5h window at the same weekly level keeps the full ceiling.
 	cool := hot
 	cool.ShortHeadroom, cool.Headroom = 0.9, 0.9
-	if got := cool.endgameAllowedSessions(); got != claudeEndgameMaxSessions {
+	if got := cool.endgameAllowedSessions(time.Now()); got != claudeEndgameMaxSessions {
 		t.Fatalf("cool 5h window allows %d drain sessions, want the ceiling %d", got, claudeEndgameMaxSessions)
 	}
 }

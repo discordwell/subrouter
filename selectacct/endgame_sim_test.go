@@ -92,6 +92,9 @@ type endgameSimAcct struct {
 	wall5, wallW            bool
 	readAt                  float64
 	reading                 Score
+	// measuredBurn, when set, is the BurnPerLive the pace tracker reports from
+	// measuredFrom on; before it, or unset, the account is unmeasured.
+	measuredBurn, measuredFrom float64
 }
 
 func endgameSimAccount(id string, weekLeft, fableLeft, rollH, used5, t5H, reserve float64, draining bool) *endgameSimAcct {
@@ -146,6 +149,11 @@ type endgameSimRun struct {
 	samples, atCapAtOne, measuredAbove, allowedSeen int
 	pinnedAt5hWall                                  int // most sessions pinned to D1 at one of its 5h walls
 	legacyMismatches                                int // allowance != pre-§55 where §55 may not act
+	// D1's in-flight session-hours and the week they spent, before its roll.
+	d1LiveHours, d1Burned float64
+	// Forced moves off a weekly or a 5h wall (the rest are holdouts), and
+	// D1's samples whose allowance a paced raise sized.
+	forcedWeekly, forced5h, pacedSamples int
 }
 
 func endgameSimulate(measuredInputs, releaseFinalDay bool, cell endgameSimCell, accts []*endgameSimAcct, work []endgameSimSession) endgameSimRun {
@@ -183,6 +191,9 @@ func endgameSimulate(measuredInputs, releaseFinalDay bool, cell endgameSimCell, 
 		scores := make([]Score, len(accts))
 		for i, a := range accts {
 			scores[i] = a.score()
+			if a.measuredBurn > 0 && now >= a.measuredFrom {
+				scores[i].Pace = Pace{BurnPerLive: a.measuredBurn, Source: "account"}
+			}
 		}
 		live := map[string]int{}
 		for i := lo; i < hi; i++ {
@@ -217,6 +228,9 @@ func endgameSimulate(measuredInputs, releaseFinalDay bool, cell endgameSimCell, 
 			a.used5 += cell.r5 * inFlightHours
 		}
 		a.usedW += cell.rW * inFlightHours
+		if acct == 0 && a.rolledAt < 0 {
+			out.d1Burned += cell.rW * inFlightHours
+		}
 		a.wallW = a.usedW >= 1
 		if a.wall5 = a.used5 >= 1; a.wall5 && acct == 0 {
 			pinned := 0
@@ -235,7 +249,7 @@ func endgameSimulate(measuredInputs, releaseFinalDay bool, cell endgameSimCell, 
 			if !a.draining || !sc.inEndgameWindow(at(now)) {
 				continue
 			}
-			if (!measuredInputs || sc.Reserve > 0) && sc.endgameAllowedSessions() != legacyEndgameAllowedSessions(sc) {
+			if (!measuredInputs || sc.Reserve > 0) && sc.endgameAllowedSessions(time.Now()) != legacyEndgameAllowedSessions(sc) {
 				out.legacyMismatches++
 			}
 			if i > 0 {
@@ -243,6 +257,9 @@ func endgameSimulate(measuredInputs, releaseFinalDay bool, cell endgameSimCell, 
 			}
 			v := sched.NewSessionVerdict(account.ProviderClaude, a.id, at(now))
 			out.samples++
+			if sc.allowance(at(now)).Paced > 0 {
+				out.pacedSamples++
+			}
 			if v.AtCap && v.LiveSessions <= 1 {
 				out.atCapAtOne++
 			}
@@ -295,6 +312,12 @@ func endgameSimulate(measuredInputs, releaseFinalDay bool, cell endgameSimCell, 
 					// sim then evicts what the scheduler just placed.
 					if a.draining {
 						out.forced++
+						switch {
+						case a.wallW:
+							out.forcedWeekly++
+						case a.wall5:
+							out.forced5h++
+						}
 					}
 					st.acct = place(now, false)
 				}
@@ -303,6 +326,9 @@ func endgameSimulate(measuredInputs, releaseFinalDay bool, cell endgameSimCell, 
 			for k := st.cur; k < st.next; k++ {
 				r := s.reqs[k]
 				if h := (min(r.end, now) - max(r.start, now-endgameSimTick)) / 3600; h > 0 {
+					if st.acct == 0 && accts[0].rolledAt < 0 {
+						out.d1LiveHours += h
+					}
 					burn(st.acct, s.m*h)
 				}
 			}
@@ -358,7 +384,13 @@ func endgameSimMean(rs []endgameSimRun, perDrain bool, metric func(endgameSimRun
 	return sum / float64(n)
 }
 
+// TestEndgameSimulation prices §55, §60 and §62 each at its own margin with
+// §72's paced allowance off: every bound below is the trade the owner accepted
+// for that patch on the legacy taper. §72's own trade is priced by
+// TestPacedAllowanceTradeTable and its forfeit by
+// TestThePacedAllowanceSpendsWhatTheTaperForfeits.
 func TestEndgameSimulation(t *testing.T) {
+	setPacedAllowanceForTest(t, false)
 	central := endgameSimCell{0.12, 0.02} // per in-flight session-hour: 12% of a 5h window, 2% of a week
 	twiceW, twice5 := endgameSimCell{0.12, 0.04}, endgameSimCell{0.24, 0.02}
 	const s1a, s1b, s4, s5 = 0, 1, 2, 3

@@ -13,8 +13,7 @@ import (
 
 // PATCHES §67, 5a: a turn the admission gate turns away because its account's
 // queue is full is held (PATCHES §58) and runs again until a slot frees,
-// instead of reaching the client as a 503. On 2026-11-19 the sessions piled
-// onto the one local account got 1,731 of those.
+// instead of reaching the client as a 503.
 
 // newDrainedHoldRig is newHoldRig for a test that runs more handlers than
 // the rig's per-run channel holds: it empties that channel until the daemon

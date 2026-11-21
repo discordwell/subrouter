@@ -377,3 +377,19 @@ func TestClaudeLivenessProbeFindsDeathOfExhaustedAccount(t *testing.T) {
 		t.Fatalf("endpoint after re-login = %+v, want no dead account and both events", report)
 	}
 }
+
+// A noted answer's last-ok time is on disk when noting it returns, so a
+// daemon restarted right after reads it. The write used to run on a goroutine
+// nothing waited for: it outlived the request, the handler and Shutdown, and
+// in this package's tests it was still writing into a store dir that TempDir
+// cleanup was removing ("directory not empty").
+func TestANotedClaudeAnswerIsOnDiskWhenNotingReturns(t *testing.T) {
+	dir := t.TempDir()
+	account := accounts.Account{ID: "claude@example.com", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "tok"}
+	before := time.Now()
+	noteClaudeCredentialAlive(nil, newClaudeCredentialHealth(dir, nil), account, account.CredentialIdentity, claudeDeathSourceProxy)
+	restarted := newClaudeCredentialHealth(dir, nil)
+	if got := restarted.lastOKAt(account.ID); got == nil || got.Before(before) {
+		t.Fatalf("a restart right after the answer reads last_ok %v, want this answer's time (at or after %v)", got, before.UTC())
+	}
+}

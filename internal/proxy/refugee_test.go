@@ -14,11 +14,11 @@ import (
 	"github.com/manaflow-ai/subrouter/session"
 )
 
-// Refugee placement (PATCHES §67; owner, 2026-11-19). A chat held on a box
-// found down is a refugee: it goes to the other box first and to a local
-// account last (D3), to an account with fewer than 4 warm refugees (D1), and
-// never back (D4). With no slot anywhere it keeps its hold and waits, and
-// each held attempt tries again (D2).
+// Refugee placement (PATCHES §67). A chat held on a box found down is a
+// refugee: it goes to another box first and to a local account last (D3), to
+// an account with a free slot under refugeeSlotsFor (D1), and never back
+// (D4). With no slot anywhere it keeps its hold and waits, and each held
+// attempt tries again (D2).
 
 // refugeeHoldsOn puts n refugee holds from box A on pool's account, each
 // placed and last served idle ago.
@@ -61,8 +61,8 @@ func refugeeHold(t *testing.T, rig *warmPeerRig, pool *RemotePool, account strin
 }
 
 // A refugee goes to the other box first, even with a local account that could
-// serve it (D3: "we see if we can have them go to the other box first"), and
-// to the local account when no account on the other box has a slot.
+// serve it (D3), and to the local account when no account on the other box
+// has a slot.
 func TestARefugeeGoesToTheOtherBoxFirstAndToALocalAccountLast(t *testing.T) {
 	t.Run("the other box has a slot", func(t *testing.T) {
 		policy := strandedPolicy(nil)
@@ -194,7 +194,7 @@ func TestRefugeeMarksSurviveARestart(t *testing.T) {
 	var before remotePoolDelegations
 	for i := range refugeeSlots {
 		key := session.ScopedSessionKey("claude", fmt.Sprintf("r%d", i))
-		id, _ := before.claimRefugee(key, now, remotePoolDelegationTTLFor("claude"), "box-b", "acct-b", mark, refugeeSlots)
+		id, _ := before.claimRefugee(key, now, remotePoolDelegationTTLFor("claude"), "box-b", "acct-b", mark, refugeeSlots, i)
 		if id == 0 {
 			t.Fatalf("calibration: refugee %d not claimed", i)
 		}
@@ -203,7 +203,7 @@ func TestRefugeeMarksSurviveARestart(t *testing.T) {
 	before.flush(path, now)
 	var after remotePoolDelegations
 	after.loadFor(path, now, "box-b")
-	if id, held := after.claimRefugee(session.ScopedSessionKey("claude", "r-next"), now, remotePoolDelegationTTLFor("claude"), "box-b", "acct-b", mark, refugeeSlots); id != 0 || held != refugeeSlots {
+	if id, held := after.claimRefugee(session.ScopedSessionKey("claude", "r-next"), now, remotePoolDelegationTTLFor("claude"), "box-b", "acct-b", mark, refugeeSlots, refugeeSlots); id != 0 || held != refugeeSlots {
 		t.Fatalf("after a restart acct-b took a refugee (claim %d, held %d), want it full with %d", id, held, refugeeSlots)
 	}
 
@@ -287,13 +287,13 @@ func (rig *holdRig) turnOf(t *testing.T, sessionID string) (*http.Response, stri
 // A local refugee takes its account's slot only while it is warm (the warm
 // window, an hour) and not held on a box since (its local pin is then a
 // placeholder). Of six marked on the local account, two are warm though idle
-// a minute short of the window, two are cold (one idle a minute past it, one
-// unseen in the tracker's three hours) and two are warm but held on box B:
+// a minute short of the window, two are cold (one idle five seconds past it,
+// one unseen in the tracker's three hours) and two are warm but held on box B:
 // the account holds two, so a third is placed there.
 func TestALocalRefugeeCountsOnlyWhileWarmAndNotHeldOnABox(t *testing.T) {
 	policy := strandedPolicy(nil)
 	boxA := newContractBox(t, eligibleBoxAccount("acct-a"))
-	boxB := newContractBox(t, eligibleBoxAccount("acct-b"))
+	boxB := newContractBox(t, fourRefugeeBoxAccount("acct-b"))
 	cutPeer(t, boxA.pool, func(int64) error { return refusedFailure() })
 	cutPeer(t, boxB.pool, func(int64) error { return nil })
 	active := seenSessions(time.Minute)
@@ -302,7 +302,7 @@ func TestALocalRefugeeCountsOnlyWhileWarmAndNotHeldOnABox(t *testing.T) {
 	holdOn(t, boxA.pool, "hold-session", "acct-a")
 	refugeeHoldsOn(boxB.pool, "acct-b", refugeeSlots, time.Minute)
 	localRefugeesOn(t, rig, "one@example.com", 6)
-	for i, idle := range []time.Duration{warmSessionIdleTTL - time.Minute, warmSessionIdleTTL - time.Minute, 0, 0, warmSessionIdleTTL + time.Minute} {
+	for i, idle := range []time.Duration{warmSessionIdleTTL - time.Minute, warmSessionIdleTTL - time.Minute, 0, 0, warmSessionIdleTTL + 5*time.Second} {
 		active.lastSeen[session.ScopedSessionKey("claude", fmt.Sprintf("local-refugee-%d", i))] = time.Now().Add(-idle)
 	}
 	holdOn(t, boxB.pool, "local-refugee-2", "acct-b")
@@ -315,7 +315,7 @@ func TestALocalRefugeeCountsOnlyWhileWarmAndNotHeldOnABox(t *testing.T) {
 	}
 }
 
-// A refugee placed on the local account stays there (D4, R4): when its
+// A refugee placed on the local account stays there (D4): when its
 // upstream cannot be dialed the turn waits for it under the hold and is never
 // spilled to box B for a turn. That holds whether its box was found down at
 // its first turn or it waited for a slot first, until a local refugee went
@@ -331,7 +331,7 @@ func TestALocalRefugeeWaitsForItsUpstreamAndIsNeverSpilledToABox(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			policy := strandedPolicy(nil)
 			boxA := newContractBox(t, eligibleBoxAccount("acct-a"))
-			boxB := newContractBox(t, eligibleBoxAccount("acct-b"))
+			boxB := newContractBox(t, fourRefugeeBoxAccount("acct-b"))
 			cutPeer(t, boxA.pool, func(int64) error { return refusedFailure() })
 			cutPeer(t, boxB.pool, func(int64) error { return nil })
 			var localDown atomic.Bool
@@ -390,7 +390,7 @@ func TestALocalRefugeeWaitsForItsUpstreamAndIsNeverSpilledToABox(t *testing.T) {
 func TestARefugeeWhosePlacementFailsKeepsItsHomeHold(t *testing.T) {
 	policy := strandedPolicy(nil)
 	boxA := newContractBox(t, eligibleBoxAccount("acct-a"))
-	boxB := newContractBox(t, eligibleBoxAccount("acct-b"))
+	boxB := newContractBox(t, fourRefugeeBoxAccount("acct-b"))
 	cutPeer(t, boxA.pool, func(int64) error { return refusedFailure() })
 	dialsB := cutPeer(t, boxB.pool, func(int64) error { return refusedFailure() })
 	rig := newHoldRig(t, holdRigOptions{hold: policy, upstream: answerOK, pin: "one@example.com", peers: []*RemotePool{boxA.pool, boxB.pool}})

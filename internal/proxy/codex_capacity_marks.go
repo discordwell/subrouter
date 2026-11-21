@@ -228,7 +228,7 @@ func codexServiceTierFromContext(ctx context.Context) string {
 //     the new-session eligibility predicate on the measured score, not
 //     upstream's 5% retention floor. The retention floor and upstream's +10pp
 //     headroom-gain gate (the rest of keepConstrainedStickyAssignment) are not
-//     ported: the 70-minute warm rule already decides retention.
+//     ported: the hour-long warm rule already decides retention.
 //
 // It picks for itself so the call site stays a one-liner beside
 // reuseStickyAssignment; Pick is deterministic, so the move path that runs

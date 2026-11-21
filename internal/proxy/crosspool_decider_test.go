@@ -1050,8 +1050,8 @@ func TestColdSessionOnTheBestLocalAccountIsRankedAgainstThePeers(t *testing.T) {
 	}
 }
 
-// P9's other half: the timer is unchanged (warmSessionIdleTTL, 70 min). A
-// session idle 50 minutes is warm, stays, and the log says so.
+// P9's other half: the idle timer (warmSessionIdleTTL, an hour) keeps a
+// session idle 50 minutes warm and local, and the log says so.
 func TestWarmSessionUnderTheIdleTimerStaysLocalAndSaysWarm(t *testing.T) {
 	box := incidentBox(t, 0)
 	laptop := newCrossPoolLaptop(t, []selectacct.Score{crossPoolClaudeScore("fifteen", 0.98, 159*time.Hour)}, box.pool)

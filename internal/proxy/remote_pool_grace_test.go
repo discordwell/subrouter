@@ -400,8 +400,8 @@ func rewindQuiet(pool *RemotePool, d time.Duration) {
 // U14 and C5 through the forward path: openings inside the grace keep every
 // hold and their line says how long the box has been silent and what the
 // grace is; the first opening past it finds the box down and keeps every
-// hold, with one line naming how many (PATCHES §67): each chat's hold ends
-// only when it is placed as a refugee.
+// hold, with one line naming how many (PATCHES §67): each chat keeps its hold
+// until its own turn places it.
 func TestAPeerDownPastTheGraceKeepsEveryHoldWithOneLine(t *testing.T) {
 	server, first := heldSessionServer(t, "http://100.64.0.9:31416")
 	server.PeerDownGrace = testPeerDownGrace

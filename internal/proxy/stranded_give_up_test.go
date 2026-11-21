@@ -1,7 +1,6 @@
 package proxy
 
 import (
-	"context"
 	"io"
 	"net/http"
 	"path/filepath"
@@ -15,12 +14,11 @@ import (
 )
 
 // A stranded chat's chain of holds gives up an hour after its last answered
-// turn (PATCHES §67; owner, 2026-11-19: "claude code should give up just
-// after an hour, because cache", then "I'd rather they go unlinked at 60"):
-// the clock that unlinks it. Before SUBROUTER_STRANDED_GIVE_UP, the warm
-// window by default, each hold answers 502, which Claude Code retries; at it
-// the chat gets a 503 with Retry-After: 3600, which Claude Code 2.1.329 shows
-// at once, and is unlinked: its next turn is placed as a new session.
+// turn (PATCHES §67; SUBROUTER_STRANDED_GIVE_UP, the warm window by default).
+// Until then each hold answers 502, which Claude Code retries; at the give-up
+// the chat gets a 503 with Retry-After: 3600, which Claude Code shows at
+// once. A chat on the local account is unlinked: its next turn is placed as
+// a new session. One a box held waits for room (waiting_refugee_test.go).
 
 // gaveUp fails unless got is the give-up answer.
 func gaveUp(t *testing.T, rig *holdRig, got clientAnswer, what string) {
@@ -28,6 +26,22 @@ func gaveUp(t *testing.T, rig *holdRig, got clientAnswer, what string) {
 	if got.err != nil || got.status != http.StatusServiceUnavailable || got.retryAfter != "3600" || got.reason != "stranded_gave_up" {
 		t.Fatalf("%s: status = %d Retry-After %q reason %q body %q err %v, want 503, 3600, stranded_gave_up; logs:\n%s",
 			what, got.status, got.retryAfter, got.reason, got.body, got.err, rig.logs.String())
+	}
+}
+
+// What the give-up tells the user: a chat that waited for the account its
+// cache is on lost that cache, and a spent pool's chat found no box.
+const (
+	gaveUpOnItsCache = "its cache is cold"
+	gaveUpOnABox     = "no account here could serve this chat, and no box could be reached for over an hour"
+)
+
+// gaveUpSaying is gaveUp for an answer whose body says says.
+func gaveUpSaying(t *testing.T, rig *holdRig, got clientAnswer, what, says string) {
+	t.Helper()
+	gaveUp(t, rig, got, what)
+	if !strings.Contains(got.body, says) {
+		t.Fatalf("%s: the give-up says %q, want %q", what, got.body, says)
 	}
 }
 
@@ -88,34 +102,12 @@ func TestAStrandedChatGivesUpAnHourAfterItsLastAnsweredTurn(t *testing.T) {
 	gaveUp(t, rig.holdRig, answeredWithin(t, rig.holdRig, resent, boxAttempts(rig), 20, "an hour after the answered turn"), "an hour after the answered turn")
 }
 
-// The chat is unlinked at the give-up (PATCHES §67, R8): its next turn is
-// placed as a new session and served, with no 503. On a box, that placement
-// is not a refugee's and takes no slot, so it is made with every slot full.
-// On the local account, the chat's pin goes too: a new session whose dial
-// fails is not waited for, and its turn is spilled to the box.
-func TestTheTurnAfterTheGiveUpIsPlacedAsANewSession(t *testing.T) {
-	t.Run("a chat held on a box", func(t *testing.T) {
-		clock := newMovableClock(warmWaitStart)
-		policy := strandedPolicy(clock)
-		rig, up := newSwitchedPeerRig(t, policy)
-		answeredOnAcctA(t, rig)
-		up.Store(false)
-		resent := strandedFrom(t, rig, policy, clock, warmWaitStart.Add(59*time.Minute), "a turn a minute before the hour")
-		clock.set(warmWaitStart.Add(warmSessionIdleTTL))
-		gaveUp(t, rig.holdRig, answeredWithin(t, rig.holdRig, resent, boxAttempts(rig), 20, "at the hour"), "at the hour")
-		rig.settle(t, 1)
-
-		refugeeHoldsOn(rig.boxB.pool, "acct-b", refugeeSlots, time.Minute)
-		localRefugeesOn(t, rig.holdRig, "one@example.com", refugeeSlots)
-		got := notHeld(t, rig.holdRig, policy, rig.sendAsync(t, holdTurnBody), "the turn after the give-up")
-		rig.settle(t, 1)
-		if got.status != http.StatusOK || rig.countLog(refugeePlacedMessage) != 0 {
-			t.Fatalf("status = %d body = %q, want it placed as a new session and served, not as a refugee; logs:\n%s", got.status, got.body, rig.logs.String())
-		}
-		if account, held := holdAccount(rig.boxA.pool, "hold-session"); held {
-			t.Fatalf("still held on box A's %q after the give-up", account)
-		}
-	})
+// A chat on the local account is unlinked at the give-up (PATCHES §67): its
+// next turn is placed as a new session and served, with no 503, and its pin
+// goes too: a new session whose dial fails is not waited for, and its turn
+// is spilled to the box. A chat a box held waits for room instead
+// (waiting_refugee_test.go).
+func TestALocalChatsTurnAfterTheGiveUpIsPlacedAsANewSession(t *testing.T) {
 	t.Run("a chat on the local account", func(t *testing.T) {
 		clock := newMovableClock(warmWaitStart)
 		policy := strandedPolicy(clock)
@@ -166,7 +158,7 @@ func lapseHold(pool *RemotePool, sessionID string) {
 }
 
 // The give-up and the unlink fall at the same hour, and the give-up wins
-// (PATCHES §67, R8): a turn held across the hour is answered 503 there, and is
+// (PATCHES §67): a turn held across the hour is answered 503 there, and is
 // not run once more to find its hold lapsed and be placed cold, uncapped. The
 // hold's backoff is an hour, so its one wait ends at the hour, and the hold
 // lapses during that wait.
@@ -189,7 +181,7 @@ func TestTheGiveUpWinsOverTheUnlinkAtTheHour(t *testing.T) {
 }
 
 // A 5xx the hold asks again is not one of the chat's turns answered (PATCHES
-// §67, R8): neither the local upstream's nor one a box relays starts the hour
+// §67): neither the local upstream's nor one a box relays starts the hour
 // over, so a chat stranded later gives up an hour after its last 2xx.
 func TestA5xxHeldAndAskedAgainDoesNotStartTheHourOver(t *testing.T) {
 	t.Run("the local upstream's", func(t *testing.T) {
@@ -268,7 +260,7 @@ func TestA5xxHeldAndAskedAgainDoesNotStartTheHourOver(t *testing.T) {
 	})
 }
 
-// The give-up's clock is the session store's (PATCHES §67, R8): a chat
+// The give-up's clock is the session store's (PATCHES §67): a chat
 // answered by one daemon and stranded on another that shares its
 // sessions.json, as a supervisor's next worker does, gives up an hour after
 // that answer, not an hour after the second daemon first held it.
@@ -306,37 +298,21 @@ func TestTheGiveUpClockIsKeptInTheSessionStore(t *testing.T) {
 }
 
 // A chat with no answered turn on record counts from its first held turn,
-// and the chain belongs to the chat, not to a request: a resend half a
-// minute before the hour gives up at the hour, not an hour after the resend.
+// and the chain belongs to the chat, not to a request: the resend that is
+// held at the hour gives up then, not an hour after that resend came.
 func TestTheStrandedGiveUpCountsFromTheChatsFirstHeldTurnAcrossResends(t *testing.T) {
 	clock := newMovableClock(warmWaitStart)
 	policy := strandedPolicy(clock)
 	rig := newWarmPeerRig(t, policy, false, func(int64) error { return refusedFailure() })
-	first, abandon := context.WithCancel(context.Background())
-	defer abandon()
-	firstDone := make(chan error, 1)
-	go func() {
-		_, _, err := rig.turn(t, first, nil)
-		firstDone <- err
-	}()
-	waitFor(t, "the first request's hold", func() bool { return policy.Active() == 1 })
-	abandon()
-	if err := <-firstDone; err == nil {
-		t.Fatal("the client abandoned the first request; Do should report it")
-	}
-	rig.settle(t, 1)
-
-	clock.set(warmWaitStart.Add(DefaultStrandedGiveUp - 30*time.Second))
-	resent := rig.sendAsync(t, holdTurnBody)
-	awaitHeld(t, rig.holdRig, policy, resent, "the resend")
-	clock.set(warmWaitStart.Add(DefaultStrandedGiveUp))
-	gaveUp(t, rig.holdRig, <-resent, "the resend at the hour")
+	giveUpAt := warmWaitStart.Add(DefaultStrandedGiveUp)
+	at := resentUntil(t, rig.holdRig, policy, clock, warmWaitStart, giveUpAt)
+	givesUpAt(t, rig.holdRig, policy, clock, boxAttempts(rig), at, giveUpAt, gaveUpOnItsCache)
 }
 
 // An overflow chat gives up at the hour even when box B, with a slot, answers
 // each of its placements with a transient 502 (its token refresh reached no
 // verdict): an answer that serves nothing is not one of the chat's turns
-// answered, so it does not start the clock over (R7).
+// answered, so it does not start the clock over.
 func TestAnOverflowChatGivesUpAtTheHourThoughBoxBAnswersEachPlacementWithoutServingIt(t *testing.T) {
 	clock := newMovableClock(warmWaitStart)
 	policy := strandedPolicy(clock)
@@ -350,14 +326,13 @@ func TestAnOverflowChatGivesUpAtTheHourThoughBoxBAnswersEachPlacementWithoutServ
 	awaitHeld(t, rig.holdRig, policy, first, "the overflow chat's first turn")
 	placements := attempts{count: func() int64 { return int64(len(rig.boxB.seen())) }, kick: func() {}}
 	heldFor(t, rig.holdRig, first, placements, 3, "box B answering each placement with a 502")
-	clock.set(warmWaitStart.Add(DefaultHoldDeadline + time.Second))
+	clock.set(warmWaitStart.Add(DefaultHoldDeadline))
 	retryable(t, answeredWithin(t, rig.holdRig, first, placements, 20, "at its deadline"), http.StatusBadGateway)
 	rig.settle(t, 1)
 
-	clock.set(warmWaitStart.Add(DefaultStrandedGiveUp + time.Minute))
-	got := notHeld(t, rig.holdRig, policy, rig.sendAsync(t, holdTurnBody), "a retry past the hour")
-	rig.settle(t, 1)
-	gaveUp(t, rig.holdRig, got, "a retry past the hour")
+	giveUpAt := warmWaitStart.Add(DefaultStrandedGiveUp)
+	at := resentUntil(t, rig.holdRig, policy, clock, warmWaitStart.Add(DefaultHoldDeadline+resendDelay), giveUpAt)
+	givesUpAt(t, rig.holdRig, policy, clock, placements, at, giveUpAt, gaveUpOnItsCache)
 }
 
 // A hold sleeps no later than the give-up: with a backoff far longer than the
@@ -368,17 +343,10 @@ func TestAHeldTurnGivesUpAtTheHourNotAtItsNextBackoff(t *testing.T) {
 	policy.GiveUp = time.Minute
 	policy.baseBackoff, policy.maxBackoff = time.Hour, time.Hour
 	rig, _ := strandedOnBoxA(t, policy)
-	first, abandon := context.WithCancel(context.Background())
-	defer abandon()
-	firstDone := make(chan error, 1)
-	go func() {
-		_, _, err := rig.turn(t, first, nil)
-		firstDone <- err
-	}()
-	waitFor(t, "the first request's hold", func() bool { return policy.Active() == 1 })
-	abandon()
-	<-firstDone
-	rig.settle(t, 1)
+	// The chat's chain of held turns began a minute before the give-up, with
+	// a held turn of which this is Claude Code's resend. That hold's own
+	// sleep would take the whole minute.
+	policy.heldAttempt(session.ScopedSessionKey("claude", "hold-session"), warmWaitStart)
 
 	clock.set(warmWaitStart.Add(time.Minute - 10*time.Millisecond))
 	resent := rig.sendAsync(t, holdTurnBody)
@@ -388,9 +356,11 @@ func TestAHeldTurnGivesUpAtTheHourNotAtItsNextBackoff(t *testing.T) {
 }
 
 // The give-up covers every hold of a stranded chat: on a box (above), on the
-// local account and for a refugee slot. It does not cover a hold for a full
-// admission queue, which is local load, not a stranded chat.
-func TestTheStrandedGiveUpCoversTheLocalWaitAndTheRefugeesWaitButNotAFullQueue(t *testing.T) {
+// local account, for a refugee slot, and a spent pool's wait for a box. That
+// last chat counts from its first held turn. Each give-up says what the chat
+// waited for. It does not cover a hold for a full admission queue, which is
+// local load, not a stranded chat.
+func TestTheStrandedGiveUpCoversEveryStrandedWaitButNotAFullQueue(t *testing.T) {
 	short := func(clock *movableClock) *HoldPolicy {
 		policy := strandedPolicy(clock)
 		policy.GiveUp = time.Minute
@@ -411,7 +381,7 @@ func TestTheStrandedGiveUpCoversTheLocalWaitAndTheRefugeesWaitButNotAFullQueue(t
 		answer := rig.sendAsync(t, holdTurnBody)
 		awaitHeld(t, rig, policy, answer, "the local wait")
 		clock.set(warmWaitStart.Add(time.Minute))
-		gaveUp(t, rig, <-answer, "the local wait at its give-up")
+		gaveUpSaying(t, rig, <-answer, "the local wait at its give-up", gaveUpOnItsCache)
 	})
 	t.Run("a refugee's wait for a slot", func(t *testing.T) {
 		clock := newMovableClock(warmWaitStart)
@@ -421,7 +391,20 @@ func TestTheStrandedGiveUpCoversTheLocalWaitAndTheRefugeesWaitButNotAFullQueue(t
 		answer := rig.sendAsync(t, holdTurnBody)
 		awaitHeld(t, rig, policy, answer, "the refugee's wait")
 		clock.set(warmWaitStart.Add(time.Minute))
-		gaveUp(t, rig, <-answer, "the refugee's wait at its give-up")
+		gaveUpSaying(t, rig, <-answer, "the refugee's wait at its give-up", gaveUpOnItsCache)
+	})
+	t.Run("a spent pool's wait for a box", func(t *testing.T) {
+		clock := newMovableClock(warmWaitStart)
+		policy := short(clock)
+		boxA := newContractBox(t, eligibleBoxAccount("acct-a"))
+		cutPeer(t, boxA.pool, func(int64) error { return refusedFailure() })
+		rig := newHoldRig(t, holdRigOptions{hold: policy, upstream: noLocalUpstream(t), exhausted: true, peers: []*RemotePool{boxA.pool}})
+		answer := rig.sendAsync(t, holdTurnBody)
+		awaitHeld(t, rig, policy, answer, "the spent pool's wait")
+		clock.set(warmWaitStart.Add(time.Minute - time.Second))
+		heldFor(t, rig, answer, attempts{count: clock.reads.Load, kick: func() { e2eRewindCooldown(boxA.pool) }}, 20, "a second before its give-up")
+		clock.set(warmWaitStart.Add(time.Minute))
+		gaveUpSaying(t, rig, <-answer, "the spent pool's wait at its give-up", gaveUpOnABox)
 	})
 	t.Run("a full admission queue", func(t *testing.T) {
 		clock := newMovableClock(warmWaitStart)
@@ -452,4 +435,57 @@ func TestTheStrandedGiveUpCoversTheLocalWaitAndTheRefugeesWaitButNotAFullQueue(t
 			t.Fatalf("status = %d reason %q, want the turn served once a slot freed, never given up; logs:\n%s", got.status, got.reason, rig.logs.String())
 		}
 	})
+}
+
+// A spent pool's chat waits for a box to come back, not for a cache: its own
+// account is spent. So its give-up counts from its first held turn, whatever
+// its last answered turn. A chat answered two hours ago is held, not given up
+// on its first attempt, and its box serves it once a dial gets through.
+func TestAColdChatOnASpentPoolIsHeldForItsBox(t *testing.T) {
+	coldChat := func(t *testing.T, fail func(int64) error) (*holdRig, *HoldPolicy) {
+		t.Helper()
+		policy := strandedPolicy(nil)
+		boxA := newContractBox(t, eligibleBoxAccount("acct-a"))
+		cutPeer(t, boxA.pool, fail)
+		rig := newHoldRig(t, holdRigOptions{hold: policy, upstream: noLocalUpstream(t), exhausted: true,
+			peers: []*RemotePool{boxA.pool}, pin: "one@example.com"})
+		if err := rig.store.NoteAnswered("claude", "hold-session", time.Now().Add(-2*time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+		if got, ok := rig.store.Get("claude", "hold-session"); !ok || got.AnsweredAt.IsZero() {
+			t.Fatalf("calibration: assignment %+v ok=%v, want a turn answered two hours ago", got, ok)
+		}
+		return rig, policy
+	}
+	t.Run("its box comes back", func(t *testing.T) {
+		rig, _ := coldChat(t, peerDownFor(1, refusedFailure()))
+		got := <-rig.sendAsync(t, holdTurnBody)
+		if got.err != nil || got.status != http.StatusOK || !strings.Contains(got.body, `"served_by":"acct-a"`) {
+			t.Fatalf("status = %d Retry-After %q reason %q body %q err %v, want box A's 200; logs:\n%s",
+				got.status, got.retryAfter, got.reason, got.body, got.err, rig.logs.String())
+		}
+	})
+	t.Run("its box stays out", func(t *testing.T) {
+		rig, policy := coldChat(t, func(int64) error { return refusedFailure() })
+		awaitHeld(t, rig, policy, rig.sendAsync(t, holdTurnBody), "a cold chat's turn on a spent pool")
+	})
+}
+
+// The spent pool's chat gives up an hour after its first held turn, though
+// its last answered turn was 59 minutes before that turn, and the give-up
+// says that no box could be reached. Each request ends at its deadline with
+// a 502, and Claude Code's resend a few seconds later carries the same clock.
+func TestASpentPoolsChatGivesUpAnHourAfterItsFirstHeldTurn(t *testing.T) {
+	clock := newMovableClock(warmWaitStart)
+	policy := strandedPolicy(clock)
+	boxA := newContractBox(t, eligibleBoxAccount("acct-a"))
+	dials := cutPeer(t, boxA.pool, func(int64) error { return refusedFailure() })
+	rig := newHoldRig(t, holdRigOptions{hold: policy, upstream: noLocalUpstream(t), exhausted: true,
+		peers: []*RemotePool{boxA.pool}, pin: "one@example.com"})
+	if err := rig.store.NoteAnswered("claude", "hold-session", warmWaitStart.Add(-59*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	giveUpAt := warmWaitStart.Add(DefaultStrandedGiveUp)
+	at := resentUntil(t, rig, policy, clock, warmWaitStart, giveUpAt)
+	givesUpAt(t, rig, policy, clock, attempts{count: dials.Load, kick: func() { e2eRewindCooldown(boxA.pool) }}, at, giveUpAt, gaveUpOnABox)
 }

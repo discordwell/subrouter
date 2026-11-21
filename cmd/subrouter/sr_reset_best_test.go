@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -102,6 +103,52 @@ func TestResetFallbackOnOlderServerBreaksAWeeklyWaitTieByRank(t *testing.T) {
 	}
 	if len(redeemed) != 1 || redeemed[0] != "b@example.com" {
 		t.Fatalf("credit redeemed for %q, want only b@example.com:\n%s", redeemed, out.String())
+	}
+}
+
+// A tie in weekly wait goes to the ranking however many accounts there are.
+// Thirteen accounts alternate, in ranking order, between the longest wait and
+// a shorter one; a13 ranks first (its 5h window resets soonest) among those
+// with the longest, so it gets the credit.
+func TestResetFallbackBreaksAWeeklyWaitTieByRankAmongManyAccounts(t *testing.T) {
+	const n = 13
+	var rows []string
+	for rank := range n {
+		weekly := 400000
+		if rank%2 == 1 {
+			weekly = 300000
+		}
+		email := fmt.Sprintf("a%02d@example.com", n-rank)
+		rows = append(rows, fmt.Sprintf(`{"id":%[1]q,"email":%[1]q,"provider":"codex","auth_mode":"oauth",
+ "windows":[{"Name":"primary","UsedPercent":10,"LimitWindowSeconds":18000,"ResetAfterSeconds":%[2]d},
+            {"Name":"secondary","UsedPercent":100,"LimitWindowSeconds":604800,"ResetAfterSeconds":%[3]d}],
+ "complimentary_reset":{"available":true,"remaining":1}}`, email, 600+100*rank, weekly))
+	}
+	var redeemed []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/_subrouter/rate-limit-reset":
+			email := r.URL.Query().Get("email")
+			if email == "" {
+				http.Error(w, "email or all=true is required", http.StatusBadRequest)
+				return
+			}
+			redeemed = append(redeemed, email)
+			_, _ = io.WriteString(w, `{"reset":1,"results":[{"email":"`+email+`","eligible":true,"reset":true}]}`)
+		case "/_subrouter/usage-status":
+			_, _ = io.WriteString(w, "["+strings.Join(rows, ",")+"]")
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	var out bytes.Buffer
+	runner := srRunner{out: &out, errOut: &out, client: server.Client()}
+	if err := runner.resetAgainstServer(t.Context(), nil, &srServerConfig{Name: "test", URL: server.URL}); err != nil {
+		t.Fatalf("%v (%s)", err, out.String())
+	}
+	if len(redeemed) != 1 || redeemed[0] != "a13@example.com" {
+		t.Fatalf("credit redeemed for %q, want only a13@example.com:\n%s", redeemed, out.String())
 	}
 }
 

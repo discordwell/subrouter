@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -196,6 +197,55 @@ func fableSpentPreferenceEnabled() (bool, error) {
 	}
 	return false, fmt.Errorf("SUBROUTER_FABLE_SPENT_PREFERENCE=%q: want 1 (the default) or 0", raw)
 }
+
+// pacedAllowanceEnabled reads SUBROUTER_PACED_ALLOWANCE (PATCHES §72). 0 keeps
+// a burndown account at the taper of at most four sessions and gives every
+// account four refugees. It does not reopen a closed admission queue: that is
+// the owner's separate ruling, switched off by closed_queue 0 in
+// admission.json.
+func pacedAllowanceEnabled() (bool, error) {
+	raw := os.Getenv("SUBROUTER_PACED_ALLOWANCE")
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "", "1", "true", "yes", "on":
+		return true, nil
+	case "0", "false", "no", "off":
+		return false, nil
+	}
+	return false, fmt.Errorf("SUBROUTER_PACED_ALLOWANCE=%q: want 1 (the default) or 0", raw)
+}
+
+func paceWasteThreshold() (float64, error) {
+	raw := os.Getenv("SUBROUTER_PACE_WASTE_THRESHOLD")
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return defaultPaceWastePoints / 100, nil
+	}
+	points, err := strconv.ParseFloat(trimmed, 64)
+	if err != nil || math.IsNaN(points) || points < 0 || points > 100 {
+		return 0, fmt.Errorf("SUBROUTER_PACE_WASTE_THRESHOLD=%q: want points of the week from 0 to 100 (default %g)", raw, defaultPaceWastePoints)
+	}
+	return points / 100, nil
+}
+
+const defaultPaceWastePoints = 5.0
+
+// pacedSessionCeiling reads SUBROUTER_PACED_SESSION_CEILING (PATCHES §72):
+// the most live sessions a paced allowance grants one account across all its
+// models, 1 to 64, 20 when unset.
+func pacedSessionCeiling() (int, error) {
+	raw := os.Getenv("SUBROUTER_PACED_SESSION_CEILING")
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return selectacct.DefaultPacedSessionCeiling, nil
+	}
+	sessions, err := strconv.Atoi(trimmed)
+	if err != nil || sessions < 1 || sessions > 64 {
+		return 0, fmt.Errorf("SUBROUTER_PACED_SESSION_CEILING=%q: want sessions from 1 to 64 (default %d)", raw, selectacct.DefaultPacedSessionCeiling)
+	}
+	return sessions, nil
+}
+
+const paceSampleInterval = 30 * time.Second
 
 const maxSecretFileBytes = 64 << 10
 
@@ -551,6 +601,7 @@ var directSRCommands = map[string]struct{}{
 	"ls":               {},
 	"logout":           {},
 	"pick":             {},
+	"plot":             {},
 	"qwen":             {},
 	"recover":          {},
 	"remove":           {},
@@ -965,6 +1016,32 @@ func serve(args []string) error {
 	if !fableSpentPreference {
 		slog.Info("fable spent preference disabled by SUBROUTER_FABLE_SPENT_PREFERENCE; Opus and Sonnet turns rank every account on its weekly pace alone, and the Fable meter is still published to peers",
 			"reenable", "unset SUBROUTER_FABLE_SPENT_PREFERENCE and restart")
+	}
+	pacedAllowance, err := pacedAllowanceEnabled()
+	if err != nil {
+		return err
+	}
+	selectacct.SetPacedAllowance(pacedAllowance)
+	if !pacedAllowance {
+		slog.Info("paced allowance disabled by SUBROUTER_PACED_ALLOWANCE; a burndown account keeps the taper of at most four sessions and every account takes four refugees, except an account with a closed admission queue, which takes none",
+			"reenable", "unset SUBROUTER_PACED_ALLOWANCE and restart",
+			"closed_queue_off", "set closed_queue to 0 in admission.json to stop closing queues; it applies within seconds, with no restart")
+	}
+	wasteThreshold, err := paceWasteThreshold()
+	if err != nil {
+		return err
+	}
+	selectacct.SetPaceWasteThreshold(wasteThreshold)
+	if wasteThreshold != defaultPaceWastePoints/100 {
+		slog.Info("pace waste threshold set by SUBROUTER_PACE_WASTE_THRESHOLD", "points", wasteThreshold*100)
+	}
+	ceiling, err := pacedSessionCeiling()
+	if err != nil {
+		return err
+	}
+	selectacct.SetPacedSessionCeiling(ceiling)
+	if ceiling != selectacct.DefaultPacedSessionCeiling {
+		slog.Info("paced session ceiling per account set by SUBROUTER_PACED_SESSION_CEILING", "sessions", ceiling, "default", selectacct.DefaultPacedSessionCeiling)
 	}
 
 	cloudConfigFile := strings.TrimSpace(*cloudConfigPath)
@@ -1575,6 +1652,8 @@ func serve(args []string) error {
 			"fix", "set SUBROUTER_ACCOUNT_IMPORT_TOKEN_FILE and SUBROUTER_ADMIN_TOKEN_FILE",
 		)
 	}
+
+	go server.RunPaceSampler(activeGenerationCtx, paceSampleInterval)
 
 	// No upstream idle score refresher (RunUsageScoreRefresher, #378): PATCHES
 	// 44.3 took #378's hand-off only. The auto-switch sweep and the usage-status
@@ -2615,6 +2694,8 @@ Usage:
   %[1]s gui-switch [email] Switch active account, sync OpenCode/pi, and restart Codex.app
   %[1]s remove <account>   Remove an account
   %[1]s status [--json]    Show usage across all configured providers (non-interactive)
+  %[1]s plot               Chart 7-day burn pace per provider, with its ceiling
+                           and the unspent accounts expiring soonest
   %[1]s qwen login [--console-account <email-or-label>] <account>
                            Authorize live Qwen Token Plan quota status
   %[1]s qwen [args]        Launch Qwen Code through the selected Token Plan pool

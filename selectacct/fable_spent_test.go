@@ -307,7 +307,7 @@ func gateFingerprint(scheduler Scheduler, accts []account.Account, now time.Time
 		score := scheduler.score(acct.Provider, acct.ID)
 		fmt.Fprintf(&b, "%s %+v headroom=%v remaining=%v allowed=%d reserve=%v routable=%v/%v\n",
 			acct.ID, scheduler.NewSessionVerdict(acct.Provider, acct.ID, now),
-			score.WeeklyHeadroom, score.WeeklyRemaining, score.endgameAllowedSessions(), score.belowWeeklyReserve(),
+			score.WeeklyHeadroom, score.WeeklyRemaining, score.endgameAllowedSessions(time.Now()), score.belowWeeklyReserve(),
 			score.routableForNewSession(now, true), score.routableForNewSession(now, false))
 	}
 	return b.String()

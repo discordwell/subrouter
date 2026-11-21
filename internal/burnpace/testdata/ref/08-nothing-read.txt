@@ -1,0 +1,9 @@
+
+  subrouter · 7d burn pace · nothing read                                              Thu 07:01
+  ────────────────────────────────────────────────────────────────────────────────────────────────
+  LOCAL MISSING — this machine's accounts are not in the numbers below (timeout after 65s)
+  HOME MISSING — home's accounts are not in the numbers below (Connection refused)
+  no fallback through this machine's daemon: timeout after 15s
+
+  no scope could be read, so there are no numbers to show
+

@@ -28,7 +28,7 @@ import (
 //     mark-free scheduler, while any account picked for it is still ranked
 //     with the marks.
 //
-// This is the same cache argument as the owner's 70-minute warm rule, and it
+// This is the same cache argument as the owner's hour-long warm rule, and it
 // narrows the owner-approved capacity exit to conversations cheap enough to
 // move. Estimates: an HTTP turn carries the whole conversation, so its decoded
 // body length / 4; a websocket turn chained with previous_response_id sends

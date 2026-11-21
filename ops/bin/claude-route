@@ -31,6 +31,10 @@
 # settings.json, the keychain, ~/.claude and ~/.codex are never written. CLAUDE_CONFIG_DIR is
 # left alone (sr claude would point it at the pool's active profile), except that `off`
 # drops one pointing into ~/.subrouter: off means your own login, never a pool profile's.
+# A credential command (claude auth, login, logout, setup-token, /login) gets route
+# `credentials`: the route dropped as off drops it, CLAUDE_CONFIG_DIR kept, so it manages
+# the store its own environment names. Pool mode's login-less store
+# (CLAUDE_SECURESTORAGE_CONFIG_DIR) would otherwise take `sr claude addr`'s login.
 #
 #   claude-route status           where things stand
 #   claude-route install          shims (each tested before it goes live) + PATH line in ~/.zshrc and ~/.zprofile
@@ -468,6 +472,10 @@ write_shim() { # $1 = destination
 #   off    the real Claude Code, untouched (your own login)
 #   pool   the local subrouter daemon's Claude socket (first-party mode); if it does
 #          not answer, the daemon's TCP port (pool-tcp); if that does not either, off
+#   credentials  a credential command, $1 = auth, login, logout, setup-token or /login:
+#          the real Claude Code with the route dropped as off drops it, CLAUDE_CONFIG_DIR
+#          kept, so it manages the store its own environment names (sr claude addr
+#          logging a profile in). Beats every route but a word; no daemon I/O.
 # Route words: an exception typed FIRST, before any flag. The default never changes.
 #   claude local ...       safety mode: your own login, with everything that points at
 #                          subrouter dropped. Decided with no daemon I/O at all.
@@ -532,6 +540,9 @@ nl=$'\n'
 SHIM
     shim_common
     cat <<'SHIM'
+
+case "${1:-}" in auth|login|logout|setup-token|/login) credential_cmd=1 ;; *) credential_cmd="" ;; esac
+case "${1:-}:${2:-}" in logout:*|auth:logout) logout_cmd=1 ;; *) logout_cmd="" ;; esac
 
 # Route word: $1 only. `local` is decided with no I/O at all: safety mode never waits on
 # subrouter. A Claude Code command (doctor, mcp, ...) is never a word.
@@ -600,7 +611,17 @@ done
 ok() { [[ "$1" =~ \"ok\"[[:space:]]*:[[:space:]]*true ]]; }
 probe() { curl -q -s --noproxy '*' -m 2 "$@" 2>/dev/null; }
 route=""; note=""; want=""
-if [ -n "$refuse" ]; then
+if [ -n "$logout_cmd" ] && { under_subrouter "${CLAUDE_CONFIG_DIR:-}" || under_subrouter "${CLAUDE_CODE_CONFIG_DIR:-}"; }; then
+    # The credentials route keeps a pool profile's config dir for sr's login, so a
+    # logout there would sign the pool's account out (PATCHES §73).
+    route=refused; refuse_kind=pool-profile-logout
+    refuse="this would sign out the pool profile in ${CLAUDE_CONFIG_DIR:-$CLAUDE_CODE_CONFIG_DIR}. Nothing was launched. To remove a pool account: sr claude remove <name>. To sign out your own login, unset CLAUDE_CONFIG_DIR first"
+elif [ -n "$credential_cmd" ]; then
+    # Undo what a parent shim set; drop_subrouter takes the rest (PATCHES §73).
+    for k in ${CLAUDE_ROUTE_SET:-}; do unset "$k"; done
+    unset CLAUDE_ROUTE_SET
+    route=credentials
+elif [ -n "$refuse" ]; then
     route=refused
 elif [ -n "$word" ] && [ "$settings_route" = 1 ]; then
     route=refused; refuse_kind=settings; refuse="'$typed' can't be honoured: this launch's --settings names a route of its own. Nothing was launched"
@@ -697,7 +718,7 @@ own_headers() { # the caller's header lines minus every subrouter selector (any 
     printf '%s' "$out"
 }
 pin_headers() { local h; h="$(own_headers)"; printf '%s%sX-Subrouter-Agent: claude%sX-Subrouter-Account-ID: %s' "$h" "${h:+$nl}" "$nl" "$pin"; }
-drop_subrouter() { # off means off: nothing pointing at subrouter survives, whoever set it
+drop_subrouter() { # $1 = off | credentials. Nothing pointing at subrouter survives, whoever set it
     local via_sock="" k
     case "${ANTHROPIC_UNIX_SOCKET:-}" in "") ;; "$sock"|*/.subrouter/*) unset ANTHROPIC_UNIX_SOCKET; via_sock=1 ;; esac
     case "${ANTHROPIC_BASE_URL:-}" in
@@ -714,6 +735,8 @@ drop_subrouter() { # off means off: nothing pointing at subrouter survives, whoe
     fi
     # A config dir inside ~/.subrouter is a pool profile (sr claude sets one): running there
     # would use and refresh that account's login outside the daemon. Off is your own login.
+    # A credential command keeps it: that is sr claude logging the profile in.
+    [ "$1" = off ] || return 0
     for k in CLAUDE_CONFIG_DIR CLAUDE_CODE_CONFIG_DIR; do
         if [ -n "${!k:-}" ] && under_subrouter "${!k}"; then
             unset "$k"; note="${note:+$note; }$k pointed into ~/.subrouter (a pool profile); dropped it, so this runs on your own login"
@@ -748,8 +771,8 @@ case "$route" in
         keep CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY 1
         export CLAUDE_ROUTE_SET="${set_keys# }"
         ;;
-    off)
-        drop_subrouter
+    off|credentials)
+        drop_subrouter "$route"
         ;;
 esac
 export CLAUDE_ROUTE_ACTIVE="$route"
@@ -1256,6 +1279,16 @@ cmd_status() {
     echo "socket:      $(socket_ok && echo "serving $SOCK" || echo "NOT answering ($SOCK)")"
     echo "daemon TCP:  $(tcp_ok && echo healthy || echo DOWN)"
     echo "pool now:    $(pool_sessions | wc -l | tr -d ' ') running process(es) route through the socket"
+    # Pool launches read this store on a 401 and must find no login in it. A login saved there
+    # is one `claude auth login` that ran on the pool route before PATCHES §73.
+    if [ -x /usr/bin/security ]; then
+        local ss; ss="Claude Code-credentials-$(printf '%s' "$ROUTE_HOME/securestorage" | shasum -a 256 | cut -c1-8)"
+        if /usr/bin/security find-generic-password -a "$USER" -s "$ss" >/dev/null 2>&1; then
+            echo "pool store:  HOLDS A LOGIN (Keychain '$ss'): pool sessions that meet a 401 adopt it. Move it into the profile it belongs to, then delete it"
+        else
+            echo "pool store:  no login (Keychain '$ss')"
+        fi
+    fi
     [ -x "$SHIM" ] && echo "decision:    $(env -u ANTHROPIC_BASE_URL -u ANTHROPIC_UNIX_SOCKET -u CLAUDE_CODE_OAUTH_TOKEN -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_API_KEY -u CLAUDE_ROUTE CLAUDE_ROUTE_DRYRUN=1 "$SHIM" | head -1) (a fresh launch now)"
     echo "last test:   $(cat "$LAST_TEST" 2>/dev/null || echo never)"
     echo "-- route words (claude local | claude <account>; codex local | codex <account>) --"

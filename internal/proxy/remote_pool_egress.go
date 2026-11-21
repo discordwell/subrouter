@@ -65,8 +65,8 @@ type localEgress struct {
 	upSince atomic.Int64
 	// connectedAt is the last new connection this daemon completed, its dial
 	// and TLS handshake done, to the local upstream or to any peer. A request
-	// on a pooled connection does not set it. On 2026-11-19 a building
-	// gateway refused new connections while open ones kept answering.
+	// on a pooled connection does not set it. A gateway can refuse new
+	// connections while open ones keep answering.
 	connectedAt atomic.Int64
 }
 

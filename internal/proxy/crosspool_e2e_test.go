@@ -384,6 +384,24 @@ func e2eLogLines(logs *syncBuffer, message string) []map[string]any {
 	return out
 }
 
+// awaitLogLines waits, at most 5 s, until logs holds n lines with message,
+// and returns them all: a turn placed on a box is logged after its answer
+// has gone out.
+func awaitLogLines(t *testing.T, logs *syncBuffer, message string, n int) []map[string]any {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		lines := e2eLogLines(logs, message)
+		if len(lines) >= n {
+			return lines
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d %q lines after 5 s, want %d; logs:\n%s", len(lines), message, n, logs.String())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 // --- the laptop: a real Server with a local pool and one peer -----------------
 
 type e2eLaptop struct {
@@ -1031,7 +1049,7 @@ func TestE2ETransientTroubleKeepsThePinAndASpentWindowRecomputes(t *testing.T) {
 	})
 }
 
-// P9: the idle timer (warmSessionIdleTTL, 70 min, unchanged) decides WHETHER a
+// P9: the idle timer (warmSessionIdleTTL, an hour) decides WHETHER a
 // session re-ranks; the one ranking decides where. Cold on a healthy local
 // account that is still the best LOCAL one, it is still weighed against every
 // peer account; warm, it stays and the log says warm; a delegated session

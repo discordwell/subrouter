@@ -60,33 +60,77 @@ func remoteKeyPath() string {
 	return filepath.Join(storepath.CodexDirForReadOnlyInspection(), remoteKeyFileName)
 }
 
-var (
-	remoteGateOnce     sync.Once
-	remoteGateUnlocked bool
+// remoteGateVerdict is the one answer to "may this machine reach beyond
+// itself". refusal is set only when a key exists and was refused: a machine
+// that never had a key is not told the file's name.
+type remoteGateVerdict struct {
+	unlocked bool
+	refusal  *remoteKeyRefusal
+}
+
+// remoteKeyRefusalKind is why an existing remote.key did not open the gate,
+// one kind per check of resolveRemoteGate.
+type remoteKeyRefusalKind uint8
+
+const (
+	keyNotRegularFile remoteKeyRefusalKind = iota + 1
+	keyModeTooOpen
+	keyUnreadable
+	keyTooShort
 )
 
-// remoteUnlocked resolves the verdict ONCE per process.
+type remoteKeyRefusal struct {
+	kind remoteKeyRefusalKind
+	path string
+	perm os.FileMode // keyModeTooOpen only
+	err  error       // keyUnreadable only
+}
+
+func (r remoteKeyRefusal) warning() string {
+	switch r.kind {
+	case keyNotRegularFile:
+		return fmt.Sprintf("subrouter: %s is not a regular file; remote stays off", r.path)
+	case keyModeTooOpen:
+		return fmt.Sprintf("subrouter: %s is mode %04o; chmod 600 it to enable remote", r.path, r.perm)
+	case keyUnreadable:
+		return fmt.Sprintf("subrouter: cannot read %s (%v); remote stays off", r.path, r.err)
+	case keyTooShort:
+		return fmt.Sprintf("subrouter: %s is too short to be a key; remote stays off", r.path)
+	}
+	panic(fmt.Sprintf("remote key refusal of unknown kind %d", r.kind))
+}
+
+var (
+	remoteGateOnce    sync.Once
+	remoteGateCurrent remoteGateVerdict
+)
+
+// remoteGate resolves the verdict ONCE per process.
 //
 // The architecture rule this fork keeps re-learning is "publish the verdict;
 // never re-derive it" -- eligibility lived in four places and every copy
 // eventually disagreed with the router. One Once, one answer, so two call sites
 // in the same run cannot reach opposite conclusions because the file changed
 // between them.
-func remoteUnlocked() bool {
+func remoteGate() remoteGateVerdict {
 	remoteGateOnce.Do(func() {
-		remoteGateUnlocked = resolveRemoteGate(os.Stderr)
+		remoteGateCurrent = resolveRemoteGate(os.Stderr)
 	})
-	return remoteGateUnlocked
+	return remoteGateCurrent
+}
+
+func remoteUnlocked() bool {
+	return remoteGate().unlocked
 }
 
 // resetRemoteGateCache is test-only: the Once is the production contract, and
 // tests need to change HOME/SUBROUTER_STATE_DIR between cases.
 func resetRemoteGateCache() {
 	remoteGateOnce = sync.Once{}
-	remoteGateUnlocked = false
+	remoteGateCurrent = remoteGateVerdict{}
 }
 
-func resolveRemoteGate(warn io.Writer) bool {
+func resolveRemoteGate(warn io.Writer) remoteGateVerdict {
 	// Deliberately no migration: an earlier draft minted a key when servers.json
 	// held a server, so a machine that had been set up before the gate kept
 	// working untouched. That makes servers.json a second key -- a machine with
@@ -97,28 +141,29 @@ func resolveRemoteGate(warn io.Writer) bool {
 	info, err := os.Stat(path)
 	if err != nil {
 		// No key: total silence. Naming the file here would defeat the point.
-		return false
+		return remoteGateVerdict{}
 	}
 	// Past this line the operator already knows the file exists, so explaining
 	// why it did not work leaks nothing and saves a baffling silent lock.
+	refuse := func(refusal remoteKeyRefusal) remoteGateVerdict {
+		refusal.path = path
+		fmt.Fprintln(warn, refusal.warning())
+		return remoteGateVerdict{refusal: &refusal}
+	}
 	if !info.Mode().IsRegular() {
-		fmt.Fprintf(warn, "subrouter: %s is not a regular file; remote stays off\n", path)
-		return false
+		return refuse(remoteKeyRefusal{kind: keyNotRegularFile})
 	}
 	if perm := info.Mode().Perm(); perm&0o077 != 0 {
-		fmt.Fprintf(warn, "subrouter: %s is mode %04o; chmod 600 it to enable remote\n", path, perm)
-		return false
+		return refuse(remoteKeyRefusal{kind: keyModeTooOpen, perm: perm})
 	}
 	body, err := os.ReadFile(path)
 	if err != nil {
-		fmt.Fprintf(warn, "subrouter: cannot read %s (%v); remote stays off\n", path, err)
-		return false
+		return refuse(remoteKeyRefusal{kind: keyUnreadable, err: err})
 	}
 	if len(strings.TrimSpace(string(body))) < remoteKeyMinLength {
-		fmt.Fprintf(warn, "subrouter: %s is too short to be a key; remote stays off\n", path)
-		return false
+		return refuse(remoteKeyRefusal{kind: keyTooShort})
 	}
-	return true
+	return remoteGateVerdict{unlocked: true}
 }
 
 // remotePoolFromEnv builds the peer-pool config from the environment, or

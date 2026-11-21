@@ -101,6 +101,8 @@ Usage:
   sr gui-switch [email] Switch active account, sync OpenCode/pi, and restart Codex.app
   sr remove <account>   Remove an account from this machine's pool
   sr status [--json]    Show usage across all configured providers (non-interactive)
+  sr plot               Chart 7-day burn pace per provider, with its ceiling
+                        and the unspent accounts expiring soonest
   sr recover list [--json] [--query TEXT] [--limit N]
                         Find interrupted local Claude sessions and task artifacts
   sr recover show --session ID [--json]
@@ -722,6 +724,8 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 		return r.spend(ctx)
 	case "errors", "error":
 		return r.upstreamErrors(ctx, args[1:])
+	case "plot":
+		return r.plot(ctx, args[1:])
 	case "gemini":
 		return r.gemini(args[1:])
 	case "oai", "openai":
@@ -799,8 +803,9 @@ func shouldRouteSRCommand(command string) bool {
 		return false
 	// status renders local AND every configured server. Routing it to the box
 	// replaced that combined view with the box alone, which is the other half of
-	// the bug fixed above -- `sr status` never even reached r.status.
-	case "status":
+	// the bug fixed above -- `sr status` never even reached r.status. plot
+	// draws the same pool, and runRemoteAccountCommand has no arm for it.
+	case "status", "plot":
 		return false
 	default:
 		return true
@@ -3061,9 +3066,7 @@ func sortUsageRowsWithinHeadings(rows []srUsageRow, less func(a, b srUsageRow) b
 // bottom. A weekly reading with no reset time counts as 0 left; rows with no
 // weekly reading follow, and rows in error come last.
 func usageRowWeekLess(a, b srUsageRow) bool {
-	// Status tier 6 is the ranking's failure tier: a failed usage read, a
-	// rejected credential or key, a revoked login.
-	inError := func(row srUsageRow) bool { return row.err != nil || usageRowStatusTier(row) == 6 }
+	inError := func(row srUsageRow) bool { return row.err != nil || usageRowStatusTier(row) == usageStatusTierFailed }
 	if ae, be := inError(a), inError(b); ae != be {
 		return be
 	}
@@ -3664,6 +3667,10 @@ func authErrorNeedsReadd(err error) bool {
 	return false
 }
 
+// usageStatusTierFailed is usageRowStatusTier's last tier: a failed usage
+// read, a rejected credential or key, a revoked login.
+const usageStatusTierFailed = 6
+
 // usageRowStatusTier keeps rows that need human attention out of the usable
 // portion of the table. A headerless 429 is a telemetry throttle, not proof
 // that quota is exhausted, so it belongs in the low-signal tail after rows
@@ -3671,7 +3678,7 @@ func authErrorNeedsReadd(err error) bool {
 // they require re-verification before the account can be considered usable.
 func usageRowStatusTier(row srUsageRow) int {
 	if !row.revokedSince.IsZero() {
-		return 6
+		return usageStatusTierFailed
 	}
 	if claudeCreditCooldownActive(row) {
 		return 3
@@ -3686,7 +3693,7 @@ func usageRowStatusTier(row srUsageRow) int {
 		return 5
 	}
 	if row.err != nil || (row.authChecked && !row.authValid) || usageRowProviderFailure(row) {
-		return 6
+		return usageStatusTierFailed
 	}
 	return 0
 }

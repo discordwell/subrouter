@@ -24,7 +24,7 @@ import (
 // 2026-09-28 decision (PATCHES section 27). Before it the fork recorded a
 // capacity failure as a pool EXHAUSTION mark (MarkExhaustedUntil), which made
 // the account Evicted and moved every warm session on it after ONE failure --
-// the 70-minute warm rule's only exit. Capacity eviction is now the rule's
+// the hour-long warm rule's only exit. Capacity eviction is now the rule's
 // second, owner-approved exit, and it takes two consecutive failures. Only the
 // capacity parts are ported: upstream's sticky-retention floor and +10pp move
 // gate (keepConstrainedStickyAssignment's headroom branch) are deliberately

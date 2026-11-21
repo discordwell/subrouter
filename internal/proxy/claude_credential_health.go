@@ -248,7 +248,9 @@ func (h *claudeCredentialHealth) noteOK(accountID string, now time.Time) bool {
 	}
 	h.mu.Unlock()
 	if flush {
-		go h.flushLastOK(snapshot)
+		// On the caller's goroutine: a write handed to its own goroutine
+		// outlives the request that noted it, and Shutdown with it.
+		h.flushLastOK(snapshot)
 	}
 	return recheck
 }

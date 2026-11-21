@@ -46,12 +46,15 @@ func holdTestPolicy(deadline time.Duration) *HoldPolicy {
 
 // holdRig is one daemon in front of one fake upstream.
 type holdRig struct {
-	daemon  *httptest.Server
-	logs    *syncBuffer
-	sched   *selectacct.SchedulerRef
-	store   *session.Store
-	dials   atomic.Int64
-	handled chan struct{} // one value per finished handler run
+	daemon *httptest.Server
+	logs   *syncBuffer
+	sched  *selectacct.SchedulerRef
+	store  *session.Store
+	// storePath is the session store's file, for a second rig standing for
+	// the next process.
+	storePath string
+	dials     atomic.Int64
+	handled   chan struct{} // one value per finished handler run
 	// pool is the peer, when the rig has one; peerTurns counts the requests
 	// it served that were not its usage read.
 	pool      *RemotePool
@@ -94,6 +97,9 @@ type holdRigOptions struct {
 	// onLog sees every log record as the daemon logs it, before the rig's
 	// log has it, so a test can act at an exact point in a turn.
 	onLog func(slog.Record)
+	// refugeeSlots, when set, is each account's refugee cap
+	// (Server.refugeeSlotsOverride).
+	refugeeSlots func(peer, account, poolModel string) int
 }
 
 // hookedHandler runs hook on each record before next handles it.
@@ -161,7 +167,7 @@ func newHoldRig(t *testing.T, opts holdRigOptions) *holdRig {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rig.store = store
+	rig.store, rig.storePath = store, sessionsPath
 	if opts.pin != "" {
 		if _, err := store.Put("claude", "hold-session", opts.pin, ""); err != nil {
 			t.Fatal(err)
@@ -204,6 +210,8 @@ func newHoldRig(t *testing.T, opts holdRigOptions) *holdRig {
 		PeerDownGrace:    opts.peerDownGrace,
 		admission:        opts.admission,
 		ActiveSessions:   opts.active,
+
+		refugeeSlotsOverride: opts.refugeeSlots,
 	}
 	handler := server.Handler()
 	if opts.public {
@@ -1155,12 +1163,10 @@ func TestTransientNetworkCause(t *testing.T) {
 	}
 }
 
-// The 11/19 outage. The local pool was spent, so every turn went to a peer,
-// and the building gateway timed out or refused the dials to both of them.
-// The daemon answered at once with "no non-exhausted claude accounts
-// available" and a Retry-After of half an hour, which Claude Code does not
-// wait for: 59 background agents died in half an hour. A peer this daemon
-// cannot reach is now waited out like an unreachable api.anthropic.com.
+// A spent local pool sends every turn to a peer, and a gateway can time out or
+// refuse the dials to all of them. A peer this daemon cannot reach is waited
+// out like an unreachable api.anthropic.com, not answered with the
+// pool-exhausted 503, whose Retry-After Claude Code does not wait for.
 
 // cutPeer reads pool's usage, as the daemon had it before the outage, then
 // puts the gateway in the way: the nth dial to the peer fails with fail(n),
@@ -1322,24 +1328,27 @@ func retryAfterOver60(resp *http.Response) bool {
 func TestASpentPoolHoldAnswers502HoweverItEnds(t *testing.T) {
 	today := newHoldRig(t, holdRigOptions{upstream: noLocalUpstream(t), exhausted: true, peer: peerAnswer})
 	cutPeer(t, today.pool, func(int64) error { return refusedFailure() })
-	todayResp, _, err := today.turn(t, context.Background(), nil)
+	todayResp, todayBody, err := today.turn(t, context.Background(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if todayResp.StatusCode != http.StatusServiceUnavailable || !retryAfterOver60(todayResp) {
-		t.Fatalf("calibration: the unheld answer is %d with Retry-After %q, want the spent pool's 503 with one over 60 s",
-			todayResp.StatusCode, todayResp.Header.Get("Retry-After"))
+	if unheld := spentPoolAnswerOf(todayResp, todayBody); unheld.status != http.StatusServiceUnavailable || !retryAfterOver60(todayResp) ||
+		unheld.reason != "pool_exhausted" || !strings.HasPrefix(todayBody, "no non-exhausted claude accounts available; next account frees up in") {
+		t.Fatalf("calibration: the unheld answer is %+v with Retry-After %q, want the spent pool's 503 with one over 60 s",
+			unheld, todayResp.Header.Get("Retry-After"))
 	}
 	for _, end := range []struct {
 		name         string
 		maxRequests  int
+		dial         func(t *testing.T) error
 		atSecondDial func(*Lifecycle, *movableClock)
 		logged       string
 	}{
-		{"deadline", 8, func(_ *Lifecycle, clock *movableClock) { clock.set(warmWaitStart.Add(time.Hour)) }, "outcome=deadline status=502"},
-		{"no room", 0, nil, "proxy hold refused"},
-		{"drain", 8, func(lifecycle *Lifecycle, _ *movableClock) { lifecycle.Drain() }, "outcome=draining status=502"},
-		{"shutdown", 8, func(lifecycle *Lifecycle, _ *movableClock) { lifecycle.BeginShutdown() }, "outcome=shutdown_502 status=502"},
+		{"deadline", 8, nil, func(_ *Lifecycle, clock *movableClock) { clock.set(warmWaitStart.Add(time.Hour)) }, "outcome=deadline status=502"},
+		{"deadline after dial timeouts", 8, realDialTimeout, func(_ *Lifecycle, clock *movableClock) { clock.set(warmWaitStart.Add(time.Hour)) }, "outcome=deadline status=502"},
+		{"no room", 0, nil, nil, "proxy hold refused"},
+		{"drain", 8, nil, func(lifecycle *Lifecycle, _ *movableClock) { lifecycle.Drain() }, "outcome=draining status=502"},
+		{"shutdown", 8, nil, func(lifecycle *Lifecycle, _ *movableClock) { lifecycle.BeginShutdown() }, "outcome=shutdown_502 status=502"},
 	} {
 		t.Run(end.name, func(t *testing.T) {
 			clock := newMovableClock(warmWaitStart)
@@ -1348,11 +1357,15 @@ func TestASpentPoolHoldAnswers502HoweverItEnds(t *testing.T) {
 			policy.now = clock.now
 			lifecycle := NewLifecycle()
 			rig := newHoldRig(t, holdRigOptions{hold: policy, upstream: noLocalUpstream(t), exhausted: true, peer: peerAnswer, lifecycle: lifecycle})
+			failure := refusedFailure()
+			if end.dial != nil {
+				failure = end.dial(t)
+			}
 			cutPeer(t, rig.pool, func(n int64) error {
 				if n == 2 && end.atSecondDial != nil {
 					end.atSecondDial(lifecycle, clock)
 				}
-				return refusedFailure()
+				return failure
 			})
 			resp, body, err := rig.turn(t, context.Background(), nil)
 			if err != nil {
@@ -1366,6 +1379,9 @@ func TestASpentPoolHoldAnswers502HoweverItEnds(t *testing.T) {
 			}
 			if !strings.Contains(logs, "reason=peers_unreachable:pool_exhausted") || !strings.Contains(logs, end.logged) {
 				t.Fatalf("want the spent pool's hold ended with %q; logs:\n%s", end.logged, logs)
+			}
+			if started, want := rig.countLog("proxy hold started"), min(end.maxRequests, 1); started != want {
+				t.Fatalf("%d proxy hold started lines, want %d; logs:\n%s", started, want, logs)
 			}
 		})
 	}

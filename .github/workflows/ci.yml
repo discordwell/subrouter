@@ -8,6 +8,10 @@ on:
     types: [checks_requested]
   push:
     branches: [main]
+  # The full suite (unit tests, cross-compiles, the Docker profiles) runs only
+  # when someone starts it:  gh workflow run ci.yml --ref <branch>
+  # Every other event runs the public check alone (ops/PATCHES.md §74).
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -21,8 +25,11 @@ concurrency:
   # completed result at all, so "is main red?" had no answer.
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+# Where the Linux jobs run is the repository variable LINUX_RUNNER, a JSON value for runs-on. With no
+# such variable they run on GitHub's ubuntu-latest, which is what a public repository must do: a
+# self-hosted runner on a public repository lets any pull request run code on it.
 jobs:
-  # Fork (discordwell/clawedswap): upstream's CLA step, deploy-scripts job
+  # Fork (discordwell/subrouter): upstream's CLA step, deploy-scripts job
   # (deploy/macos deploy, guard, verify, canary, upgrade-host and autoupdate
   # suites, the bake gate end to end, shellcheck), shadow rehearsal,
   # exact-head client artifact and macOS LaunchAgent job are left out. They
@@ -35,7 +42,7 @@ jobs:
   # of them rather than their sum.
   test:
     name: Build, vet, test
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.LINUX_RUNNER || '"ubuntu-latest"') }}
     needs: [changes, unit, cross-compile, public-check]
     # Run when a gated job fails (so the required check fails too), but not
     # when the whole run is cancelled because a newer push superseded it:
@@ -68,7 +75,7 @@ jobs:
     name: Unit tests
     needs: changes
     if: ${{ needs.changes.outputs.code == 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.LINUX_RUNNER || '"ubuntu-latest"') }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
@@ -109,7 +116,7 @@ jobs:
   # request, merge group and push.
   public-check:
     name: Public check
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.LINUX_RUNNER || '"ubuntu-latest"') }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
@@ -139,7 +146,7 @@ jobs:
     name: Cross-compile release targets (${{ matrix.group }})
     needs: changes
     if: ${{ needs.changes.outputs.code == 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.LINUX_RUNNER || '"ubuntu-latest"') }}
     strategy:
       fail-fast: false
       matrix:
@@ -205,7 +212,7 @@ jobs:
     # It already ran on the pull request and runs again on the push to main.
     needs: changes
     if: ${{ github.event_name != 'merge_group' && needs.changes.outputs.code == 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.LINUX_RUNNER || '"ubuntu-latest"') }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
@@ -222,7 +229,7 @@ jobs:
   # required check passes instead of waiting for a run that never starts.
   changes:
     name: Detect changed paths
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.LINUX_RUNNER || '"ubuntu-latest"') }}
     permissions:
       contents: read
       pull-requests: read
@@ -242,6 +249,14 @@ jobs:
             echo "code=true" >> "${GITHUB_OUTPUT}"
             exit 0
           }
+          # Until this project has users, a change is tested where it is built
+          # and merged without waiting here; a bad merge costs a fix. So only a
+          # run someone starts tests the code. "Build, vet, test" still
+          # reports on every event, with the public check (ops/PATCHES.md §74).
+          if [ "${EVENT}" != "workflow_dispatch" ]; then
+            echo "code=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
           case "${EVENT}" in
             pull_request)
               if ! files="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/pulls/${PR}/files" --jq '.[].filename')"; then

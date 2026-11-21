@@ -1,0 +1,380 @@
+[
+ {
+  "provider": "claude",
+  "id": "acct1086",
+  "auth_mode": "oauth",
+  "auth_checked": true,
+  "auth_valid": true,
+  "windows": [
+   {
+    "Name": "5h",
+    "UsedPercent": 0,
+    "LimitWindowSeconds": 18000,
+    "ResetAfterSeconds": 1121
+   },
+   {
+    "Name": "7d",
+    "UsedPercent": 39,
+    "LimitWindowSeconds": 604800,
+    "ResetAfterSeconds": 441998
+   },
+   {
+    "Name": "extra",
+    "UsedPercent": 0,
+    "LimitWindowSeconds": 0,
+    "ResetAfterSeconds": 0
+   },
+   {
+    "Name": "oauth-apps-weekly",
+    "UsedPercent": 58,
+    "LimitWindowSeconds": 604800,
+    "ResetAfterSeconds": 441998
+   }
+  ]
+ },
+ {
+  "provider": "codex",
+  "id": "acct1334",
+  "auth_mode": "oauth",
+  "auth_checked": true,
+  "auth_valid": true,
+  "windows": [
+   {
+    "Name": "primary",
+    "UsedPercent": 101,
+    "LimitWindowSeconds": 604800,
+    "ResetAfterSeconds": 442025
+   },
+   {
+    "Name": "reached",
+    "UsedPercent": 101,
+    "LimitWindowSeconds": 0,
+    "ResetAfterSeconds": 0
+   }
+  ]
+ },
+ {
+  "provider": "codex",
+  "id": "acct1458",
+  "auth_mode": "oauth",
+  "auth_checked": true,
+  "auth_valid": true,
+  "windows": [
+   {
+    "Name": "primary",
+    "UsedPercent": 0,
+    "LimitWindowSeconds": 604800,
+    "ResetAfterSeconds": 382972
+   }
+  ]
+ },
+ {
+  "provider": "claude",
+  "id": "acct1652",
+  "auth_mode": "oauth",
+  "auth_checked": true,
+  "auth_valid": true,
+  "windows": [
+   {
+    "Name": "7d",
+    "UsedPercent": 50,
+    "LimitWindowSeconds": 604800,
+    "ResetAfterSeconds": 45162
+   },
+   {
+    "Name": "extra",
+    "UsedPercent": 0,
+    "LimitWindowSeconds": 0,
+    "ResetAfterSeconds": 0
+   },
+   {
+    "Name": "oauth-apps-weekly",
+    "UsedPercent": 95,
+    "LimitWindowSeconds": 604800,
+    "ResetAfterSeconds": 45162
+   }
+  ]
+ },
+ {
+  "provider": "claude",
+  "id": "acct2996",
+  "auth_mode": "oauth",
+  "auth_checked": true,
+  "auth_valid": true,
+  "windows": [
+   {
+    "Name": "7d",
+    "UsedPercent": 33,
+    "LimitWindowSeconds": 604800,
+    "ResetAfterSeconds": 472624
+   },
+   {
+    "Name": "extra",
+    "UsedPercent": 0,
+    "LimitWindowSeconds": 0,
+    "ResetAfterSeconds": 0
+   },
+   {
+    "Name": "oauth-apps-weekly",
+    "UsedPercent": 60,
+    "LimitWindowSeconds": 604800,
+    "ResetAfterSeconds": 472624
+   }
+  ]
+ },
+ {
+  "provider": "codex",
+  "id": "acct3345",
+  "auth_mode": "oauth",
+  "auth_checked": true,
+  "auth_valid": true,
+  "windows": [
+   {
+    "Name": "primary",
+    "UsedPercent": 0,
+    "LimitWindowSeconds": 604800,
+    "ResetAfterSeconds": 574155
+   }
+  ]
+ },
+ {
+  "provider": "codex",
+  "id": "acct3519",
+  "auth_mode": "oauth",
+  "auth_checked": true,
+  "auth_valid": true,
+  "windows": [
+   {
+    "Name": "primary",
+    "UsedPercent": 4,
+    "LimitWindowSeconds": 604800,
+    "ResetAfterSeconds": 516036
+   }
+  ]
+ },
+ {
+  "provider": "claude",
+  "id": "acct3777",
+  "auth_mode": "oauth",
+  "auth_checked": true,
+  "auth_valid": true,
+  "windows": [
+   {
+    "Name": "7d",
+    "UsedPercent": 0,
+    "LimitWindowSeconds": 604800,
+    "ResetAfterSeconds": 569627
+   },
+   {
+    "Name": "extra",
+    "UsedPercent": 0,
+    "LimitWindowSeconds": 0,
+    "ResetAfterSeconds": 0
+   },
+   {
+    "Name": "oauth-apps-weekly",
+    "UsedPercent": 0,
+    "LimitWindowSeconds": 604800,
+    "ResetAfterSeconds": 569627
+   }
+  ]
+ },
+ {
+  "provider": "claude",
+  "id": "acct3938",
+  "auth_mode": "oauth",
+  "auth_checked": true,
+  "auth_valid": true,
+  "windows": [
+   {
+    "Name": "7d",
+    "UsedPercent": 57,
+    "LimitWindowSeconds": 604800,
+    "ResetAfterSeconds": 273906
+   },
+   {
+    "Name": "extra",
+    "UsedPercent": 0,
+    "LimitWindowSeconds": 0,
+    "ResetAfterSeconds": 0
+   },
+   {
+    "Name": "oauth-apps-weekly",
+    "UsedPercent": 76,
+    "LimitWindowSeconds": 604800,
+    "ResetAfterSeconds": 273906
+   }
+  ]
+ },
+ {
+  "provider": "claude",
+  "id": "acct5621",
+  "auth_mode": "oauth",
+  "auth_checked": true,
+  "auth_valid": true,
+  "windows": [
+   {
+    "Name": "7d",
+    "UsedPercent": 79,
+    "LimitWindowSeconds": 604800,
+    "ResetAfterSeconds": 166020
+   },
+   {
+    "Name": "extra",
+    "UsedPercent": 0,
+    "LimitWindowSeconds": 0,
+    "ResetAfterSeconds": 0
+   },
+   {
+    "Name": "oauth-apps-weekly",
+    "UsedPercent": 101,
+    "LimitWindowSeconds": 604800,
+    "ResetAfterSeconds": 166020
+   }
+  ]
+ },
+ {
+  "provider": "claude",
+  "id": "acct7089",
+  "auth_mode": "oauth",
+  "auth_checked": true,
+  "auth_valid": true,
+  "windows": [
+   {
+    "Name": "7d",
+    "UsedPercent": 57,
+    "LimitWindowSeconds": 604800,
+    "ResetAfterSeconds": 67347
+   },
+   {
+    "Name": "extra",
+    "UsedPercent": 0,
+    "LimitWindowSeconds": 0,
+    "ResetAfterSeconds": 0
+   },
+   {
+    "Name": "oauth-apps-weekly",
+    "UsedPercent": 101,
+    "LimitWindowSeconds": 604800,
+    "ResetAfterSeconds": 67347
+   }
+  ]
+ },
+ {
+  "provider": "codex",
+  "id": "acct7251",
+  "auth_mode": "oauth",
+  "auth_checked": true,
+  "auth_valid": true,
+  "windows": [
+   {
+    "Name": "primary",
+    "UsedPercent": 0,
+    "LimitWindowSeconds": 604800,
+    "ResetAfterSeconds": 586432
+   }
+  ]
+ },
+ {
+  "provider": "claude",
+  "id": "acct7415",
+  "auth_mode": "oauth",
+  "auth_checked": true,
+  "auth_valid": true,
+  "windows": [
+   {
+    "Name": "7d",
+    "UsedPercent": 65,
+    "LimitWindowSeconds": 604800,
+    "ResetAfterSeconds": 7542
+   },
+   {
+    "Name": "extra",
+    "UsedPercent": 0,
+    "LimitWindowSeconds": 0,
+    "ResetAfterSeconds": 0
+   },
+   {
+    "Name": "oauth-apps-weekly",
+    "UsedPercent": 100,
+    "LimitWindowSeconds": 604800,
+    "ResetAfterSeconds": 7542
+   }
+  ]
+ },
+ {
+  "provider": "claude",
+  "id": "acct7769",
+  "auth_mode": "oauth",
+  "auth_checked": true,
+  "auth_valid": true,
+  "windows": [
+   {
+    "Name": "7d",
+    "UsedPercent": 60,
+    "LimitWindowSeconds": 604800,
+    "ResetAfterSeconds": 27880
+   },
+   {
+    "Name": "extra",
+    "UsedPercent": 0,
+    "LimitWindowSeconds": 0,
+    "ResetAfterSeconds": 0
+   },
+   {
+    "Name": "oauth-apps-weekly",
+    "UsedPercent": 100,
+    "LimitWindowSeconds": 604800,
+    "ResetAfterSeconds": 27880
+   }
+  ]
+ },
+ {
+  "provider": "claude",
+  "id": "acct9418",
+  "auth_mode": "oauth",
+  "auth_checked": true,
+  "auth_valid": true,
+  "windows": [
+   {
+    "Name": "7d",
+    "UsedPercent": 49,
+    "LimitWindowSeconds": 604800,
+    "ResetAfterSeconds": 59388
+   },
+   {
+    "Name": "extra",
+    "UsedPercent": 0,
+    "LimitWindowSeconds": 0,
+    "ResetAfterSeconds": 0
+   },
+   {
+    "Name": "oauth-apps-weekly",
+    "UsedPercent": 99,
+    "LimitWindowSeconds": 604800,
+    "ResetAfterSeconds": 59388
+   }
+  ]
+ },
+ {
+  "provider": "codex",
+  "id": "acct9602",
+  "auth_mode": "oauth",
+  "auth_checked": true,
+  "auth_valid": true,
+  "windows": [
+   {
+    "Name": "primary",
+    "UsedPercent": 102,
+    "LimitWindowSeconds": 604800,
+    "ResetAfterSeconds": 488618
+   },
+   {
+    "Name": "reached",
+    "UsedPercent": 102,
+    "LimitWindowSeconds": 0,
+    "ResetAfterSeconds": 0
+   }
+  ]
+ }
+]

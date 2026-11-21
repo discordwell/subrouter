@@ -1,5 +1,7 @@
 # Subrouter
 
+> **A maintained fork of [manaflow-ai/subrouter](https://github.com/manaflow-ai/subrouter).** Upstream has merged nothing since late October 2026, so maintenance continues here. This fork is not affiliated with or endorsed by Manaflow. Fixes that apply upstream are offered back as pull requests, and if upstream resumes, this fork follows it. [`ops/PATCHES.md`](ops/PATCHES.md) lists every change the fork makes, and [`ops/`](ops/) holds the tools that deploy and run it.
+
 Subrouter is a local AI coding-agent proxy. It routes traffic across Codex accounts with sticky conversation-to-account assignment so cached context stays useful.
 
 ## Goals
@@ -494,6 +496,7 @@ go run ./cmd/subrouter import
 go run ./cmd/subrouter list
 go run ./cmd/subrouter status
 sr status
+sr plot
 ```
 
 The supported Codex commands include `add`, `add-key`, `import`, `list`, `switch`, `g`, `gui`, `gui-switch`, `remove`, `status`, `usage`, `server`, `add-admin-key`, `admin-keys`, `remove-admin-key`, `attach-project`, `claude`, and `gemini`. The older `subrouter cx <command>` form remains as a compatibility alias.
@@ -595,17 +598,37 @@ up (its deadline, or a full hold). A session whose prompt cache is warm on an
 account (a peer account it is held on, or its local account) is held the same
 way when that account's peer or upstream cannot be dialed, so an outage does
 not move it to a cold cache. A hold that ends first (its deadline, a full
-hold, a drain) answers 502, Claude Code retries it, and the retry is held
-again: the session waits across retries until its account answers. A session
-held on a peer moves only once that peer is found down, as a refugee: to
-another peer's account first and a local account last, at most 4 warm
-refugees to an account, and never back. With no slot anywhere it keeps its
-hold and waits. A session's held turns give up an hour after its last
-answered turn, when an idle session goes unlinked (`SUBROUTER_STRANDED_GIVE_UP`;
-0 is no limit), with a 503, `Retry-After: 3600` and `X-Subrouter-Reason:
-stranded_gave_up`, which Claude Code shows at once. The session is then
-unlinked, and its next turn is placed as a new session (`ops/PATCHES.md`
-§67). The public listener never holds. Upstream's 8-minute same-account ladder, its
+hold, a drain or a quiesce) answers 502, Claude Code retries it, and the retry
+is held again: the session waits across retries until its account answers. A
+turn that a spent pool cannot serve while no peer can be reached is held the
+same way, and answers 502, not the pool-exhausted 503. A session
+held on a peer moves only once that peer is found down, as a refugee. Refugees
+spread across the accounts of the other peers, the one with the most free
+refugee slots first, each up to the refugee cap the account's owner publishes
+(see below), and never go back. One turn of a session places it at a time;
+another that comes meanwhile waits and then follows it. An account with an
+open admission queue takes 4 when its owner publishes no cap or runs with
+`SUBROUTER_PACED_ALLOWANCE=0`.
+A local account takes one only when every other peer is found down, full, or
+not an option. While another peer cannot be asked, or with no slot anywhere,
+the session keeps its hold and waits. A session's held turns give up an hour
+after its last answered turn, when an idle session goes unlinked
+(`SUBROUTER_STRANDED_GIVE_UP`; 0 is no limit), or, on a spent pool, an hour
+after its first held turn, with a 503, `Retry-After: 3600` and
+`X-Subrouter-Reason: stranded_gave_up`, which Claude Code shows at once. A
+session a peer held then waits for room. Restarted, its next turn goes home if
+that peer answers, though it was found down. Otherwise it is placed as a
+refugee, and a home peer that is not found down keeps it off the local
+accounts, as any other peer does. With nowhere to go it gets the same 503 at
+once. Once placed it no longer waits. A store that cannot be written leaves
+the wait with the running process. Any other session is unlinked, and its
+next turn is placed as a new session (`ops/PATCHES.md` §67). A spent pool's
+chain of held turns also ends when one of its turns is answered, when a hold
+of it ends with a box's own 503 or a client that left, and after the hold
+deadline and 2 minutes with no held attempt. The session
+store keeps the chain with the session's assignment, so a restart carries it
+on; a session with no assignment, or whose store cannot be written, keeps it
+in the running process. The public listener never holds. Upstream's 8-minute same-account ladder, its
 `SUBROUTER_CLAUDE_OVERLOAD_*` settings, the `X-Subrouter-Retry` header,
 `sr claude --retry-interval/--retry-max-wait` and its opt-in reroute are not
 part of this fork. If you really want to move a conversation, start or fork a
@@ -614,6 +637,60 @@ new session (it is placed fresh), or launch with
 different rule: the Codex account failover is on unless
 `SUBROUTER_CODEX_OVERLOAD_FAILOVER=0` (`ops/PATCHES.md` §27); see
 [docs/codex.md](docs/codex.md#selected-model-is-at-capacity).
+
+A Claude account's week is spent on pace (`ops/PATCHES.md` §72).
+The daemon measures each local account's weekly burn per live session over
+the last two hours. A session is live while one of its requests is admitted
+and in flight. A request waiting in the admission queue burns nothing, so it
+does not count. In
+its burndown window (within a day of its weekly roll, or, for an account
+holding a saved weekly reset, once under a quarter of its week is left) an
+account normally takes at most 4 live sessions, fewer as its budget runs out.
+When the budget left over the hours left needs more live sessions than that,
+it takes them, up to 20. An account with no measured burn is sized on 1.5
+points of the week an hour per live session (`burn_source=default` in the
+log): 17% left 1.5 hours from the roll takes 8, not 3. That default needs a
+current usage reading with a 5h window, because the 5h brake is what stops a
+wrong guess. A stale reading, or an account with no 5h meter, keeps the taper
+until its burn is measured.
+`SUBROUTER_PACED_SESSION_CEILING` (1 to 64, default 20) sets that ceiling.
+It counts one account's live sessions across all its models, not per model.
+It caps only the raise. It never lowers an account below its taper, so a ceiling
+of 2 leaves an account that the taper allows 3 at 3. A
+non-quota 429 holds the account at no more than 4 for 15 minutes. A request
+waiting at the account's admission gate does not: the gate tunes its own
+limit, and the closed queue below stops a backlog. Lowering the allowance
+only stops new sessions; a session already on the account stays. Each change
+is logged as `paced allowance` with its inputs. `SUBROUTER_PACED_ALLOWANCE=0`
+turns the raise off: a burndown account keeps the taper of at most 4
+sessions, and every account takes 4 refugees. It does not turn off the closed
+queue below. `SUBROUTER_PACE_WASTE_THRESHOLD` sets, in points of the week
+(default 5), the projected waste at the roll that the log line reports as
+`danger=true`.
+
+Each account's owner also publishes how many warm refugees the account takes,
+so a refugee goes dark before it drains the account it moved to: one per 10
+points of the week left above the owner's reserve, as the usage meter last read
+it (30% takes 3, 9% takes none), and in its burndown window at least one per
+5 points scaled to the hours left (20% with 12 hours left takes 8). An account
+whose week is unknown, a daemon too old to publish the cap, or any account with
+`SUBROUTER_PACED_ALLOWANCE=0`, takes 4. An account with a closed queue takes
+none, whatever that switch says. Each refugee that stops counting on its
+account is logged once as `refugee went dark`, with the points its account lost
+while it stayed.
+
+Once any model's admission queue on an account holds `closed_queue` waiting
+requests (`admission.json`, default 16), the account takes no new session and
+no refugee until the queue drains below it.
+It publishes `new_session.reason` `queue_closed` with a refugee cap of 0, a
+peer's targeted new session gets 409 `queue_closed`, and a local new session
+goes to another account, or gets the 503 `pool_exhausted` when none is left.
+Sessions already on the account stay and wait in its queue. A turn may still
+spill onto a closed account when its session keeps its pin, but a spill that
+would move the session there does not. This closure is a
+switch of its own, independent of `SUBROUTER_PACED_ALLOWANCE`: `closed_queue`
+0 in `admission.json` turns it off, and the daemon applies the file within
+seconds, with no restart (`ops/PATCHES.md` §70).
 
 For manual client configuration, authenticate to the Subrouter proxy rather
 than exposing an upstream Claude OAuth token. A trusted local or legacy

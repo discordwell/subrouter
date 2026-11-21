@@ -134,7 +134,7 @@ func TestPruneNeverDropsRecentlyUpdatedAssignments(t *testing.T) {
 // a persisted UpdatedAt can lag a session's last turn by more than the window
 // the prune protects.
 func TestTouchIntervalFitsInsideTheWarmWindow(t *testing.T) {
-	if sessionActivityWriteInterval >= warmSessionWindow {
-		t.Fatalf("sessionActivityWriteInterval %s must be shorter than the %s warm window", sessionActivityWriteInterval, warmSessionWindow)
+	if sessionActivityWriteInterval >= WarmSessionWindow {
+		t.Fatalf("sessionActivityWriteInterval %s must be shorter than the %s warm window", sessionActivityWriteInterval, WarmSessionWindow)
 	}
 }
