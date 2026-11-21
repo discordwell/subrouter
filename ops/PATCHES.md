@@ -2234,3 +2234,27 @@ with `gh workflow run ci.yml --ref <branch>`; there the classifier runs everythi
 early exit.
 
 - Code: `.github/workflows/ci.yml` (`on.workflow_dispatch`, the `changes` job's first lines)
+
+## 75. A dual-stack MPTCP listener is read as dual-stack, so a legacy handoff on Linux keeps it
+
+Go 1.24 and later listen with MPTCP wherever the kernel offers it. On kernels such as 6.8, an MPTCP
+socket answers `getsockopt(IPPROTO_IPV6, IPV6_V6ONLY)` with `EOPNOTSUPP`. The coverage check
+(`listenerIPv6WildcardAcceptsIPv4`) took any error for "IPv6-only". So on such a Linux host it judged
+every dual-stack `[::]` listener unable to serve an IPv4 `0.0.0.0` configuration. Takeover, listener
+transfer and front handoff then refused the legacy dual-stack listener that older builds made by
+listening on network `tcp`. An exact-address handoff and macOS never reached this path.
+
+§75.1 On `EOPNOTSUPP`, and only then, the flag is read from the kernel's TCP listener table over
+`NETLINK_SOCK_DIAG` (attribute `INET_DIAG_SKV6ONLY`, which `ss -e` also reads). The entry is matched by
+the socket's inode from `fstat`. The MPTCP subflow listener reports the parent socket's inode.
+
+§75.2 It fails safe. A missing entry, a missing attribute or any netlink error leaves the check at "not
+covered", which is the same refusal as before. Other Unix systems get a stub that returns `EOPNOTSUPP`,
+so their behaviour is unchanged.
+
+§75.3 Tests. `TestListenerCoverageReadsDualStackCapabilityOfMultipathListeners` builds dual-stack and
+IPv6-only listeners explicitly as MPTCP. It skips only when the kernel hands back plain TCP. The
+takeover tests skip where `pidfd_getfd` is refused for the calling process itself, as under Docker's
+default seccomp profile, because a refusal there can only mean the system call is blocked.
+
+- Code: `cmd/subrouter/listener_address_linux.go`, `cmd/subrouter/listener_address_unix.go`

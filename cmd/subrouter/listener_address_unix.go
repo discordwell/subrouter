@@ -3,6 +3,7 @@
 package main
 
 import (
+	"errors"
 	"net"
 
 	"golang.org/x/sys/unix"
@@ -21,6 +22,9 @@ func listenerIPv6WildcardAcceptsIPv4(listener net.Listener) bool {
 	var optionErr error
 	if err := raw.Control(func(descriptor uintptr) {
 		v6Only, optionErr = unix.GetsockoptInt(int(descriptor), unix.IPPROTO_IPV6, unix.IPV6_V6ONLY)
+		if errors.Is(optionErr, unix.EOPNOTSUPP) {
+			v6Only, optionErr = listenerIPv6OnlyFromSocketDiag(int(descriptor))
+		}
 	}); err != nil || optionErr != nil {
 		return false
 	}

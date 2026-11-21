@@ -3,14 +3,39 @@
 package main
 
 import (
+	"errors"
 	"io"
 	"net"
 	"os"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
+// skipWithoutPidfdGetfd skips listener takeover tests where pidfd_getfd is
+// refused even for the calling process, as under Docker's default seccomp
+// profile. Ptrace access to one's own process always passes, so such a
+// refusal means the system call itself is unavailable.
+func skipWithoutPidfdGetfd(t *testing.T) {
+	t.Helper()
+	pidfd, err := unix.PidfdOpen(os.Getpid(), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(pidfd)
+	duplicate, err := unix.PidfdGetfd(pidfd, pidfd, 0)
+	if errors.Is(err, unix.EPERM) || errors.Is(err, unix.ENOSYS) {
+		t.Skipf("pidfd_getfd is unavailable on this host (%v); listener takeover needs it", err)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = unix.Close(duplicate)
+}
+
 func TestTakeoverTCPListenerKeepsTheSameKernelSocketAccepting(t *testing.T) {
+	skipWithoutPidfdGetfd(t)
 	original, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
