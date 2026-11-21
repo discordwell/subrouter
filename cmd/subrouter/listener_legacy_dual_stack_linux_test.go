@@ -18,6 +18,7 @@ import (
 )
 
 func TestTakeoverTCPListenerAcceptsLegacyDualStackWildcardForIPv4Configuration(t *testing.T) {
+	skipWithoutPidfdGetfd(t)
 	original := listenIPv6Wildcard(t, false)
 	file, err := original.File()
 	if err != nil {
@@ -44,6 +45,7 @@ func TestTakeoverTCPListenerAcceptsLegacyDualStackWildcardForIPv4Configuration(t
 }
 
 func TestTakeoverTCPListenerRejectsIPv6OnlyWildcardForIPv4Configuration(t *testing.T) {
+	skipWithoutPidfdGetfd(t)
 	original := listenIPv6Wildcard(t, true)
 	defer original.Close()
 	file, err := original.File()
@@ -110,7 +112,56 @@ func TestListenerTransferAcceptsLegacyDualStackWildcardForIPv4Configuration(t *t
 	assertListenerAcceptsIPv4(t, result.listener)
 }
 
+func TestListenerCoverageReadsDualStackCapabilityOfMultipathListeners(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		v6Only bool
+		want   bool
+	}{
+		{name: "dual-stack", v6Only: false, want: true},
+		{name: "IPv6-only", v6Only: true, want: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			listener := listenIPv6WildcardWithMultipath(t, test.v6Only, true)
+			defer listener.Close()
+			if protocol := listenerProtocol(t, listener); protocol != unix.IPPROTO_MPTCP {
+				t.Skipf("listener protocol = %d; this kernel does not offer MPTCP listeners", protocol)
+			}
+			expected := ipv4WildcardForListener(t, listener)
+			if got := listenerCoversConfiguredAddress(listener, expected); got != test.want {
+				t.Fatalf("listenerCoversConfiguredAddress(%q, %q) = %t, want %t",
+					listener.Addr(), expected, got, test.want)
+			}
+		})
+	}
+}
+
+func listenerProtocol(t *testing.T, listener *net.TCPListener) int {
+	t.Helper()
+	raw, err := listener.SyscallConn()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var protocol int
+	var optionErr error
+	if err := raw.Control(func(descriptor uintptr) {
+		protocol, optionErr = unix.GetsockoptInt(int(descriptor), unix.SOL_SOCKET, unix.SO_PROTOCOL)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if optionErr != nil {
+		t.Fatal(optionErr)
+	}
+	return protocol
+}
+
 func listenIPv6Wildcard(t *testing.T, v6Only bool) *net.TCPListener {
+	t.Helper()
+	var config net.ListenConfig
+	return listenIPv6WildcardWithMultipath(t, v6Only, config.MultipathTCP())
+}
+
+func listenIPv6WildcardWithMultipath(t *testing.T, v6Only, multipath bool) *net.TCPListener {
 	t.Helper()
 	skipWithoutIPv6Listen(t)
 	value := 0
@@ -126,6 +177,7 @@ func listenIPv6Wildcard(t *testing.T, v6Only bool) *net.TCPListener {
 		}
 		return socketErr
 	}}
+	config.SetMultipathTCP(multipath)
 	listener, err := config.Listen(context.Background(), "tcp6", "[::]:0")
 	if err != nil {
 		t.Fatal(err)

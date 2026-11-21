@@ -46,6 +46,7 @@ func TestListenerCoverageUsesLiveDualStackCapability(t *testing.T) {
 				}
 				return socketErr
 			}}
+			config.SetMultipathTCP(false)
 			listener, err := config.Listen(context.Background(), "tcp6", "[::]:0")
 			if err != nil {
 				t.Fatal(err)
