@@ -140,6 +140,21 @@ func TestExpiredTokenIsRefused(t *testing.T) {
 	}
 }
 
+// replaceFile swaps in a new body by temp file and rename, as the store
+// writes. An in-place os.WriteFile of the same size can land in the same
+// mtime granule on the same inode, which the checker's cache key rightly
+// cannot tell apart.
+func replaceFile(t *testing.T, path string, body []byte) {
+	t.Helper()
+	next := path + ".next"
+	if err := os.WriteFile(next, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(next, path); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // A file that stops parsing must refuse every named token, and must not keep
 // honouring what it said before it broke. Fixing it must be picked up without
 // a restart: the failure is never cached.
@@ -153,15 +168,11 @@ func TestUnreadableFileRefusesEveryNamedToken(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(store.Path, []byte(`{"version":1,"tokens":[`), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	replaceFile(t, store.Path, []byte(`{"version":1,"tokens":[`))
 	if got := checker.Check(alice); got.Verdict != VerdictUnreadable {
 		t.Fatalf("corrupt file: Check = %s, want unreadable", got.Verdict)
 	}
-	if err := os.WriteFile(store.Path, good, 0o600); err != nil {
-		t.Fatal(err)
-	}
+	replaceFile(t, store.Path, good)
 	if got := checker.Check(alice); got.Verdict != VerdictValid {
 		t.Fatalf("repaired file: Check = %s, want valid", got.Verdict)
 	}
@@ -172,9 +183,7 @@ func TestUnreadableFileRefusesEveryNamedToken(t *testing.T) {
 	if newer == string(good) {
 		t.Fatal("test setup: no version field to bump")
 	}
-	if err := os.WriteFile(store.Path, []byte(newer), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	replaceFile(t, store.Path, []byte(newer))
 	if got := checker.Check(alice); got.Verdict != VerdictUnreadable {
 		t.Fatalf("newer version: Check = %s, want unreadable", got.Verdict)
 	}
