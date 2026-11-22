@@ -398,6 +398,13 @@ func TestStagedDiffAfterADeletion(t *testing.T) {
 	refused(t, out, err, "notes.md:4", "<private>-new.md: in the path", "<private>-new.md:2")
 }
 
+// The lines after git's "\ No newline at end of file" keep their numbers.
+func TestNoNewlineAtEndOfFile(t *testing.T) {
+	s := newSandbox(t, fixture{privateValues: "Fernwood Analytics\n", base: "1\n2"})
+	out, err := s.commit("notes.md", "1\n2\nFernwood Analytics\n", "notes")
+	refusedExactly(t, out, err, "notes.md:3")
+}
+
 // A user's git diff settings change nothing: each hook finds the same lines,
 // with their numbers, and the same new path. The change has a hunk with
 // context lines, a file after it, a move into a path that holds a value, and a
@@ -967,6 +974,9 @@ func TestNewRefName(t *testing.T) {
 	s.mustGit("push", "-q", "--no-verify", "origin", "main:quillfeather-fix")
 	s.commit("notes.md", "notes\nmore\n", "notes")
 	out, err = s.git("push", "-q", "origin", "main:quillfeather-fix")
+	passed(t, out, err)
+	// A push that deletes a branch adds nothing to the remote.
+	out, err = s.git("push", "-q", "origin", "--delete", "quillfeather-fix")
 	passed(t, out, err)
 }
 
