@@ -156,3 +156,37 @@ func TestDockerRunTrimsItsBuildCacheBeforeTheSuite(t *testing.T) {
 		}
 	})
 }
+
+// On macOS the deploy cases refuse to run outside a sandbox (PATCHES §76.6), so
+// a run with --no-sandbox fails them at once. The option's help says so, and
+// names --docker for them.
+func TestNoSandboxHelpSaysTheDeployCasesRefuseOnMacOS(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("sr-local-ci is a bash script")
+	}
+	repo, err := filepath.Abs(filepath.Join("..", ".."))
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := exec.Command("bash", filepath.Join(repo, "ops", "bin", "sr-local-ci"), "--help").CombinedOutput()
+	if err != nil {
+		t.Fatalf("sr-local-ci --help: %v\n%s", err, out)
+	}
+	_, rest, found := strings.Cut(string(out), "\n  --no-sandbox ")
+	if !found {
+		t.Fatalf("the help has no --no-sandbox option:\n%s", out)
+	}
+	if next := strings.Index(rest, "\n  -"); next >= 0 {
+		rest = rest[:next]
+	}
+	help := strings.Join(strings.Fields(rest), " ")
+	for _, want := range []string{
+		"On macOS the deploy cases refuse to run without the sandbox (PATCHES §76)",
+		"TestDeployScripts fails at once and counts as a real failure",
+		"run them with --docker",
+	} {
+		if !strings.Contains(help, want) {
+			t.Errorf("the --no-sandbox help does not say %q:\n%s", want, help)
+		}
+	}
+}

@@ -46,4 +46,5 @@ To clear a volume by hand, remove it while no test run uses it. Docker refuses t
 ```bash
 docker volume rm subrouter-test-gobuild   # the build cache: the next run compiles everything again
 docker volume rm subrouter-test-gomod     # the modules: needed after go.mod gains a dependency
+docker volume rm sr-local-ci-gocache      # the build cache of ops/bin/sr-local-ci --docker
 ```
