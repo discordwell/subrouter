@@ -50,8 +50,8 @@ type State string
 
 const (
 	StateUntested    State = "untested"    // no token test or request has reached it yet
-	StateOK          State = "ok"          // its last answer was not a refusal
-	StateRefused     State = "refused"     // its last answer was a 401: it refuses the token
+	StateOK          State = "ok"          // its last answer showed it takes the token
+	StateRefused     State = "refused"     // its last token test was a 401: it refuses the token
 	StateUnreachable State = "unreachable" // every address failed before a request was sent
 	// The token file cannot be used.
 	StateFileMissing    State = "file_missing"
@@ -130,8 +130,11 @@ type entry struct {
 type member struct {
 	entry
 	addresses []*address // the tailnet address, then the URL; none with a problem
-	result    State      // guarded by Set.mu
-	at        time.Time  // guarded by Set.mu
+	// Guarded by Set.mu. A request's 401 sets recheck, which asks the next
+	// sweep for a token test.
+	result  State
+	at      time.Time
+	recheck bool
 }
 
 type address struct {
@@ -168,7 +171,8 @@ func NewSet(cfg Config) (*Set, error) {
 // Run reloads the files every ReloadEvery, and tests a box's token when no
 // test or request has told the set about that box for TestEvery: every 10
 // minutes while the stand-in is idle, and not while requests reach the box.
-// It returns when ctx ends. Run it once.
+// A box that answered a request with a 401 is tested on the next tick. It
+// returns when ctx ends. Run it once.
 func (s *Set) Run(ctx context.Context) {
 	var sweeps sync.WaitGroup
 	defer sweeps.Wait()
@@ -257,9 +261,16 @@ func rendezvous(name, sessionID string) uint64 {
 	return binary.BigEndian.Uint64(sum[:8])
 }
 
-// Answered records a box's answer to a request or a token test: a 401 means
-// it refuses the token, any other answer that it takes it.
-func (s *Set) Answered(box *Box, status int) {
+// Answered records a box's answer to a request: any answer but a 401 means
+// the box takes the token. A 401 decides nothing, because a box also relays
+// an upstream 401: its identity answers policy_limits with one once Anthropic
+// revokes the identity's token, while the box serves every model turn. So a
+// 401 asks for a token test on the next tick, and only that test can show the
+// box refused (PATCHES §79.2).
+func (s *Set) Answered(box *Box, status int) { s.record(box, status, false) }
+
+// record records a box's answer, to a request or to a token test.
+func (s *Set) record(box *Box, status int, tokenTest bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	a := s.addresses[box]
@@ -267,11 +278,14 @@ func (s *Set) Answered(box *Box, status int) {
 		return
 	}
 	a.failedAt = time.Time{}
-	state := StateOK
-	if status == http.StatusUnauthorized {
-		state = StateRefused
+	switch {
+	case status != http.StatusUnauthorized:
+		s.decide(a.member, StateOK)
+	case tokenTest:
+		s.decide(a.member, StateRefused)
+	default:
+		a.member.recheck = true
 	}
-	s.decide(a.member, state)
 }
 
 // Unreachable records an address that failed before a request was sent to
@@ -301,17 +315,17 @@ func (s *Set) decide(m *member, state State) {
 		}
 		s.logger.Log(context.Background(), level, "standby: box state changed", "box", m.name, "state", state, "was", m.result)
 	}
-	m.result, m.at = state, time.Now()
+	m.result, m.at, m.recheck = state, time.Now(), false
 }
 
 // sweep tests the token of every box no test or request has told the set
-// about for TestEvery.
+// about for TestEvery, and of every box a request's 401 asked about.
 func (s *Set) sweep(ctx context.Context) {
 	s.mu.Lock()
 	var stale []*member
 	now := time.Now()
 	for _, m := range s.members {
-		if len(m.addresses) > 0 && (m.at.IsZero() || now.Sub(m.at) >= s.cfg.TestEvery) {
+		if len(m.addresses) > 0 && (m.recheck || m.at.IsZero() || now.Sub(m.at) >= s.cfg.TestEvery) {
 			stale = append(stale, m)
 		}
 	}
@@ -326,7 +340,7 @@ func (s *Set) sweep(ctx context.Context) {
 				s.Unreachable(a.box)
 				continue
 			}
-			s.Answered(a.box, status)
+			s.record(a.box, status, true)
 			break
 		}
 	}
@@ -334,7 +348,7 @@ func (s *Set) sweep(ctx context.Context) {
 
 // testToken sends HEAD / with the box's token, the cheapest request a box
 // authenticates: its proxy answers 204 to a token it takes and 401 to one it
-// refuses, and sends nothing upstream.
+// refuses, and sends nothing upstream, so its 401 cannot be a relayed one.
 func (b *Box) testToken(ctx context.Context) (int, error) {
 	ctx, cancel := context.WithTimeout(ctx, boxTestTimeout)
 	defer cancel()
