@@ -214,6 +214,9 @@ type standbyView struct {
 	// Boxes is the box set's own status: each box's name and the word for
 	// its token.
 	Boxes *standby.Status `json:"boxes,omitempty"`
+	// PolicyCopy says whether the stand-in holds the daemon's policy_limits
+	// answer, and its age (PATCHES §79.4).
+	PolicyCopy standbyPolicyView `json:"policy_copy"`
 }
 
 // standbyConfig is what one stand-in runs with. parseStandbyConfig fills the
@@ -221,7 +224,7 @@ type standbyView struct {
 // test sets them.
 type standbyConfig struct {
 	// StateDir is the daemon's state folder: the stand-in tokens and the
-	// peer-holds files are read there, and the stand-in's two files are
+	// peer-holds files are read there, and the stand-in's own files are
 	// written there.
 	StateDir string
 	// Socket is the daemon's Claude socket path, and ControlSocket the
@@ -235,6 +238,9 @@ type standbyConfig struct {
 	PeersFile string
 	Tailnet   string
 	Hold      time.Duration
+	// PolicyEvery is how often the daemon is asked for its policy_limits
+	// answer while it serves the socket.
+	PolicyEvery time.Duration
 	// RemoteUnlocked is the remote.key gate's verdict for StateDir.
 	RemoteUnlocked bool
 
@@ -274,6 +280,7 @@ func (c standbyConfig) withDefaults() standbyConfig {
 	set(&c.StopGrace, standbyStopGrace)
 	set(&c.SelfCheckEvery, standbySelfCheckEvery)
 	set(&c.SelfCheckTimeout, standbySelfCheckTimeout)
+	set(&c.PolicyEvery, standbyPolicyEvery)
 	if c.clock == nil {
 		c.clock = time.Now
 	}
@@ -313,6 +320,7 @@ func parseStandbyConfig(args []string, getenv func(string) string) (standbyConfi
 	flags.StringVar(&config.PeersFile, "peers-file", "", "the daemon's peers file (default: "+remotePeersFileEnv+" in the worker config, else in the environment)")
 	flags.StringVar(&config.Tailnet, "tailnet", "", "name=IP pairs to dial over Tailscale first (default: "+peerTailnetEnv+" in the worker config, else in the environment)")
 	flags.DurationVar(&config.Hold, "hold", standbyHold, "how long requests wait after the stand-in takes the path, in case the daemon comes straight back; at most "+standbyHoldMax.String())
+	flags.DurationVar(&config.PolicyEvery, "policy-every", standbyPolicyEvery, "how often the daemon is asked for its policy_limits answer while it serves the socket; at least 1m and under 24h")
 	if err := flags.Parse(args); err != nil {
 		return standbyConfig{}, err
 	}
@@ -343,6 +351,11 @@ func parseStandbyConfig(args []string, getenv func(string) string) (standbyConfi
 	config.Socket = filepath.Clean(config.Socket)
 	if config.Hold < 0 || config.Hold > standbyHoldMax {
 		return standbyConfig{}, fmt.Errorf("hold must be between 0 and %s, got %s", standbyHoldMax, config.Hold)
+	}
+	// Under a minute would put the identity's policy call on Anthropic every
+	// few seconds; a day or more would let the copy expire between asks.
+	if config.PolicyEvery < time.Minute || config.PolicyEvery >= standbyPolicyMaxAge {
+		return standbyConfig{}, fmt.Errorf("policy-every must be at least 1m and under %s, got %s", standbyPolicyMaxAge, config.PolicyEvery)
 	}
 	// A worker reads its settings from the worker config over the
 	// supervisor's environment (workerEnvironment), so the stand-in does too.
@@ -416,8 +429,12 @@ type standIn struct {
 	tenure    *standbyTenure
 	// draining are stays that have ended while their streams run on.
 	draining []*standbyTenure
-	// takes are the times it took the path within standbyFlapWindow.
+	// takes are the times it took the path within standbyFlapWindow, and
+	// took the number of takes since the process started.
 	takes []time.Time
+	took  int
+	// policy is the daemon's saved policy_limits answer (PATCHES §79.4).
+	policy standbyPolicy
 	// retryAt is the real time before which the path is not tried again.
 	retryAt   time.Time
 	lastNoted string
@@ -560,6 +577,10 @@ func runStandby(ctx context.Context, config standbyConfig) error {
 	if saved, ok := readSupervisorReading(filepath.Join(config.StateDir, standbyReadingFile)); ok {
 		s.last, s.saved = &saved, saved
 	}
+	s.policy.ask = make(chan struct{}, 1)
+	if saved := readSavedPolicy(filepath.Join(config.StateDir, standbyPolicyFile)); saved != nil {
+		s.policy.saved.Store(saved)
+	}
 	s.logger.Info("standby: started", "socket", config.Socket, "control_socket", config.ControlSocket,
 		"peers_file", config.PeersFile != "", "remote_unlocked", config.RemoteUnlocked, "hold", config.Hold)
 	s.publish()
@@ -579,6 +600,12 @@ func runStandby(ctx context.Context, config standbyConfig) error {
 		defer background.Done()
 		s.watchSupervisor(ctx, sights)
 	}()
+	policies := make(chan policyAnswer)
+	background.Add(1)
+	go func() {
+		defer background.Done()
+		s.askForPolicies(ctx, policies)
+	}()
 
 	poll := time.NewTicker(config.LockPoll)
 	defer poll.Stop()
@@ -593,6 +620,8 @@ func runStandby(ctx context.Context, config standbyConfig) error {
 			return nil
 		case sight := <-sights:
 			s.saw(sight)
+		case answer := <-policies:
+			s.gotPolicy(answer)
 		case err := <-failed:
 			s.logger.Error("standby: the socket stopped accepting; letting go of the path", "error", err)
 			s.letGo("its listener failed")
@@ -685,6 +714,7 @@ func (s *standIn) saw(sight supervisorSight) {
 	} else {
 		s.decideArming(now)
 	}
+	s.considerPolicy(now)
 	s.publish()
 }
 
@@ -783,6 +813,7 @@ func (s *standIn) take(now time.Time) {
 		}
 	}
 	s.takes = append(kept, now)
+	s.took++
 	t := &standbyTenure{
 		tookAt:   now,
 		steady:   flapSteady(len(s.takes)),
@@ -794,6 +825,9 @@ func (s *standIn) take(now time.Time) {
 	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if standby.IsHealth(r) {
 			s.serveHealth(w)
+			return
+		}
+		if s.answerPolicy(w, r) {
 			return
 		}
 		proceed, sent := t.gate.wait(r.Context().Done())
@@ -1035,6 +1069,7 @@ func (s *standIn) snapshot() standbyView {
 		boxes := s.set.Status()
 		view.Boxes = &boxes
 	}
+	view.PolicyCopy = s.policyView(s.cfg.clock())
 	return view
 }
 
@@ -1056,7 +1091,7 @@ func (s *standIn) publish() {
 	s.mu.Unlock()
 	view := s.snapshot()
 	steady := view
-	steady.Parked, steady.ReadyChecks = 0, 0
+	steady.Parked, steady.ReadyChecks, steady.PolicyCopy.AgeSeconds = 0, 0, nil
 	if view.Supervisor != nil {
 		reading := *view.Supervisor
 		reading.At = time.Time{}

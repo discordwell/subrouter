@@ -48,7 +48,10 @@ const (
 // So it gets a 503, with one exception. A session that starts without a 200
 // on policy_limits withholds WebFetch, DesignSync and RemoteTrigger, and does
 // not ask again for an hour; a box's answer kept them and wrote no identity
-// to a file (PATCHES §79.1).
+// to a file (PATCHES §79.1). The process that owns the socket answers an
+// unpinned policy_limits with the daemon's own saved answer when it has one
+// under a day old (§79.4, PolicyCopyAnswers), so this handler sees it only
+// when it has none.
 //
 // A request that names an account (claude <account>) was promised that
 // account and no other, so it waits for the daemon.
@@ -59,7 +62,7 @@ func routeFor(r *http.Request) route {
 		return routeHealth
 	case clean == "/_subrouter" || strings.HasPrefix(clean, "/_subrouter/"):
 		return routeDaemonSurface
-	case clean == "/api/claude_code/policy_limits":
+	case isPolicyLimits(r):
 		// To a box, unless it is pinned.
 	case clean == "/api" || strings.HasPrefix(clean, "/api/"):
 		return routeControlPlane
@@ -76,6 +79,25 @@ func routeFor(r *http.Request) route {
 // once, while every other request waits out its hold.
 func IsHealth(r *http.Request) bool {
 	return path.Clean("/"+r.URL.Path) == "/_subrouter/health"
+}
+
+// isPolicyLimits reports whether r asks for /api/claude_code/policy_limits,
+// the one /api/ call a socket session makes.
+func isPolicyLimits(r *http.Request) bool {
+	return path.Clean("/"+r.URL.Path) == "/api/claude_code/policy_limits"
+}
+
+// PolicyCopyAnswers reports whether r may be answered with the daemon's
+// saved policy_limits answer (PATCHES §79.4): a GET of policy_limits that
+// names no account. The daemon answers a pinned launch's policy_limits from
+// the pinned account, so the copy, which its identity account answered, is
+// not that launch's answer.
+func PolicyCopyAnswers(r *http.Request) bool {
+	if r.Method != http.MethodGet || !isPolicyLimits(r) {
+		return false
+	}
+	_, pinned, _ := session.ExtractAccountIDWithPresence(r)
+	return !pinned
 }
 
 // Handler answers a Claude Code request, as it arrives on the Mac's Claude
