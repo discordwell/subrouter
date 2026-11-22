@@ -147,8 +147,16 @@ drain_status() { curl -s -m 5 --unix-socket "$DRAIN_SOCKET" "http://drain-socket
 
 # shellcheck disable=SC2317 # run through await
 tcp_ok() { [ "$(health | json_field ok)" = true ]; }
+# serving | standby | down: who answers health at the Claude socket. A stand-in
+# holds the path while the daemon is away (PATCHES §84).
+socket_owner() {
+    local body; body=$(health "$CLAUDE_SOCKET")
+    if [ "$(json_field ok <<<"$body")" != true ]; then echo down
+    elif [ "$(json_field claude_socket <<<"$body")" = standby ]; then echo standby
+    else echo serving; fi
+}
 # shellcheck disable=SC2317 # run through await
-socket_ok() { [ "$(health "$CLAUDE_SOCKET" | json_field ok)" = true ]; }
+daemon_on_socket() { [ "$(socket_owner)" = serving ]; }
 # shellcheck disable=SC2317 # run through await
 supervisor_up() { [ "$(supervisor_status | json_field accepting)" = true ]; }
 
@@ -191,11 +199,15 @@ verify_direct() {
     if ! await 120 "the daemon to answer on $ADDR" tcp_ok; then echo "   tcp health      -> DOWN ($ADDR)"; return 1; fi
     echo "   tcp health      -> ok ($ADDR)"
     [ -n "$CLAUDE_SOCKET" ] || return 0
-    if await 60 "the Claude socket to answer on $CLAUDE_SOCKET" socket_ok; then
+    if await 60 "the daemon to answer on $CLAUDE_SOCKET" daemon_on_socket; then
         echo "   claude socket   -> serving"
         return 0
     fi
-    echo "   claude socket   -> no answer on $CLAUDE_SOCKET"
+    if [ "$(socket_owner)" = standby ]; then
+        echo "   claude socket   -> a stand-in answers on $CLAUDE_SOCKET, not the daemon, so the daemon does not own its socket. The stand-in keeps the path until the daemon asks for it"
+    else
+        echo "   claude socket   -> no answer on $CLAUDE_SOCKET"
+    fi
     return 1
 }
 

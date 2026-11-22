@@ -85,7 +85,15 @@ MARK_END='# <<< claude-route <<<'
 die() { echo "claude-route: $*" >&2; exit 1; }
 health_ok() { [[ "$1" =~ \"ok\"[[:space:]]*:[[:space:]]*true ]]; }
 probe() { curl -q -s --noproxy '*' -m 2 "$@" 2>/dev/null; }
-socket_ok() { [ -S "$SOCK" ] && health_ok "$(probe --unix-socket "$SOCK" http://api.anthropic.com/_subrouter/health)"; }
+# Who answers health at the socket: serving (the daemon), standby (a stand-in
+# that holds the path while the daemon is away, PATCHES §84) or down.
+socket_owner() {
+    local body
+    [ -S "$SOCK" ] && body=$(probe --unix-socket "$SOCK" http://api.anthropic.com/_subrouter/health) && health_ok "$body" || { echo down; return; }
+    if [[ "$body" =~ \"claude_socket\"[[:space:]]*:[[:space:]]*\"standby\" ]]; then echo standby; else echo serving; fi
+}
+# A launch's route needs only an answer at the path; a stand-in's will do.
+socket_ok() { [ "$(socket_owner)" != down ]; }
 tcp_ok() { health_ok "$(probe "$TCP/_subrouter/health")"; }
 plist_get() { # <Key[:Sub]>
     "$PY" -I - "$PLIST" "$1" <<'PY'
@@ -1182,13 +1190,18 @@ reload_daemon() { # PLIST_SET_ENV=<name>=<value> | PLIST_DELETE_ENV=<name>
 }
 
 cmd_socket_on() {
-    local cur; cur=$(plist_sock)
-    if [ "$cur" = "$SOCK" ] && socket_ok; then echo "socket: already serving $SOCK"; return 0; fi
+    local cur owner; cur=$(plist_sock); owner=$(socket_owner)
+    if [ "$cur" = "$SOCK" ] && [ "$owner" = serving ]; then echo "socket: already serving $SOCK"; return 0; fi
+    if [ "$cur" = "$SOCK" ] && [ "$owner" = standby ]; then
+        echo "socket-on: the plist already names $SOCK, and a stand-in answers there, not the daemon. Restarting the daemon would not hand it the path. Nothing was changed. To see why the daemon does not hold it: $DEPLOY <the daemon's binary> --check" >&2
+        return 1
+    fi
     supervisor_restart_allowed socket-on "${1:-}"
     echo "restarting the daemon on its own binary with SUBROUTER_CLAUDE_SOCKET=$SOCK (deploy-laptop.sh) ..."
     local rc=0; reload_daemon PLIST_SET_ENV="SUBROUTER_CLAUDE_SOCKET=$SOCK" || rc=$?
-    if [ "$rc" = 0 ] && socket_ok; then echo "socket: serving $SOCK"; return 0; fi
-    echo "!! socket-on failed (deploy exit $rc, socket $(socket_ok && echo up || echo down)); deploy-laptop.sh's output above says what it changed and what it put back" >&2
+    owner=$(socket_owner)
+    if [ "$rc" = 0 ] && [ "$owner" = serving ]; then echo "socket: serving $SOCK"; return 0; fi
+    echo "!! socket-on failed (deploy exit $rc, socket $owner); deploy-laptop.sh's output above says what it changed and what it put back" >&2
     if tcp_ok; then echo "daemon: healthy" >&2; else echo "!! daemon NOT healthy: tail -50 ~/Library/Logs/subrouter.err.log" >&2; fi
     return 1
 }
@@ -1276,7 +1289,11 @@ cmd_status() {
     echo "shim:        $([ -x "$SHIM" ] && echo "$SHIM" || echo 'NOT installed')"
     local f; for f in "${RC_FILES[@]}"; do echo "PATH line:   $f: $(rc_has_block "$f" && echo present || echo absent)"; done
     echo "plist:       SUBROUTER_CLAUDE_SOCKET=$(plist_sock || true)"
-    echo "socket:      $(socket_ok && echo "serving $SOCK" || echo "NOT answering ($SOCK)")"
+    case $(socket_owner) in
+        serving) echo "socket:      serving $SOCK" ;;
+        standby) echo "socket:      STAND-IN at $SOCK: the daemon does not own its socket. A stand-in answers there, so pool launches still work" ;;
+        *) echo "socket:      NOT answering ($SOCK)" ;;
+    esac
     echo "daemon TCP:  $(tcp_ok && echo healthy || echo DOWN)"
     echo "pool now:    $(pool_sessions | wc -l | tr -d ' ') running process(es) route through the socket"
     # Pool launches read this store on a 401 and must find no login in it. A login saved there
@@ -1529,7 +1546,7 @@ FAKE
     echo "== preflight =="
     check "daemon answers on TCP"                         tcp_ok
     check "plist names the socket"                        test "$(plist_sock)" = "$SOCK"
-    check "daemon answers THROUGH the socket"             socket_ok
+    check "daemon answers THROUGH the socket"             test "$(socket_owner)" = serving
 
     echo "== decisions (dry run, no API calls) =="
     local o

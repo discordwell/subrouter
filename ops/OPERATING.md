@@ -151,7 +151,7 @@ Each `proxy request` line names the `agent`, `session`, `account`, `path`, and `
 
 | Command | Effect |
 |---|---|
-| `claude-route status` | The mode, the shims, the socket, the identity account, and the last test. |
+| `claude-route status` | The mode, the shims, the socket (`STAND-IN` when a stand-in holds it, PATCHES §84), the identity account, and the last test. |
 | `claude-route pool`, `claude-route off` | New Claude Code launches use the pool over the socket, or your own login. |
 | `claude-route codex pool`, `claude-route codex off` | The same switch for new Codex launches. |
 | `claude-route test` | The wet test. `pool` refuses without a pass today. |

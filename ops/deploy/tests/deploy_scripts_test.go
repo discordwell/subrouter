@@ -251,7 +251,8 @@ var requiredCases = []string{
 	"harness-cleanup-signals-only-its-own-runs",
 	"scripts-default-to-the-live-job",
 	// A deploy or a check never says OK while the daemon does not own its
-	// Claude socket, and triage names a stand-in there (PATCHES §84).
+	// Claude socket, and triage, claude-route and an activation's rollback
+	// name a stand-in there (PATCHES §84).
 	"sup-stand-in-at-the-claude-socket-is-not-the-daemon",
 	"sup-check-stand-in-the-supervisor-does-not-ask-back",
 	"sup-claude-socket-waiting-is-not-deploy-ok",
@@ -259,6 +260,8 @@ var requiredCases = []string{
 	"sup-claude-socket-yielded-says-until-when",
 	"laptop-stand-in-at-the-claude-socket-is-not-the-daemon",
 	"triage-tells-a-stand-in-from-the-daemon",
+	"route-status-and-socket-on-tell-a-stand-in-from-the-daemon",
+	"act-rollback-tells-a-stand-in-from-the-daemon",
 	// deploy-laptop.sh step 7: old backups go only after the routes verify,
 	// this run's never; pre-isolation leftovers are named once a record is
 	// migrated; the checkout srq runs from is compared with the
