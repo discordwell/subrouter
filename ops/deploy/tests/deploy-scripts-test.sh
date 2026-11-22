@@ -4318,6 +4318,17 @@ if begin act-rollback-waits-for-the-claude-socket; then
   finish
 fi
 
+# A stand-in answers health at the Claude socket with "ok": true, and is not
+# the daemon serving it (PATCHES §84).
+if begin act-rollback-tells-a-stand-in-from-the-daemon; then
+  act_setup post post; run_act; expect_rc 0
+  run_act FAKE_CLAUDE_WORD=standby -- --rollback
+  expect_rc 2; expect_out "claude socket   -> a stand-in answers on $H/.subrouter/claude.sock, not the daemon, so the daemon does not own its socket"
+  expect_no_out "claude socket   -> serving"; expect_out "ROLLED BACK, NOT HEALTHY"
+  expect_loaded serve
+  finish
+fi
+
 if begin act-rollback-says-a-reload-is-not-healthy; then
   act_setup post post; unload_job
   run_act FAKE_CRASH_BUILD=old -- --rollback
@@ -4594,6 +4605,26 @@ if begin route-socket-on-consent-holds-when-the-job-turns-supervised; then
   expect_rc 1; expect_out "RELOAD=1, and every plist edit, restarts the job"; expect_out "Nothing was changed"
   expect_no_restart; expect_loaded supervised
   cmp -s "$C/supervised.plist" "$RPLIST" && ok || bad "the activated plist changed"
+  finish
+fi
+
+# A stand-in at the socket answers health with "ok": true, and is not the
+# daemon serving it (PATCHES §84). status names it, and socket-on neither says
+# "already serving" nor restarts anything.
+if begin route-status-and-socket-on-tell-a-stand-in-from-the-daemon; then
+  route_setup SUBROUTER_CLAUDE_SOCKET="$C/home/.subrouter/claude.sock"
+  "$PY3" -c 'import os, socket, sys; os.chdir(sys.argv[1]); socket.socket(socket.AF_UNIX).bind("claude.sock")' "$H/.subrouter"
+  run_route_stub_deploy status
+  expect_out "socket:      serving $H/.subrouter/claude.sock"
+  run_route_stub_deploy socket-on
+  expect_rc 0; expect_out "socket: already serving $H/.subrouter/claude.sock"
+  run_route_as "$ROUTE_SH" CLAUDE_ROUTE_DEPLOY="$C/deploy-stub" FAKE_CLAUDE_WORD=standby -- status
+  expect_out "socket:      STAND-IN at $H/.subrouter/claude.sock: the daemon does not own its socket"
+  expect_no_out "socket:      serving"
+  run_route_as "$ROUTE_SH" CLAUDE_ROUTE_DEPLOY="$C/deploy-stub" FAKE_CLAUDE_WORD=standby -- socket-on
+  expect_rc 1; expect_out "a stand-in answers there, not the daemon"; expect_out "Nothing was changed"
+  expect_no_out "already serving"
+  expect_plist_unchanged; expect_no_log "^deploy"; expect_no_restart
   finish
 fi
 
