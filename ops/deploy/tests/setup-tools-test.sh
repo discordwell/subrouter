@@ -1024,7 +1024,9 @@ if begin quickstart-peer-restart-waits-for-launchd; then
 prints=$(grep -c "^launchctl print" "$FAKE_LOG")
 case "$1" in
   managername) echo Aqua ;;
-  print) [ "$prints" -gt "$FAKE_HELD" ] && exit "$FAKE_GONE_RC"; exit 0 ;;
+  print)
+    [ "$prints" -gt "$FAKE_HELD" ] && exit "$FAKE_GONE_RC"
+    printf "%s = {\n\tpath = %s\n}\n" "$2" "$HOME/Library/LaunchAgents/$SUBROUTER_LABEL.plist"; exit 0 ;;
   bootstrap)
     [ "$prints" -gt "$FAKE_HELD" ] || { echo "Bootstrap failed: 5: Input/output error" >&2; exit 5; }
     : > "$FAKE_DAEMON_FILE"; exit 0 ;;
@@ -1042,20 +1044,25 @@ fi
 
 # launchctl as a session sees it: managername prints FAKE_MANAGER (Background,
 # as from ssh) and exits FAKE_MANAGER_RC, print answers FAKE_PRINT_RC until a
-# bootout and 113 after it, and launchd refuses the bootstrap.
+# bootout and 113 after it, and launchd refuses the bootstrap. A loaded job is
+# the one launchd loaded from the plist write_plist writes.
 stub_launchd_session() {
   stub launchctl 'echo "launchctl $*" >> "$FAKE_LOG"
 case "$1" in
   managername) [ -n "${FAKE_MANAGER-Background}" ] && echo "${FAKE_MANAGER-Background}"; exit "${FAKE_MANAGER_RC:-0}" ;;
-  print) grep -q "^launchctl bootout" "$FAKE_LOG" && exit 113; exit "${FAKE_PRINT_RC:-0}" ;;
+  print)
+    grep -q "^launchctl bootout" "$FAKE_LOG" && exit 113
+    [ "${FAKE_PRINT_RC:-0}" = 0 ] && printf "%s = {\n\tpath = %s\n}\n" "$2" "$HOME/Library/LaunchAgents/$SUBROUTER_LABEL.plist"
+    exit "${FAKE_PRINT_RC:-0}" ;;
   bootstrap) echo "Bootstrap failed: 125: Domain does not support specified action" >&2; exit 125 ;;
 esac
 exit 0'
 }
 
-# launchd with state: bootstrap loads the plist's env into FAKE_LAUNCHD (a JSON
-# file), bootout unloads it, and print shows a loaded job as launchctl does,
-# its inherited environment block first, then its environment block.
+# launchd with state: bootstrap loads the plist's path and env into
+# FAKE_LAUNCHD (a JSON file: {"path", "environment"}), bootout unloads it, and
+# print shows a loaded job as launchctl does: its path, its inherited
+# environment block, then its environment block. load_job writes that state.
 stub_launchd() {
   { printf '#!%s\n' "$PY3"; cat <<'PY'; } > "$C/bin/launchctl"
 import json, os, plistlib, sys
@@ -1069,8 +1076,12 @@ if verb == "managername":
 elif verb == "print":
     if not os.path.exists(state):
         sys.exit(113)
-    print(args[1] + " = {\n\tinherited environment = {\n\t\tSSH_AUTH_SOCK => /private/tmp/agent.sock\n\t}\n\tenvironment = {")
-    for key, value in json.load(open(state)).items():
+    job = json.load(open(state))
+    print(args[1] + " = {")
+    if job.get("path"):
+        print(f"\tpath = {job['path']}")
+    print("\tinherited environment = {\n\t\tSSH_AUTH_SOCK => /private/tmp/agent.sock\n\t}\n\tenvironment = {")
+    for key, value in job["environment"].items():
         print(f"\t\t{key} => {value}")
     print("\t}\n}")
 elif verb == "bootout":
@@ -1080,11 +1091,15 @@ elif verb == "bootstrap":
     with open(args[2], "rb") as handle:
         plist = plistlib.load(handle)
     with open(state, "w") as out:
-        json.dump(dict(plist.get("EnvironmentVariables") or {}, XPC_SERVICE_NAME=plist["Label"]), out)
+        environment = dict(plist.get("EnvironmentVariables") or {}, XPC_SERVICE_NAME=plist["Label"])
+        json.dump({"path": args[2], "environment": environment}, out)
 else:
     sys.exit(1)
 PY
   chmod 755 "$C/bin/launchctl"
+}
+load_job() { # plist, or "" for none named: the job launchd holds, with HOME in its env
+  printf '{"path": "%s", "environment": {"HOME": "%s"}}\n' "$1" "$H" > "$C/launchd.json"
 }
 
 if begin quickstart-peer-rerun-leaves-a-peered-daemon-alone; then
@@ -1095,7 +1110,7 @@ if begin quickstart-peer-rerun-leaves-a-peered-daemon-alone; then
   qs_setup; seed_remote_key "$H/.subrouter"; stub_launchd
   write_plist "{\"EnvironmentVariables\": {\"HOME\": \"$H\"}}"
   P="$H/Library/LaunchAgents/$TEST_LABEL.plist"
-  printf '{"HOME": "%s"}\n' "$H" > "$C/launchd.json"
+  load_job "$P"
   run_qs FAKE_QS_CALL=configure_peer FAKE_LAUNCHD="$C/launchd.json" FAKE_DAEMON_UP=1
   expect_rc 0; expect_out "restarted and healthy"; expect_log "^launchctl bootstrap"
   cp "$P" "$C/plist-peered"; : > "$C/log"
@@ -1104,7 +1119,7 @@ if begin quickstart-peer-rerun-leaves-a-peered-daemon-alone; then
   cmp -s "$P" "$C/plist-peered" && ok || bad "the plist was written again"
   # The plist holds the peer and the loaded job does not, as after a run killed
   # between the write and the restart: restart, and leave the plist as it is.
-  printf '{"HOME": "%s"}\n' "$H" > "$C/launchd.json"; : > "$C/log"
+  load_job "$P"; : > "$C/log"
   run_qs FAKE_QS_CALL=configure_peer FAKE_LAUNCHD="$C/launchd.json" FAKE_DAEMON_UP=1
   expect_rc 0; expect_out "restarted and healthy"; expect_log "^launchctl bootstrap"
   cmp -s "$P" "$C/plist-peered" && ok || bad "the plist was written again"
