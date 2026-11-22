@@ -38,7 +38,7 @@ ops/deploy/macos/deploy-laptop.sh ~/bin/subrouter --check
 
 ## Know what every run that changes the job does
 
-- It takes `<plist>.supervisor-mutation.lock`, the lock that `sr update` and upstream's supervisor scripts take, and refuses while another run holds it. `--check` and `--dry-run` take no lock.
+- It takes `<plist>.supervisor-mutation.lock`, the lock that `sr update` and upstream's supervisor scripts take, and refuses while another run holds it. `--check` and `--dry-run` take no lock. A small helper process holds the lock for the run. If that helper has not answered within 30 seconds (`SUBROUTER_MUTATION_LEASE_WAIT_SECONDS`), the run kills it and stops, having changed nothing, and the lock is free again (PATCHES §83).
 - A run that restarts the job refuses unless `launchctl managername` prints `Aqua` and `launchctl print` answers 0 or 113 (PATCHES §47). From ssh, launchd boots the job out and then refuses to bootstrap it. From a terminal that outlived a logout, launchd refuses every verb. A supervised deploy restarts nothing, so it needs only `launchctl print` to answer.
 - Every run that changes the job, a supervised upgrade included, goes on in a detached process and writes `~/.subrouter/transitions/<script>-<stamp>-<pid>.log`, with the exit code in `.rc` and the pid in `.pid`. Your shell shows the log as it grows. If the shell is closed or killed, or a tool times out, the run still finishes.
 - Before a bootout, a run tells the watchdog the stop is on purpose (PATCHES §81), and once its bootstrap works it says so. A run that dies in between leaves a notice that ends within three minutes.
