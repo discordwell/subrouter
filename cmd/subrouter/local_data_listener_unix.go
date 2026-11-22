@@ -223,3 +223,55 @@ func (l *ownedLocalDataListener) Close() error {
 	})
 	return l.err
 }
+
+// pathState, rebind and retire let the Claude socket's keeper
+// (claude_socket_keeper.go) keep the path this listener was bound at. The
+// local-data socket and the drain socket never call them. PATCHES section 77.1.
+
+func (l *ownedLocalDataListener) pathState(socket string) socketPathState {
+	parent, err := os.Stat(filepath.Dir(socket))
+	if err != nil || !l.lease.parentMatches(parent) {
+		return socketPathParentReplaced
+	}
+	var stat unix.Stat_t
+	err = unix.Fstatat(int(l.lease.parent.Fd()), l.name, &stat, unix.AT_SYMLINK_NOFOLLOW)
+	if err == nil && uint64(stat.Dev) == l.dev && stat.Ino == l.ino {
+		return socketPathOurs
+	}
+	// The dial comes after the inode check, so this listener never dials
+	// itself. A socket that answers is somebody's, and is never replaced.
+	if err == nil && claudeSocketAnswers(socket) {
+		return socketPathForeign
+	}
+	return socketPathFree
+}
+
+// rebind binds the leased name again, as openPrivateServedSocket did the first
+// time: a dead socket there is removed only if it is a current-user mode-0600
+// one, and the new socket is renamed into place already private. The lease is
+// never released: the returned listener shares it with l until the caller
+// retires l.
+func (l *ownedLocalDataListener) rebind(socket string) (leasedListener, error) {
+	if err := l.lease.removeStaleSocket(); err != nil {
+		return nil, err
+	}
+	listener, err := l.lease.listenPrivate(socket, 0o600, func() bool {
+		parent, statErr := os.Stat(filepath.Dir(socket))
+		return statErr == nil && l.lease.parentMatches(parent)
+	})
+	if err != nil {
+		return nil, err
+	}
+	next, err := wrapOwnedLocalDataListener(listener, socket, l.lease)
+	if err != nil {
+		_ = listener.Close()
+		return nil, err
+	}
+	return next.(*ownedLocalDataListener), nil
+}
+
+// retire stops l accepting and leaves the lease and the path to the listener
+// rebind returned. A later Close of l does nothing.
+func (l *ownedLocalDataListener) retire() {
+	l.once.Do(func() { _ = l.Listener.Close() })
+}

@@ -38,11 +38,23 @@ const claudeSocketEnv = "SUBROUTER_CLAUDE_SOCKET"
 // /_subrouter/health. Fixed words, never the path or an error string: health is
 // also served on --public-addr, and a syscall error carries the path (and so the
 // user name).
+//
+// waiting and displaced are the keeper's (socketKeeper, PATCHES section 77.1).
+// waiting: this process does not hold the socket's lock and keeps asking for
+// it. displaced: it holds the lock, and a socket it does not own answers at the
+// path. unavailable is a path refused at start, which is never tried again, or
+// a path the keeper could not bind again, which it keeps trying.
+//
+// Fixed since 2026-11-21: the deploy scripts and a process that stands in on
+// the socket path match these words, and the supervisor-status fields
+// claude_socket_waits_for_lock and claude_socket_rebinds, by name.
 const (
 	claudeSocketServing     = "serving"
 	claudeSocketUnavailable = "unavailable"
 	claudeSocketStopped     = "stopped"
 	claudeSocketSupervised  = "owned_by_supervisor"
+	claudeSocketWaiting     = "waiting"
+	claudeSocketDisplaced   = "displaced"
 )
 
 // claudeSocket owns the opt-in listener and its health word.
@@ -57,8 +69,11 @@ type claudeSocket struct {
 	path       string
 	supervised bool
 	state      atomic.Value // string
-	listener   net.Listener
-	served     chan struct{}
+	// open binds the path under its lock; the keeper calls it until it works.
+	open     func(string) (leasedListener, error)
+	keeper   *socketKeeper
+	listener net.Listener
+	served   chan struct{}
 	// guard keeps every 401 from the socket's clients, which Claude Code
 	// would answer by sending the human's own stored login, and counts the
 	// clients that already send one (proxy.ClaudeSocketGuard). startGuarded
@@ -90,6 +105,7 @@ func newClaudeSocket(flagValue string, getenv func(string) string) *claudeSocket
 	socket := &claudeSocket{
 		path:       filepath.Clean(path),
 		supervised: strings.TrimSpace(getenv(inheritedListenerFDEnv)) != "",
+		open:       openLeasedClaudeSocket,
 		guard:      proxy.NewClaudeSocketGuard(nil),
 	}
 	socket.state.Store(claudeSocketUnavailable)
@@ -168,18 +184,22 @@ func (c *claudeSocket) start(serve func(net.Listener) error, localDataSocket str
 		logger.Error("claude socket not served: it names the --local-data-socket path", "path", c.path)
 		return
 	}
-	listener, err := openPrivateClaudeSocketListener(c.path)
-	if err != nil {
+	// A path the opener refuses before it takes the lock is a fault in the
+	// configuration. It is not kept, and the word stays unavailable.
+	if _, _, err := servedSocketParent(c.path); err != nil {
 		logger.Error("claude socket not served; TCP is unaffected", "path", c.path, "error", err)
 		return
 	}
+	c.keeper = keepSocket(c.path, c.open, logger, func(word string) { c.state.Store(word) })
+	listener := loopbackTCPListener{Listener: c.keeper, addr: c.keeper.Addr()}
 	c.listener = listener
 	c.served = make(chan struct{})
-	c.state.Store(claudeSocketServing)
-	logger.Info("subrouter claude socket", "path", c.path)
 	go func() {
 		defer close(c.served)
 		err := serve(listener)
+		// Whatever ended serve, nobody accepts now: give up the path and
+		// the lock, and only then say so, after the keeper's last word.
+		_ = listener.Close()
 		c.state.Store(claudeSocketStopped)
 		if err != nil && !errors.Is(err, http.ErrServerClosed) && !errors.Is(err, net.ErrClosed) {
 			// Never fatal (see claudeSocket). Health now says "stopped", which is
@@ -196,15 +216,12 @@ func (c *claudeSocket) close() {
 	}
 }
 
-// openPrivateClaudeSocketListener opens the Claude socket
-// (openPrivateServedSocket) and makes its peers report loopback
-// (loopbackTCPListener).
-func openPrivateClaudeSocketListener(socket string) (net.Listener, error) {
-	owned, err := openPrivateServedSocket(socket, "claude socket")
-	if err != nil {
-		return nil, err
+// rebinds counts the times the keeper bound the path after the first.
+func (c *claudeSocket) rebinds() int {
+	if c.keeper == nil {
+		return 0
 	}
-	return loopbackTCPListener{Listener: owned, addr: &net.UnixAddr{Name: socket, Net: "unix"}}, nil
+	return c.keeper.rebinds()
 }
 
 // openPrivateServedSocket opens a socket serve serves beside TCP: the Claude
@@ -225,19 +242,7 @@ func openPrivateClaudeSocketListener(socket string) (net.Listener, error) {
 // The local-data socket keeps its own opener unchanged: it is the supervisor's
 // fatal path on the box, and this change has no reason to touch it.
 func openPrivateServedSocket(socket, what string) (net.Listener, error) {
-	if !filepath.IsAbs(socket) || socket == string(filepath.Separator) {
-		return nil, errors.New("path must be absolute")
-	}
-	// First, before the lease, the liveness dial or the stale-socket removal
-	// touch the path (see checkPrivateSocketPathLength).
-	if err := checkPrivateSocketPathLength(socket); err != nil {
-		return nil, err
-	}
-	parent, err := validatePrivateLocalServingStorePath(filepath.Dir(socket), true)
-	if err != nil || parent != filepath.Dir(socket) {
-		return nil, errors.New("parent must be canonical, current-user-owned, and not group/world writable")
-	}
-	parentInfo, err := os.Stat(parent)
+	parent, parentInfo, err := servedSocketParent(socket)
 	if err != nil {
 		return nil, err
 	}
@@ -278,6 +283,29 @@ func openPrivateServedSocket(socket, what string) (net.Listener, error) {
 	}
 	releaseLease = false
 	return owned, nil
+}
+
+// servedSocketParent is what openPrivateServedSocket checks before it touches
+// anything: the path's shape and its folder. A path it refuses can be served
+// by no process, whoever holds the lock.
+func servedSocketParent(socket string) (string, os.FileInfo, error) {
+	if !filepath.IsAbs(socket) || socket == string(filepath.Separator) {
+		return "", nil, errors.New("path must be absolute")
+	}
+	// First, before the lease, the liveness dial or the stale-socket removal
+	// touch the path (see checkPrivateSocketPathLength).
+	if err := checkPrivateSocketPathLength(socket); err != nil {
+		return "", nil, err
+	}
+	parent, err := validatePrivateLocalServingStorePath(filepath.Dir(socket), true)
+	if err != nil || parent != filepath.Dir(socket) {
+		return "", nil, errors.New("parent must be canonical, current-user-owned, and not group/world writable")
+	}
+	parentInfo, err := os.Stat(parent)
+	if err != nil {
+		return "", nil, err
+	}
+	return parent, parentInfo, nil
 }
 
 // claudeSocketAnswers reports whether something accepts connections at socket.
