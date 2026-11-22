@@ -2430,7 +2430,8 @@ The log names the box and the word, never a token. A peers-file entry that canno
 shows `box_invalid`. The files are read again every 2 s, so a token file written, changed or removed is used
 from then on, with no restart, and a rewritten peers file is picked up the same way. A box whose entry and
 token did not change keeps its connections and its result. A peers file that stops loading keeps the boxes
-of the last file that loaded, and the status names the error.
+of the last file that loaded. The status then shows a fixed word for the peers file, the token file's words
+(`file_missing`, `file_mode`, `file_unreadable` or `file_malformed`), and the log has the loader's message.
 
 A session the Mac holds on a box goes to that box, which has its account and its prompt cache. The holds
 are the daemon's `peer-holds.json` for the first peer and `peer-holds-<name>.json` for each other, keyed

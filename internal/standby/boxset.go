@@ -45,7 +45,7 @@ var (
 	tailscaleIPv6 = netip.MustParsePrefix("fd7a:115c:a1e0::/48")
 )
 
-// State is one box's word in the stand-in's status.
+// State is a word in the stand-in's status: a box's, or the peers file's.
 type State string
 
 const (
@@ -53,7 +53,7 @@ const (
 	StateOK          State = "ok"          // its last answer showed it takes the token
 	StateRefused     State = "refused"     // its last token test was a 401: it refuses the token
 	StateUnreachable State = "unreachable" // every address failed before a request was sent
-	// The token file cannot be used.
+	// The token file, or the peers file, cannot be used.
 	StateFileMissing    State = "file_missing"
 	StateFileMode       State = "file_mode" // group or others can read it
 	StateFileUnreadable State = "file_unreadable"
@@ -109,7 +109,7 @@ type Set struct {
 	logged    map[string]string
 
 	mu        sync.Mutex
-	peersErr  string
+	peersFile State
 	members   []*member
 	addresses map[*Box]*address
 	holds     map[string]string // session key: the name of the box that holds it
@@ -374,19 +374,18 @@ type BoxStatus struct {
 
 // Status is the box set as a status body shows it.
 type Status struct {
-	// PeersFile is "ok", or why the peers file last failed to load; the set
-	// keeps the boxes of the last file that loaded.
-	PeersFile string      `json:"peers_file"`
+	// PeersFile is ok, or the word for why the peers file last failed to
+	// load (file_missing, file_mode, file_unreadable or file_malformed); the
+	// log has the loader's own message. The set keeps the boxes of the last
+	// file that loaded.
+	PeersFile State       `json:"peers_file"`
 	Boxes     []BoxStatus `json:"boxes"`
 }
 
 func (s *Set) Status() Status {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	status := Status{PeersFile: "ok", Boxes: make([]BoxStatus, 0, len(s.members))}
-	if s.peersErr != "" {
-		status.PeersFile = s.peersErr
-	}
+	status := Status{PeersFile: s.peersFile, Boxes: make([]BoxStatus, 0, len(s.members))}
 	for _, m := range s.members {
 		status.Boxes = append(status.Boxes, BoxStatus{Name: m.name, Token: m.result, At: m.at})
 	}
@@ -398,9 +397,9 @@ func (s *Set) Status() Status {
 func (s *Set) reload() {
 	s.reloading.Lock()
 	defer s.reloading.Unlock()
-	peersErr := ""
+	peersFile, peersErr := StateOK, ""
 	if pools, err := proxy.LoadRemotePeersFile(s.cfg.PeersFile); err != nil {
-		peersErr = err.Error()
+		peersFile, peersErr = peersFileState(s.cfg.PeersFile), err.Error()
 	} else {
 		// Only the name, URL and pin are kept: the peer tokens go no further.
 		s.peers = make([]peer, 0, len(pools))
@@ -445,7 +444,7 @@ func (s *Set) reload() {
 		}
 	}
 	s.holds = holds
-	s.peersErr = peersErr
+	s.peersFile = peersFile
 }
 
 // note logs a lasting problem once, when it starts or changes.
@@ -485,17 +484,36 @@ func (s *Set) build(e entry) *member {
 	return m
 }
 
-// readToken reads a stand-in token file: a regular file that only its owner
-// can read, holding one token.
-func readToken(path string) (string, State) {
+// fileState checks a file that holds secrets: a regular file that only its
+// owner can read. It returns "" for one.
+func fileState(path string) (fs.FileInfo, State) {
 	info, err := os.Stat(path)
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
-		return "", StateFileMissing
+		return nil, StateFileMissing
 	case err != nil || !info.Mode().IsRegular():
-		return "", StateFileUnreadable
+		return nil, StateFileUnreadable
 	case info.Mode().Perm()&0o077 != 0:
-		return "", StateFileMode
+		return nil, StateFileMode
+	}
+	return info, ""
+}
+
+// peersFileState is the word for a peers file the daemon's loader refused.
+func peersFileState(path string) State {
+	if _, problem := fileState(path); problem != "" {
+		return problem
+	}
+	return StateFileMalformed
+}
+
+// readToken reads a stand-in token file: a regular file that only its owner
+// can read, holding one token.
+func readToken(path string) (string, State) {
+	info, problem := fileState(path)
+	switch {
+	case problem != "":
+		return "", problem
 	case info.Size() > tokenFileMaxBytes:
 		return "", StateFileMalformed
 	}

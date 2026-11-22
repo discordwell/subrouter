@@ -750,6 +750,54 @@ func TestTheTokenIsTestedEveryTenMinutesByDefault(t *testing.T) {
 	eventually(t, "a second token test 10 min 30 s after the first", func() bool { return tokenTests(box) == 2 })
 }
 
+// A peers file that does not load shows a fixed word in the status, and the
+// log has the loader's own message. The set keeps the boxes of the last file
+// that loaded.
+func TestAPeersFileThatDoesNotLoadShowsAFixedWord(t *testing.T) {
+	box := startBox(t, okBox)
+	peer := peerOf("a", box)
+	f := newBoxSetFixture(t, peer)
+	f.writeToken(t, "a", box.token, 0o600)
+	good, err := os.ReadFile(f.peersFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logs := &lockedBuffer{}
+	set := startSet(t, f, "", time.Hour, logs)
+	word := func() string { return string(set.Status().PeersFile) }
+	if got := word(); got != string(standby.StateOK) {
+		t.Fatalf("peers_file = %q, want ok", got)
+	}
+
+	for _, c := range []struct {
+		name  string
+		write func()
+		want  standby.State
+	}{
+		{"a file that is not JSON", func() { replaceFile(t, f.peersFile, []byte(`{"peers": [`), 0o600) }, standby.StateFileMalformed},
+		{"a file others can read", func() { replaceFile(t, f.peersFile, good, 0o644) }, standby.StateFileMode},
+		{"a removed file", func() {
+			if err := os.Remove(f.peersFile); err != nil {
+				t.Fatal(err)
+			}
+		}, standby.StateFileMissing},
+	} {
+		c.write()
+		eventually(t, c.name+" shows "+string(c.want), func() bool { return word() == string(c.want) })
+		if got := names(set.Candidates(testSessionID)); len(got) != 1 || got[0] != "a" {
+			t.Fatalf("with %s, Candidates = %v, want [a] from the last good file", c.name, got)
+		}
+		replaceFile(t, f.peersFile, good, 0o600)
+		eventually(t, "the good file shows ok again", func() bool { return word() == string(standby.StateOK) })
+	}
+	if !strings.Contains(logs.String(), "not valid JSON") {
+		t.Fatalf("the log does not hold the loader's message:\n%s", logs.String())
+	}
+	if strings.Contains(logs.String(), peer.Token) {
+		t.Fatalf("the log holds the peer token:\n%s", logs.String())
+	}
+}
+
 type fileState struct {
 	mode    fs.FileMode
 	size    int64
