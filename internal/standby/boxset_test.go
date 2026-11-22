@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/fs"
 	"log/slog"
 	mathrand "math/rand/v2"
@@ -199,9 +200,24 @@ func messageFor(t *testing.T, front *httptest.Server, sessionID string) *http.Re
 	return send(t, front, http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"m"}`), header)
 }
 
+// refusingBox answers as a box's proxy gate answers a token it refuses.
 func refusingBox(w http.ResponseWriter, _ *http.Request) {
 	http.Error(w, "unauthorized", http.StatusUnauthorized)
 }
+
+// tokenTests counts the token tests a box was sent, and turns the requests
+// that were not one.
+func tokenTests(b *testBox) int {
+	n := 0
+	for _, seen := range b.requests() {
+		if seen.Method == http.MethodHead && seen.Path == "/" {
+			n++
+		}
+	}
+	return n
+}
+
+func turns(b *testBox) int { return len(b.requests()) - tokenTests(b) }
 
 // A token file written, changed or removed while the stand-in runs is used
 // from then on, with no restart.
@@ -434,10 +450,10 @@ func TestThePeerTokenOfThePeersFileIsNeverSent(t *testing.T) {
 	}
 }
 
-// A box that refuses a request's token is skipped by the next request at
-// once, without waiting for a token test. The set does not run, so no token
-// test is ever sent.
-func TestABoxThatRefusesARequestIsSkippedByTheNextOne(t *testing.T) {
+// A box that answers a request with a 401 has its token tested on the next
+// tick, not at its next test an hour later, and once that test shows it
+// refused, the next request goes to another box.
+func TestABoxThatRefusesARequestIsTestedAtOnceAndThenSkipped(t *testing.T) {
 	var refuse atomic.Bool
 	a := startBox(t, func(w http.ResponseWriter, r *http.Request) {
 		if refuse.Load() {
@@ -450,27 +466,81 @@ func TestABoxThatRefusesARequestIsSkippedByTheNextOne(t *testing.T) {
 	f := newBoxSetFixture(t, peerOf("a", a), peerOf("b", b))
 	f.writeToken(t, "a", a.token, 0o600)
 	f.writeToken(t, "b", b.token, 0o600)
+	onA := sessionsFirstOn(t, newSet(t, f, "", time.Hour, &lockedBuffer{}), "a", 1)[0]
 	logs := &lockedBuffer{}
-	set := newSet(t, f, "", time.Hour, logs)
-	onA := sessionsFirstOn(t, set, "a", 1)[0]
+	set := startSet(t, f, "", time.Hour, logs)
+	eventually(t, "a passed its first token test", func() bool { return boxState(set, "a").Token == standby.StateOK })
 	front := standInOver(t, set, logs)
 
-	if resp := messageFor(t, front, onA); resp.StatusCode != http.StatusOK || len(a.requests()) != 1 {
-		t.Fatalf("status = %d with a at %d requests, want a's 200", resp.StatusCode, len(a.requests()))
+	if resp := messageFor(t, front, onA); resp.StatusCode != http.StatusOK || turns(a) != 1 {
+		t.Fatalf("status = %d with a at %d turns, want a's 200", resp.StatusCode, turns(a))
 	}
 	// The token is revoked on a between two tests.
 	refuse.Store(true)
 	if resp := messageFor(t, front, onA); resp.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want the guard's 503 for a's 401", resp.StatusCode)
 	}
-	if got := boxState(set, "a").Token; got != standby.StateRefused {
-		t.Fatalf("after a's 401, a = %q, want %q", got, standby.StateRefused)
+	eventually(t, "a's 401 brought a token test that shows a refused", func() bool {
+		return boxState(set, "a").Token == standby.StateRefused
+	})
+	if resp := messageFor(t, front, onA); resp.StatusCode != http.StatusOK || turns(b) != 1 {
+		t.Fatalf("the next request: status = %d with b at %d turns, want b's 200", resp.StatusCode, turns(b))
 	}
-	if resp := messageFor(t, front, onA); resp.StatusCode != http.StatusOK || len(b.requests()) != 1 {
-		t.Fatalf("the next request: status = %d with b at %d requests, want b's 200", resp.StatusCode, len(b.requests()))
+	if got := turns(a); got != 2 {
+		t.Fatalf("a saw %d turns, want 2: the one after its refused test must go to b", got)
 	}
-	if got := len(a.requests()); got != 2 {
-		t.Fatalf("a saw %d requests, want 2: the one after its 401 must go to b", got)
+}
+
+// A box's identity whose token Anthropic revoked answers policy_limits with
+// Anthropic's own 401, and the box relays it, while the box takes the
+// stand-in token and serves every model turn. That 401 does not take the box
+// out: its token test passes, and model turns still reach it.
+func TestAnUpstream401ABoxRelaysDoesNotTakeTheBoxOut(t *testing.T) {
+	revokedIdentity := func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/claude_code/policy_limits" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = io.WriteString(w, `{"type":"error","error":{"type":"authentication_error","message":"OAuth access token has been revoked"}}`)
+			return
+		}
+		okBox(w, r)
+	}
+	a := startBox(t, revokedIdentity)
+	b := startBox(t, revokedIdentity)
+	f := newBoxSetFixture(t, peerOf("a", a), peerOf("b", b))
+	f.writeToken(t, "a", a.token, 0o600)
+	f.writeToken(t, "b", b.token, 0o600)
+	plain := newSet(t, f, "", time.Hour, &lockedBuffer{})
+	onA := sessionsFirstOn(t, plain, "a", 1)[0]
+	onB := sessionsFirstOn(t, plain, "b", 1)[0]
+	logs := &lockedBuffer{}
+	set := startSet(t, f, "", time.Hour, logs)
+	eventually(t, "both boxes passed their first token test", func() bool {
+		return boxState(set, "a").Token == standby.StateOK && boxState(set, "b").Token == standby.StateOK
+	})
+	front := standInOver(t, set, logs)
+
+	asked := time.Now()
+	for _, id := range []string{onA, onB} {
+		header := claudeHeaders()
+		header.Set("X-Claude-Code-Session-Id", id)
+		if resp := send(t, front, http.MethodGet, "/api/claude_code/policy_limits", nil, header); resp.StatusCode != http.StatusServiceUnavailable {
+			t.Fatalf("policy_limits status = %d, want the guard's 503 for the relayed 401", resp.StatusCode)
+		}
+	}
+	for _, name := range []string{"a", "b"} {
+		eventually(t, name+" passed the token test its 401 asked for", func() bool {
+			got := boxState(set, name)
+			return got.Token == standby.StateOK && got.At.After(asked)
+		})
+	}
+	for _, id := range []string{onA, onB} {
+		if resp := messageFor(t, front, id); resp.StatusCode != http.StatusOK {
+			t.Fatalf("session %s: status = %d, want 200: both boxes serve model turns", id, resp.StatusCode)
+		}
+	}
+	if turns(a) != 2 || turns(b) != 2 {
+		t.Fatalf("a saw %d turns and b %d, want each its own session's policy_limits and message", turns(a), turns(b))
 	}
 }
 
@@ -639,15 +709,7 @@ func TestTheTokenTestRepeatsOnlyWhileTheBoxIsIdle(t *testing.T) {
 	box := startBox(t, okBox)
 	f := newBoxSetFixture(t, peerOf("a", box))
 	f.writeToken(t, "a", box.token, 0o600)
-	tests := func() int {
-		n := 0
-		for _, seen := range box.requests() {
-			if seen.Method == http.MethodHead && seen.Path == "/" {
-				n++
-			}
-		}
-		return n
-	}
+	tests := func() int { return tokenTests(box) }
 
 	logs := &lockedBuffer{}
 	set := startSet(t, f, "", 3*time.Second, logs)
