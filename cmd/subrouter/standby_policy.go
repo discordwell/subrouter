@@ -220,8 +220,8 @@ func (s *standIn) gotPolicy(answer policyAnswer) {
 	}
 }
 
-// answerPolicy answers an unpinned policy_limits with the copy when the copy
-// is under a day old, and reports whether it did.
+// answerPolicy answers a GET of policy_limits, pinned or not, with the copy
+// when the copy is under a day old, and reports whether it did.
 func (s *standIn) answerPolicy(w http.ResponseWriter, r *http.Request) bool {
 	if !standby.PolicyCopyAnswers(r) {
 		return false

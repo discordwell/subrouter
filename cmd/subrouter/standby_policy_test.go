@@ -177,10 +177,20 @@ func requireTheDaemonsAnswer(t *testing.T, answer pathAnswer, body, when string)
 	}
 }
 
+// requirePinnedRefused checks that a pinned launch's policy_limits got §79.1's
+// 503, which a pinned launch gets when the stand-in has no copy to answer
+// with.
+func requirePinnedRefused(t *testing.T, answer pathAnswer, when string) {
+	t.Helper()
+	if answer.err != nil || answer.status != http.StatusServiceUnavailable || answer.header.Get("X-Subrouter-Reason") != "standby_pinned_account" {
+		t.Fatalf("%s a pinned launch's policy_limits got %s, reason %q; want the 503 standby_pinned_account", when, answer, answer.header.Get("X-Subrouter-Reason"))
+	}
+}
+
 // While the daemon serves the socket, the stand-in asks it for policy_limits
 // as a starting session does, and keeps its 200. Once the stand-in holds the
 // path, it answers policy_limits with that copy at once, the hold included,
-// and asks no box.
+// pinned or not, and asks no box.
 func TestStandbyAnswersPolicyLimitsWithTheDaemonsSavedAnswer(t *testing.T) {
 	box := startStandbyBox(t, "box-one")
 	f := newStandbyFixture(t, box)
@@ -206,17 +216,13 @@ func TestStandbyAnswersPolicyLimitsWithTheDaemonsSavedAnswer(t *testing.T) {
 	fake.say(supervisorSays("yielded"))
 	f.waitForState(t, standbyHolding, "")
 	requireTheDaemonsAnswer(t, askPolicyAtThePath(f.socket, ""), daemonPolicyBody, "inside the hold,")
+	requireTheDaemonsAnswer(t, askPolicyAtThePath(f.socket, "pinned-account"), daemonPolicyBody, "inside the hold, a pinned launch's")
 	requireNoTurn(t, box, "after policy_limits was answered from the copy")
 
 	f.clock.advance(90 * time.Second)
 	requireTheDaemonsAnswer(t, askPolicyAtThePath(f.socket, ""), daemonPolicyBody, "after the hold,")
+	requireTheDaemonsAnswer(t, askPolicyAtThePath(f.socket, "pinned-account"), daemonPolicyBody, "after the hold, a pinned launch's")
 	requireNoTurn(t, box, "after policy_limits was answered from the copy")
-	// The daemon answers a pinned launch's policy_limits from the pinned
-	// account, not from its identity, so the copy is not that launch's answer.
-	if answer := askPolicyAtThePath(f.socket, "pinned-account"); answer.status != http.StatusServiceUnavailable ||
-		answer.header.Get("X-Subrouter-Reason") != "standby_pinned_account" {
-		t.Fatalf("a pinned launch's policy_limits got %s, reason %q; want the 503 standby_pinned_account", answer, answer.header.Get("X-Subrouter-Reason"))
-	}
 	view := f.waitForHealth(t, "a copy 90 s old", func(view standbyView) bool {
 		return view.PolicyCopy.AgeSeconds != nil && *view.PolicyCopy.AgeSeconds == 90
 	})
@@ -239,8 +245,9 @@ func TestStandbyAnswersPolicyLimitsWithTheDaemonsSavedAnswer(t *testing.T) {
 }
 
 // The copy is kept in the state folder, so a stand-in that starts during an
-// outage still answers with it. A copy 24 hours old is not answered with, and
-// the request goes to a box, as it does with no copy.
+// outage still answers with it. A copy 24 hours old is not answered with: the
+// request goes to a box, as it does with no copy, and a pinned launch's gets
+// the 503.
 func TestStandbyAnswersPolicyLimitsFromACopyUnderADayOld(t *testing.T) {
 	box := startStandbyBox(t, "box-one")
 	f := newStandbyFixture(t, box)
@@ -257,9 +264,12 @@ func TestStandbyAnswersPolicyLimitsFromACopyUnderADayOld(t *testing.T) {
 	requireTheDaemonsAnswer(t, askPolicyAtThePath(f.socket, ""), daemonPolicyBody, "a stand-in started after the copy was saved, inside its hold:")
 	f.clock.advance(standbyPolicyMaxAge - time.Second)
 	requireTheDaemonsAnswer(t, askPolicyAtThePath(f.socket, ""), daemonPolicyBody, "with the copy a second under 24 hours old,")
+	requireTheDaemonsAnswer(t, askPolicyAtThePath(f.socket, "pinned-account"), daemonPolicyBody, "with the copy a second under 24 hours old, a pinned launch's")
 	requireNoTurn(t, box, "while the copy is under 24 hours old")
 
 	f.clock.advance(time.Second)
+	requirePinnedRefused(t, askPolicyAtThePath(f.socket, "pinned-account"), "with the copy 24 hours old,")
+	requireNoTurn(t, box, "after a pinned launch's policy_limits")
 	if answer := askPolicyAtThePath(f.socket, ""); answer.err != nil || answer.status != http.StatusOK || answer.box != box.name {
 		t.Fatalf("with the copy 24 hours old, policy_limits got %s; want the box's answer", answer)
 	}
@@ -360,7 +370,8 @@ func TestStandbyKeepsOnlyTheDaemonsPolicyAnswer(t *testing.T) {
 		}
 	})
 	t.Run("an answer that comes back after the stand-in took the path is dropped", func(t *testing.T) {
-		f := newStandbyFixture(t, startStandbyBox(t, "box-one"))
+		box := startStandbyBox(t, "box-one")
+		f := newStandbyFixture(t, box)
 		fake := startFakeSupervisor(t, f, supervisorSays("serving"))
 		daemon := startPolicyDaemon(t, f)
 		release := daemon.holdAnswers()
@@ -381,5 +392,9 @@ func TestStandbyKeepsOnlyTheDaemonsPolicyAnswer(t *testing.T) {
 		if view := f.waitForHealth(t, "the stand-in's state", func(standbyView) bool { return true }); view.PolicyCopy.Held {
 			t.Fatalf("health's policy_copy = %+v after an answer that came back once the path changed hands; want none", view.PolicyCopy)
 		}
+		f.clock.advance(standbyHold)
+		f.waitForState(t, standbyServing, "")
+		requirePinnedRefused(t, askPolicyAtThePath(f.socket, "pinned-account"), "with no copy, after the hold,")
+		requireNoTurn(t, box, "after a pinned launch's policy_limits")
 	})
 }

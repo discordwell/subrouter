@@ -2721,7 +2721,8 @@ as the daemon's, because both identities had the default policy. A box whose ide
 organization would apply that organization's policy. The path is cleaned before it is read, so
 `/v1/../api/...` counts as `/api`. A request that names an account (`X-Subrouter-Account-ID` or
 `X-Subrouter-Account`, set by `claude <account>`) gets a 503 and is never sent, `policy_limits` included,
-because a pinned launch is promised that account and no other. §79.4's copy does not answer it either. With no box usable, the client gets a 503
+because a pinned launch is promised that account and no other. Only §79.4's copy, when the stand-in holds one
+under a day old, answers a pinned launch's `policy_limits`. With no box usable, the client gets a 503
 with Retry-After 30 at once, and nothing is parked. Every 503 the handler makes has Anthropic's `api_error`
 shape, which Claude Code retries like any server error, and names its cause in `X-Subrouter-Reason`:
 `standby_no_box`, `standby_box_unreachable`, `standby_box_failed`, `standby_pinned_account`,
@@ -2995,15 +2996,24 @@ path is dropped, because it may be the stand-in's own copy or a box's. A disarme
 does one beside a supervisor that says `waiting` or `displaced`, because nobody, or another process, answers
 at the path then.
 
-Answering. While the stand-in holds the path, a `GET policy_limits` that names no account is answered with
-the copy when the copy is under 24 hours old. It is answered at once, the hold included, and a client's
-`If-None-Match` still gets the 200. A copy 24 hours old or more is not used. The answer's signature expires a
-day after it was issued; Claude Code 2.1.330 does not check it, and a later client may. With no copy, or an
-older one, the request goes to a box after the hold, as in §79.1, and the stand-in never answers it with a
-503 of its own choosing. A launch pinned to an account still gets §79.1's 503. The daemon answers a pinned
-launch's `policy_limits` from the pinned account (`internal/proxy/proxy.go`: a forced account is chosen
-before the control-plane identity), so the identity's copy is not that launch's answer. The file is read at
-start, so a stand-in that launchd restarts during an outage still has its copy.
+Answering. While the stand-in holds the path, a `GET policy_limits` is answered with the copy when the copy
+is under 24 hours old, whether or not the request names an account. It is answered at once, the hold
+included, and a client's `If-None-Match` still gets the 200. A copy 24 hours old or more is not used. The
+answer's signature expires a day after it was issued; Claude Code 2.1.330 does not check it, and a later
+client may. With no copy, or an older one, an unpinned request goes to a box after the hold, as in §79.1, and
+the stand-in never answers it with a 503 of its own choosing. A pinned one then gets §79.1's 503, because a
+box is not the account it was promised. The file is read at start, so a stand-in that launchd restarts during
+an outage still has its copy.
+
+A pinned launch gets the copy as well. A session that starts without a 200 here loses WebFetch, DesignSync
+and RemoteTrigger for an hour, and the daemon's return does not give them back, so the 503 costs a pinned
+launch more than the copy can. The daemon answers a pinned launch's `policy_limits` from the pinned account
+(`internal/proxy/proxy.go`: a forced account is chosen before the control-plane identity). But the copy is
+this Mac's daemon's own last answer, and on this build `claude-route` launches a pin to an account on this
+Mac only when it names the identity account, the account the copy came from. Where the accounts differ, the
+default policy gives the same body: §79.1's box identity, in another organization, answered with the
+daemon's body byte for byte. The first build of this part answered a pinned launch's `policy_limits` with
+the 503 even when it held a fresh copy.
 
 The health body and the state file have `policy_copy`: `held`, and when held, `saved_at` and
 `age_seconds`. As with `parked`, the state file's `age_seconds` is as of its last write. Neither holds the
@@ -3028,19 +3038,19 @@ holds the socket's lock and answers `policy_limits` with the header names of a r
 - `TestStandbyAnswersPolicyLimitsWithTheDaemonsSavedAnswer`: one ask at start, with no session id, no
   `X-Subrouter-Session` and no credential, and a file of mode 0600. Once the daemon is gone and the stand-in
   holds the path, `policy_limits` gets the daemon's status, body and headers inside the hold and after it,
-  without `Set-Cookie` and `X-Subrouter-*`, and the box sees nothing. A pinned launch gets the 503. Health
-  shows the copy 90 s old after the clock moves 90 s, and neither health nor the state file holds the body
-  or a header.
+  without `Set-Cookie` and `X-Subrouter-*`, and the box sees nothing. A pinned launch gets the same copy
+  inside the hold and after it. Health shows the copy 90 s old after the clock moves 90 s, and neither health
+  nor the state file holds the body or a header.
 - `TestStandbyAnswersPolicyLimitsFromACopyUnderADayOld`: a stand-in started after the first one stopped
-  answers with the saved file inside its hold. A second under 24 hours the copy still answers, and at
-  24 hours the box answers.
+  answers with the saved file inside its hold. A second under 24 hours the copy still answers, pinned or not.
+  At 24 hours the box answers, and a pinned launch gets the 503 and sends the box nothing.
 - `TestStandbyKeepsItsPolicyCopyWhenTheDaemonAnswers500`: after a 500 the state file still shows the first
   copy, and the path answers with it.
 - `TestStandbyAsksForPolicyLimitsEveryHalfHour`: one ask 29 minutes after the first, two at 30 minutes, and
   the second 200 replaces the copy.
 - `TestStandbyKeepsOnlyTheDaemonsPolicyAnswer`: a disarmed stand-in asks nothing; beside a supervisor that
   says `displaced`, the process at the path is not asked; an answer held back until the stand-in has taken
-  the path is dropped.
+  the path is dropped, and with no copy a pinned launch gets the 503 after the hold.
 - `TestStandbyClosesItsBoxConnectionsWhenItStops` (`cmd/subrouter/standby_test.go`): the box has no
   connection left 10 s after the stop. `TestStandbyGivesThePathBackWhenTheSupervisorAsksForIt` checks the same
   after a hand-back.
