@@ -317,7 +317,8 @@ Plists use the env var, never the flag: an old binary exits on an unknown flag, 
 crash-loop under KeepAlive. Socket failures are soft (logged; TCP keeps serving), because reusing the fatal
 `--local-data-socket` opener would have made a socket problem a respawn loop with every TCP client down. Health
 reports `claude_socket` as `serving`, `unavailable`, `stopped` or `ignored_under_supervise` (fixed words, since
-health is also served on `--public-addr` and an error string carries the path). A socket peer reports `127.0.0.1`, so loopback gates treat it as
+health is also served on `--public-addr` and an error string carries the path). §77.1 adds `waiting` and
+`displaced`, and the socket is no longer opened only once. A socket peer reports `127.0.0.1`, so loopback gates treat it as
 loopback TCP and it gains nothing more. Without this, a token-enforcing daemon would 401 the placeholder and
 machine policy would count the socket as a second machine. The socket is 0600. The
 proxy replaces the placeholder `Authorization` with the pooled credential. The socket is bound as
@@ -2279,6 +2280,86 @@ On 2026-11-21 a stopped test run unloaded the developer's live service, and noth
 - Code: `ops/deploy/macos/laptop-deploy-lib.sh` (`own_job_or_exit`, `kickstart_job`, `bootout_and_wait`, `bootstrap_job`, `take_mutation_lock`), `ops/deploy/macos/deploy-laptop.sh` (`restart`), `ops/bin/sr-triage`, `ops/bin/sr-local-ci`
 - Tests: `ops/deploy/tests/deploy-scripts-test.sh` (`run_sandboxed`, `finish`, `cleanup`, and the six cases listed under §76 in `requiredCases`), `ops/deploy/tests/deploy_scripts_test.go`
 - Docs: `AGENTS.md`, `ops/README.md`
+
+## 77. The supervisor keeps its Claude socket
+
+On 2026-11-21 the laptop's daemon was gone for more than two hours, and every Claude Code session on
+the Mac failed with it while the boxes were healthy. A session in socket mode has one endpoint, the
+socket path, and no TCP fallback (§30). The plan is that another process stands in on that path while
+the daemon is away and sends turns to a box. That works only if the supervisor takes the path back
+afterwards, and it did not. It opened the socket once, at start. A lock held at that moment left it at
+`unavailable` until the next restart, and a restart drops every connection. For the same reason a
+deleted socket path stayed deleted while supervisor-status said `serving`.
+
+§77.1 One goroutine, the keeper (`socketKeeper`), now owns the socket for as long as the supervisor or a
+plain `serve` runs. Without the socket's lock (the flock on `<path>.lock`) it asks for the lock every
+250 ms. With the lock it checks the path every 2 s. Each look ends in one word, reported as
+`claude_socket` in supervisor-status and, under a plain `serve`, in `/_subrouter/health`.
+
+- `waiting` means that it does not hold the lock and its last try to bind the path failed. The lock
+  is held elsewhere, or a listener answers at the path, or the bind failed for another reason. It
+  keeps trying until it stops, and it binds the path as soon as a try succeeds.
+- `serving` means that it holds the lock and its own socket is at the path. If the path is missing,
+  or holds a dead socket, it binds the path again under the lock it still holds and adds one to
+  `claude_socket_rebinds`. It never releases the lock to do so, so a process that waits on the lock
+  does not get it. Connections accepted before the path went keep working.
+- `displaced` means that it holds the lock and a socket it does not own answers at the path. It
+  never removes a socket that answers. It checks again every 2 s and binds the path once nothing
+  answers there.
+- `unavailable` under a held lock means that it could not bind the path again, for example because
+  a regular file is there. It removes only a mode-0600 socket of this user, as at start (§30), and
+  it tries again every 2 s.
+- `unavailable` from start means that the path is relative, too long, or in a folder that is not
+  canonical and private. Nothing is tried again.
+- `stopped` still means that the accept loop ended.
+
+When the socket's folder is replaced by another at the same path, the lock in the old folder guards a
+socket no client can dial. The keeper closes that socket, releases that lock and starts over in the
+new folder.
+
+Supervisor-status gains `claude_socket_waits_for_lock: true` and `claude_socket_rebinds`, the number of
+times the path was bound after the first. A process that stands in on the path must see the first
+field before it takes the lock, because a supervisor without it never takes the path back. A
+supervisor with no Claude socket reports neither field. The words and the two field names are fixed.
+
+An accept loop that ended used to keep the path and the lock. Clients queued on a socket nobody
+accepted, and nothing else could take the path. The socket is now closed when its accept loop ends,
+so the path is unlinked and the lock is free before the word becomes `stopped`.
+
+The supervisor's accept loops (`front.Router.Serve`) also ended on any accept error. `EMFILE`,
+`ENFILE` and `ECONNABORTED` say nothing about the listener, so the loop now retries them on the same
+listener after a pause that doubles from 5 ms to 1 s, and logs one line for each run of failures.
+On the TCP listener such an error used to end the supervisor, and with it every connection it
+carried. `subrouter front` uses the same loop.
+
+A socket that opens at start and whose path nobody touches behaves as before. The keeper adds one
+`fstatat` and one `stat` every 2 s.
+
+- Knobs: none. The keeper runs whenever `SUBROUTER_CLAUDE_SOCKET` (or `--unix-socket`) names a
+  socket. To be without it, run a build from before this section as the supervisor.
+- Code: `cmd/subrouter/claude_socket_keeper.go` (`socketKeeper`, `leasedListener`),
+  `cmd/subrouter/claude_socket.go` (`start`, `servedSocketParent`),
+  `cmd/subrouter/local_data_listener_unix.go` (`pathState`, `rebind`, `retire`),
+  `cmd/subrouter/supervisor.go` (supervisor-status), `internal/front/router.go` (`Serve`)
+- Tests, in Docker (`./deploy/docker/test.sh ./cmd/subrouter ./internal/front`), each seen failing with
+  its part of the change taken out: `TestSupervisorRecreatesDeletedClaudeSocket` (a stream opened
+  before the delete finishes, and a waiter blocked on the lock never gets it),
+  `TestSupervisorReplacesADeadSocketAtTheClaudeSocketPath`,
+  `TestSupervisorTakesClaudeSocketWhenLeaseFrees`,
+  `TestSupervisorWaitsWhileAnotherProcessListensAtTheClaudeSocket`,
+  `TestSupervisorDoesNotStealALiveForeignSocket`,
+  `TestSupervisorLeavesAnUnsafeEntryAtTheClaudeSocketPathAlone`,
+  `TestSupervisorTakesTheClaudeSocketAgainWhenItsFolderIsReplaced`,
+  `TestSupervisorStatusSaysItWaitsForTheClaudeSocketLock`,
+  `TestSupervisorShutsDownCleanlyWhileWaitingForTheClaudeSocket`,
+  `TestSupervisorShutsDownCleanlyWhileDisplacedFromTheClaudeSocket`,
+  `TestClaudeSocketKeepsAcceptingAfterTemporaryError`,
+  `TestClaudeSocketGivesUpThePathWhenItStopsServing`, `TestClaudeSocketSecondOwnerIsSoft` and
+  `TestRouterKeepsAcceptingAfterTemporaryAcceptErrors`. Not tested on macOS. The tests run on Linux
+  only, and the laptop's supervisor picks the change up at its next restart.
+- Related: builds on §30 (the socket and its lock) and §69 (the supervisor owns the socket). The
+  activation still requires `serving`. The deploy's probe asks through the socket and prints the
+  word only when nothing answers there.
 
 ## 78. An end client is told to wait at most a minute in the daemon's own 503s
 
