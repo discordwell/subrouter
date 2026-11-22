@@ -245,6 +245,20 @@ class Revive(unittest.TestCase):
                                                          "check:x#1": {"value": "check:x#1"},
                                                          "check:x#2": {"value": "check:x#2"}})
 
+    def test_a_panel_that_numbers_every_member_stays_apart_when_a_cap_runs_it_one_at_a_time(self):
+        self.agent("r1", "review:u#1", 6, "failed")    # each member starts only after the one before it died
+        self.agent("r2", "review:u#2", 5, "failed")
+        self.agent("r3", "review:u#3", 4, "failed")
+        self.agent("c1", "check:u#1", 6, "failed")
+        self.agent("c2", "check:u#2", 5, "result")
+        self.write()
+        self.assertEqual(self.states(), {"r1": "dead", "r2": "dead", "r3": "dead", "c1": "dead"})
+        self.assertEqual(json.loads(self.tool("done")), {"check:u#2": {"value": "check:u#2"}})
+        steps, _ = self.plan()
+        self.assertEqual(steps, {"review:u#1": ("revive", "r1"), "review:u#2": ("revive", "r2"),
+                                 "review:u#3": ("revive", "r3"), "check:u#1": ("revive", "c1"),
+                                 "check:u#2": ("reuse", "c2")})
+
     def test_plan_says_what_a_revive_would_do_for_each_stage_and_changes_nothing(self):
         self.agent("a1", "build:u1", 5, "result")
         self.agent("b1", "build:u2", 1, "failed")

@@ -38,9 +38,10 @@ rerun  for each chosen run that is over and has unfinished stages: writes a copy
        waits for every revived agent's report, unless --wait: then the new run waits instead.
 
 A stage is an agent's label without the endings that mark another attempt at it: `:wait`, `:try<N>`,
-`-try<N>`, `-attempt<N>`, `-retry<N>` (or with a colon), ` (retry <N>)`, and `#<N>` when every agent
-before it under that label had failed before it started. Agents numbered `#<N>` that ran side by side,
-like a review panel, or after one of them returned, are stages of their own.
+`-try<N>`, `-attempt<N>`, `-retry<N>` (or with a colon), ` (retry <N>)`, and `#<N>` when an agent under
+that label with no number started before it and every agent before it under that label had failed before
+it started. Agents numbered `#<N>` with no unnumbered first, like a review panel, or that ran side by
+side, or after one of them returned, are stages of their own.
 
 The session id defaults to $CLAUDE_CODE_SESSION_ID. Reports default to <session>/subagents/revived/.
 Read SKILL.md beside this file first.
@@ -88,19 +89,23 @@ def journal(run: str) -> list[dict]:
 def stages(rows: list[dict]) -> dict[str, str]:
     """Each started agent's stage, from the journal's row order.
 
-    `#<N>` marks a retry only when every agent before it under the same label had failed before it started.
-    In the journals read on 2026-11-21, most `#<N>` labels numbered agents that ran side by side and each
-    returned a result, like a review panel. Those, and agents that start after one of them returned, are
-    stages of their own."""
-    named, base, running, returned, separate = {}, {}, {}, set(), set()
+    `#<N>` marks a retry only when an agent under the same label with no number started before it, and
+    every agent before it under that label had failed before it started: `fix:x`, then `fix:x#2`. A panel
+    numbers every member, so it stays apart even when a concurrency cap starts its members one at a time
+    after the earlier ones died. In the journals read on 2026-11-21, every `#<N>` retry followed an
+    unnumbered first attempt, and most `#<N>` labels numbered agents that ran side by side."""
+    named, base, running, returned, bare, separate = {}, {}, {}, set(), set(), set()
     for row in rows:
         kind, agent = row.get("type"), row.get("agentId")
         if kind == "started":
             named[agent] = RETRY.sub("", row.get("label", ""))
             base[agent] = COUNTER.sub("", named[agent])
+            numbered = named[agent] != base[agent]
             others = running.setdefault(base[agent], set())
-            if others - {agent} or base[agent] in returned:
+            if others - {agent} or base[agent] in returned or (numbered and base[agent] not in bare):
                 separate.add(base[agent])
+            if not numbered:
+                bare.add(base[agent])
             others.add(agent)
         elif kind in ("result", "failed") and agent in base:
             running[base[agent]].discard(agent)
