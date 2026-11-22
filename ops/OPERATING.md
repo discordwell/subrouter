@@ -484,9 +484,10 @@ The daemon reads these from its environment when it starts.
 | `SUBROUTER_OUTAGE_SPILL_BURST` | 10 | The spill's burst. |
 | `SUBROUTER_RESET_HOLD_PRIORITY` | on | `0` stops ranking reset holders at 2x (§56). A value it does not recognize stops the daemon. |
 | `SUBROUTER_FABLE_RESERVATION` | off | `1` holds back weekly budget for Fable (§57). A value it does not recognize stops the daemon. |
+| `SUBROUTER_START_UNSTARTED_WEEK` | on | `0` stops giving the next new session first to an account whose weekly window has not started (§86). A value it does not recognize stops the daemon. |
 | `SUBROUTER_CODEX_AUTO_RATE_LIMIT_RESET` | off | `1` lets failover spend a Codex reset credit. |
 | `SUBROUTER_PUBLIC_ADMIN` | off | On a box, `1` serves admin routes on the public listener to named admin tokens. |
 
-Most of these log an unreadable value and start with the default. Two do not. `SUBROUTER_RESET_HOLD_PRIORITY` and `SUBROUTER_FABLE_RESERVATION` accept only `1` or `0`, or `true` or `false`, `yes` or `no`, `on` or `off`. Any other value stops `serve` from starting, and on a plain job launchd then restarts it forever. The other on/off settings read any value but `1`, `true`, `yes`, or `on` as off, and log nothing.
+Most of these log an unreadable value and start with the default. Three do not. `SUBROUTER_RESET_HOLD_PRIORITY`, `SUBROUTER_FABLE_RESERVATION` and `SUBROUTER_START_UNSTARTED_WEEK` accept only `1` or `0`, or `true` or `false`, `yes` or `no`, `on` or `off`. Any other value stops `serve` from starting, and on a plain job launchd then restarts it forever. The other on/off settings read any value but `1`, `true`, `yes`, or `on` as off, and log nothing.
 
 The deploy scripts read `SUBROUTER_LABEL`, `SUBROUTER_PLIST`, `SUBROUTER_ADDR` (as `host:port`), and `SUBROUTER_CONTROL_SOCKET` to find the job, and default to the LaunchAgent above.
