@@ -107,7 +107,7 @@ class Revive(unittest.TestCase):
         self.assertEqual(self.states(), {"a2": "dead", "b1": "dead", "c1": "never-started"})
 
     def test_done_holds_finished_results_and_waits_for_revived_agents(self):
-        self.agent("a1", "build:u1", 3, "result")
+        self.agent("a1", "build:u1:wait:try2", 3, "result")    # a waiting agent's result is its stage's
         self.agent("a2", "verify:u1", 4, "failed")
         self.agent("b1", "build:u2", 3, "failed")
         self.agent("b2", "build:u2:try2", 1, "failed")
@@ -118,7 +118,7 @@ class Revive(unittest.TestCase):
         with open(os.path.join(reports, "a2.json"), "w") as handle:
             json.dump({"verdict": "pass"}, handle)
         done = json.loads(self.tool("done"))
-        self.assertEqual(done, {"build:u1": {"value": "build:u1"}, "verify:u1": {"verdict": "pass"},
+        self.assertEqual(done, {"build:u1": {"value": "build:u1:wait:try2"}, "verify:u1": {"verdict": "pass"},
                                 "build:u2": {"$wait": os.path.join(reports, "b1.json")}})
 
         held = json.loads(self.tool("rerun"))

@@ -43,7 +43,7 @@ import shutil
 import sys
 import time
 
-TRY = re.compile(r":try\d+$")
+TRY = re.compile(r"(:wait)?(:try\d+)?$")     # a retry of a stage, or the agent that waited for its report
 ASSISTANT = '"type":"assistant"'     # the record's own type sits near the end of its line
 STAMP = re.compile(r'"timestamp":"(\d{4}-\d\d-\d\dT[0-9:]+)')
 MARK = "// wf-revive:done"
