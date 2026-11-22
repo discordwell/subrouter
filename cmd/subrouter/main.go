@@ -198,6 +198,22 @@ func fableSpentPreferenceEnabled() (bool, error) {
 	return false, fmt.Errorf("SUBROUTER_FABLE_SPENT_PREFERENCE=%q: want 1 (the default) or 0", raw)
 }
 
+// startUnstartedWeekEnabled reads SUBROUTER_START_UNSTARTED_WEEK, the kill
+// switch of PATCHES §86: an account whose weekly window has not started takes
+// the next new session first, once. Off governs only this daemon's ranking,
+// never what it reads and reports. Read like SUBROUTER_FABLE_SPENT_PREFERENCE:
+// unset means on, 0/false/no/off turns it off, anything else is an error.
+func startUnstartedWeekEnabled() (bool, error) {
+	raw := os.Getenv("SUBROUTER_START_UNSTARTED_WEEK")
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "", "1", "true", "yes", "on":
+		return true, nil
+	case "0", "false", "no", "off":
+		return false, nil
+	}
+	return false, fmt.Errorf("SUBROUTER_START_UNSTARTED_WEEK=%q: want 1 (the default) or 0", raw)
+}
+
 // pacedAllowanceEnabled reads SUBROUTER_PACED_ALLOWANCE (PATCHES §72). 0 keeps
 // a burndown account at the taper of at most four sessions and gives every
 // account four refugees. It does not reopen a closed admission queue: that is
@@ -1016,6 +1032,16 @@ func serve(args []string) error {
 	if !fableSpentPreference {
 		slog.Info("fable spent preference disabled by SUBROUTER_FABLE_SPENT_PREFERENCE; Opus and Sonnet turns rank every account on its weekly pace alone, and the Fable meter is still published to peers",
 			"reenable", "unset SUBROUTER_FABLE_SPENT_PREFERENCE and restart")
+	}
+	// PATCHES §86, the same way as §65.
+	startUnstartedWeek, err := startUnstartedWeekEnabled()
+	if err != nil {
+		return err
+	}
+	selectacct.SetStartUnstartedWeek(startUnstartedWeek)
+	if !startUnstartedWeek {
+		slog.Info("unstarted week priority disabled by SUBROUTER_START_UNSTARTED_WEEK; an account whose weekly window has not started ranks on its weekly pace like any other",
+			"reenable", "unset SUBROUTER_START_UNSTARTED_WEEK and restart")
 	}
 	pacedAllowance, err := pacedAllowanceEnabled()
 	if err != nil {

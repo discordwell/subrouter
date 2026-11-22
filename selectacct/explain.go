@@ -161,6 +161,17 @@ func (s Scheduler) compare(left, right account.Account, now time.Time, allowEndg
 				}
 			}
 		}
+		// An unstarted week (PATCHES §86): one new session starts a clock
+		// that is otherwise not running, so it outranks the drain and every
+		// rate term below, a peer's account included (the local 2x is a pace
+		// factor below). In both modes: a week that has not started cannot
+		// roll tonight. Two unstarted accounts fall through to the clauses
+		// below, and a start mark (NoteNewSession) turns the priority off.
+		leftStarts := s.startsWeek(left, leftScore, now)
+		rightStarts := s.startsWeek(right, rightScore, now)
+		if leftStarts != rightStarts {
+			return leftStarts, reasonStartsWeek
+		}
 		bothDraining := false
 		if allowEndgame {
 			// Endgame drain: an account within a day of its weekly roll is

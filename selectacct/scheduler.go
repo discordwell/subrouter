@@ -104,6 +104,14 @@ type Score struct {
 	// provider publishing no weekly window. Codex DOES publish one (its
 	// `primary` window is 604800s) and is paced on it like Claude.
 	WeeklyResetAt time.Time
+	// WeeklyUnstarted marks a binding weekly window that has not started: its
+	// reading gives the window's whole length as left. A Codex week starts on
+	// its first request, so the next new session goes here first to start its
+	// clock (PATCHES §86). Set only where the windows are read
+	// (scoreFromLimitWindows), never rebuilt from WeeklyResetAt, which is
+	// anchored when the score was built, not when the window was read. A
+	// missing or unread window is not unstarted.
+	WeeklyUnstarted bool
 	// ResetHeldUntil is when the account's unclaimed saved usage-limit reset
 	// (cedar_ember, PATCHES §46) expires: while it is in the future the
 	// account ranks at ResetHoldPreferenceRatio and drains early below
@@ -251,6 +259,9 @@ type Scheduler struct {
 	nonFableClaudeTurn bool
 	paces              map[string]Pace
 	closedAccounts     map[string]bool
+	// startSent is when each account's start mark expires (PATCHES §86),
+	// keyed by ScoreKey. SchedulerRef.Get attaches it.
+	startSent map[string]time.Time
 }
 
 // MachineView answers the two machine-scoped questions selection needs, without
