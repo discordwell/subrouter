@@ -2907,6 +2907,17 @@ if begin laptop-refusal-that-cannot-put-the-build-back-says-how; then
   finish
 fi
 
+if begin laptop-refusal-puts-the-edited-plist-back; then
+  # A plist edit is a file the next start of the job would read too.
+  laptop_setup post post; cp -p "$H/$LAPTOP_PLIST_REL" "$C/plist.orig"
+  run_laptop PLIST_SET_ENV="SUBROUTER_CLAUDE_SOCKET=$H/.subrouter/claude.sock" FAKE_SIGN_MOVES_JOB="$C/other/$TEST_JOB.plist"
+  expect_rc 1; expect_out "$H/$LAPTOP_PLIST_REL: SUBROUTER_CLAUDE_SOCKET=$H/.subrouter/claude.sock"
+  expect_out "refusing to boot out gui/$(id -u)/$TEST_JOB"; expect_no_restart; expect_running old
+  expect_out "the files this run changed are as they were before it"; expect_build "$CUR" old
+  cmp -s "$C/plist.orig" "$H/$LAPTOP_PLIST_REL" && ok || bad "the plist on disk still holds this run's edit"
+  finish
+fi
+
 if begin laptop-reload-refused-without-its-plist; then
   # Nothing could load the job again after this bootout.
   laptop_setup pre post; run_laptop RELOAD=1 FAKE_SIGN_REMOVES_PLIST=1
@@ -3375,6 +3386,14 @@ fi
 if begin sup-restart-supervisor-rolls-back-both; then
   sup_setup post post; run_laptop FAKE_BAD=accounts-404 -- "$NEWBIN" --restart-supervisor
   expect_rc 1; expect_out "!! ROLLING BACK"; expect_out "rolled back, healthy"
+  expect_build "$CUR" old; expect_build "$H/bin/subrouter-supervisor" sup-old
+  finish
+fi
+
+if begin sup-restart-supervisor-refusal-puts-both-builds-back; then
+  sup_setup post post; run_laptop FAKE_SIGN_MOVES_JOB="$C/other/$TEST_JOB.plist" -- "$NEWBIN" --restart-supervisor
+  expect_rc 1; expect_out "refusing to boot out gui/$(id -u)/$TEST_JOB"; expect_no_restart
+  expect_out "the files this run changed are as they were before it"
   expect_build "$CUR" old; expect_build "$H/bin/subrouter-supervisor" sup-old
   finish
 fi
