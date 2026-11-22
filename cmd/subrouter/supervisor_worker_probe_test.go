@@ -345,6 +345,43 @@ func TestSupervisorReplacesAWorkerWhoseSocketIsGone(t *testing.T) {
 	}
 }
 
+// A stopped process is the plainest silent worker. The kernel still takes
+// connections for it, nothing reads them, and no signal that asks reaches it.
+func TestSupervisorReplacesAndEndsAStoppedWorker(t *testing.T) {
+	p := startProbedSupervisor(t, nil)
+	stopped := getSupervisorStatus(t, p.control)
+	if err := syscall.Kill(stopped.Worker.PID, syscall.SIGSTOP); err != nil {
+		t.Fatal(err)
+	}
+	// The stop takes effect a moment after kill returns, and until then the
+	// worker still answers. It is asked on its own socket, because a request
+	// through the supervisor's port would stay routed to it.
+	p.workersMu.Lock()
+	worker := p.workers[stopped.Active.ID]
+	p.workersMu.Unlock()
+	deadline := time.Now().Add(probeTestPatience)
+	for {
+		if _, err := readyStatus(worker, probeTestTimeout); err != nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the worker (pid %d) still answered %s after SIGSTOP", stopped.Worker.PID, probeTestPatience)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	p.round(t, 0)
+	requireProbeMisses(t, p.round(t, 0), 2, stopped.Active.ID, "after two probes of a stopped worker")
+	requireReplaced(t, p.round(t, 0), stopped, "after three probes of a stopped worker")
+
+	deadline = time.Now().Add(probeTestPatience)
+	for !errors.Is(syscall.Kill(stopped.Worker.PID, 0), syscall.ESRCH) {
+		if time.Now().After(deadline) {
+			t.Fatalf("the stopped worker (pid %d) was still there %s after it was replaced", stopped.Worker.PID, probeTestPatience)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
 func TestSupervisorForgetsMissesOnceTheWorkerAnswers(t *testing.T) {
 	p := startProbedSupervisor(t, nil)
 	silent := p.silenceActiveWorker(t)
