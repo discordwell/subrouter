@@ -395,9 +395,21 @@ When a box is found down, each of its chats becomes a refugee. It goes to anothe
 
 ### The stand-in, when the daemon itself is gone
 
-None of the above helps when the supervisor is not running: a Claude Code session talks only to the daemon's socket. `subrouter standby` (§79.3) is a second process for that case. It waits on the lock of the Claude socket. When the supervisor lets go of the lock, the stand-in binds the same path, holds new requests for 30 seconds in case the daemon comes straight back, and after that sends turns to a box. It gives the path back when the supervisor asks for it and the daemon has answered ready 3 times in a row. Nothing installs or starts it yet.
+None of the above helps when the supervisor is not running: a Claude Code session talks only to the daemon's socket. `subrouter standby` (§79.3) is a second process for that case. It waits on the lock of the Claude socket. When the supervisor lets go of the lock, the stand-in binds the same path, holds new requests for 30 seconds in case the daemon comes straight back, and after that sends turns to a box. It gives the path back when the supervisor asks for it and the daemon has answered ready 3 times in a row. `ops/deploy/macos/install-standby.sh` runs it as its own LaunchAgent, `ai.manaflow.subrouter-standby` (§79.5).
 
 It needs the peers file, one `membership` token for each box in `~/.subrouter/standby-tokens/<box name>` (mode 0600, §79.2), the remote gate's key (§17), and a supervisor that waits for the socket's lock: `claude_socket_waits_for_lock` in `supervisor-status`. Beside an older supervisor it stays disarmed and touches nothing.
+
+Install it from the checkout. Mint one `membership` token on each box (see [Mint tokens on the box](#mint-tokens-on-the-box)) and give it to the stand-in through standard input, so it never shows on screen or in your shell's history:
+
+```bash
+pbpaste | bash ops/deploy/macos/install-standby.sh token <box name> --expires <its last day, YYYY-MM-DD>
+bash ops/deploy/macos/install-standby.sh install bin/subrouter --dry-run   # what it would write and run
+bash ops/deploy/macos/install-standby.sh install bin/subrouter
+bash ops/deploy/macos/install-standby.sh status
+bash ops/deploy/macos/install-standby.sh uninstall                       # turns it off; the tokens stay
+```
+
+`install` copies the build to `~/.subrouter/standby/subrouter-standby`, which no deploy of the daemon replaces, and loads the job with the daemon's own settings, read from the daemon's plist. First it asks the build, with `subrouter standby --check`, whether the stand-in would arm, and refuses with one line when it would not: the gate is locked, the peers file is missing, no supervisor answers, or the supervisor lacks `claude_socket_waits_for_lock` and must be restarted on a newer build first. A box without a token is a warning. Run `install` again with a new build to upgrade; it refuses while the stand-in holds the socket, because the restart would cut every session it carries. It adds the job to the watchdog's list (§81), and `uninstall` takes it off. `status` shows the job, the copy's sha256, the state, each box's token word and last day (`renew_soon` in the last 7 days, `lapsed` after), the age of the saved `policy_limits` answer, and whether the watchdog watches the job. Its log is `~/Library/Logs/subrouter-standby.log`.
 
 ```bash
 cat ~/.subrouter/standby-state.json                                          # its state, written at each change
@@ -475,7 +487,11 @@ An account that holds an unclaimed Claude reset ranks at twice a non-holder unti
 | `~/.subrouter/claude.sock` | The daemon's Claude socket. |
 | `~/.subrouter/supervisor.sock` | The supervisor's control socket. |
 | `~/.subrouter/worker-config.json` | The supervised worker's `serve` arguments and extra environment. |
+| `~/Library/LaunchAgents/ai.manaflow.subrouter-standby.plist` | The stand-in's LaunchAgent, written by `install-standby.sh` (§79.5). |
+| `~/.subrouter/standby/subrouter-standby` | The build the stand-in runs, a copy of its own. |
+| `~/Library/Logs/subrouter-standby.log` | The stand-in's log. |
 | `~/.subrouter/standby-tokens/<box name>` | The stand-in's `membership` token for one box (§79.2). |
+| `~/.subrouter/standby-token-expiry/<box name>` | The last day of that token, when `install-standby.sh token --expires` recorded one. |
 | `~/.subrouter/standby-state.json`, `~/.subrouter/standby-supervisor.json` | The stand-in's state, and the supervisor's last answer to it (§79.3). |
 | `~/.subrouter/standby-policy.json` | The daemon's last 200 to `policy_limits`, which the stand-in answers sessions with while it holds the socket (§79.4). |
 | `~/.subrouter/transitions/` | Logs of deploy, activation, and rollback runs. |

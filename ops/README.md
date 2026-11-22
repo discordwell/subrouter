@@ -29,8 +29,9 @@ Tools and docs for running this fork on your own Mac and, optionally, your own L
 | `deploy/macos/laptop-deploy-lib.sh` | The route checks, launchd checks, lock and detached run that the laptop scripts share. |
 | `deploy/macos/subrouter-watchdog.sh` | Loads the daemon's job again when something unloads it, unless a stop is announced; `hold` and `release` announce one. |
 | `deploy/macos/install-watchdog.sh` | Installs, removes and shows the watchdog's own LaunchAgent, `ai.manaflow.subrouter-watchdog`. |
+| `deploy/macos/install-standby.sh` | Installs, upgrades, removes and shows the stand-in's own LaunchAgent, `ai.manaflow.subrouter-standby`, which answers the Claude socket from a box while the daemon is gone, and writes its box tokens. |
 | `deploy/lightsail/` | Bootstraps your box (Tailscale, the binary, systemd, tokens, the TLS listener) and deploys builds to it with a drain, checks and rollback. `deploy/lightsail/README.md` walks through it. |
-| `deploy/tests/` | Tests for the laptop and box scripts, the watchdog, the setup tools, `claude-route` and `sr-triage`, and rehearsals against scratch LaunchAgents. |
+| `deploy/tests/` | Tests for the laptop and box scripts, the watchdog, the stand-in's installer, the setup tools, `claude-route` and `sr-triage`, and rehearsals against scratch LaunchAgents. |
 | `LAPTOP.md` | How to move the laptop under the supervisor, deploy, roll back, and recover. |
 | `PATCHES.md` | Every change against upstream and why, by § number, condensed. |
 | `KNOWN-ISSUES.md` | Problems and misleading meters, with their status, condensed. |
@@ -50,6 +51,7 @@ ops/bin/sr-local-ci deploy                         # the same on this Mac, sandb
 DEPLOY_TESTS_SANDBOX=1 bash ops/deploy/tests/deploy-scripts-test.sh   # the cases alone, each script sandboxed
 bash ops/deploy/tests/rehearse-laptop-supervisor.sh <build-a> <build-b> <scratch-dir>   # real launchd, scratch job
 bash ops/deploy/tests/rehearse-watchdog.sh <scratch-dir>        # the watchdog on real launchd, scratch jobs
+bash ops/deploy/tests/rehearse-standby.sh <scratch-dir> <subrouter binary> <token-dir> <peers-file>   # the stand-in on real launchd, scratch jobs
 docker run --rm --init --user "$(id -u):$(id -g)" -e HOME=/tmp -e GOCACHE=/tmp/go-cache -e GOPATH=/tmp/go \
   -v "$PWD:/src" -w /src/ops golang:1.26-bookworm go test -count=1 ./...   # the whole ops module on Linux, as CI runs it
 python3 ops/bin/srq selftest
