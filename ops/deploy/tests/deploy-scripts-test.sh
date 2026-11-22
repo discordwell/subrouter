@@ -4591,6 +4591,70 @@ if begin triage-never-installed-is-missing; then
   finish
 fi
 
+# --- the watchdog's stop marker (PATCHES §81) ----------------------------------
+# A bootout by these scripts is a stop on purpose, so they announce it to the
+# watchdog first and withdraw it once their own bootstrap worked. The stand-in
+# launchd's bootout and bootstrap are wrapped to log the marker they find.
+STOP_MARKER_REL=".subrouter/watchdog-stop.$TEST_JOB"
+watch_the_marker() {
+  mv "$C/bin/launchctl" "$C/bin/launchctl.rig"
+  stub launchctl '
+case "$1" in bootout|bootstrap)
+  m="$HOME/'"$STOP_MARKER_REL"'"
+  if [ -f "$m" ]; then echo "marker at $1: $(tr "\n" " " < "$m")now=$(date +%s)" >> "$FAKE_LOG"
+  else echo "marker at $1: none" >> "$FAKE_LOG"; fi ;;
+esac
+exec "$(dirname "$0")/launchctl.rig" "$@"'
+}
+marker_seconds_left() { # log line regex: until minus now, as that line logged them
+  grep -E -- "$1" "$C/log" | head -1 | sed -n 's/.*until=\([0-9]*\) .*now=\([0-9]*\).*/\1 \2/p' | { read -r u n; echo $((u - n)); }
+}
+
+if begin laptop-announces-its-bootout-to-the-watchdog; then
+  laptop_setup pre post; watch_the_marker; run_laptop RELOAD=1
+  expect_rc 0; expect_out "DEPLOY OK"
+  expect_log "^marker at bootout: label=$TEST_JOB until=[0-9]+ by=deploy-laptop.sh "
+  expect_log "^marker at bootstrap: label=$TEST_JOB until=[0-9]+ "
+  # Before the bootout it covers the whole wait for launchd (600 s here) and
+  # the bootstrap after it; once the job is gone, three minutes.
+  left=$(marker_seconds_left "^marker at bootout: ")
+  [ "$left" -gt 600 ] && [ "$left" -le 790 ] && ok || bad "the marker at the bootout had ${left}s left, want 601 to 790"
+  left=$(marker_seconds_left "^marker at bootstrap: ")
+  [ "$left" -gt 0 ] && [ "$left" -le 180 ] && ok || bad "the marker at the bootstrap had ${left}s left, want 1 to 180"
+  expect_no_file "$H/$STOP_MARKER_REL"
+  finish
+fi
+
+if begin laptop-leaves-a-short-marker-when-its-bootstrap-fails; then
+  # A run that cannot load the job again leaves the marker to expire within
+  # three minutes, and the watchdog then loads the job.
+  laptop_setup pre post; watch_the_marker; run_laptop RELOAD=1 FAKE_BOOTSTRAP_FAILS=1
+  expect_rc 2; expect_out "STILL DOWN"
+  expect_file "$H/$STOP_MARKER_REL"
+  left=$(( $(sed -n 's/^until=//p' "$H/$STOP_MARKER_REL" 2>/dev/null) - $(date +%s) ))
+  [ "$left" -gt 0 ] && [ "$left" -le 180 ] && ok || bad "the marker left behind has ${left}s left, want 1 to 180"
+  finish
+fi
+
+# No case may hand the marker code the live job's label: a marker for it is
+# the one the live watchdog reads. finish cannot see one, so each run looks
+# over its whole test dir after its cases.
+live_stop_markers() { # dir
+  find "$1" \( -name 'watchdog-stop.ai.manaflow.subrouter' -o -name 'watchdog-stop.ai.manaflow.subrouter.*' \) 2>/dev/null
+}
+
+if begin live-stop-marker-is-seen-anywhere-in-a-case; then
+  mkdir -p "$C/home/.subrouter"; : > "$C/home/.subrouter/watchdog-stop.ai.manaflow.subrouter.42"
+  [ -n "$(live_stop_markers "$T")" ] && ok || bad "a stop marker for the live job went unseen"
+  rm -f "$C/home/.subrouter/watchdog-stop.ai.manaflow.subrouter.42"
+  [ -z "$(live_stop_markers "$T")" ] && ok || bad "a removed marker is still reported"
+  finish
+fi
+
+CASE=no-case-wrote-a-stop-marker-for-the-live-job
+LIVE_STOP_MARKER=$(live_stop_markers "$T" | head -1)
+[ -z "$LIVE_STOP_MARKER" ] || bad "a case wrote a stop marker for the live job: ${LIVE_STOP_MARKER#"$T"/}"
+
 echo
 echo "deploy script tests: $PASS assertions passed, $FAILED failed"
 if [ "$FAILED" -ne 0 ]; then

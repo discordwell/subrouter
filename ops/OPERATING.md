@@ -248,7 +248,7 @@ Read the newest log in `~/.subrouter/transitions/`. A `.log` with no `.rc` besid
 
 - If a script says launchd refused to answer (launchctl rc 141, 153, or 125), run it again from a new Terminal.app window (§47).
 - If a script refuses because the plist and the running job disagree, run the command the refusal names.
-- If the daemon is down and nothing is running, load it from Terminal.app:
+- If the daemon is down and nothing is running, the watchdog, once installed, loads it within about 5 s unless a stop is announced (§81, [LAPTOP.md](LAPTOP.md#keep-the-job-loaded-with-the-watchdog)). Without the watchdog, load it from Terminal.app:
 
   ```bash
   launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.manaflow.subrouter.plist

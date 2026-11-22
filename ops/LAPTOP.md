@@ -41,6 +41,7 @@ ops/deploy/macos/deploy-laptop.sh ~/bin/subrouter --check
 - It takes `<plist>.supervisor-mutation.lock`, the lock that `sr update` and upstream's supervisor scripts take, and refuses while another run holds it. `--check` and `--dry-run` take no lock.
 - A run that restarts the job refuses unless `launchctl managername` prints `Aqua` and `launchctl print` answers 0 or 113 (PATCHES §47). From ssh, launchd boots the job out and then refuses to bootstrap it. From a terminal that outlived a logout, launchd refuses every verb. A supervised deploy restarts nothing, so it needs only `launchctl print` to answer.
 - Every run that changes the job, a supervised upgrade included, goes on in a detached process and writes `~/.subrouter/transitions/<script>-<stamp>-<pid>.log`, with the exit code in `.rc` and the pid in `.pid`. Your shell shows the log as it grows. If the shell is closed or killed, or a tool times out, the run still finishes.
+- Before a bootout, a run tells the watchdog the stop is on purpose (PATCHES §81), and once its bootstrap works it says so. A run that dies in between leaves a notice that ends within three minutes.
 - The activation and both rollbacks boot the job out and wait for launchd to let it go before they write a binary or a plist. `deploy-laptop.sh` installs first, staged, signed and renamed so that the running process keeps the file it was started from, and makes its plist edit if it has one. Then it restarts the job, by `kickstart -k` or by a bootout, a wait for launchd to let the job go, and a bootstrap.
 
 ## Move the job under the supervisor
@@ -108,7 +109,27 @@ Read the newest log in `~/.subrouter/transitions/`. A `.log` with no `.rc` besid
 - If a script refuses because the plist and the job launchd runs disagree, run the command the refusal names. A plist that says serve under a running supervisor needs `activate-laptop-supervisor.sh --rollback`. A plist that says supervise under a running serve needs `--rollback`, and then the activation again.
 - If launchd has not loaded the job at all, run the same command again. A deploy of a supervised job and an activation or rollback that has nothing left to do bootstrap the plist on disk and verify it. An unsupervised deploy loads the job as part of its restart.
 - If a script says launchd refused to answer (rc 141, 153, or 125), run it from a new Terminal.app window. A new Superset tab stays in the ended login session.
-- If the daemon is down and nothing is running, load the plist on disk from a Terminal.app window with `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.manaflow.subrouter.plist`.
+- If the daemon is down and nothing is running, the watchdog loads the plist on disk within about 5 s, unless a stop is announced. Without the watchdog, load it from a Terminal.app window with `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.manaflow.subrouter.plist`.
+
+## Keep the job loaded with the watchdog
+
+launchd forgets a job that is booted out, and `KeepAlive` then has nothing to restart. The watchdog is a second LaunchAgent, `ai.manaflow.subrouter-watchdog`, that checks every 5 s and loads the daemon's job again from its plist when launchd has no job for it (PATCHES §81). It never restarts a job that is loaded, and it leaves alone a job loaded from another plist. Each time it acts it sends one notification and logs what it found and did in `~/Library/Logs/subrouter-watchdog.log`.
+
+```bash
+bash ops/deploy/macos/install-watchdog.sh install --dry-run   # what it would write and run
+bash ops/deploy/macos/install-watchdog.sh install
+bash ops/deploy/macos/install-watchdog.sh status
+bash ops/deploy/macos/install-watchdog.sh uninstall           # turns it off
+```
+
+The deploy scripts and `sr daemon restart` announce their own stops. `sr daemon down` does not, on purpose: a stray one must not keep the watchdog away for long. To stop the daemon by hand, with `sr daemon down` or a `launchctl bootout`, or before `deploy/macos/migrate-launchagent-to-supervisor.sh`, `rollback-launchagent-supervisor.sh` or the peer step of `ops/bin/subrouter-quickstart`, announce it first, for up to a day, or the watchdog loads it again:
+
+```bash
+bash ops/deploy/macos/subrouter-watchdog.sh hold ai.manaflow.subrouter 3600
+bash ops/deploy/macos/subrouter-watchdog.sh release ai.manaflow.subrouter   # before the hour ends
+```
+
+Rehearse it on scratch jobs, from a Terminal.app window: `bash ops/deploy/tests/rehearse-watchdog.sh <scratch-dir>`. It ends with `REHEARSAL PASS` when a booted-out scratch job came back in under 10 s each time, an announced stop was kept until it was withdrawn or its marker ended, and a job loaded from another plist was left as it was.
 
 ## Rehearse on a scratch job
 

@@ -284,6 +284,20 @@ await() { # seconds what command...: true once the command is, within the limit
 
 LAUNCHD_ERR=""
 
+# --- the watchdog's stop marker (PATCHES §81) ------------------------------------
+# The watchdog job loads $LABEL again whenever launchd has no job for it. A
+# bootout here is a stop on purpose, so it is announced first, for the whole
+# wait and three minutes more, shortened to three minutes once the job is gone,
+# and withdrawn when the bootstrap worked. A run that dies in between leaves a
+# marker that expires, and the watchdog then loads the job.
+STOP_HOLD=180
+announce_stop() { # seconds
+    "${BASH:-/bin/bash}" "$LAPTOP_LIB_DIR/subrouter-watchdog.sh" hold "${LABEL##*/}" "$1" \
+        --by "$(basename "$0") (pid $$)" > /dev/null \
+        || echo "   could not tell the watchdog this stop is on purpose; it may load ${LABEL##*/} again first"
+}
+withdraw_stop() { "${BASH:-/bin/bash}" "$LAPTOP_LIB_DIR/subrouter-watchdog.sh" release "${LABEL##*/}"; }
+
 # Boots the job out and waits on the JOB, never the port: launchd holds the
 # label for the whole drain, and a bootstrap before then fails with `5:
 # Input/output error`. Only rc 113 says the job is gone; a shell launchd
@@ -293,6 +307,7 @@ bootout_and_wait() { # [exit timeout seconds]
     case "$exit_timeout" in ''|*[!0-9]*) ;; *) [ $((exit_timeout + 60)) -gt $limit ] && limit=$((exit_timeout + 60)) ;; esac
     LAUNCHD_ERR=""
     own_job_or_exit "boot out"
+    announce_stop $((limit + STOP_HOLD))
     echo "   booting out $LABEL"
     out=$(launchctl bootout "$LABEL" 2>&1)
     while :; do
@@ -306,6 +321,7 @@ bootout_and_wait() { # [exit timeout seconds]
         [ "$waited" -gt 0 ] && [ $((waited % 10)) = 0 ] && echo "   waiting for launchd to let the old daemon go (${waited}s of ${limit}s)"
         sleep 1; waited=$((waited + 1))
     done
+    announce_stop "$STOP_HOLD"
     if [ "$rc" != 113 ]; then
         LAUNCHD_ERR="launchctl print $LABEL answered rc $rc after the bootout${out:+ ($out)}, and only 113 means the job is gone; not bootstrapping blind"
         echo "   $LAUNCHD_ERR"
@@ -331,7 +347,7 @@ bootstrap_job() {
         return 1
     fi
     out=$(launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>&1); rc=$?
-    [ "$rc" = 0 ] && return 0
+    [ "$rc" = 0 ] && { withdraw_stop; return 0; }
     LAUNCHD_ERR="launchctl bootstrap gui/$(id -u) $PLIST failed: rc $rc${out:+: $out}"
     echo "   $LAUNCHD_ERR"
     return 1

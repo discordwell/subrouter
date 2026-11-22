@@ -297,8 +297,11 @@ func TestLaunchdIsNeverAskedOutsideTheGUILogin(t *testing.T) {
 		{"stop", launchdController.stop},
 		{"restart", launchdController.restart},
 		{"remove", launchdController.remove},
-		{"restartLaunchAgent", func(c launchdController) error { return restartLaunchAgent(c.plist(), c.label, c.runner) }},
+		{"restartLaunchAgent", func(c launchdController) error { return restartLaunchAgent(c.home, c.plist(), c.label, c.runner) }},
 	}
+	// In the GUI login a restart announces its stop to the watchdog, so the
+	// job is a scratch one (ops/PATCHES.md §81).
+	label := "test.subrouter.login-session"
 	for _, answer := range answers {
 		for _, action := range actions {
 			t.Run(answer.name+"/"+action.name, func(t *testing.T) {
@@ -306,7 +309,7 @@ func TestLaunchdIsNeverAskedOutsideTheGUILogin(t *testing.T) {
 				launchctlManagerName = answer.answer
 				t.Cleanup(func() { launchctlManagerName = previous })
 				runner := &recordingRunner{}
-				controller := launchdController{label: defaultDaemonLabel, home: t.TempDir(), runner: runner}
+				controller := launchdController{label: label, home: t.TempDir(), runner: runner}
 				writeLaunchAgentPlist(t, controller)
 				err := action.run(controller)
 				if err == nil {
@@ -332,7 +335,7 @@ func TestLaunchdIsNeverAskedOutsideTheGUILogin(t *testing.T) {
 	// zero calls above are the preflight and not a runner that records nothing.
 	for _, action := range actions {
 		runner := &recordingRunner{}
-		controller := launchdController{label: defaultDaemonLabel, home: t.TempDir(), runner: runner}
+		controller := launchdController{label: label, home: t.TempDir(), runner: runner}
 		writeLaunchAgentPlist(t, controller)
 		_ = action.run(controller)
 		if !runner.sawContaining("launchctl ") {
