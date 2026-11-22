@@ -658,6 +658,26 @@ restore_backups() {
     [ -z "$PLIST_BACKUP" ] || { cp -p "$PLIST_BACKUP" "$PLIST.restore.$$" && mv -f "$PLIST.restore.$$" "$PLIST"; }
 }
 
+# UNDO_ON_REFUSAL from step 4 on (own_job_or_exit, PATCHES §76.6): launchd's
+# job changed during the run, the restart was refused, and the files go back
+# to what they were before this run. Each file is tried on its own, and one
+# that stays as this run left it is named with the command that puts it back.
+put_back_on_refusal() {
+    local left=0
+    install_binary "$BACKUP" "$CUR" || { still_new "$BACKUP" "$CUR"; left=1; }
+    if [ -n "$SUP_BACKUP" ]; then
+        install_binary "$SUP_BACKUP" "$SUPERVISOR_BIN" || { still_new "$SUP_BACKUP" "$SUPERVISOR_BIN"; left=1; }
+    fi
+    if [ -n "$PLIST_BACKUP" ]; then
+        { cp -p "$PLIST_BACKUP" "$PLIST.restore.$$" && mv -f "$PLIST.restore.$$" "$PLIST"; } || { still_new "$PLIST_BACKUP" "$PLIST"; left=1; }
+    fi
+    [ "$left" = 1 ] || echo "   the files this run changed are as they were before it: $CUR is $BACKUP again" >&2
+}
+still_new() { # backup file
+    echo "   !! $2 still holds what this run installed, and the next start of $LABEL would use it. To put it back:" >&2
+    printf '     cp -p %q %q && mv -f %q %q\n' "$1" "$2.restore" "$2.restore" "$2" >&2
+}
+
 if [ "$SUPERVISED" = 1 ] && [ "$LOADED_SHAPE" = none ]; then
     echo "== 0. launchd has not loaded $LABEL: bootstrapping $PLIST =="
     bootstrap_job || { fail "launchd did not load $PLIST; the daemon is DOWN"; exit 2; }
@@ -701,6 +721,8 @@ if [ -n "$PLIST_BACKUP" ]; then
     echo "   $PLIST: ${PLIST_SET_ENV:-without $PLIST_DELETE_ENV}"
     job_state
 fi
+# shellcheck disable=SC2034 # read by own_job_or_exit
+UNDO_ON_REFUSAL=put_back_on_refusal
 
 if [ "$SWAP" = upgrade ]; then
     echo "== 4. upgrade the worker (POST /_subrouter/upgrade) =="

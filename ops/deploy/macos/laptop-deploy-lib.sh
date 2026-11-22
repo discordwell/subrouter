@@ -72,19 +72,26 @@ PY
 # first, and so does take_mutation_lock, so a mismatch found at the start stops
 # a script before it changes a file. A print launchd refuses proves nothing
 # either way; launchd_blocker and bootout_and_wait already refuse on it.
+#
+# A script that has already written over a file the job runs or reads names a
+# function in UNDO_ON_REFUSAL, which puts the file back before the exit: the
+# refused restart left launchd on the build from before the run, and its next
+# start must not run one nothing verified (PATCHES §76.6).
+UNDO_ON_REFUSAL=""
 own_job_or_exit() { # kickstart | "boot out" | bootstrap | change
-    local printed from
-    if printed=$(launchctl print "$LABEL" 2>/dev/null); then
-        from=$(printf '%s\n' "$printed" | sed -n 's/^	path = //p' | head -1)
-        if [ "$from" != "$PLIST" ] && ! [ "$from" -ef "$PLIST" ]; then
-            echo "refusing to $1 $LABEL: launchd loaded it from ${from:-a plist it does not name}, and this script's plist is $PLIST. launchd was not changed." >&2
-            exit 1
-        fi
-        if [ "$1" = "boot out" ] && [ ! -f "$PLIST" ]; then
-            echo "refusing to boot out $LABEL: $PLIST does not exist, so launchd could not load the job again. launchd was not changed." >&2
-            exit 1
-        fi
+    local printed from why
+    printed=$(launchctl print "$LABEL" 2>/dev/null) || return 0
+    from=$(printf '%s\n' "$printed" | sed -n 's/^	path = //p' | head -1)
+    if [ "$from" != "$PLIST" ] && ! [ "$from" -ef "$PLIST" ]; then
+        why="launchd loaded it from ${from:-a plist it does not name}, and this script's plist is $PLIST"
+    elif [ "$1" = "boot out" ] && [ ! -f "$PLIST" ]; then
+        why="$PLIST does not exist, so launchd could not load the job again"
+    else
+        return 0
     fi
+    echo "refusing to $1 $LABEL: $why. launchd was not changed." >&2
+    [ -z "$UNDO_ON_REFUSAL" ] || "$UNDO_ON_REFUSAL"
+    exit 1
 }
 
 take_mutation_lock() {

@@ -202,9 +202,9 @@ A deploy that stops before its restart, on a sha mismatch or a failed backup, le
 
 ## Test
 
-The harness stubs ssh, sudo, systemctl, curl and the binary, and moves every fixed path under its own directory. It never reaches a real box.
+The harness stubs ssh, sudo, systemctl, curl and the binary, and moves every fixed path under its own directory. It never reaches a real box. The same harness drives the laptop scripts, so on a Mac it runs only in a sandbox (`ops/PATCHES.md` §76):
 
 ```bash
-(cd ops && go test -count=1 -run 'TestDeployScripts/(box|boot|push)-' ./deploy/tests)
-bash ops/deploy/tests/deploy-scripts-test.sh '=box-default-ok'
+ops/bin/sr-local-ci --docker -run 'TestDeployScripts/(box|boot|push)-' deploy
+DEPLOY_TESTS_SANDBOX=1 bash ops/deploy/tests/deploy-scripts-test.sh '=box-default-ok'
 ```

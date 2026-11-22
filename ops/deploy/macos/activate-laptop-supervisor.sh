@@ -590,6 +590,12 @@ roll_back() {
         *) echo; echo "ROLLED BACK, NOT HEALTHY: tail -50 the plist's StandardErrorPath; launchctl print $LABEL" >&2; load_hint; exit 2 ;;
     esac
 }
+# Until step 4's bootout returns: own_job_or_exit refused it because launchd's
+# job is not this script's own any more, nothing was restarted, and the files
+# go back (PATCHES §76.6).
+undo_on_refusal() { undo_files "launchd's job is not this script's own any more"; }
+# shellcheck disable=SC2034 # read by own_job_or_exit
+UNDO_ON_REFUSAL=undo_on_refusal
 
 echo "== 2. install the build as the worker and the supervisor =="
 install_binary "$BUILD" "$WORKER_BIN" || undo_files "could not install $WORKER_BIN"
@@ -608,7 +614,9 @@ if [ -n "$WAIT_QUIET" ]; then
     echo "   the baseline took a while: --wait-quiet checks the turns again"
     if TURNS_WHY=$(turns_blocker); then undo_files "$TURNS_WHY"; fi
 fi
-bootout_and_wait "$LAUNCHD_EXIT" || roll_back "the live job did not exit"
+bootout_and_wait "$LAUNCHD_EXIT"; bootout_rc=$?
+UNDO_ON_REFUSAL=""
+[ "$bootout_rc" = 0 ] || roll_back "the live job did not exit"
 bootstrap_job || roll_back "launchd did not load the supervised plist"
 
 echo "== 5. verify =="

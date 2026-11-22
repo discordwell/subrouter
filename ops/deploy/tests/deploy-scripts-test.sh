@@ -7,9 +7,10 @@
 # (PATCHES §48). The step-7 cases build throwaway git repos under the test dir
 # with the real git, never reading this machine's git config.
 #
-#   bash ops/deploy/tests/deploy-scripts-test.sh              all cases, in parallel
-#   bash ops/deploy/tests/deploy-scripts-test.sh <substring>  matching cases, in order
-#   bash ops/deploy/tests/deploy-scripts-test.sh '=<case>'    exactly that case (quote it in zsh)
+#   ops/bin/sr-local-ci --docker deploy                                      every case, on Linux in Docker
+#   DEPLOY_TESTS_SANDBOX=1 bash ops/deploy/tests/deploy-scripts-test.sh              all cases, in parallel
+#   DEPLOY_TESTS_SANDBOX=1 bash ops/deploy/tests/deploy-scripts-test.sh <substring>  matching cases, in order
+#   DEPLOY_TESTS_SANDBOX=1 bash ops/deploy/tests/deploy-scripts-test.sh '=<case>'    exactly that case (quote it in zsh)
 #
 # Every external effect is a stub on PATH: sudo, systemctl, launchctl, curl,
 # codesign, ss, lsof, journalctl, sleep, ssh, the subrouter binary itself (a
@@ -28,8 +29,10 @@
 # DEPLOY_TESTS_SANDBOX=1 (macOS) additionally runs each script inside
 # sandbox-exec: writes outside the test dir, network, exec of the real
 # sudo/launchctl/codesign/security/tailscale, and reads of the real
-# ~/.subrouter, ~/.codex and ~/.claude are denied. Off by default only because
-# the sandbox makes every exec several times slower.
+# ~/.subrouter, ~/.codex and ~/.claude are denied. It makes every exec several
+# times slower. On macOS the test refuses to run without it or sr-local-ci's
+# sandbox (SR_LOCAL_CI_SANDBOX=1), and checks that exec of /bin/launchctl is
+# refused before any case runs (PATCHES §76.6). On Linux it changes nothing.
 set -uo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd -P)
@@ -54,6 +57,53 @@ if [ "${DEPLOY_TESTS_SANDBOX:-0}" = 1 ]; then
     /*) ;;
     *) echo "cannot resolve this user's home (got '$USER_HOME'; directory services are unreachable from this shell), so DEPLOY_TESTS_SANDBOX=1 would fence nothing" >&2; exit 2 ;;
   esac
+fi
+
+# DEPLOY_TESTS_SANDBOX=1's profile, for a test dir. /private/tmp: macOS
+# /bin/bash 3.2 writes here-document temp files there whatever TMPDIR says, and
+# deploy-laptop.sh must run under it.
+sandbox_profile() { # test dir
+  printf '%s' "(version 1)(allow default)
+(deny file-write* (require-not (require-any (subpath \"$1\") (subpath \"/private/tmp\") (literal \"/dev/null\") (literal \"/dev/tty\") (literal \"/dev/dtracehelper\") (subpath \"/dev/fd\"))))
+(deny process-exec (literal \"/usr/bin/sudo\") (literal \"/bin/launchctl\") (literal \"/usr/bin/codesign\") (literal \"/usr/bin/security\") (literal \"/usr/bin/open\") (literal \"/opt/homebrew/bin/tailscale\") (literal \"/usr/local/bin/tailscale\"))
+(deny file-read* (subpath \"$USER_HOME/.subrouter\") (subpath \"$USER_HOME/.codex\") (subpath \"$USER_HOME/.claude\") (subpath \"$HOME/.subrouter\") (subpath \"$HOME/.codex\") (subpath \"$HOME/.claude\"))
+(deny network-outbound (remote ip))"
+}
+
+# On macOS only stubs stand between a script and the real launchctl, and a
+# stopped test run once unloaded the live service (PATCHES §76). So a run there
+# needs a sandbox that refuses exec of launchctl. A variable that names one is
+# not proof: before any case runs, exec of /bin/launchctl must fail with EPERM,
+# as a sandbox fails it (PATCHES §76.6). If the sandbox lets it run, it runs
+# `launchctl version`, which changes nothing.
+refuse_unfenced() { # why
+  {
+    echo "refusing to run the deploy script cases on macOS outside a sandbox: $1. They drive scripts that call launchctl, and a stopped test run once unloaded the live subrouter service (ops/PATCHES.md §76). Run them with one of:"
+    echo "	ops/bin/sr-local-ci --docker deploy                                   (Linux, in Docker)"
+    echo "	ops/bin/sr-local-ci deploy                                            (this Mac, in sr-local-ci's sandbox)"
+    echo "	DEPLOY_TESTS_SANDBOX=1 bash ops/deploy/tests/deploy-scripts-test.sh   (this Mac, each script sandboxed; add a case filter)"
+  } >&2
+  exit 2
+}
+SANDBOX_EXEC=""
+if [ "$(uname -s)" = Darwin ]; then
+  if [ "${DEPLOY_TESTS_SANDBOX:-0}" = 1 ]; then
+    SANDBOX_EXEC=$(command -v sandbox-exec) || refuse_unfenced "DEPLOY_TESTS_SANDBOX=1, but there is no sandbox-exec on PATH"
+    fenced="DEPLOY_TESTS_SANDBOX=1"
+    probe=$("$SANDBOX_EXEC" -p "$(sandbox_profile /var/empty)" /bin/launchctl version 2>&1); probe_rc=$?
+  elif [ "${SR_LOCAL_CI_SANDBOX:-0}" = 1 ]; then
+    fenced="SR_LOCAL_CI_SANDBOX=1"
+    probe=$(/bin/launchctl version 2>&1); probe_rc=$?
+  else
+    refuse_unfenced "neither DEPLOY_TESTS_SANDBOX=1 nor SR_LOCAL_CI_SANDBOX=1 is set"
+  fi
+  case "$probe_rc:$probe" in
+    0:*) refuse_unfenced "$fenced is set, but exec of /bin/launchctl was not refused: it ran (${probe:-no output})" ;;
+    *[Oo]"peration not permitted"*) ;;
+    *) refuse_unfenced "$fenced is set, but exec of /bin/launchctl was not refused by a sandbox (rc $probe_rc: ${probe:-no output})" ;;
+  esac
+elif [ "${DEPLOY_TESTS_SANDBOX:-0}" = 1 ]; then
+  SANDBOX_EXEC=$(command -v sandbox-exec)
 fi
 
 # With no case filter, fan the cases out: each runs as its own copy of this
@@ -104,11 +154,26 @@ export TEST_JOB TEST_ADDR
 # helper would carry on if the helper died first. A run that started just
 # before a signal can write its pid a moment late.
 STOPPED=0
+# The process group of the detached run a pid file names, only when that pid
+# is still a run of this test, with this test's dir in its arguments, and the
+# group is neither this test's own nor 0 or 1. A run that died can leave its
+# pid to another process, a pid of 0 names this test's own group, and kill
+# -1 reaches every process this user owns (PATCHES §76.6).
+run_group() { # pid file
+  local pid
+  pid=$(cat "$1" 2>/dev/null) || return 1
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$pid" -gt 1 ] || return 1
+  case "$(ps -ww -o args= -p "$pid" 2>/dev/null)" in *"$T/"*) ;; *) return 1 ;; esac
+  "$PY3" -c 'import os, sys
+group = os.getpgid(int(sys.argv[1]))
+sys.exit(1) if group <= 1 or group == os.getpgid(0) else print(group)' "$pid" 2>/dev/null
+}
 stop_detached_runs() {
   local f pgid
   while IFS= read -r f; do
     { [ -n "$f" ] && [ ! -e "${f%.pid}.rc" ]; } || continue
-    pgid=$("$PY3" -c 'import os, sys; print(os.getpgid(int(open(sys.argv[1]).read())))' "$f" 2>/dev/null) || continue
+    pgid=$(run_group "$f") || continue
     kill -STOP -- "-$pgid" 2>/dev/null
     kill -KILL -- "-$pgid" 2>/dev/null
   done <<EOF
@@ -131,15 +196,7 @@ trap 'STOPPED=1; exit 143' TERM
 PASS=0; FAILED=0; FAIL_LIST=""; CASE=""; C=""; RC=0
 
 SANDBOX=""
-if [ "${DEPLOY_TESTS_SANDBOX:-0}" = 1 ] && command -v sandbox-exec >/dev/null 2>&1; then
-  # /private/tmp: macOS /bin/bash 3.2 writes here-document temp files there
-  # whatever TMPDIR says, and deploy-laptop.sh must run under it.
-  SANDBOX="(version 1)(allow default)
-(deny file-write* (require-not (require-any (subpath \"$T\") (subpath \"/private/tmp\") (literal \"/dev/null\") (literal \"/dev/tty\") (literal \"/dev/dtracehelper\") (subpath \"/dev/fd\"))))
-(deny process-exec (literal \"/usr/bin/sudo\") (literal \"/bin/launchctl\") (literal \"/usr/bin/codesign\") (literal \"/usr/bin/security\") (literal \"/usr/bin/open\") (literal \"/opt/homebrew/bin/tailscale\") (literal \"/usr/local/bin/tailscale\"))
-(deny file-read* (subpath \"$USER_HOME/.subrouter\") (subpath \"$USER_HOME/.codex\") (subpath \"$USER_HOME/.claude\") (subpath \"$HOME/.subrouter\") (subpath \"$HOME/.codex\") (subpath \"$HOME/.claude\"))
-(deny network-outbound (remote ip))"
-fi
+[ -z "$SANDBOX_EXEC" ] || SANDBOX=$(sandbox_profile "$T")
 
 # --- stubs --------------------------------------------------------------------
 # #!/bin/bash, not env: half the execs, and the stubs stay bash-3.2 clean.
@@ -664,7 +721,7 @@ run_sandboxed() { # env-assignments... -- command...
   shift
   for e in "${envs[@]}"; do case "$e" in PATH=*) assert_shadowed "${e#PATH=}" ;; esac; done
   if [ -n "$SANDBOX" ]; then
-    env -i "${envs[@]}" sandbox-exec -p "$SANDBOX" "$@" > "${OUT:-$C/out}" 2>&1
+    env -i "${envs[@]}" "$SANDBOX_EXEC" -p "$SANDBOX" "$@" > "${OUT:-$C/out}" 2>&1
   else
     env -i "${envs[@]}" "$@" > "${OUT:-$C/out}" 2>&1
   fi
@@ -2821,6 +2878,25 @@ if begin laptop-stops-before-kickstarting-a-job-from-another-plist; then
   expect_rc 1
   expect_out "refusing to kickstart gui/$(id -u)/$TEST_JOB: launchd loaded it from $C/other/$TEST_JOB.plist, and this script's plist is $H/$LAPTOP_PLIST_REL"
   expect_no_restart; expect_running old
+  # The next start of the job runs the build from before this run, not the
+  # new one, which nothing verified (PATCHES §76.6).
+  expect_build "$CUR" old; expect_out "the files this run changed are as they were before it"
+  finish
+fi
+
+if begin laptop-refusal-that-cannot-put-the-build-back-says-how; then
+  # The restore's signature fails too: the run names the file that still holds
+  # the new build and the command that puts it back, and that command does.
+  laptop_setup pre post; run_laptop FAKE_SIGN_MOVES_JOB="$C/other/$TEST_JOB.plist" FAKE_SIGN_FAILS_AFTER=1
+  expect_rc 1; expect_out "refusing to kickstart gui/$(id -u)/$TEST_JOB"
+  expect_no_restart; expect_running old; expect_build "$CUR" new
+  expect_out "!! $CUR still holds what this run installed, and the next start of gui/$(id -u)/$TEST_JOB would use it"
+  expect_no_out "the files this run changed are as they were before it"
+  bak=$(printf '%s\n' "$H/bin/subrouter.bak-"*)
+  expect_line "     cp -p $bak $CUR.restore && mv -f $CUR.restore $CUR"
+  undo=$(grep -E '^     cp -p ' "$C/out")
+  /bin/bash -c "$undo" && ok || bad "the printed command failed: $undo"
+  expect_build "$CUR" old
   finish
 fi
 
@@ -2829,7 +2905,7 @@ if begin laptop-reload-refused-without-its-plist; then
   laptop_setup pre post; run_laptop RELOAD=1 FAKE_SIGN_REMOVES_PLIST=1
   expect_rc 1
   expect_out "refusing to boot out gui/$(id -u)/$TEST_JOB: $H/$LAPTOP_PLIST_REL does not exist, so launchd could not load the job again"
-  expect_no_restart; expect_running old
+  expect_no_restart; expect_running old; expect_build "$CUR" old
   finish
 fi
 
@@ -4298,6 +4374,19 @@ if begin act-refuses-a-job-loaded-from-another-plist; then
   finish
 fi
 
+if begin act-refusal-at-the-restart-puts-the-files-back; then
+  # launchd's job moved after step 2 installed the builds: the bootout is
+  # refused, and the plist and builds go back, as for any failure before the
+  # restart (PATCHES §76.6).
+  act_setup post post; run_act FAKE_SIGN_MOVES_JOB="$C/other/$TEST_JOB.plist"
+  expect_rc 1
+  expect_out "refusing to boot out gui/$(id -u)/$TEST_JOB: launchd loaded it from $C/other/$TEST_JOB.plist, and this script's plist is $APLIST"
+  expect_out "restored the files from"
+  expect_plist_orig; expect_build "$CUR" old; expect_no_restart
+  [ -e "$H/bin/subrouter-supervisor" ] && bad "subrouter-supervisor was left behind" || ok
+  finish
+fi
+
 
 ROUTE_SH="$(cd "$DEPLOY/.." && pwd -P)/bin/claude-route"
 route_setup() { # [plist env assignments...]
@@ -4700,6 +4789,72 @@ if begin triage-never-installed-is-missing; then
   expect_rc 0; expect_out "which:     NOT ON PATH"; expect_out "binary:    MISSING"
   # No sr, so no help was read: that is not a locked build.
   expect_out "help shows remote verbs? not checked (no sr found)"; expect_no_out "LOCKED"
+  finish
+fi
+
+# --- the harness itself (PATCHES §76.6) ---------------------------------------
+if begin harness-cleanup-signals-only-its-own-runs; then
+  # A pid file can name a pid that is another process's by then, or 0 or 1,
+  # whose groups are this test's own and every process this user owns. kill is
+  # a function here, so the case records what the cleanup would signal and
+  # signals nothing; the pid files are gone before this test's own cleanup.
+  D="$C/home/.subrouter/transitions"; mkdir -p "$D"
+  in_own_session() { # pid: its process group is its own pid
+    local n=0
+    until [ "$(ps -o pgid= -p "$1" 2>/dev/null | tr -d ' ')" = "$1" ] || [ "$n" -ge 600 ]; do /bin/sleep 0.05; n=$((n + 1)); done
+  }
+  # A detached run of this test: a session of its own, this test's dir in its arguments.
+  "$PY3" -c 'import os, time; os.setsid(); time.sleep(120)' "$D/run" & RUN=$!
+  # Another process: a session of its own, nothing of this test's in its arguments.
+  "$PY3" -c 'import os, time; os.setsid(); time.sleep(120)' & OTHER=$!
+  # A process in this test's own group, this test's dir in its arguments.
+  "$PY3" -c 'import time; time.sleep(120)' "$D/own" & OWN=$!
+  in_own_session "$RUN"; in_own_session "$OTHER"
+  echo "$RUN" > "$D/run.pid"; echo "$OTHER" > "$D/other.pid"; echo "$OWN" > "$D/own.pid"
+  echo 0 > "$D/zero.pid"; echo 1 > "$D/one.pid"; echo none > "$D/none.pid"
+  kill() { echo "kill $*" >> "$C/signalled"; }
+  stop_detached_runs
+  unset -f kill
+  rm -f "$D/"*.pid
+  want="kill -STOP -- -$RUN
+kill -KILL -- -$RUN"
+  [ "$(cat "$C/signalled" 2>/dev/null)" = "$want" ] && ok ||
+    bad "the cleanup would signal [$(tr '\n' ';' < "$C/signalled" 2>/dev/null)], want only the run's group $RUN"
+  kill -9 "$RUN" "$OTHER" "$OWN" 2>/dev/null; wait "$RUN" "$OTHER" "$OWN" 2>/dev/null
+  finish
+fi
+
+if begin scripts-default-to-the-live-job; then
+  # Every other case gives the scripts a label and address of this test's own,
+  # so none runs one on its defaults. This case reads each default a script
+  # would use with the variable unset, and runs no script.
+  want_default() { case "$1" in
+    SUBROUTER_LABEL) echo ai.manaflow.subrouter ;;
+    SUBROUTER_ADDR) echo 127.0.0.1:31415 ;;
+    CLAUDE_ROUTE_TCP) echo http://127.0.0.1:31415 ;;
+  esac; }
+  while IFS='|' read -r script names; do
+    found=""
+    while IFS= read -r expr; do
+      [ -n "$expr" ] || continue
+      name=${expr#??}; name=${name%%:-*}
+      got=$(env -i /bin/bash -c "printf %s \"$expr\"")
+      [ "$got" = "$(want_default "$name")" ] && ok || bad "$(basename "$script"): $expr gives '$got', want '$(want_default "$name")'"
+      found="$found $name"
+    done <<EOF
+$(grep -oE '\$\{(SUBROUTER_LABEL|SUBROUTER_ADDR|CLAUDE_ROUTE_TCP):-[^}]*\}' "$script" | sort -u)
+EOF
+    for name in $names; do
+      case " $found " in *" $name "*) ok ;; *) bad "$(basename "$script") has no default for $name" ;; esac
+    done
+  done <<EOF
+$LAPTOP_SH|SUBROUTER_LABEL SUBROUTER_ADDR
+$DEPLOY/macos/laptop-deploy-lib.sh|SUBROUTER_ADDR
+$DEPLOY/macos/rollback-laptop-peer.sh|SUBROUTER_LABEL SUBROUTER_ADDR
+$ACT_SH|SUBROUTER_LABEL SUBROUTER_ADDR
+$TRIAGE|SUBROUTER_LABEL SUBROUTER_ADDR
+$ROUTE_SH|CLAUDE_ROUTE_TCP
+EOF
   finish
 fi
 

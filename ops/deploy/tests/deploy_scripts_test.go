@@ -243,6 +243,13 @@ var requiredCases = []string{
 	"laptop-plist-gone-after-the-bootout-is-not-bootstrapped",
 	"peer-rollback-refuses-a-job-loaded-from-another-plist",
 	"act-refuses-a-job-loaded-from-another-plist",
+	// A refusal at the restart puts back what a deploy or an activation
+	// installed, or says how to; the harness signals only its own runs; and
+	// one case reads the scripts' default label and address (PATCHES §76.6).
+	"laptop-refusal-that-cannot-put-the-build-back-says-how",
+	"act-refusal-at-the-restart-puts-the-files-back",
+	"harness-cleanup-signals-only-its-own-runs",
+	"scripts-default-to-the-live-job",
 	// deploy-laptop.sh step 7: old backups go only after the routes verify,
 	// this run's never; pre-isolation leftovers are named once a record is
 	// migrated; the checkout srq runs from is compared with the
@@ -423,7 +430,9 @@ var caseLine = regexp.MustCompile(`(?m)^if begin ([A-Za-z0-9_-]+); then$`)
 // and on macOS the cases still run only under a sandbox that refuses exec of
 // launchctl: the harness's own (DEPLOY_TESTS_SANDBOX=1), or sr-local-ci's,
 // which says so with SR_LOCAL_CI_SANDBOX=1 (a sandbox-exec inside it would be
-// refused). Linux has no launchctl, so CI and Docker runs are unchanged.
+// refused). Linux has no launchctl, so CI and Docker runs are unchanged. The
+// variables only say which sandbox; the harness itself checks that it refuses
+// launchctl before any case runs.
 func requireFence(t *testing.T) {
 	t.Helper()
 	if why := fenceRefusal(runtime.GOOS, os.Getenv); why != "" {
@@ -477,9 +486,90 @@ func TestDeployCasesRefuseAMacOutsideASandbox(t *testing.T) {
 	}
 }
 
+// Run by itself on macOS, the harness refuses too, and it does not take a
+// variable's word for a sandbox: it execs launchctl as a case would and runs
+// only when that is refused (PATCHES §76.6). Here Linux stands in for the Mac:
+// uname says Darwin, and a stand-in sandbox-exec refuses /bin/launchctl, or
+// runs it.
+func TestDeployHarnessRefusesAMacOutsideASandbox(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("stands in for macOS on Linux; on a Mac the harness checks its real sandbox")
+	}
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	harness := filepath.Join(wd, "deploy-scripts-test.sh")
+	const one = "laptop-refuses-a-job-loaded-from-another-plist"
+	refusing := `if [ "$3" = /bin/launchctl ]; then echo "sandbox-exec: execvp() of '/bin/launchctl' failed: Operation not permitted" >&2; exit 71; fi
+shift 2; exec "$@"`
+	for _, c := range []struct {
+		name    string
+		env     []string
+		sandbox string // the stand-in sandbox-exec's body; "" for none on PATH
+		filter  []string
+		refusal string // "" when the case runs
+	}{
+		{"nothing says sandboxed", nil, "", []string{"=" + one}, "neither DEPLOY_TESTS_SANDBOX=1 nor SR_LOCAL_CI_SANDBOX=1 is set"},
+		{"nothing says sandboxed, every case", nil, "", nil, "neither DEPLOY_TESTS_SANDBOX=1 nor SR_LOCAL_CI_SANDBOX=1 is set"},
+		{"DEPLOY_TESTS_SANDBOX=1 with no sandbox-exec", []string{"DEPLOY_TESTS_SANDBOX=1"}, "", []string{"=" + one}, "there is no sandbox-exec on PATH"},
+		{"DEPLOY_TESTS_SANDBOX=1 in a sandbox that runs launchctl", []string{"DEPLOY_TESTS_SANDBOX=1"}, `shift 2; exec "$@"`, []string{"=" + one}, "exec of /bin/launchctl was not refused"},
+		{"SR_LOCAL_CI_SANDBOX=1 outside sr-local-ci's sandbox", []string{"SR_LOCAL_CI_SANDBOX=1"}, "", []string{"=" + one}, "exec of /bin/launchctl was not refused"},
+		{"DEPLOY_TESTS_SANDBOX=1 in a sandbox that refuses launchctl", []string{"DEPLOY_TESTS_SANDBOX=1"}, refusing, []string{"=" + one}, ""},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			bin, tmp := t.TempDir(), t.TempDir()
+			calls := filepath.Join(bin, "sandbox-calls")
+			write := func(name, body string) {
+				if err := os.WriteFile(filepath.Join(bin, name), []byte("#!/bin/sh\n"+body+"\n"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			write("uname", "echo Darwin")
+			if c.sandbox != "" {
+				write("sandbox-exec", fmt.Sprintf("echo \"$*\" >> %q\n%s", calls, c.sandbox))
+			}
+			cmd := exec.Command("bash", append([]string{harness}, c.filter...)...)
+			cmd.Dir = wd
+			cmd.Env = append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH"), "TMPDIR="+tmp, "KEEP=",
+				"DEPLOY_TESTS_JOBS=1", "DEPLOY_TESTS_SANDBOX=", "SR_LOCAL_CI_SANDBOX=")
+			cmd.Env = append(cmd.Env, c.env...)
+			out, err := cmd.CombinedOutput()
+			text := string(out)
+			if c.refusal == "" {
+				if err != nil || !strings.Contains(text, "\n  ok   "+one+"\n") {
+					t.Fatalf("a sandbox that refuses launchctl was refused (%v):\n%s", err, text)
+				}
+				ran, _ := os.ReadFile(calls)
+				if !strings.Contains(string(ran), "/bin/launchctl version") || !strings.Contains(string(ran), "deploy-laptop.sh") {
+					t.Fatalf("the probe and the case's script did not both go through sandbox-exec:\n%s", ran)
+				}
+				return
+			}
+			if code := cmd.ProcessState.ExitCode(); code != 2 {
+				t.Errorf("exit %d, want 2:\n%s", code, text)
+			}
+			for _, want := range []string{"refusing to run the deploy script cases on macOS", c.refusal,
+				"ops/bin/sr-local-ci --docker deploy", "DEPLOY_TESTS_SANDBOX=1 bash ops/deploy/tests/deploy-scripts-test.sh"} {
+				if !strings.Contains(text, want) {
+					t.Errorf("the refusal lacks %q:\n%s", want, text)
+				}
+			}
+			if left, _ := filepath.Glob(filepath.Join(tmp, "deploy-tests*")); len(left) > 0 || strings.Contains(text, "  ok   ") {
+				t.Errorf("a case started before the refusal (%v):\n%s", left, text)
+			}
+		})
+	}
+}
+
 // AGENTS.md told agents to run go test before handing off, and the Test
 // section of ops/README.md listed plain go test for these cases (PATCHES §76).
-var plainOpsGoTest = regexp.MustCompile(`cd ops && go test|go test[^\n]*\./deploy/tests`)
+// The harness's own usage lines and the box README's Test section gave the
+// harness and go test without a sandbox too (PATCHES §76.6).
+var (
+	plainOpsGoTest = regexp.MustCompile(`cd ops && go test|go test[^\n]*\./deploy/tests`)
+	plainHarness   = regexp.MustCompile(`\bbash\s+\S*deploy-scripts-test\.sh`)
+)
 
 func TestDocsNameTheSafeDeployTestCommands(t *testing.T) {
 	wd, err := os.Getwd()
@@ -503,10 +593,19 @@ func TestDocsNameTheSafeDeployTestCommands(t *testing.T) {
 	if docker := safeDeployTestCommands[0].command; !strings.Contains(agents, docker) {
 		t.Errorf("AGENTS.md does not name %q", docker)
 	}
-	for name, doc := range map[string]string{"ops/README.md": readme, "AGENTS.md": agents} {
+	// Of the harness, only its comments: the usage lines are there.
+	comments := strings.Split(read("ops/deploy/tests/deploy-scripts-test.sh"), "\n")
+	for i, line := range comments {
+		if !strings.HasPrefix(line, "#") {
+			comments[i] = ""
+		}
+	}
+	for name, doc := range map[string]string{"ops/README.md": readme, "AGENTS.md": agents,
+		"ops/deploy/lightsail/README.md":          read("ops/deploy/lightsail/README.md"),
+		"ops/deploy/tests/deploy-scripts-test.sh": strings.Join(comments, "\n")} {
 		for i, line := range strings.Split(doc, "\n") {
-			if plainOpsGoTest.MatchString(line) && !strings.Contains(line, "DEPLOY_TESTS_SANDBOX=1") {
-				t.Errorf("%s:%d runs the deploy cases with go test outside a sandbox: %s", name, i+1, line)
+			if (plainOpsGoTest.MatchString(line) || plainHarness.MatchString(line)) && !strings.Contains(line, "DEPLOY_TESTS_SANDBOX=1") {
+				t.Errorf("%s:%d runs the deploy cases outside a sandbox: %s", name, i+1, line)
 			}
 		}
 	}
@@ -606,23 +705,10 @@ func TestStoppedHarnessKillsItsDetachedRuns(t *testing.T) {
 			done := make(chan error, 1)
 			go func() { done <- cmd.Wait() }()
 
-			pgid := 0
-			for deadline := time.Now().Add(5 * time.Minute); pgid == 0; time.Sleep(50 * time.Millisecond) {
-				held, _ := filepath.Glob(filepath.Join(dir, "deploy-tests.*", "hold.held"))
-				if len(held) == 1 {
-					if b, err := os.ReadFile(held[0]); err == nil {
-						pgid, _ = strconv.Atoi(strings.TrimSpace(string(b)))
-					}
-				}
-				select {
-				case err := <-done:
-					t.Fatalf("the harness ended (%v) before its detached run reached the kickstart:\n%s", err, out.String())
-				default:
-				}
-				if pgid == 0 && time.Now().After(deadline) {
-					_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-					t.Fatalf("the detached run never reached the kickstart:\n%s", out.String())
-				}
+			pgid, err := awaitHeld(dir, heldStall, done)
+			if err != nil {
+				_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+				t.Fatalf("%v:\n%s", err, out.String())
 			}
 			if pgid <= 1 {
 				t.Fatalf("hold.held names process group %d", pgid)
@@ -652,6 +738,93 @@ func TestStoppedHarnessKillsItsDetachedRuns(t *testing.T) {
 	}
 }
 
+// The detached run parks in its kickstart and writes its process group to
+// hold.held under dir. A loaded machine can take many minutes to get there: at
+// a load near 60, two subtests ran out a fixed 5 minutes in a full run and
+// passed alone (PATCHES §76.6). So the wait lasts while the run makes
+// progress, a file under dir changing, and gives up once nothing has changed
+// for stall.
+const heldStall = 3 * time.Minute
+
+func awaitHeld(dir string, stall time.Duration, ended <-chan error) (int, error) {
+	last, progress := "", time.Now()
+	for {
+		if held, _ := filepath.Glob(filepath.Join(dir, "deploy-tests.*", "hold.held")); len(held) == 1 {
+			if b, err := os.ReadFile(held[0]); err == nil {
+				if pgid, err := strconv.Atoi(strings.TrimSpace(string(b))); err == nil {
+					return pgid, nil
+				}
+			}
+		}
+		select {
+		case err := <-ended:
+			return 0, fmt.Errorf("the harness ended (%v) before its detached run reached the kickstart", err)
+		default:
+		}
+		if now := treeState(dir); now != last {
+			last, progress = now, time.Now()
+		} else if time.Since(progress) > stall {
+			return 0, fmt.Errorf("the detached run never reached the kickstart: nothing under %s changed for %v", dir, stall)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// How many files are under dir, their total size and their latest change.
+func treeState(dir string) string {
+	n, size, latest := 0, int64(0), int64(0)
+	_ = filepath.WalkDir(dir, func(_ string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		if info, err := d.Info(); err == nil {
+			n, size = n+1, size+info.Size()
+			latest = max(latest, info.ModTime().UnixNano())
+		}
+		return nil
+	})
+	return fmt.Sprint(n, size, latest)
+}
+
+func TestHeldWaitFollowsTheRunsProgress(t *testing.T) {
+	const stall = 1500 * time.Millisecond
+	t.Run("a slow run that keeps going", func(t *testing.T) {
+		run := filepath.Join(t.TempDir(), "deploy-tests.x")
+		if err := os.Mkdir(run, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		go func() {
+			// Twice and more the stall in all, each step well inside it.
+			for i := 1; i <= 40; i++ {
+				_ = os.WriteFile(filepath.Join(run, "log"), []byte(strings.Repeat("x", i)), 0o644)
+				time.Sleep(100 * time.Millisecond)
+			}
+			_ = os.WriteFile(filepath.Join(run, "hold.next"), []byte("4242\n"), 0o644)
+			_ = os.Rename(filepath.Join(run, "hold.next"), filepath.Join(run, "hold.held"))
+		}()
+		if pgid, err := awaitHeld(filepath.Dir(run), stall, nil); err != nil || pgid != 4242 {
+			t.Fatalf("awaitHeld = %d, %v; want 4242 from a run that kept going", pgid, err)
+		}
+	})
+	t.Run("a run that stops", func(t *testing.T) {
+		run := filepath.Join(t.TempDir(), "deploy-tests.x")
+		if err := os.MkdirAll(run, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		_ = os.WriteFile(filepath.Join(run, "log"), []byte("x"), 0o644)
+		if _, err := awaitHeld(filepath.Dir(run), stall, nil); err == nil || !strings.Contains(err.Error(), "changed for") {
+			t.Fatalf("awaitHeld on a run that stopped: %v, want the stall", err)
+		}
+	})
+	t.Run("a harness that ends first", func(t *testing.T) {
+		ended := make(chan error, 1)
+		ended <- fmt.Errorf("exit status 1")
+		if _, err := awaitHeld(t.TempDir(), stall, ended); err == nil || !strings.Contains(err.Error(), "harness ended") {
+			t.Fatalf("awaitHeld after the harness ended: %v", err)
+		}
+	})
+}
+
 type syncBuffer struct {
 	mu  sync.Mutex
 	buf bytes.Buffer
@@ -672,11 +845,50 @@ func (b *syncBuffer) String() string {
 // Every launchctl call that changes a job is in laptop-deploy-lib.sh's
 // kickstart_job, bootout_and_wait or bootstrap_job, which first check that the
 // job is the script's own (PATCHES §76). A call anywhere else skips that check.
+// A call is launchctl, by name or by path, where a command starts: at the
+// start of a line, after ; & | ( ) { } ! a backquote or $(, or after a
+// keyword; behind any of command, exec, env, nohup, nice, time, sudo and
+// timeout with their options, and behind variable assignments. Its verb is
+// one that loads, unloads, starts, stops or signals a job (PATCHES §76.6). A
+// line that ends in a backslash goes on into the next.
 var (
-	launchdChange = regexp.MustCompile(`(^|[;&|({]|\$\(|\bthen|\bdo|\belse)\s*launchctl\s+(kickstart|bootout|bootstrap)\b`)
-	shellFunc     = regexp.MustCompile(`^([A-Za-z_][A-Za-z0-9_]*)\(\) *\{`)
-	guardedCalls  = map[string]bool{"kickstart_job": true, "bootout_and_wait": true, "bootstrap_job": true}
+	launchdChange = regexp.MustCompile(`(?:^|[;&|(){}!` + "`" + `]|\$\(|\b(?:then|do|else|if|elif|while|until)\b)\s*` +
+		`(?:(?:[A-Za-z_][A-Za-z0-9_]*=\S*|(?:\S*/)?(?:command|exec|env|nohup|nice|time|sudo|timeout)|-\S+|[0-9][0-9.]*[smhd]?)\s+)*` +
+		`["']?(?:\S*/)?launchctl["']?\s+["']?(?:kickstart|bootout|bootstrap|load|unload|remove|kill|stop|start|enable|disable|submit)\b`)
+	shellFunc    = regexp.MustCompile(`^([A-Za-z_][A-Za-z0-9_]*)\(\) *\{`)
+	guardedCalls = map[string]bool{"kickstart_job": true, "bootout_and_wait": true, "bootstrap_job": true}
 )
+
+type launchdCall struct {
+	line     int // the first line of the call
+	function string
+	text     string
+}
+
+// Each call in a shell script that changes a launchd job, with the function it
+// is in.
+func launchdChanges(src string) []launchdCall {
+	var calls []launchdCall
+	fn := ""
+	lines := strings.Split(src, "\n")
+	for i := 0; i < len(lines); i++ {
+		first, line := i, lines[i]
+		for strings.HasSuffix(line, `\`) && i+1 < len(lines) {
+			i++
+			line = strings.TrimSuffix(line, `\`) + " " + lines[i]
+		}
+		if m := shellFunc.FindStringSubmatch(line); m != nil {
+			fn = m[1]
+		} else if strings.HasPrefix(line, "}") {
+			fn = ""
+		}
+		if strings.HasPrefix(strings.TrimSpace(line), "#") || !launchdChange.MatchString(line) {
+			continue
+		}
+		calls = append(calls, launchdCall{first + 1, fn, strings.TrimSpace(line)})
+	}
+	return calls
+}
 
 func TestLaptopScriptsChangeLaunchdOnlyThroughTheGuard(t *testing.T) {
 	wd, err := os.Getwd()
@@ -687,33 +899,86 @@ func TestLaptopScriptsChangeLaunchdOnlyThroughTheGuard(t *testing.T) {
 	if err != nil || len(scripts) == 0 {
 		t.Fatalf("found no laptop scripts beside the harness: %v", err)
 	}
-	guarded := 0
+	guarded := map[string]bool{}
 	for _, path := range scripts {
 		src, err := os.ReadFile(path)
 		if err != nil {
 			t.Fatal(err)
 		}
-		fn := ""
-		for i, line := range strings.Split(string(src), "\n") {
-			if m := shellFunc.FindStringSubmatch(line); m != nil {
-				fn = m[1]
-			} else if strings.HasPrefix(line, "}") {
-				fn = ""
-			}
-			if strings.HasPrefix(strings.TrimSpace(line), "#") || !launchdChange.MatchString(line) {
-				continue
-			}
-			if filepath.Base(path) == "laptop-deploy-lib.sh" && guardedCalls[fn] {
-				guarded++
+		for _, c := range launchdChanges(string(src)) {
+			if filepath.Base(path) == "laptop-deploy-lib.sh" && guardedCalls[c.function] {
+				guarded[c.function] = true
 				continue
 			}
 			t.Errorf("%s:%d changes a launchd job outside kickstart_job, bootout_and_wait and bootstrap_job, so it skips their check that the job is this script's own: %s",
-				filepath.Base(path), i+1, strings.TrimSpace(line))
+				filepath.Base(path), c.line, c.text)
 		}
 	}
 	// A pattern that matches nothing would pass every script.
-	if guarded != len(guardedCalls) {
-		t.Fatalf("found %d launchctl calls in the guarded functions, want %d; the pattern no longer matches laptop-deploy-lib.sh", guarded, len(guardedCalls))
+	for fn := range guardedCalls {
+		if !guarded[fn] {
+			t.Errorf("found no launchctl call in %s; the pattern no longer matches laptop-deploy-lib.sh", fn)
+		}
+	}
+}
+
+// The independent check of §76 found that its first pattern missed most of
+// these.
+func TestLaunchdChangeScanCatchesEverySpelling(t *testing.T) {
+	for _, line := range []string{
+		`launchctl bootout "$LABEL"`,
+		`    out=$(launchctl bootout "$LABEL" 2>&1)`,
+		`if launchctl bootout "$LABEL"; then`,
+		`elif launchctl kickstart -k "$LABEL"; then`,
+		`! launchctl bootstrap "gui/$(id -u)" "$PLIST"`,
+		`if ! launchctl bootout "$LABEL"; then`,
+		`while launchctl bootout "$LABEL"; do`,
+		`until launchctl bootstrap gui/501 "$PLIST"; do`,
+		`/bin/launchctl kickstart -k "$LABEL"`,
+		`command launchctl bootout "$LABEL"`,
+		`exec launchctl bootout "$LABEL"`,
+		`env -i PATH=/bin launchctl bootout "$LABEL"`,
+		`/usr/bin/env launchctl bootout "$LABEL"`,
+		`timeout 10 launchctl bootout "$LABEL"`,
+		`timeout -k 5 10s launchctl bootout "$LABEL"`,
+		`LC_ALL=C launchctl bootout "$LABEL"`,
+		`sudo -n launchctl bootout "$LABEL"`,
+		`nohup launchctl kickstart -k "$LABEL" &`,
+		`check && launchctl kickstart -k "$LABEL"`,
+		`check || launchctl bootstrap gui/501 "$PLIST"`,
+		`{ launchctl bootout "$LABEL"; }`,
+		"x=`launchctl bootout \"$LABEL\"`",
+		`case $a in x) launchctl bootout "$LABEL" ;; esac`,
+		`launchctl unload "$PLIST"`,
+		`launchctl load -w "$PLIST"`,
+		`launchctl remove "$JOB"`,
+		`launchctl kill TERM "$LABEL"`,
+		`launchctl stop "$JOB"`,
+		`launchctl start "$JOB"`,
+		`launchctl disable "$LABEL"`,
+		`launchctl enable "$LABEL"`,
+		`launchctl submit -l x -- /bin/true`,
+	} {
+		if got := launchdChanges(line); len(got) != 1 {
+			t.Errorf("not taken for a launchd change: %s", line)
+		}
+	}
+	src := "x\nkickstart_job() {\n    launchctl \\\n        bootout \"$LABEL\"\n}\n"
+	if got := launchdChanges(src); len(got) != 1 || got[0].line != 3 || got[0].function != "kickstart_job" {
+		t.Errorf("a call continued on the next line: %+v, want one call at line 3 in kickstart_job", got)
+	}
+	for _, line := range []string{
+		`echo "     launchctl bootstrap gui/$(id -u) $PLIST" >&2`,
+		`echo "If launchctl refused (rc 141, 153 or 125), this shell is the problem" >&2`,
+		`LAUNCHD_ERR="launchctl bootstrap gui/$(id -u) $PLIST failed: rc $rc"`,
+		`launchctl print "$LABEL" >/dev/null 2>&1; rc=$?`,
+		`mgr=$(launchctl managername 2>&1); rc=$?`,
+		`    launchctl_hint`,
+		`# launchctl bootout "$LABEL"`,
+	} {
+		if got := launchdChanges(line); len(got) != 0 {
+			t.Errorf("taken for a launchd change: %s", line)
+		}
 	}
 }
 
