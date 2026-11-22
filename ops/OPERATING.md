@@ -166,7 +166,7 @@ Route words are one-launch exceptions, typed first:
 - `codex local` and `codex <account>` do the same for Codex.
 - `CLAUDE_ROUTE=off claude` and `CLAUDE_ROUTE=pool claude` override the mode for one launch.
 
-A pool launch whose socket does not answer falls back to the daemon's TCP port, then to your own login. A Claude Code session that started in socket mode does not fall back if the socket dies later. It retries for minutes. Watch `claude_socket` in `/_subrouter/health`.
+A pool launch whose socket does not answer falls back to the daemon's TCP port, then to your own login. A Claude Code session that started in socket mode does not fall back if the socket dies later. It retries for minutes. Watch `claude_socket` in `/_subrouter/health`. A running daemon binds a deleted or dead socket path again within about 2 seconds (§77.1), so the session hangs only while the daemon itself is down.
 
 A credential command (`claude auth`, `claude login`, `claude logout`, `claude setup-token`) bypasses the route, so a login lands in the store its environment names (§73). `claude-route status` warns when the shim's login-free store holds a login (`pool store:`).
 
@@ -240,7 +240,7 @@ ops/deploy/macos/activate-laptop-supervisor.sh --rollback                    # b
 curl -s --unix-socket ~/.subrouter/supervisor.sock http://supervisor/_subrouter/supervisor-status
 ```
 
-`supervisor-status` gives the active worker's CDHash as `active_worker.executable_identity`, and the Claude socket's state as `claude_socket`.
+`supervisor-status` gives the active worker's CDHash as `active_worker.executable_identity`, and the Claude socket's state as `claude_socket`. `serving` is the only word that means the supervisor serves the socket. `waiting` and `displaced` mean that another process has the socket's lock or its path, and the supervisor takes the path back as soon as it can (§77.1).
 
 ### Recover from an interrupted run
 
