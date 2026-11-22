@@ -102,10 +102,6 @@ CODEX = os.path.join(config_dir("CODEX_HOME", "~/.codex"), "config.toml")
 # broker.DefaultConfigPath, where `setup` writes localProxyToken.
 CLOUD = os.environ.get("SUBROUTER_CLOUD_CONFIG", "").strip() or os.path.expanduser("~/.config/subrouter/cloud.json")
 LOG = os.path.expanduser("~/Library/Logs/subrouter.err.log")
-PLIST = os.path.expanduser("~/Library/LaunchAgents/ai.manaflow.subrouter.plist")
-LABEL = "ai.manaflow.subrouter"
-DOMAIN = f"gui/{os.getuid()}"
-JOB = f"{DOMAIN}/{LABEL}"
 BAK = ".subrouter-bak-"  # same shape subrouter-unbrick restores from
 MARKER = "subrouter-ok"
 RC_FILES = ("~/.zshrc", "~/.bashrc", "~/.zprofile", "~/.bash_profile", "~/.profile")
@@ -131,6 +127,11 @@ def sibling(name: str):
 remote_key = sibling("subrouter-remote-key")
 # How a backup goes back, link or file.
 unbrick = sibling("subrouter-unbrick")
+# The LaunchAgent, which subrouter-remote-key finds as deploy-laptop.sh does.
+LABEL = remote_key.LABEL
+PLIST = str(remote_key.PLIST)
+DOMAIN = f"gui/{os.getuid()}"
+JOB = f"{DOMAIN}/{LABEL}"
 
 
 class Stop(Exception):
