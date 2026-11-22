@@ -129,6 +129,8 @@ The supervisor keeps that socket for as long as it runs, and `claude_socket` is 
 
 `supervisor-status` also reports `claude_socket_waits_for_lock: true` and `claude_socket_rebinds`, the number of times the supervisor bound the path after the first. A supervisor with no Claude socket reports none of the three fields.
 
+This fork: the supervisor also probes its active worker. Every 15 seconds it sends `GET /_subrouter/ready` to the worker's private socket and waits up to 10 seconds. Any HTTP answer counts, a 503 included. After 3 probes in a row with no answer, the supervisor starts a new generation and retires the silent worker the way an upgrade does, so the streams that worker still sends finish. `--worker-probe-interval`, `--worker-probe-timeout` and `--worker-probe-misses` set the three numbers, and an interval of `0` turns the probe off. The supervisor skips a probe while an upgrade or a canary is under way and while it shuts down. A tick that arrives more than 10 seconds late, as after the machine slept, sets the count of misses to 0. `supervisor-status` reports the probe as `worker_probe`, with the current `misses`, a `replace_error` while a replacement cannot be made, and the `last_replacement` with its time and reason.
+
 The supervisor is deliberately separate from the replaceable worker binary. Routine releases update `/usr/local/bin/subrouter`; they do not replace or restart `/usr/local/libexec/subrouter-supervisor`.
 
 ### One-time LaunchDaemon migration

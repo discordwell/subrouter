@@ -240,7 +240,7 @@ ops/deploy/macos/activate-laptop-supervisor.sh --rollback                    # b
 curl -s --unix-socket ~/.subrouter/supervisor.sock http://supervisor/_subrouter/supervisor-status
 ```
 
-`supervisor-status` gives the active worker's CDHash as `active_worker.executable_identity`, and the Claude socket's state as `claude_socket`. `serving` is the only word that means the supervisor serves the socket. `waiting` and `displaced` mean that another process has the socket's lock or its path, and the supervisor takes the path back as soon as it can (§77.1).
+`supervisor-status` gives the active worker's CDHash as `active_worker.executable_identity`, and the Claude socket's state as `claude_socket`. `serving` is the only word that means the supervisor serves the socket. `waiting` and `displaced` mean that another process has the socket's lock or its path, and the supervisor takes the path back as soon as it can (§77.1). `worker_probe` shows the supervisor's check of its worker. `misses` counts the probes in a row that the active worker has not answered. After 3 the supervisor starts a new worker and retires the silent one, and `last_replacement` says when and why (§77.2).
 
 ### Recover from an interrupted run
 
