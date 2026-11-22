@@ -32,13 +32,18 @@ func startRouterFor(t *testing.T, address string) (*Router, string) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	return router, serveRouter(t, router)
+}
+
+func serveRouter(t *testing.T, router *Router) string {
+	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = listener.Close() })
 	go func() { _ = router.Serve(listener) }()
-	return router, listener.Addr().String()
+	return listener.Addr().String()
 }
 
 func waitRouterIdle(t *testing.T, router *Router, within time.Duration, when string) {
@@ -246,12 +251,14 @@ func TestRouterReleasesAClientThatLeftAWorkerThatNeverCloses(t *testing.T) {
 		close(accepted)
 		<-hold
 	}()
-	restore := workerCloseGrace
-	workerCloseGrace = 500 * time.Millisecond
-	t.Cleanup(func() { workerCloseGrace = restore })
-
-	router, address := startRouterFor(t, listener.Addr().String())
-	client, err := net.Dial("tcp", address)
+	router, err := NewRouter(Backend{ID: "worker", Address: listener.Addr().String()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Set on this router alone and before it serves: routers that earlier
+	// tests left running still read their own.
+	router.workerGrace = 500 * time.Millisecond
+	client, err := net.Dial("tcp", serveRouter(t, router))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -268,7 +275,7 @@ func TestRouterReleasesAClientThatLeftAWorkerThatNeverCloses(t *testing.T) {
 	}
 	_ = client.Close()
 
-	waitRouterIdle(t, router, workerCloseGrace+3*time.Second, "with the client gone and the worker silent")
+	waitRouterIdle(t, router, router.workerGrace+3*time.Second, "with the client gone and the worker silent")
 }
 
 func TestRouterBehindProxyProtocolPassesTheWorkersEndToTheClientAtOnce(t *testing.T) {
