@@ -58,6 +58,27 @@ On 2026-11-21 five such runs were resumed with the exact script and arguments. W
 
    An agent ten minutes into one test run is `quiet`, not dead. A message to it starts a second copy in the same folder.
 
+   Attempts at one stage count once, and the one that got furthest is the one shown. The tool drops these endings from a label: `:wait`, `:try<N>`, `-try<N>`, `-attempt<N>`, `-retry<N>` and ` (retry <N>)`. It drops `#<N>` only when every agent before it under that label had failed before it started. Agents numbered `#<N>` that ran side by side, like a review panel, or after one of them returned a result, are stages of their own. In the journals read on 2026-11-21, most `#<N>` labels were of that kind.
+
+   To see what the remaining steps would do with every stage, without changing anything:
+
+   ```
+   python3 ~/.claude/skills/revive-workflow-agents/wf_revive.py plan --hours 6       # or --runs wf_x
+   ```
+
+   It prints one JSON line per stage, in the order the stages started, and then a count of each action.
+
+   | Action | Meaning |
+   |---|---|
+   | `reuse` | The stage finished, or its revived agent wrote a report that fits. `rerun` passes that result on. |
+   | `revive` | Its agent died after real work. Steps 4 to 6 continue it. |
+   | `start fresh` | Its agent never got past its first turn, or left no transcript. Step 7 starts it. |
+   | `wait` | Its revived agent has not written its report, or wrote one that does not fit. The line names the file. |
+   | `leave` | Its run is going, so the run's script still owns the stage. A run whose whole session died never ends: stage its agents with `--ids`. |
+   | `ignore` | The prefix's probes of the API, `probe:try<N>`. They are not work. |
+
+   Stages the run never reached have no line. Step 7 starts them.
+
 3. **Make sure nothing else works in the same place.** A revived agent and a new agent in one worktree overwrite each other. If a resumed run is redoing a dead agent's stage, stop that run first.
 
 4. **Stage the transcripts.**
@@ -192,7 +213,7 @@ async function finish(result) {
 - **The probe gate.** The first stage with no result opens one gate for the whole run. Stages already running carry on. A new stage waits while one small probe agent at a time asks for one word, with waits of 2 to 30 minutes between probes, about 5.5 hours in all. When a probe answers, the waiting stages start. When the last probe fails, every stage that has not started stops with `not started: the API did not come back`.
 - Keep the comment `// wf-revive:done` on the `DONE` line. `rerun` replaces that one line.
 - The waiting agent runs on the session's model, on purpose. On 2026-11-22 the smallest model at low effort copied a one-key report wrongly three times out of three (the file's text inside a string field twice, the bare value once). The default model copied it right once out of once. Without `--wait` no model copies anything.
-- Give every stage a label that is the same on each run and names one stage of one unit: `build:<unit>`, `verify:<unit>:r2`. Probes are labelled `probe:try<N>`. The tool ignores a `:try<N>` suffix, so it counts all probes as one stage, `probe`.
+- Give every stage a label that is the same on each run and names one stage of one unit: `build:<unit>`, `verify:<unit>:r2`. Probes are labelled `probe:try<N>`. The tool reads a `:try<N>` ending as another attempt at the same stage, so it counts all probes as one stage, `probe`, and `plan` ignores it. Give agents that run side by side for one stage labels of their own, such as `review:<unit>#1` and `review:<unit>#2`.
 - A stage's result must be all the next stage needs. The new run has the old result, not the old agent.
 - The map can also be passed as `args.done`, from `wf_revive.py done`.
 
