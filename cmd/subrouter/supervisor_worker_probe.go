@@ -197,6 +197,8 @@ func (s *supervisor) replaceSilentWorker(silent *workerGeneration, reason string
 	}
 	slog.Error("active subrouter worker stopped answering; replacing it",
 		"generation", silent.id, "pid", silent.command.Process.Pid, "reason", reason)
+	// A worker found silent failed as one that exited did. PATCHES section 77.3.
+	s.claudeSocket.workerFailed()
 	if err := s.upgradeLocked(); err != nil {
 		s.probe.replaceFailed(err)
 		slog.Error("silent subrouter worker could not be replaced", "generation", silent.id, "error", err)

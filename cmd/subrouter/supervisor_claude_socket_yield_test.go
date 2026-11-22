@@ -623,6 +623,31 @@ func TestSupervisorCountsOnlyWorkerExitsOfTheLastTenMinutes(t *testing.T) {
 	requireYielded(t, status, "worker_exits", p.clock.Now().Add(90*time.Second), "after a third exit within 10 minutes")
 }
 
+// A worker build that goes silent every time is replaced by the probe every
+// minute or so with no end, and none of those workers ever exits while it is
+// the active one.
+func TestSupervisorCountsAWorkerItFoundSilentWithTheExits(t *testing.T) {
+	p, socket := startYieldTestSupervisor(t, nil)
+	standIn := standByForClaudeSocketLock(t, socket)
+	killActiveWorkers(t, p.control, 2)
+
+	silent := p.silenceActiveWorker(t)
+	p.round(t, 0)
+	status := p.round(t, 0)
+	requireServing(t, status, "after two exits and two missed probes")
+	if status.ClaudeSocketExitGuard.RecentExits != 2 {
+		t.Fatalf("claude_socket_exit_guard.recent_exits = %d after two exits and two missed probes, want 2", status.ClaudeSocketExitGuard.RecentExits)
+	}
+
+	status = p.round(t, 0)
+	requireReplaced(t, status, silent, "after three silent probes")
+	standIn.waitForLock(t, "after two exits and one worker found silent")
+	requireYielded(t, status, "worker_exits", p.clock.Now().Add(90*time.Second), "after two exits and one worker found silent")
+	if status.ClaudeSocketExitGuard.RecentExits != 3 {
+		t.Fatalf("claude_socket_exit_guard.recent_exits = %d after two exits and one worker found silent, want 3", status.ClaudeSocketExitGuard.RecentExits)
+	}
+}
+
 func TestSupervisorKeepsTheClaudeSocketThroughWorkerExitsWithTheGuardOff(t *testing.T) {
 	p, socket := startYieldTestSupervisor(t, func(config *supervisorConfig) { config.ClaudeSocketYieldExits = 0 })
 
