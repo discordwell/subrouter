@@ -13,7 +13,7 @@ Tools and notes for running this fork on a Mac, kept for the redesign.
 | `bin/codexmode`, `bin/claudemode` | Start Codex or Claude Code against the pool that has capacity. |
 | `bin/claude-route` | Switches new Claude Code and Codex launches between the pool and your own login, and turns the daemon's Claude socket on and off. |
 | `bin/public-scrub` | Replaces private values with placeholders from a map kept outside the repo. `--check` lists any that remain. |
-| `skills/revive-workflow-agents/` | A Claude Code skill and `wf_revive.py`: continues workflow agents that died in an outage from their saved transcripts, and starts their runs again without redoing finished stages. |
+| `skills/revive-workflow-agents/` | A Claude Code skill and `wf_revive.py`: continues workflow agents that died in an outage from their saved transcripts, and starts their runs again without redoing finished stages. The skill also holds the standard prefix for workflow scripts. |
 | `publiccheck/` | Fails CI on a tailnet address outside the placeholder blocks. It holds no private values. |
 | `deploy/macos/activate-laptop-supervisor.sh` | Moves the laptop job under `subrouter supervise` once, and `--rollback` moves it back. |
 | `deploy/macos/deploy-laptop.sh` | Deploys a build to this Mac, checks its routes, and rolls back on failure. Under the supervisor it upgrades the worker without a restart. |
@@ -41,6 +41,7 @@ bash ops/deploy/tests/rehearse-laptop-supervisor.sh <build-a> <build-b> <scratch
 python3 ops/bin/srq selftest
 python3 ops/bin/sr-plot --selftest
 python3 ops/skills/revive-workflow-agents/test_wf_revive.py
+node --test ops/skills/revive-workflow-agents/test_wf_prefix.mjs
 ops/bin/sr-local-ci --selftest
 ```
 
