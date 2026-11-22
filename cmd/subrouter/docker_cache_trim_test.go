@@ -7,7 +7,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -381,4 +383,64 @@ func TestDockerTestScriptTrimsItsBuildCacheBeforeTheRun(t *testing.T) {
 			t.Fatal("the tests ran with a limit that is not a number")
 		}
 	})
+}
+
+// deploy/docker/README.md gives the limit, how to turn the trim off, and how to
+// clear each cache volume by hand (PATCHES §85.5). The volumes and the default
+// limit are read from what test.sh hands docker and from sr-local-ci, so the
+// README cannot drift from them.
+func TestDockerReadmeSaysHowToBoundAndClearTheCaches(t *testing.T) {
+	requireCacheTrimTools(t)
+	env, dir := fakeDocker(t)
+	run := runScript(t, append(env, "SUBROUTER_TEST_CACHE_LIMIT_GB="), "sh",
+		filepath.Join("..", "..", "deploy", "docker", "test.sh"), "./internal/proxy", "-run", "TestX")
+	if run.rc != 0 {
+		t.Fatalf("test.sh exit %d, stderr %q", run.rc, run.stderr)
+	}
+	volume := regexp.MustCompile(`-v ([A-Za-z0-9][A-Za-z0-9_.-]*):/`)
+	trimLimit := regexp.MustCompile(`trim-go-cache\.sh \S+ ([0-9]+) `)
+	volumes := map[string]bool{}
+	defaultGB := ""
+	for _, call := range dockerCalls(t, dir) {
+		for _, m := range volume.FindAllStringSubmatch(call, -1) {
+			volumes[m[1]] = true
+		}
+		if m := trimLimit.FindStringSubmatch(call); m != nil {
+			kib, err := strconv.Atoi(m[1])
+			if err != nil {
+				t.Fatal(err)
+			}
+			defaultGB = strconv.FormatFloat(float64(kib)/(1<<20), 'f', -1, 64)
+		}
+	}
+	src, err := os.ReadFile(filepath.Join("..", "..", "ops", "bin", "sr-local-ci"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	local := regexp.MustCompile(`(?m)^\s*gocache_volume=([A-Za-z0-9_.-]+)$`).FindSubmatch(src)
+	if len(volumes) < 2 || defaultGB == "" || local == nil {
+		t.Fatalf("read volumes %v, a default limit of %q GB and sr-local-ci's volume %q; want two volumes, a limit and a volume", volumes, defaultGB, local)
+	}
+	volumes[string(local[1])] = true
+
+	readme, err := os.ReadFile(filepath.Join("..", "..", "deploy", "docker", "README.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, section, found := strings.Cut(string(readme), "\n## Test runner caches\n")
+	if !found {
+		t.Fatal("deploy/docker/README.md has no Test runner caches section")
+	}
+	if end := strings.Index(section, "\n## "); end >= 0 {
+		section = section[:end]
+	}
+	wants := []string{"`SUBROUTER_TEST_CACHE_LIMIT_GB` (default " + defaultGB + ")", "`0` to turn the trim off"}
+	for v := range volumes {
+		wants = append(wants, "docker volume rm "+v+" ")
+	}
+	for _, want := range wants {
+		if !strings.Contains(section, want) {
+			t.Errorf("the README's Test runner caches section does not say %q", want)
+		}
+	}
 }

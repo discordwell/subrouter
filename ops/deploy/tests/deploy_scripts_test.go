@@ -509,6 +509,10 @@ func TestDeployHarnessRefusesAMacOutsideASandbox(t *testing.T) {
 		t.Fatal(err)
 	}
 	harness := filepath.Join(wd, "deploy-scripts-test.sh")
+	realID, err := exec.LookPath("id")
+	if err != nil {
+		t.Fatal(err)
+	}
 	const one = "laptop-refuses-a-job-loaded-from-another-plist"
 	refusing := `if [ "$3" = /bin/launchctl ]; then echo "sandbox-exec: execvp() of '/bin/launchctl' failed: Operation not permitted" >&2; exit 71; fi
 shift 2; exec "$@"`
@@ -535,6 +539,10 @@ shift 2; exec "$@"`
 				}
 			}
 			write("uname", "echo Darwin")
+			// With DEPLOY_TESTS_SANDBOX=1 the harness needs the home of `id -un`.
+			// The uid of the Docker run in ops/README.md has no passwd entry, so
+			// no name; root has one on every Linux.
+			write("id", fmt.Sprintf(`if [ "$*" = -un ]; then echo root; else exec %q "$@"; fi`, realID))
 			if c.sandbox != "" {
 				write("sandbox-exec", fmt.Sprintf("echo \"$*\" >> %q\n%s", calls, c.sandbox))
 			}
@@ -857,12 +865,13 @@ func (b *syncBuffer) String() string {
 // A call is launchctl, by name or by path, where a command starts: at the
 // start of a line, after ; & | ( ) { } ! a backquote or $(, or after a
 // keyword; behind any of command, exec, env, nohup, nice, time, sudo and
-// timeout with their options, and behind variable assignments. Its verb is
+// timeout with their options, an option's value included, and behind variable
+// assignments. Its verb is
 // one that loads, unloads, starts, stops or signals a job (PATCHES §76.6). A
 // line that ends in a backslash goes on into the next.
 var (
 	launchdChange = regexp.MustCompile(`(?:^|[;&|(){}!` + "`" + `]|\$\(|\b(?:then|do|else|if|elif|while|until)\b)\s*` +
-		`(?:(?:[A-Za-z_][A-Za-z0-9_]*=\S*|(?:\S*/)?(?:command|exec|env|nohup|nice|time|sudo|timeout)|-\S+|[0-9][0-9.]*[smhd]?)\s+)*` +
+		`(?:(?:[A-Za-z_][A-Za-z0-9_]*=\S*|(?:\S*/)?(?:command|exec|env|nohup|nice|time|sudo|timeout)|-\S+(?:\s+(?:"[^"]*"|'[^']*'|[^-\s]\S*))?|[0-9][0-9.]*[smhd]?)\s+)*` +
 		`["']?(?:\S*/)?launchctl["']?\s+["']?(?:kickstart|bootout|bootstrap|load|unload|remove|kill|stop|start|enable|disable|submit)\b`)
 	shellFunc    = regexp.MustCompile(`^([A-Za-z_][A-Za-z0-9_]*)\(\) *\{`)
 	guardedCalls = map[string]bool{"kickstart_job": true, "bootout_and_wait": true, "bootstrap_job": true}
@@ -952,6 +961,12 @@ func TestLaunchdChangeScanCatchesEverySpelling(t *testing.T) {
 		`timeout -k 5 10s launchctl bootout "$LABEL"`,
 		`LC_ALL=C launchctl bootout "$LABEL"`,
 		`sudo -n launchctl bootout "$LABEL"`,
+		`timeout -s KILL 10 launchctl bootout "$LABEL"`,
+		`timeout --signal KILL 10 launchctl bootout "$LABEL"`,
+		`env -u HOME launchctl bootout "$LABEL"`,
+		`sudo -u "$USER" launchctl bootout "$LABEL"`,
+		`sudo -p 'a prompt: ' launchctl bootout "$LABEL"`,
+		`nice -n 5 launchctl kickstart -k "$LABEL"`,
 		`nohup launchctl kickstart -k "$LABEL" &`,
 		`check && launchctl kickstart -k "$LABEL"`,
 		`check || launchctl bootstrap gui/501 "$PLIST"`,
@@ -983,6 +998,7 @@ func TestLaunchdChangeScanCatchesEverySpelling(t *testing.T) {
 		`launchctl print "$LABEL" >/dev/null 2>&1; rc=$?`,
 		`mgr=$(launchctl managername 2>&1); rc=$?`,
 		`    launchctl_hint`,
+		`notify -u "$USER" launchctl bootout "$LABEL"`,
 		`# launchctl bootout "$LABEL"`,
 	} {
 		if got := launchdChanges(line); len(got) != 0 {
