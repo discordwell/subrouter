@@ -40,11 +40,16 @@ func privateSocketTempRoot(t *testing.T) string {
 
 // TestMain lets the test binary double as a minimal supervised worker so
 // startWorkerGeneration can be exercised end to end without a real build, as
-// the stand-in serve of the daemon-log tests (runDaemonLogChild), and as main()
-// itself in an ended login session (runMainChild). For the tests themselves it
+// the stand-in serve of the daemon-log tests (runDaemonLogChild), as main()
+// itself in an ended login session (runMainChild), and as a `subrouter standby`
+// process (runStandbyChild, standby_test.go). For the tests themselves it
 // first clears the exported store overrides, so a test's own HOME decides
 // where every store lives (test_env_isolation_test.go).
 func TestMain(m *testing.M) {
+	if spec := os.Getenv("SUBROUTER_TEST_STANDBY_CHILD"); spec != "" {
+		runStandbyChild(spec)
+		return
+	}
 	if os.Getenv("SUBROUTER_TEST_FAKE_WORKER") == "1" {
 		runFakeWorker()
 		return
