@@ -101,7 +101,7 @@ func TestStrandedGiveUpStartLine(t *testing.T) {
 		warns    bool
 	}{
 		{"the default", holdSettings{deadline: proxy.DefaultHoldDeadline, giveUp: 60 * time.Minute},
-			[]string{"stranded give-up is on", "stranded_give_up=1h0m0s", "last answered turn", "Retry-After 3600", "unlinked", "env=" + strandedGiveUpEnv}, false},
+			[]string{"stranded give-up is on", "stranded_give_up=1h0m0s", "last answered turn", "503 (stranded_gave_up)", "unlinked", "env=" + strandedGiveUpEnv}, false},
 		{"no limit", holdSettings{deadline: proxy.DefaultHoldDeadline},
 			[]string{"stranded give-up is off", "0 turns off only the limit", "env=" + strandedGiveUpEnv}, false},
 		{"longer than the warm window", holdSettings{deadline: proxy.DefaultHoldDeadline, giveUp: 61 * time.Minute},
@@ -124,5 +124,87 @@ func TestStrandedGiveUpStartLine(t *testing.T) {
 		func(name string) string { return map[string]string{"SUBROUTER_WARM_WAIT": "90s"}[name] }, nil)
 	if err != nil || got.giveUp != proxy.DefaultStrandedGiveUp {
 		t.Fatalf("settings %+v err %v with SUBROUTER_WARM_WAIT set; want it ignored", got, err)
+	}
+}
+
+// PATCHES §78: the cap on the Retry-After an end client is told is on at
+// 60 s by default, a Go duration sets it, 0 turns it off, and a value that
+// does not parse keeps the default with a warning.
+func TestResolveClientRetryAfterMax(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		value string
+		want  time.Duration
+		says  []string
+	}{
+		{"unset", "", time.Minute, nil},
+		{"a duration", "90s", 90 * time.Second, nil},
+		{"zero turns it off", "0", 0, nil},
+		{"an unreadable value keeps the default", "a minute", time.Minute, []string{"level=WARN", "ignoring an unreadable Retry-After cap", "env=" + clientRetryAfterMaxEnv}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var logs bytes.Buffer
+			got := resolveClientRetryAfterMax(func(name string) string {
+				if name == clientRetryAfterMaxEnv {
+					return tc.value
+				}
+				return ""
+			}, slog.New(slog.NewTextHandler(&logs, nil)))
+			if got != tc.want {
+				t.Fatalf("cap = %v, want %v", got, tc.want)
+			}
+			for _, want := range tc.says {
+				if !strings.Contains(logs.String(), want) {
+					t.Fatalf("the warning lacks %q:\n%s", want, logs.String())
+				}
+			}
+		})
+	}
+}
+
+// PATCHES §78: serve puts the cap on the Server it runs, from the variable or
+// the default, and its start line reads that Server's field. Run through serve
+// itself: a plain-HTTP --kimi-upstream stops serve at the credential-upstream
+// check just after it builds the Server, so nothing is bound.
+func TestServeRunsWithTheRetryAfterCap(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		value string
+		says  []string
+	}{
+		{"the default", "", []string{"Retry-After cap is on", "retry_after_max=1m0s", "env=" + clientRetryAfterMaxEnv}},
+		{"the variable", "90s", []string{"Retry-After cap is on", "retry_after_max=1m30s"}},
+		{"off", "0", []string{"Retry-After cap is off"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+			t.Setenv("SUBROUTER_STATE_DIR", t.TempDir())
+			t.Setenv(clientRetryAfterMaxEnv, tc.value)
+			var logs lockedBuffer
+			previous := slog.Default()
+			slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+			t.Cleanup(func() { slog.SetDefault(previous) })
+
+			err := serveMustReturn(t, []string{
+				"--addr", "127.0.0.1:0",
+				"--fetch-usage=false",
+				"--sr-switch-interval=0",
+				"--kimi-upstream", "http://kimi.example.test",
+			})
+			if err == nil || !strings.Contains(err.Error(), "must use HTTPS") {
+				t.Fatalf("serve error = %v, want the credential-upstream refusal that follows building the Server", err)
+			}
+			line := ""
+			for _, candidate := range strings.Split(logs.String(), "\n") {
+				if strings.Contains(candidate, "Retry-After cap is") {
+					line = candidate
+				}
+			}
+			for _, want := range tc.says {
+				if !strings.Contains(line, want) {
+					t.Fatalf("serve's Retry-After cap line lacks %q: %q", want, line)
+				}
+			}
+		})
 	}
 }

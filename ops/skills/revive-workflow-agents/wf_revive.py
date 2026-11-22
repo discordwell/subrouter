@@ -2,6 +2,7 @@
 """Continue Claude Code workflow agents that died mid-work, and carry their runs on.
 
   wf_revive.py list  [--session <id>] [--runs wf_a,wf_b] [--hours 6]
+  wf_revive.py plan  [--runs ...] [--reports <dir>]
   wf_revive.py stage [--runs ...] [--ids a1,a2 | --all-dead] [--reports <dir>]
   wf_revive.py check --ids a1,a2
   wf_revive.py done  [--runs ...] [--reports <dir>]
@@ -17,6 +18,13 @@ list   one row per agent that started and returned no result, with a state:
          live           wrote in the last two minutes. Leave it alone.
          retry          a weaker attempt at a stage another agent holds. Ignore it.
          superseded     another agent finished its stage. Ignore it.
+plan   one JSON line per stage of each chosen run: what reviving it would do. It changes nothing.
+         reuse          the stage finished, or its revived agent wrote a report that fits: rerun reuses it.
+         revive         its agent died after real work: stage it and SendMessage it.
+         start fresh    its agent never got past its first turn, or left no transcript: rerun starts it.
+         wait           its revived agent has not written a report that fits.
+         leave          its run is going: the run's script still owns the stage.
+         ignore         probes of the API (`probe:try<N>`), not work.
 stage  copies agent-<id>.jsonl and .meta.json from the run folder into <session>/subagents/, never
        over an existing copy. After that, SendMessage(to=<id>) continues the agent. Prints the file
        each agent's message should name for its report, and writes beside it the JSON Schema that
@@ -28,6 +36,12 @@ rerun  for each chosen run that is over and has unfinished stages: writes a copy
        with that map in place of the line marked `// wf-revive:done`, and prints the Workflow
        input that starts it. Finished stages then return from the map and call no agent. It
        waits for every revived agent's report, unless --wait: then the new run waits instead.
+
+A stage is an agent's label without the endings that mark another attempt at it: `:wait`, `:try<N>`,
+`-try<N>`, `-attempt<N>`, `-retry<N>` (or with a colon), ` (retry <N>)`, and `#<N>` when an agent under
+that label with no number started before it and every agent before it under that label had failed before
+it started. Agents numbered `#<N>` with no unnumbered first, like a review panel, or that ran side by
+side, or after one of them returned, are stages of their own.
 
 The session id defaults to $CLAUDE_CODE_SESSION_ID. Reports default to <session>/subagents/revived/.
 Read SKILL.md beside this file first.
@@ -44,7 +58,9 @@ import shutil
 import sys
 import time
 
-TRY = re.compile(r"(:wait)?(:try\d+)?$")     # a retry of a stage, or the agent that waited for its report
+RETRY = re.compile(r"(?::wait|[:-](?:try|attempt|retry)\d+| \(retry \d+\))+$")   # another attempt at a stage, or its waiting agent
+COUNTER = re.compile(r"#\d+$")      # numbers retries in some scripts and side-by-side agents in others
+PROBE = "probe"                     # the standard prefix's probes of the API, `probe:try<N>`
 ASSISTANT = '"type":"assistant"'     # the record's own type sits near the end of its line
 STAMP = re.compile(r'"timestamp":"(\d{4}-\d\d-\d\dT[0-9:]+)')
 MARK = "// wf-revive:done"
@@ -70,6 +86,34 @@ def journal(run: str) -> list[dict]:
     return rows
 
 
+def stages(rows: list[dict]) -> dict[str, str]:
+    """Each started agent's stage, from the journal's row order.
+
+    `#<N>` marks a retry only when an agent under the same label with no number started before it, and
+    every agent before it under that label had failed before it started: `fix:x`, then `fix:x#2`. A panel
+    numbers every member, so it stays apart even when a concurrency cap starts its members one at a time
+    after the earlier ones died. In the journals read on 2026-11-21, every `#<N>` retry followed an
+    unnumbered first attempt, and most `#<N>` labels numbered agents that ran side by side."""
+    named, base, running, returned, bare, separate = {}, {}, {}, set(), set(), set()
+    for row in rows:
+        kind, agent = row.get("type"), row.get("agentId")
+        if kind == "started":
+            named[agent] = RETRY.sub("", row.get("label", ""))
+            base[agent] = COUNTER.sub("", named[agent])
+            numbered = named[agent] != base[agent]
+            others = running.setdefault(base[agent], set())
+            if others - {agent} or base[agent] in returned or (numbered and base[agent] not in bare):
+                separate.add(base[agent])
+            if not numbered:
+                bare.add(base[agent])
+            others.add(agent)
+        elif kind in ("result", "failed") and agent in base:
+            running[base[agent]].discard(agent)
+            if kind == "result":
+                returned.add(base[agent])
+    return {agent: named[agent] if base[agent] in separate else base[agent] for agent in named}
+
+
 def in_tool(log: str) -> str:
     """The tool an agent's last record calls, or "": tells a long tool call from a wait for the model."""
     with open(log, "rb") as handle:
@@ -91,7 +135,9 @@ def record_of(run: str, base: str) -> str:
 def unfinished(run: str, base: str) -> list[dict]:
     """The agents of one run folder that started and have no result row, each with its state."""
     label, done, failed, order = {}, set(), set(), []
-    for row in journal(run):
+    entries = journal(run)
+    stage = stages(entries)
+    for row in entries:
         kind, agent = row.get("type"), row.get("agentId")
         if kind == "started":
             label[agent] = row.get("label", "")
@@ -100,14 +146,14 @@ def unfinished(run: str, base: str) -> list[dict]:
             done.add(agent)
         elif kind == "failed":
             failed.add(agent)
-    finished = {TRY.sub("", label[a]) for a in done if a in label}
+    finished = {stage[a] for a in done if a in stage}
     over = os.path.exists(record_of(run, base))
     rows = []
     for agent in order:
         if agent in done:
             continue
         log = os.path.join(run, f"agent-{agent}.jsonl")
-        row = {"run": os.path.basename(run), "label": label[agent], "stage": TRY.sub("", label[agent]),
+        row = {"run": os.path.basename(run), "label": label[agent], "stage": stage[agent],
                "id": agent, "log": log, "turns": 0, "minutes": 0, "last": "", "note": ""}
         rows.append(row)
         if not os.path.exists(log):
@@ -218,17 +264,53 @@ def report(reports: str, row: dict):
 
 def done_map(run: str, base: str, reports: str) -> dict:
     """A run's stages that need no agent: label to result, or to the report a revived agent will write."""
-    label, out = {}, {}
-    for row in journal(run):
-        if row.get("type") == "started":
-            label[row.get("agentId")] = TRY.sub("", row.get("label", ""))
-        elif row.get("type") == "result" and row.get("result") is not None and row.get("agentId") in label:
-            out[label[row["agentId"]]] = row["result"]
+    rows = journal(run)
+    stage, out = stages(rows), {}
+    for row in rows:
+        if row.get("type") == "result" and row.get("result") is not None and row.get("agentId") in stage:
+            out[stage[row["agentId"]]] = row["result"]
     for row in unfinished(run, base):
         if row["state"] != "revived" or row["stage"] in out:
             continue
         out[row["stage"]] = report(reports, row)
     return out
+
+
+def plan_of(run: str, base: str, reports: str) -> list[dict]:
+    """What reviving one run would do for each of its stages, in the order they started. Reads only."""
+    rows = journal(run)
+    stage = stages(rows)
+    finished = {stage[r["agentId"]]: r["agentId"] for r in rows if r.get("type") == "result" and r.get("agentId") in stage}
+    held: dict[str, dict] = {}           # the attempt each unfinished stage would continue from
+    for row in unfinished(run, base):
+        if row["state"] in IGNORED:
+            continue
+        if row["stage"] not in held or held[row["stage"]]["state"] == "no-transcript":
+            held[row["stage"]] = row
+    over = os.path.exists(record_of(run, base))
+    steps = []
+    for name in dict.fromkeys(stage.values()):
+        row = held.get(name, {})
+        if name == PROBE:
+            step = {"action": "ignore", "why": "probes of the API are not work"}
+        elif name in finished:
+            step = {"action": "reuse", "id": finished[name], "why": "it finished"}
+        elif row["state"] == "revived":
+            got = report(reports, row)
+            if isinstance(got, dict) and "$wait" in got:
+                why = f"does not fit: {'; '.join(got['$misfit'])}" if "$misfit" in got else "is not written"
+                step = {"action": "wait", "id": row["id"], "why": f"its revived agent's report {got['$wait']} {why}"}
+            else:
+                step = {"action": "reuse", "id": row["id"], "why": "its revived agent's report"}
+        elif not over:
+            step = {"action": "leave", "id": row["id"], "why": f"its run is going and its script owns it ({row['state']})"}
+        elif row["state"] == "dead":
+            step = {"action": "revive", "id": row["id"], "why": f"it died after {row['turns']} turns"}
+        else:
+            step = {"action": "start fresh", "id": row["id"],
+                    "why": "it left no transcript" if row["state"] == "no-transcript" else "it never got past its first turn"}
+        steps.append({"run": os.path.basename(run), "stage": name, **step})
+    return steps
 
 
 def rerun(run: str, base: str, reports: str, out_dir: str, wait: bool) -> dict | None:
@@ -273,7 +355,7 @@ def rerun(run: str, base: str, reports: str, out_dir: str, wait: bool) -> dict |
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("verb", choices=["list", "stage", "check", "done", "rerun"])
+    parser.add_argument("verb", choices=["list", "plan", "stage", "check", "done", "rerun"])
     parser.add_argument("--session", default=os.environ.get("CLAUDE_CODE_SESSION_ID", ""))
     parser.add_argument("--runs", default="")
     parser.add_argument("--hours", type=float, default=6)
@@ -295,6 +377,14 @@ def main() -> int:
         for run in runs:
             merged.update(done_map(run, base, reports))
         print(json.dumps(merged, ensure_ascii=False))
+        return 0
+
+    if args.verb == "plan":
+        steps = [step for run in runs for step in plan_of(run, base, reports)]
+        for step in steps:
+            print(json.dumps(step, ensure_ascii=False))
+        actions = [step["action"] for step in steps]
+        print(json.dumps({action: actions.count(action) for action in sorted(set(actions))}))
         return 0
 
     if args.verb == "rerun":

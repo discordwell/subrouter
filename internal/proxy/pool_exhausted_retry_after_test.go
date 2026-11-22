@@ -55,6 +55,14 @@ func sevenDay(used float64, resetAt time.Time) accounts.UsageWindow {
 // every Claude account in pool exhausted and returns the 503.
 func serveExhaustedClaudePool(t *testing.T, pool []exhaustedPoolAccount) *httptest.ResponseRecorder {
 	t.Helper()
+	return serveExhaustedClaudePoolTo(t, pool, 0, nil)
+}
+
+// serveExhaustedClaudePoolTo is serveExhaustedClaudePool on a daemon whose
+// Server.ClientRetryAfterMax is retryAfterMax, for a request with extra
+// headers.
+func serveExhaustedClaudePoolTo(t *testing.T, pool []exhaustedPoolAccount, retryAfterMax time.Duration, extra http.Header) *httptest.ResponseRecorder {
+	t.Helper()
 	var accountList []accounts.Account
 	var scores []selectacct.Score
 	for _, entry := range pool {
@@ -89,11 +97,16 @@ func serveExhaustedClaudePool(t *testing.T, pool []exhaustedPoolAccount) *httpte
 		Accounts:       accountList,
 		SchedulerRef:   schedulerRef,
 		MaxBodyBytes:   1 << 20,
+
+		ClientRetryAfterMax: retryAfterMax,
 	}.Handler()
 	req := httptest.NewRequest(http.MethodPost, "http://subrouter.local/v1/messages", strings.NewReader(`{"model":"claude-opus-4-8","messages":[]}`))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Subrouter-Agent", "claude")
 	req.Header.Set("X-Subrouter-Session", "session-exhausted-pool")
+	for key, values := range extra {
+		req.Header[key] = values
+	}
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, req)
 	if response.Code != http.StatusServiceUnavailable {
@@ -214,7 +227,7 @@ func TestPoolExhaustedErrorMessageContract(t *testing.T) {
 // the only hint that crosses. It must reach both the header and the body token.
 func TestBrokerRetryAfterReachesBodyToken(t *testing.T) {
 	response := httptest.NewRecorder()
-	writeAccountSelectionUnavailable(response, &broker.HTTPStatusError{
+	Server{}.writeAccountSelectionUnavailable(response, httptest.NewRequest(http.MethodPost, "http://subrouter.local/v1/messages", nil), &broker.HTTPStatusError{
 		StatusCode: http.StatusServiceUnavailable, RetryAfter: "1800", Message: "Service Unavailable",
 	})
 	if response.Code != http.StatusServiceUnavailable {

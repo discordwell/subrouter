@@ -78,7 +78,7 @@ type spentPoolChat struct {
 	dials  *atomic.Int64
 }
 
-func newSpentPoolChat(t *testing.T, giveUp time.Duration, pinned bool, local http.HandlerFunc) *spentPoolChat {
+func newSpentPoolChat(t *testing.T, giveUp time.Duration, pinned bool, local http.HandlerFunc, tweaks ...func(*holdRigOptions)) *spentPoolChat {
 	t.Helper()
 	chat := &spentPoolChat{clock: newMovableClock(warmWaitStart), out: new(atomic.Bool), blips: new(atomic.Int64)}
 	chat.out.Store(true)
@@ -101,6 +101,9 @@ func newSpentPoolChat(t *testing.T, giveUp time.Duration, pinned bool, local htt
 	opts := holdRigOptions{hold: chat.policy, upstream: local, exhausted: true, peers: []*RemotePool{chat.box.pool}}
 	if pinned {
 		opts.pin = "one@example.com"
+	}
+	for _, tweak := range tweaks {
+		tweak(&opts)
 	}
 	chat.holdRig = newHoldRig(t, opts)
 	return chat

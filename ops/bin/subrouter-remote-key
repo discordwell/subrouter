@@ -1,0 +1,329 @@
+#!/usr/bin/env python3
+"""subrouter-remote-key -- give this machine the key that turns the remote on.
+
+  subrouter-remote-key            mint a key here, if there is not one already
+  subrouter-remote-key --check    say whether this machine holds one; touch nothing
+  subrouter-remote-key --remove   take it away: this machine goes local-only
+  subrouter-remote-key --force    replace the key that is there
+
+Without a key this build is local-only (PATCHES §17). `sr server`, `sr remote`,
+`sr tenant`, `sr login`, `sr logout`, `sr storage`, `sr team`, `sr account` and
+`sr key-credit` are not merely refused: they are absent from `sr help` and
+answer like a typo. The peer pool stays off however SUBROUTER_REMOTE_POOL or
+SUBROUTER_REMOTE_POOLS_FILE is set, and a configured servers.json is ignored. A
+machine meant to stay on its own accounts shows nothing that could send a
+credential off it.
+
+Run this only on a machine that is meant to reach your box, such as the laptop
+that peers with it.
+
+*** ORDER MATTERS on a machine that already reaches a box. *** The gate ships in
+the binary, so a gated build installed on a machine with a servers.json or a
+peer but no key loses the remote at the next `sr` call, and its peer pool at the
+next daemon start. Mint first, install second.
+
+The contents are random and mean nothing to the box. The file is proof of
+possession, not a credential, and the gate is no access control: the source is
+public, so anyone can create the file. The box's own tokens are the boundary.
+They live in servers.json and the daemon's environment, never here, so losing
+this file leaks no box access, and a copy on a machine with no tokens reaches
+nothing.
+
+Other ops tools import this file for the same answers (key_path, problem,
+daemon_env, daemon_store, remedy), so the rules below are written once.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import pathlib
+import plistlib
+import secrets
+import stat
+import sys
+
+KEY_NAME = "remote.key"
+# cmd/subrouter/remote_gate.go remoteKeyMinLength.
+MIN_LENGTH = 16
+# The LaunchAgent, by deploy-laptop.sh's SUBROUTER_LABEL and SUBROUTER_PLIST.
+# The tests give it a label of their own, so no run of theirs names the live
+# job (PATCHES §76).
+LABEL = os.environ.get("SUBROUTER_LABEL") or "ai.manaflow.subrouter"
+PLIST = pathlib.Path(os.environ.get("SUBROUTER_PLIST") or pathlib.Path.home() / "Library" / "LaunchAgents" / f"{LABEL}.plist")
+TOOL = pathlib.Path(os.path.realpath(__file__))
+
+
+def state_root() -> pathlib.Path:
+    """storepath.StateDir: SUBROUTER_STATE_DIR, else ~/.subrouter."""
+    override = os.environ.get("SUBROUTER_STATE_DIR", "").strip()
+    return pathlib.Path(override) if override else pathlib.Path.home() / ".subrouter"
+
+
+def _skipped(name: str) -> bool:
+    """storepath.shouldSkipLegacyEntry."""
+    return name.startswith("._") or name.endswith(".lock") or (name.startswith(".") and ".tmp-" in name)
+
+
+def _holds_a_file(directory: pathlib.Path) -> bool:
+    """storepath.dirNonEmpty: any entry that is not a directory, at any depth.
+
+    The import marker the daemon leaves in <state>/codex is such an entry, so it
+    needs no rule of its own.
+    """
+    with os.scandir(directory) as entries:
+        for entry in entries:
+            if _skipped(entry.name):
+                continue
+            if not entry.is_dir(follow_symlinks=False):
+                return True
+            if _holds_a_file(pathlib.Path(entry.path)):
+                return True
+    return False
+
+
+def codex_store(root: pathlib.Path, home: pathlib.Path) -> pathlib.Path:
+    """The directory the gate reads, by storepath.CodexDirForStateRootReadOnlyInspection.
+
+    Until the daemon's first start imports a pre-fork ~/.codex-accounts, that
+    directory is the store. A key minted into the empty <state>/codex would
+    open the gate, and would also make the import find a store that is not
+    empty and skip it. Any error answers <state>/codex, as the Go side does.
+    """
+    target = root / "codex"
+    legacy = home / ".codex-accounts"
+    try:
+        if os.path.normpath(target) == os.path.normpath(legacy) or not legacy.is_dir():
+            return target
+        if target.exists() and _holds_a_file(target):
+            return target
+    except OSError:
+        return target
+    return legacy
+
+
+def key_path(root: pathlib.Path | None = None, home: pathlib.Path | None = None) -> pathlib.Path:
+    return codex_store(root or state_root(), home or pathlib.Path.home()) / KEY_NAME
+
+
+def problem(path: pathlib.Path) -> str | None:
+    """Why the gate stays closed with this file, or None when it opens.
+
+    The four rules of resolveRemoteGate, in its order: a regular file, no group
+    or other permission bits, readable, at least MIN_LENGTH bytes once trimmed.
+    """
+    try:
+        info = os.stat(path)
+    except FileNotFoundError:
+        return "absent"
+    except OSError as error:
+        return f"not reachable ({error.strerror})"
+    if not stat.S_ISREG(info.st_mode):
+        return "not a regular file"
+    mode = stat.S_IMODE(info.st_mode)
+    if mode & 0o077:
+        return f"mode {mode:04o}"
+    try:
+        body = pathlib.Path(path).read_bytes().decode("utf-8", "surrogateescape")
+    except OSError as error:
+        return f"unreadable ({error.strerror})"
+    if len(body.strip().encode("utf-8", "surrogateescape")) < MIN_LENGTH:
+        return "too short to be a key"
+    return None
+
+
+def describe(path: pathlib.Path) -> str:
+    found = problem(path)
+    if found is None:
+        return "present -- this machine can reach the remote"
+    if found == "absent":
+        return "absent -- this machine is local-only"
+    if found.startswith("not reachable"):
+        # The file may not be there at all, and the gate cannot tell either.
+        return f"{found}; the gate cannot reach it either, so the remote is off"
+    if found.startswith("mode "):
+        return f"present but {found}; the gate ignores it (chmod 600 it)"
+    return f"present but {found}; the gate ignores it"
+
+
+def same_file(one: pathlib.Path, other: pathlib.Path) -> bool:
+    return os.path.realpath(one) == os.path.realpath(other)
+
+
+def job() -> dict:
+    """The LaunchAgent's keys, or {} when there is none or it does not parse."""
+    try:
+        data = plistlib.loads(PLIST.read_bytes())
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def supervised_flag(argv: list, flag: str) -> str:
+    """The value of a `supervise` job's flag, or "" for a plain serve."""
+    if "supervise" in argv and flag in argv[:-1]:
+        return str(argv[argv.index(flag) + 1])
+    return ""
+
+
+def daemon_env(plist_kept: bool = True) -> dict:
+    """The environment the LaunchAgent's DAEMON runs with, not this shell's.
+
+    launchd hands the daemon only its plist's EnvironmentVariables, so an
+    export in this shell does not reach it, and a supervised job's worker gets
+    its --worker-config env over the plist's. plist_kept=False answers for the
+    plist `setup` writes in its place: HOME becomes this process's, every other
+    key of the old plist, SUBROUTER_STATE_DIR included, is kept (PATCHES §37),
+    and it is a plain serve, which reads no worker config.
+    """
+    plist = job()
+    env = dict(plist.get("EnvironmentVariables") or {})
+    config = supervised_flag(plist.get("ProgramArguments") or [], "--worker-config")
+    if plist_kept and config:
+        try:
+            with open(config) as handle:
+                env.update(json.load(handle).get("env") or {})
+        except Exception:
+            pass
+    if not plist_kept:
+        env["HOME"] = os.path.expanduser("~")
+    return env
+
+
+def daemon_store(plist_kept: bool = True) -> tuple[pathlib.Path, pathlib.Path]:
+    """The state root and HOME the daemon runs with (daemon_env)."""
+    env = daemon_env(plist_kept)
+    home = str(env.get("HOME") or "").strip() or os.path.expanduser("~")
+    state = str(env.get("SUBROUTER_STATE_DIR") or "").strip() or os.path.join(home, ".subrouter")
+    return pathlib.Path(state), pathlib.Path(home)
+
+
+def remedy(path: pathlib.Path, state: pathlib.Path, found: str) -> str:
+    """The command that fixes `found`, a problem() answer, for the store at `state`.
+
+    One fix per problem. `--force` rewrites the file in place, so it fixes a
+    short key and nothing else.
+    """
+    mint = f"SUBROUTER_STATE_DIR={state} {TOOL}"
+    if found == "absent":
+        return mint
+    if found.startswith("mode "):
+        return f"chmod 600 {path}"
+    if found == "too short to be a key":
+        return f"{mint} --force"
+    if found == "not a regular file":
+        return f"mv {path} {path}.aside && {mint}"
+    if found.startswith("unreadable"):
+        return f"ls -l {path}   # make it yours (the daemon runs as you), then chmod 600 it"
+    return f"ls -ld {path.parent} {state}   # the daemon runs as you and must reach it"
+
+
+def restart_hint(minted: pathlib.Path) -> list[str]:
+    """What makes the daemon read the key, which it reads only when it starts."""
+    if not PLIST.exists():
+        return [f"There is no LaunchAgent at {PLIST}. If a daemon runs here another way, restart it to arm "
+                "the peer pool; one installed later reads the key when it starts."]
+    state, home = daemon_store()
+    reads = key_path(state, home)
+    found = problem(reads)
+    if not same_file(reads, minted) and found is not None:
+        # The plist names a store of its own, so a restart would arm nothing.
+        return [f"The LaunchAgent's daemon reads {reads}, not this file, and that one is {found}. Fix it there:",
+                f"  {remedy(reads, state, found)}"]
+    worker = supervised_flag(job().get("ProgramArguments") or [], "--worker-bin")
+    if worker:
+        # Under the supervisor each worker reads the key when it starts, and a
+        # deploy of the installed build starts one without a restart (PATCHES §69).
+        deploy = TOOL.parent.parent / "deploy" / "macos" / "deploy-laptop.sh"
+        return ["The supervisor's next worker reads it. To start one now, without a restart:",
+                f"  {deploy} {worker}"]
+    # Only the key is new, so a restart that does not re-read the plist will do.
+    return ["The daemon reads it at startup, so restart it to arm the peer pool:",
+            f"  launchctl kickstart -k gui/$(id -u)/{LABEL}"]
+
+
+def make_private_dirs(directory: pathlib.Path) -> None:
+    """Create what is missing of `directory` at 0700, as the daemon creates its store.
+
+    A mint on a fresh Mac comes before the daemon, so this can create the store,
+    and its file names are account emails. A directory that is already there
+    keeps its mode, as with the Go side's MkdirAll.
+    """
+    missing = []
+    while not directory.exists():
+        missing.append(directory)
+        directory = directory.parent
+    for each in reversed(missing):
+        try:
+            os.mkdir(each, 0o700)
+        except FileExistsError:
+            pass
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Give this machine the key that turns the remote on.")
+    parser.add_argument("--check", action="store_true", help="report only")
+    parser.add_argument("--remove", action="store_true", help="delete the key")
+    parser.add_argument("--force", action="store_true", help="overwrite an existing key")
+    args = parser.parse_args()
+
+    path = key_path()
+
+    if args.check:
+        print(f"{path}: {describe(path)}")
+        reads = key_path(*daemon_store())
+        if PLIST.exists() and not same_file(reads, path):
+            print(f"{reads}: {describe(reads)} (the LaunchAgent's daemon reads this one)")
+        return 0
+
+    found = problem(path)
+
+    if args.remove:
+        if found == "absent":
+            print(f"{path}: already absent")
+            return 0
+        if found == "not a regular file":
+            print(f"{path} is not a regular file, so nothing was removed. The gate ignores it: the remote is already off here.")
+            return 0
+        try:
+            path.unlink()
+        except OSError as error:
+            print(f"cannot remove {path}: {error.strerror}")
+            return 1
+        print(f"removed {path}")
+        print("Remote is off here from the next `sr` call, and from the next daemon start.")
+        return 0
+
+    if found == "not a regular file":
+        print(f"{path} is not a regular file, so nothing was written. Move it aside and run this again.")
+        return 1
+    if found != "absent" and not args.force:
+        print(f"{path}: {describe(path)}")
+        if found is None:
+            print("Nothing to do. Pass --force to replace it.")
+            return 0
+        # The remote stays off with this file, so keeping it is not success.
+        print(f"To fix it: {remedy(path, state_root(), found)}")
+        return 1
+
+    try:
+        make_private_dirs(path.parent)
+        # Created private, then written: the key is never readable by others, even briefly.
+        handle = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(handle, "w") as out:
+            out.write(secrets.token_hex(32) + "\n")
+        os.chmod(path, 0o600)
+    except OSError as error:
+        print(f"cannot write {path}: {error.strerror}")
+        return 1
+
+    print(f"wrote {path}")
+    print("Remote is on here from the next `sr` call.")
+    for line in restart_hint(path):
+        print(line)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

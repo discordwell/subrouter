@@ -1,0 +1,1151 @@
+#!/usr/bin/env python3
+"""subrouter-quickstart -- stand up this Mac's daemon without killing the agent
+doing the install.
+
+  subrouter-quickstart                build, install, add accounts, prove, cut over
+  subrouter-quickstart --peer URL --peer-token-file PATH [--peer-fingerprint SHA256]
+                                      ... and draw on your box's pool as well
+  subrouter-quickstart --check        say what it would do; touch nothing of yours
+                                      (phase 1 may fetch go.mod's Go into Go's cache)
+  subrouter-quickstart --no-cutover   everything except pointing Claude Code at it
+  subrouter-quickstart --rollback     put Claude Code back: settings.json from its newest backup
+                                      that is off the daemon
+
+Two shapes, same six phases:
+
+  no --peer   this Mac pooling your subscriptions. Nothing leaves it.
+  --peer URL  the same daemon, also peered with your box (ops/deploy/lightsail/):
+              a turn no local account can take goes to the box (PATCHES §16).
+              The accounts can all live on the box, so an empty local store is
+              fine here, and "never point a client at an empty pool" (PATCHES
+              §3) does not apply: the pool is at the other end. The box's
+              public listener is self-signed and pinned by --peer-fingerprint;
+              a plain-http tailnet address needs no pin. It needs remote.key
+              first (subrouter-remote-key): without it the build ignores the
+              peer, so phase 1 stops rather than install a daemon with no pool
+              at either end. A daemon that reads a peers file
+              (SUBROUTER_REMOTE_POOLS_FILE) takes the box in that file, not
+              from --peer, and only with remote.key too.
+
+Both end with Claude Code talking to the daemon on 127.0.0.1, carrying the
+daemon's local proxy token in its settings.json. No token goes into your shell
+profile.
+
+*** THE INVARIANT ***
+
+The client configs are not touched until a throwaway `claude -p` has already
+completed a real turn through the daemon. Until that moment your editor is on
+exactly the auth it started with, so the agent running this script keeps working
+even if every step below fails. That is the whole design:
+
+  phase 1-5   nothing the running agent depends on is modified
+  phase 5     a SEPARATE process proves the new stack end to end
+  phase 6     only then is settings.json rewritten, backed up first, and
+              re-verified by another separate process
+
+`sr setup` does the flip as part of installing, which is how people end up
+holding restore instructions inside a session that can no longer reach a model.
+Here the flip is last, gated, and reversible.
+
+*** WHAT IT CANNOT DO FOR YOU ***
+
+`sr claude addr` opens a browser and waits for you to paste a code back. There is
+no localhost callback for Claude and no way to script it. The script stops at
+that point, prints the commands, and picks up where it left off when re-run.
+`sr add codex` self-completes; you only click Approve.
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import fcntl
+import glob
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+import plistlib
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+
+
+def config_dir(variable: str, default: str) -> str:
+    """The directory a client reads, by the rule the Go writers use."""
+    return os.environ.get(variable, "").strip() or os.path.expanduser(default)
+
+
+def proxy_root(url: str) -> str:
+    """The daemon's root URL, by codexProxyRootURL: no trailing /v1 or /backend-api."""
+    root = url.strip().rstrip("/")
+    for suffix in ("/v1", "/backend-api"):
+        if root.endswith(suffix):
+            root = root[: -len(suffix)]
+            break
+    return root.rstrip("/")
+
+
+# The Go CLI's own override (localBaseURL), which carries /v1 as Go's default
+# does. `setup` takes the root from it before writing Claude's base URL, and
+# the probes here ask the root for /_subrouter/*.
+ADDR = proxy_root(os.environ.get("SUBROUTER_LOCAL_BASE_URL", "").strip() or "http://127.0.0.1:31415")
+CLAUDE = os.path.join(config_dir("CLAUDE_CONFIG_DIR", "~/.claude"), "settings.json")
+CODEX = os.path.join(config_dir("CODEX_HOME", "~/.codex"), "config.toml")
+# broker.DefaultConfigPath, where `setup` writes localProxyToken.
+CLOUD = os.environ.get("SUBROUTER_CLOUD_CONFIG", "").strip() or os.path.expanduser("~/.config/subrouter/cloud.json")
+LOG = os.path.expanduser("~/Library/Logs/subrouter.err.log")
+BAK = ".subrouter-bak-"  # same shape subrouter-unbrick restores from
+MARKER = "subrouter-ok"
+RC_FILES = ("~/.zshrc", "~/.bashrc", "~/.zprofile", "~/.bash_profile", "~/.profile")
+export_pattern = re.compile(r"\s*export\s+ANTHROPIC_(BASE_URL|AUTH_TOKEN)")
+log_line = re.compile(r"^(\d{4}/\d\d/\d\d \d\d:\d\d:\d\d).*proxy request.*agent=claude.*?account=(\S+)")
+
+# ops/bin, from this file's real path, so a symlink to it still finds the checkout.
+HERE = os.path.dirname(os.path.realpath(__file__))
+SRC = os.path.dirname(os.path.dirname(HERE))
+BIN = os.path.join(SRC, "bin", "subrouter")
+
+
+def sibling(name: str):
+    """Load another ops/bin tool as a module, so the rules it owns are written once."""
+    sys.dont_write_bytecode = True
+    loader = importlib.machinery.SourceFileLoader(name.replace("-", "_"), os.path.join(HERE, name))
+    module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+    loader.exec_module(module)
+    return module
+
+
+# Where the daemon's gate reads remote.key, and whether it opens (PATCHES §17).
+remote_key = sibling("subrouter-remote-key")
+# How a backup goes back, link or file.
+unbrick = sibling("subrouter-unbrick")
+# The LaunchAgent, which subrouter-remote-key finds as deploy-laptop.sh does.
+LABEL = remote_key.LABEL
+PLIST = str(remote_key.PLIST)
+DOMAIN = f"gui/{os.getuid()}"
+JOB = f"{DOMAIN}/{LABEL}"
+
+
+class Stop(Exception):
+    """Abort with a message and an exit code, having changed nothing further."""
+
+    footer: str | None = "Your clients were not left half-configured; re-running is safe."
+
+    def __init__(self, message: str, code: int = 1):
+        super().__init__(message)
+        self.code = code
+
+
+class DaemonDown(Stop):
+    """Abort after the peer step booted the daemon out and did not get it back.
+
+    It is the one stop that can leave the daemon down, so the usual footer
+    would be false. A client routed at the daemon is down with it.
+    """
+
+    footer = None
+
+
+def say(message: str) -> None:
+    print(message, flush=True)
+
+
+def phase(number: int, title: str) -> None:
+    say(f"\n== {number}/6  {title}")
+
+
+def run(argv: list[str], **kw) -> subprocess.CompletedProcess:
+    return subprocess.run(argv, capture_output=True, text=True, **kw)
+
+
+def write_private(path: str, body: bytes, mode: int = 0o600) -> None:
+    """Replace `path` with `body` through a temp file created 0600, then given `mode`.
+
+    settings.json and the plist carry tokens, so neither is readable by another
+    local user at any moment, even if this run dies midway (as Go's
+    claude.WritePrivateFileAtomic writes settings.json).
+    """
+    handle, temporary = tempfile.mkstemp(dir=os.path.dirname(path), prefix=f".{os.path.basename(path)}.tmp-")
+    try:
+        with os.fdopen(handle, "wb") as out:
+            out.write(body)
+        os.chmod(temporary, mode)
+        os.replace(temporary, path)
+    except BaseException:
+        if os.path.exists(temporary):
+            os.remove(temporary)
+        raise
+
+
+def get_json(path: str, token: str | None = None, timeout: int = 5):
+    request = urllib.request.Request(ADDR + path)
+    if token:
+        request.add_header("Authorization", "Bearer " + token)
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.load(response)
+
+
+def daemon_alive() -> bool:
+    try:
+        return bool(get_json("/_subrouter/health", timeout=2).get("ok"))
+    except Exception:
+        return False
+
+
+def pool_size() -> int:
+    """How many accounts the daemon lists, or 0 when it does not answer."""
+    try:
+        accounts = get_json("/_subrouter/accounts")
+    except Exception:
+        return 0
+    return len(accounts) if isinstance(accounts, list) else 0
+
+
+def local_proxy_token() -> str:
+    """The bearer the daemon enforces on its own provider routes.
+
+    Writing the literal string "subrouter" here -- which older docs suggested --
+    401s every request against your own daemon, and the symptom looks like a
+    broken pool rather than a wrong constant.
+    """
+    if not os.path.exists(CLOUD):
+        raise Stop(f"no {CLOUD}; run the install phase first")
+    token = (json.load(open(CLOUD)) or {}).get("localProxyToken", "").strip()
+    if not token:
+        raise Stop("cloud.json carries no localProxyToken; re-run `subrouter setup --storage local --no-config --yes`")
+    return token
+
+
+def recent_log_lines() -> list[str]:
+    """The daemon log, preceded by the tail of its newest rotated copy.
+
+    The daemon rotates its own log (PATCHES §39): past the cap it copies the file
+    to LOG.1 and empties it, and the first start of such a build does that to
+    the whole old file at once. A line logged just before a rotation is only in
+    LOG.1, and missing it would call a working daemon broken.
+    """
+    lines: list[str] = []
+    rotated = LOG + ".1"
+    if os.path.exists(rotated):
+        offset = max(0, os.path.getsize(rotated) - (1 << 20))
+        with open(rotated, "rb") as handle:
+            handle.seek(offset)
+            lines = handle.read().decode(errors="replace").splitlines(keepends=True)
+        if offset:
+            lines = lines[1:]  # the seek landed mid-line
+    if os.path.exists(LOG):
+        with open(LOG, errors="replace") as handle:
+            lines.extend(handle)
+    return lines
+
+
+def served_since(start: float) -> str | None:
+    """Newest `proxy request ... agent=claude` line logged after `start`.
+
+    Only a FRESH line counts. A previously working machine has thousands of old
+    ones, and matching those would certify a setup that never served anything.
+    """
+    newest = None
+    for line in recent_log_lines():
+        match = log_line.match(line)
+        if not match:
+            continue
+        when = time.mktime(time.strptime(match.group(1), "%Y/%m/%d %H:%M:%S"))
+        if when >= start - 2:
+            newest = match.group(2)
+    return newest
+
+
+ROUTING_KEYS = ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN")
+
+
+def claude_turn(settings_env: dict[str, str] | None = None) -> tuple[bool, str, str | None]:
+    """Drive a real one-shot Claude Code turn in a SEPARATE process.
+
+    This is the probe rather than a hand-rolled POST because the pool serves
+    subscription OAuth, and a raw /v1/messages call is not the shape the
+    subscription endpoint expects -- it can fail for reasons that have nothing to
+    do with whether the pool works, which is the worst possible false negative.
+
+    The probe inherits neither routing key from this shell. `settings_env`
+    reaches it as a --settings file, never as its environment: a settings.json
+    env beats the environment (PATCHES §29.9.1), so a settings.json routed at
+    a box would take the probe there, and --settings beats settings.json. The
+    file is 0600, removed after, and keeps the token out of argv. Without
+    `settings_env` the probe reads settings.json alone, which phase 6 proves.
+    """
+    if not shutil.which("claude"):
+        return False, "the `claude` CLI is not on PATH, so the end-to-end probe cannot run", None
+    env = {key: value for key, value in os.environ.items() if key not in ROUTING_KEYS}
+    argv = ["claude", "-p"]
+    settings = None
+    if settings_env:
+        handle, settings = tempfile.mkstemp(prefix="subrouter-probe-", suffix=".json")
+        with os.fdopen(handle, "w") as out:
+            json.dump({"env": settings_env}, out)
+        argv += ["--settings", settings]
+    start = time.time()
+    try:
+        result = run(argv + [f"Reply with exactly: {MARKER}"], env=env, timeout=180)
+    finally:
+        if settings:
+            os.remove(settings)
+    where = evidence_since(start)
+    if MARKER not in (result.stdout or ""):
+        detail = (result.stderr or result.stdout or "").strip().splitlines()
+        return False, (detail[-1] if detail else f"claude -p exited {result.returncode}"), where
+    if where is None:
+        level = quiet_log_level()
+        if level:
+            return False, (f"claude answered, but the daemon runs with SUBROUTER_LOG_LEVEL={level}, which drops "
+                           "the Info line that proves a turn went through it. Set it to info where the LaunchAgent "
+                           "sets it, restart the daemon, and re-run"), None
+        return False, "claude answered, but nothing fresh in the log -- it did NOT go through the daemon", None
+    return True, "", where
+
+
+def quiet_log_level() -> str | None:
+    """The daemon's SUBROUTER_LOG_LEVEL when it is above Info, else None.
+
+    Both lines a proof reads, `proxy request` and `serving from remote pool`,
+    are Info (PATCHES §39). The parse is daemonLogLevel's: debug, info, warn or
+    error in any case, with an optional +N or -N, and anything else is Info.
+    """
+    raw = str(remote_key.daemon_env().get("SUBROUTER_LOG_LEVEL") or "").strip()
+    match = re.fullmatch(r"(?i)(debug|info|warn|error)([+-][0-9]+)?", raw)
+    if not match:
+        return None
+    level = {"debug": -4, "info": 0, "warn": 4, "error": 8}[match.group(1).lower()] + int(match.group(2) or 0)
+    return raw if level > 0 else None
+
+
+def evidence_since(start: float) -> str | None:
+    """How a turn logged after `start` was served, or None if none was.
+
+    Two shapes, and accepting only the first is a trap: a delegated turn logs
+    `serving from remote pool` and carries **no** `account=`, because the peer's
+    account is not observable from here. A probe that insisted on the local line
+    would call a working peered daemon broken -- which is the exact setup this
+    script exists to stand up.
+    """
+    account = served_since(start)
+    if account:
+        return f"local:{account}"
+    return "peer" if remote_serve_since(start) else None
+
+
+def remote_serve_since(start: float) -> bool:
+    """Did a turn logged after `start` get handed to the peer rather than served here?"""
+    for line in reversed(recent_log_lines()[-4000:]):
+        match = re.match(r"^(\d{4}/\d\d/\d\d \d\d:\d\d:\d\d).*serving from remote pool", line)
+        if match and time.mktime(time.strptime(match.group(1), "%Y/%m/%d %H:%M:%S")) >= start - 2:
+            return True
+    return False
+
+
+def configure_peer(url: str, token: str, fingerprint: str, check: bool) -> None:
+    """Peer the daemon with your box.
+
+    `install-daemon` has no flag for any of this, so it goes in the LaunchAgent,
+    where a later `sr setup` keeps it (PATCHES §37). The values have to change
+    together, and each one alone fails in a way that reads as something else:
+
+      URL          without it there is no peer at all
+      TOKEN        a peer-role token the box minted for this daemon (`subrouter
+                   token mint <name> --role peer` on the box, PATCHES §43.1),
+                   or the box's static proxy token. A membership token cannot
+                   read the usage-status the ranking needs, so the box is
+                   never chosen. An admin token is refused for spending on a
+                   public listener, which looks like a bad secret, even where
+                   the box opens its admin routes there (SUBROUTER_PUBLIC_ADMIN=1)
+      FINGERPRINT  a public listener is self-signed (`subrouter fingerprint`
+                   on the box prints its pin), so an unpinned client dies in
+                   ordinary CA validation, which looks like a network fault
+
+    Claude Code presents the local proxy token, so the loopback exemption
+    (SUBROUTER_ALLOW_LOOPBACK_PROXY) is not needed and is left as it is.
+    """
+    env = {
+        "SUBROUTER_REMOTE_POOL": url,
+        "SUBROUTER_REMOTE_POOL_TOKEN": token,
+    }
+    if fingerprint:
+        env["SUBROUTER_REMOTE_POOL_FINGERPRINT"] = fingerprint
+    if check:
+        say(f"  would add to the LaunchAgent: {', '.join(sorted(env))}")
+        return
+    if not os.path.exists(PLIST):
+        raise Stop(f"no {PLIST}; the daemon install did not complete")
+    with mutation_lease():
+        # Phase 1 predicted which plist this would be. This is the one launchd is
+        # about to read, so ask again before the peer goes into it.
+        require_remote_key(plist_kept=True)
+        require_single_peer(plist_kept=True)
+        require_launchd()
+        with open(PLIST, "rb") as handle:
+            data = plistlib.load(handle)
+        variables = data.setdefault("EnvironmentVariables", {})
+        # launchd reads the plist only at a bootstrap, so the plist and the
+        # loaded job are compared apart: a run killed between the write and the
+        # restart leaves a plist that has the peer and a daemon that does not.
+        if not holds(variables, env):
+            variables.update(env)
+            write_private(PLIST, plistlib.dumps(data))
+            say(f"  peer:    {url} (token and pin written to the LaunchAgent, mode 600)")
+        elif holds(loaded_env(), env):
+            say(f"  peer:    {url}, already in the LaunchAgent and the running daemon; not restarted")
+            return
+        else:
+            say(f"  peer:    {url}, already in the LaunchAgent; restarting the daemon to read it")
+        reload_job(data)
+
+
+def holds(have: dict | None, want: dict) -> bool:
+    return have is not None and all(have.get(key) == value for key, value in want.items())
+
+
+def loaded_env() -> dict[str, str] | None:
+    """The environment launchd gave the loaded job, or None when it is not loaded.
+
+    `launchctl print` lists it in the job's `environment` block, one
+    `KEY => value` per line. The `inherited environment` block before it is
+    the login session's, not the plist's.
+    """
+    result = run(["launchctl", "print", JOB])
+    if result.returncode != 0:
+        return None
+    env, inside = {}, False
+    for line in result.stdout.splitlines():
+        if line == "\tenvironment = {":
+            inside = True
+        elif inside and line.strip() == "}":
+            break
+        elif inside and " => " in line:
+            key, value = line.strip().split(" => ", 1)
+            env[key] = value
+    return env
+
+
+@contextlib.contextmanager
+def mutation_lease():
+    """Hold the lock every other writer of the plist takes (PATCHES §69.5).
+
+    deploy-laptop.sh, the supervisor scripts and `sr update` edit the plist and
+    restart the job under <plist>.supervisor-mutation.lock, a flock. Without it
+    one of them could write over the peer env, or restart the job while this
+    run does. The descriptor is not inherited, so launchctl never holds it.
+    """
+    lock = f"{PLIST}.supervisor-mutation.lock"
+    try:
+        descriptor = os.open(lock, os.O_WRONLY | os.O_CREAT, 0o600)
+    except OSError as error:
+        raise Stop(f"cannot open {lock}: {error.strerror}. Nothing was changed.")
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise Stop(f"another deploy, rollback or update holds {lock}. Nothing was changed; "
+                       "run this again when that one finishes.")
+        yield
+    finally:
+        os.close(descriptor)
+
+
+def launchd_blocker() -> str | None:
+    """Why this shell must not restart the LaunchAgent, or None.
+
+    laptop-deploy-lib.sh's launchd_blocker for a restart (PATCHES §47, §69.4).
+    From ssh, or a terminal that outlived a logout, a bootout of gui/<uid>
+    works and launchd refuses the bootstrap after it, which leaves the daemon
+    down and KeepAlive nothing to restart. setup checks this itself, but the
+    peer step also restarts a daemon that already answered, which setup never
+    touched.
+    """
+    manager = run(["launchctl", "managername"])
+    name = manager.stdout.strip()
+    if manager.returncode != 0:
+        detail = (manager.stderr or manager.stdout).strip() or "no output"
+        return (f"this shell cannot reach launchd (`launchctl managername`: rc {manager.returncode}, {detail}): "
+                "it belongs to a login session that has ended")
+    if name != "Aqua":
+        return (f"this shell is in launchd's '{name or 'unnamed'}' session, not the logged-in GUI (Aqua) session "
+                f"that owns {DOMAIN}, so a bootout could succeed and the bootstrap fail")
+    rc = run(["launchctl", "print", JOB]).returncode
+    if rc not in (0, 113):
+        return (f"`launchctl print {JOB}` answered rc {rc} (only 0, loaded, and 113, not loaded, are answers), "
+                "so a restart could not tell a stopped job from a refused query")
+    return None
+
+
+def require_launchd() -> None:
+    """--peer restarts the daemon. Checked in phase 1, before the build, and
+    again in the peer step, before the plist is written."""
+    why = launchd_blocker()
+    if why:
+        raise Stop(f"--peer restarts the daemon, and {why}. Nothing was changed.\n"
+                   "  Run this from a new Terminal.app window: `launchctl managername` must print Aqua.")
+    require_own_job()
+
+
+def require_own_job() -> None:
+    """laptop-deploy-lib.sh's own_job_or_exit (PATCHES §76.1).
+
+    The peer step boots JOB out and bootstraps PLIST. For a job launchd loaded
+    from another plist, that restarts the job and loads a different one in its
+    place. A job that is not loaded is this script's to start, and a print
+    launchd refuses proves nothing either way: launchd_blocker refuses on it.
+    """
+    printed = run(["launchctl", "print", JOB])
+    if printed.returncode != 0:
+        return
+    found = re.search(r"^\tpath = (.*)$", printed.stdout, re.M)
+    loaded = found.group(1) if found else ""
+    try:
+        ours = loaded == PLIST or os.path.samefile(loaded, PLIST)
+    except OSError:
+        ours = False
+    if not ours:
+        raise Stop(f"refusing to restart {JOB}: launchd loaded it from {loaded or 'a plist it does not name'}, "
+                   f"and this script's plist is {PLIST}. launchd was not changed.")
+
+
+def reload_job(data: dict) -> None:
+    """Restart the LaunchAgent so it reads the plist `data` came from again.
+
+    kickstart -k restarts the loaded job WITHOUT re-reading the plist, so the
+    new env would silently not apply. bootout, wait for the label to actually
+    go, then bootstrap -- bootstrapping early fails with `5: Input/output error`.
+    The wait is deploy-laptop.sh's (bootout_and_wait): a supervised job drains
+    for up to its ExitTimeOut, and only rc 113 from `launchctl print` is gone.
+    """
+    exit_timeout = data.get("ExitTimeOut")
+    limit = max(600, exit_timeout + 60) if isinstance(exit_timeout, int) else 600
+    start = f"launchctl bootstrap {DOMAIN} {PLIST}"
+    run(["launchctl", "bootout", JOB])
+    for waited in range(limit + 1):
+        rc = run(["launchctl", "print", JOB]).returncode
+        if rc != 0 or waited == limit:
+            break
+        time.sleep(1)
+    if rc != 113:
+        held = (f"launchd still holds {LABEL} {limit} s after the bootout" if rc == 0 else
+                f"`launchctl print` answered rc {rc} after the bootout, not 113, the answer for a job that is gone")
+        raise daemon_down(f"{held}, so the daemon was not started again.\n"
+                          f"  Once `launchctl print {JOB}` answers 113, start it: {start}")
+    result = run(["launchctl", "bootstrap", DOMAIN, PLIST])
+    if result.returncode != 0:
+        raise daemon_down("launchctl bootstrap failed: " + (result.stderr or result.stdout).strip() + "\n"
+                          "  The daemon is DOWN: it was booted out to read the peer env, and launchd did not start it again.\n"
+                          f"  Start it from a new Terminal.app window: {start}")
+    # A supervised job's first worker has its --ready-timeout to come up (2m
+    # from activate-laptop-supervisor.sh, PATCHES §69.1). deploy-laptop.sh
+    # waits 120 s, or that timeout plus 60 s when that is longer.
+    ready = go_seconds(remote_key.supervised_flag(data.get("ProgramArguments") or [], "--ready-timeout"))
+    up = max(120, ready + 60)
+    for _ in range(up):
+        if daemon_alive():
+            say("  daemon:  restarted and healthy with the peer env")
+            return
+        time.sleep(1)
+    raise daemon_down(f"launchd started the daemon again, but it has not answered for {up} s; see {LOG}")
+
+
+def go_seconds(duration: str) -> int:
+    """A Go duration such as 2m or 1m30s in whole seconds, or 0 when it is not one
+    (job_state's seconds() in laptop-deploy-lib.sh)."""
+    parts = re.findall(r"([0-9]+(?:\.[0-9]+)?)(ms|h|m|s)", duration)
+    if not parts or "".join(number + unit for number, unit in parts) != duration:
+        return 0
+    return max(1, int(sum(float(number) * {"ms": 0.001, "s": 1, "m": 60, "h": 3600}[unit] for number, unit in parts)))
+
+
+def daemon_down(what: str) -> DaemonDown:
+    """`what`, and what it leaves Claude Code with."""
+    if file_points_at_daemon(CLAUDE):
+        what += ("\n  settings.json points Claude Code at this daemon, so Claude Code is down with it; "
+                 f"{os.path.join(HERE, 'subrouter-unbrick')} takes it off until the daemon answers.")
+    return DaemonDown(what)
+
+
+def cli() -> str:
+    """What to call for `… claude addr`.
+
+    `make build` produces bin/subrouter and bin/mockupstream -- there is no
+    bin/sr, so naming one is a path that does not exist. The `sr` shim appears
+    only once the daemon is installed (phase 3), and argv[0] selects the CLI
+    surface, so prefer it when it is there.
+    """
+    for candidate in (shutil.which("sr"), os.path.expanduser("~/bin/sr"), BIN):
+        if candidate and os.path.exists(candidate):
+            return candidate
+    return BIN
+
+
+def where_sr_is() -> str:
+    """How to call `sr` once this has run.
+
+    setup links ~/bin/sr to the binary it installs, and macOS does not put ~/bin
+    on PATH, so on a fresh Mac a bare `sr` is "command not found".
+    """
+    installed = os.path.expanduser("~/bin/sr")
+    if not os.path.exists(installed):
+        return f"`sr`: there is no {installed}; call the CLI as {cli()}"
+    on_path = shutil.which("sr")
+    if on_path and os.path.realpath(on_path) == os.path.realpath(installed):
+        return f"`sr` is {installed}, on your PATH."
+    if on_path:
+        return f"`sr` is {installed}; the `sr` first on your PATH is {on_path}, another file, so call it by its full path."
+    return (f"`sr` is {installed}, and ~/bin is not on your PATH: call it as {installed}, "
+            "or add  export PATH=\"$HOME/bin:$PATH\"  to ~/.zshrc and open a new terminal.")
+
+
+def shell_exports() -> list[str]:
+    found = []
+    for name in RC_FILES:
+        path = os.path.expanduser(name)
+        if not os.path.exists(path):
+            continue
+        for number, line in enumerate(open(path, errors="replace"), 1):
+            if export_pattern.match(line):
+                found.append(f"{name}:{number}: {line.strip()}")
+    return found
+
+
+def require_remote_key(plist_kept: bool, peer: str = "--peer") -> None:
+    """A peer arms nothing on a machine without remote.key (PATCHES §17, §40).
+
+    The gate ships in the binary: without the key, `serve` ignores every
+    SUBROUTER_REMOTE_POOL* variable and the peers file, and it does so
+    silently, because naming the file would defeat the gate. So phase 3 would
+    write the peer into the LaunchAgent and restart a healthy daemon with no
+    peer, phase 4 would call the empty local store fine ("the peer is the
+    pool"), and phase 5 would fail on a pool with nothing at either end --
+    which reads as a bad token or a dead box. For --peer, checked in phase 1,
+    before anything is built or installed, and again in phase 3 against the
+    plist launchd is about to read; for a peers file, in phase 4. `peer` names
+    what needs the key.
+    """
+    state, home = remote_key.daemon_store(plist_kept)
+    path = remote_key.key_path(state, home)
+    problem = remote_key.problem(path)
+    if problem is None:
+        say(f"  remote:  {path} present -- the peer can arm")
+        return
+    fix = remote_key.remedy(path, state, problem)
+    raise Stop(
+        f"{peer} needs this machine to hold remote.key, and {path} is {problem}.\n"
+        "  Without it the daemon ignores SUBROUTER_REMOTE_POOL* and SUBROUTER_REMOTE_POOLS_FILE,\n"
+        "  so it would have no peer and an empty pool, and nothing would say why.\n"
+        "  Fix it where the daemon reads it, then re-run:\n"
+        f"    {fix}"
+    )
+
+
+def peers_file(plist_kept: bool) -> str:
+    """The peers file the daemon reads (SUBROUTER_REMOTE_POOLS_FILE), or ""."""
+    return str(remote_key.daemon_env(plist_kept).get("SUBROUTER_REMOTE_POOLS_FILE") or "").strip()
+
+
+def require_single_peer(plist_kept: bool) -> None:
+    """--peer writes the single-peer variables, and a peers file overrides them.
+
+    With SUBROUTER_REMOTE_POOLS_FILE in the daemon's env, serve takes its peers
+    from that file and ignores SUBROUTER_REMOTE_POOL* (PATCHES §31), so the peer
+    step would restart the daemon with no new peer and call it healthy.
+    """
+    peers = peers_file(plist_kept)
+    if peers:
+        raise Stop(f"the daemon takes its peers from {peers} (SUBROUTER_REMOTE_POOLS_FILE) and ignores "
+                   "SUBROUTER_REMOTE_POOL*, which is all --peer writes. Nothing was changed.\n"
+                   '  Add the box to that file\'s "peers" list instead, as {"name", "url", "token", "fingerprint"}.\n'
+                   f"  The daemon reads the file when it starts: launchctl kickstart -k {JOB}\n"
+                   "  Then run this again without --peer.")
+
+
+def version_tuple(text: str, pattern: str = r"(\d+)\.(\d+)(?:\.(\d+))?") -> tuple[int, int, int] | None:
+    match = re.match(pattern, text)
+    return (int(match.group(1)), int(match.group(2)), int(match.group(3) or 0)) if match else None
+
+
+def require_go() -> None:
+    """Stop unless the Go the build will run is at least what go.mod names.
+
+    Asked in SRC, where the build runs: from Go 1.21 the go command runs the
+    toolchain go.mod names, fetching it if need be (GOTOOLCHAIN=auto, the
+    default), but only inside the module. Asked from the caller's directory it
+    reported the local toolchain, so a Go 1.22 that builds fine was refused,
+    and against a fixed floor of 1.24 a Go 1.25 under GOTOOLCHAIN=local, which
+    cannot build a `go 1.26.0` module, was let through.
+    """
+    with open(os.path.join(SRC, "go.mod")) as handle:
+        needed = next((line.split()[1] for line in handle if line.startswith("go ") and len(line.split()) > 1), "")
+    if not shutil.which("go"):
+        raise Stop(f"no `go` on PATH; install Go {needed or '1.21+'} (any Go from 1.21 fetches what go.mod names)")
+    # This can be fetching that toolchain, --check or not (it lands in Go's own
+    # cache, as the build would fetch it). Bounded, so a stalled fetch stops the
+    # run with "`go` timed out" rather than hanging it.
+    result = run(["go", "version"], cwd=SRC, timeout=600)
+    # A failed fetch exits non-zero with only its error, which names the version too.
+    version = result.stdout.strip() or (result.stderr.strip().splitlines() or [""])[-1]
+    have = version_tuple(version, r"go version go(\d+)\.(\d+)(?:\.(\d+))?") if result.returncode == 0 else None
+    need = version_tuple(needed)
+    if need and (have is None or have < need):
+        toolchain = run(["go", "env", "GOTOOLCHAIN"], cwd=SRC, timeout=600).stdout.strip()
+        if have and have < (1, 21):
+            fix = f"Go before 1.21 cannot fetch a toolchain: install Go {needed}, or any Go from 1.21"
+        elif toolchain and not toolchain.endswith("auto"):
+            fix = (f"GOTOOLCHAIN={toolchain} keeps Go from fetching it: unset it (and `go env -u GOTOOLCHAIN` "
+                   f"if it was set with `go env -w`), or install Go {needed}")
+        else:
+            fix = f"install Go {needed}"
+        raise Stop(f"{SRC}/go.mod needs Go {needed}, and `go version` there reports {version or 'nothing'}.\n  {fix}")
+    say(f"  go:      {version}")
+
+
+def preflight(check: bool, peer: dict | None = None) -> None:
+    phase(1, "preflight")
+    if sys.platform != "darwin":
+        raise Stop("this script is macOS-only (launchd); for a Linux box see ops/deploy/lightsail/")
+    if not os.path.exists(os.path.join(SRC, "go.mod")):
+        raise Stop(f"no Go source at {SRC}; run this from a checkout of this repository")
+    require_go()
+    say(f"  source:  {SRC}")
+    exports = shell_exports()
+    if exports:
+        # A terminal `claude` applies settings.json env over these, but
+        # everything else that shell starts (Anthropic SDKs, scripts) would be
+        # routed with the proxy token and stay routed after a rollback, and a
+        # host-orchestrated launch that inherits them keeps them over
+        # settings.json. Refuse now rather than at the confusing end.
+        for line in exports:
+            say(f"  shell:   !! {line}")
+        raise Stop("delete those export lines first -- they route everything that shell starts, "
+                   "outlive a rollback, and win over settings.json for host-orchestrated launches")
+    say("  shell:   clean")
+    if peer:
+        # Phase 3 keeps the LaunchAgent only if the daemon already answers.
+        kept = daemon_alive()
+        # The key first. The peers-file stop sends the run back without
+        # --peer, and a daemon without the key ignores that file too.
+        require_remote_key(kept)
+        require_single_peer(kept)
+        require_launchd()
+    read_settings()
+    say(f"  clients: claude={'present' if os.path.exists(CLAUDE) else 'none'} "
+        f"codex={'present' if os.path.exists(CODEX) else 'none'} (untouched until phase 6)")
+
+
+def build(check: bool) -> None:
+    phase(2, "build")
+    if check:
+        say(f"  would run: make -C {SRC} build")
+        return
+    result = run(["make", "build"], cwd=SRC, timeout=900)
+    if result.returncode != 0:
+        raise Stop("build failed:\n" + (result.stderr or result.stdout)[-2000:])
+    if not os.path.exists(BIN):
+        raise Stop(f"make succeeded but {BIN} is missing")
+    say(f"  built:   {BIN}")
+
+
+def vcs_revision(path: str) -> str | None:
+    """The commit a clean build was made from, or None (no stamp, or a modified tree)."""
+    out = run(["go", "version", "-m", path], cwd=SRC).stdout
+    revision = re.search(r"^\s*build\s+vcs\.revision=(\S+)", out, re.M)
+    if not revision or re.search(r"^\s*build\s+vcs\.modified=true", out, re.M):
+        return None
+    return revision.group(1)
+
+
+def same_build(a: str, b: str) -> bool:
+    """Byte for byte, or the same clean commit: deploy-laptop.sh re-signs what it installs."""
+    with open(a, "rb") as one, open(b, "rb") as other:
+        if hashlib.sha256(one.read()).digest() == hashlib.sha256(other.read()).digest():
+            return True
+    revision = vcs_revision(a)
+    return revision is not None and revision == vcs_revision(b)
+
+
+def job_binary() -> str:
+    """The binary the LaunchAgent runs: a plain serve's program, or a supervised
+    job's --worker-bin, which is the one deploy-laptop.sh replaces (LAPTOP.md)."""
+    argv = remote_key.job().get("ProgramArguments") or []
+    return remote_key.supervised_flag(argv, "--worker-bin") or (str(argv[0]) if argv else "")
+
+
+def stale_daemon() -> str | None:
+    """Say so when the daemon that answers does not run the build phase 2 made.
+
+    Phase 3 runs `setup` only when nothing answers, so on every upgrade the
+    fresh build was left in bin/ and nothing said so. This script does not swap
+    a running daemon itself: deploy-laptop.sh does, staged, re-signed, verified
+    and rolled back on failure.
+    """
+    running = job_binary()
+    upgrade = f"{os.path.join(SRC, 'ops', 'deploy', 'macos', 'deploy-laptop.sh')} {BIN}"
+    if not running or not os.path.isfile(running):
+        # Not a LaunchAgent daemon, so not one deploy-laptop.sh can swap.
+        return (f"  !! cannot tell which binary answers (no program in {PLIST}), so the build\n"
+                "     phase 2 made may not be the one serving; this script installs nothing over it.")
+    if same_build(running, BIN):
+        return None
+    return (f"  !! the daemon runs {running}, which is not the build phase 2 made, and this script\n"
+            "     never replaces a running daemon. To install it (verified, rolled back on failure):\n"
+            f"       {upgrade}")
+
+
+def install(check: bool, peer: dict | None) -> str | None:
+    """Phase 3. Returns a warning to repeat at the end when the daemon was not upgraded."""
+    phase(3, "daemon (clients untouched)")
+    if check:
+        say(f"  would run: {BIN} setup --storage local --no-config --yes")
+        if peer:
+            configure_peer(peer["url"], peer["token"], peer["fingerprint"], True)
+        return None
+    stale = None
+    if daemon_alive():
+        say(f"  daemon:  already answering on {ADDR}, so nothing is installed")
+        stale = stale_daemon()
+        if stale:
+            say(stale)
+    else:
+        say(run([BIN, "setup", "--plan", "--storage", "local", "--no-config"]).stdout.strip()[-800:] or "  (nothing to plan)")
+        # setup applies its change set only once a person approves it at a
+        # terminal, and run() hands it a pipe. --yes is that approval; without
+        # it setup prints the plan, installs nothing and exits 0.
+        result = run([BIN, "setup", "--storage", "local", "--no-config", "--yes"], timeout=300)
+        if result.returncode != 0:
+            raise Stop("setup failed:\n" + (result.stderr or result.stdout)[-2000:])
+        for _ in range(30):
+            if daemon_alive():
+                break
+            time.sleep(1)
+        else:
+            raise Stop(f"daemon did not become healthy; see {LOG}")
+        say(f"  daemon:  healthy on {ADDR}, no client config written")
+    if peer:
+        configure_peer(peer["url"], peer["token"], peer["fingerprint"], False)
+    return stale
+
+
+def accounts(check: bool, peer: bool) -> None:
+    """Phase 4. `peer` is --peer; a peers file the daemon reads is a peer too.
+
+    --peer stops on a peers file and sends the run back without it, so phase 4
+    asks for the file itself. The daemon reads it only with remote.key, so it
+    counts only then.
+    """
+    phase(4, "accounts")
+    if check:
+        say("  would report the pool size" + (" (empty is fine with a peer)" if peer else " and stop if it is empty"))
+        return
+    count = pool_size()
+    if count:
+        say(f"  pool:    {count} local account(s)")
+        return
+    peers = "" if peer else peers_file(plist_kept=True)
+    if peers:
+        require_remote_key(plist_kept=True, peer=f"The peers file {peers}")
+    if peer or peers:
+        # "Never point a client at an empty pool" (PATCHES §3) does not apply
+        # here. The pool is at the other end of the peer link.
+        say("  pool:    0 local accounts, which is fine: the peer is the pool")
+        return
+    sr = cli()
+    raise Stop(
+        "the pool is empty, and this is the step that needs a human:\n"
+        f"    {sr} claude addr <name>   # per Claude Max sub -- prints a URL, waits for a pasted code\n"
+        f"    {sr} add codex            # per ChatGPT Pro sub -- self-completes, just click Approve\n"
+        "  then re-run this script; it resumes here.\n"
+        "  Nothing has been pointed at the empty pool, so your editor is still fine.",
+        code=3,
+    )
+
+
+def prove(check: bool) -> str:
+    phase(5, "prove it serves -- still nothing written")
+    if check:
+        say(f"  would run a throwaway `claude -p` against {ADDR} with the local proxy token")
+        return "(check)"
+    token = local_proxy_token()
+    ok, why, where = claude_turn({"ANTHROPIC_BASE_URL": ADDR, "ANTHROPIC_AUTH_TOKEN": token})
+    if not ok:
+        raise Stop(f"the daemon did not serve a turn, so the cutover is NOT safe: {why}")
+    say(f"  served:  a full turn -- {where}")
+    return where
+
+
+CACHE_TTL_ENV = "CLAUDE_CODE_PROMPT_CACHE_TTL"
+
+
+def ttl_exported_by_user() -> bool:
+    """Whether the environment running this holds the user's own TTL decision.
+
+    Claude Code applies settings.json env over the environment a terminal launch
+    starts with, so a written 1h would beat an export. Only an export that is the
+    user's and that 1h would contradict counts. Nothing counts inside Claude Code
+    (CLAUDECODE is set in every tool subprocess, and that environment carries
+    every settings file's env and the 1h `sr claude` injects -- this script is
+    meant to be run from a session). FORCE_PROMPT_CACHING_5M counts with any
+    value; the TTL variable with any value but 1h (even empty): an exported 1h is
+    no conflict, and settings.json is the only channel that reaches the desktop
+    app. Same rule as the Go writer (claudeCacheTTLExported, PATCHES §21).
+    """
+    if os.environ.get("CLAUDECODE"):
+        return False
+    if "FORCE_PROMPT_CACHING_5M" in os.environ:
+        return True
+    return CACHE_TTL_ENV in os.environ and os.environ[CACHE_TTL_ENV] != "1h"
+
+
+def ask_for_one_hour_cache(data: dict, env: dict) -> None:
+    """Ask for the 1-hour prompt cache unless the user already decided.
+
+    ANTHROPIC_AUTH_TOKEN makes Claude Code an API-key client, which asks for the
+    5-minute cache on the main thread. Env beats the promptCacheTtl setting, so
+    any of the three keys in the file (even empty) is a decision not to
+    override, and so is the user's own export (ttl_exported_by_user). The
+    subagent TTL is never touched. Same rule as the Go writer (PATCHES §21).
+    """
+    if CACHE_TTL_ENV in env or "FORCE_PROMPT_CACHING_5M" in env:
+        return
+    if "promptCacheTtl" in data or ttl_exported_by_user():
+        return
+    env[CACHE_TTL_ENV] = "1h"
+
+
+def points_at_daemon(data) -> bool:
+    return isinstance(data, dict) and str((data.get("env") or {}).get("ANTHROPIC_BASE_URL") or "").rstrip("/") == ADDR
+
+
+def file_points_at_daemon(path: str) -> bool:
+    try:
+        with open(path) as handle:
+            return points_at_daemon(json.load(handle))
+    except (OSError, ValueError):
+        return False
+
+
+def rollback_source() -> str | None:
+    """The backup --rollback restores: the newest one that is off the daemon.
+
+    The newest backup alone can point at the daemon: subrouter-unbrick backs up
+    the routed settings.json before it takes the keys out, and an older
+    quickstart backed up a cut-over file on a re-run. Restoring either puts
+    Claude Code back on a daemon that may be why it is being rolled back.
+    """
+    for path in sorted(glob.glob(f"{CLAUDE}{BAK}*"), reverse=True):
+        if not file_points_at_daemon(path):
+            return path
+    return None
+
+
+def rollback() -> int:
+    if not file_points_at_daemon(CLAUDE):
+        say(f"settings.json does not point at {ADDR}, so it is left as it is.")
+        return 0
+    source = rollback_source()
+    if source is None:
+        say(f"settings.json points at {ADDR}, and no backup of it is off the daemon.\n"
+            "Run subrouter-unbrick: it takes out the two ANTHROPIC_* keys and keeps the rest.")
+        return 1
+    unbrick.restore_backup(source, CLAUDE)
+    if os.path.islink(source):
+        say(f"settings.json: the link to {os.readlink(source)} is back, from {os.path.basename(source)}")
+    else:
+        say(f"settings.json: restored from {os.path.basename(source)}")
+    say("Fully quit and reopen Claude Code -- the base URL is read at process start.")
+    return 0
+
+
+def read_settings() -> tuple[bytes | None, int, dict]:
+    """settings.json's bytes, mode and keys, or (None, 0o644, {}) when there is none.
+
+    Stops on a file phase 6 cannot rewrite: one that is not a JSON object with
+    an object "env". Phase 1 asks too, so that stop comes before the build.
+    """
+    if not os.path.exists(CLAUDE):
+        return None, 0o644, {}
+    with open(CLAUDE, "rb") as handle:
+        body = handle.read()
+    try:
+        data = json.loads(body)
+    except ValueError as error:
+        raise Stop(f"{CLAUDE} is not valid JSON ({error}); fix it by hand, then re-run")
+    if not isinstance(data, dict) or not isinstance(data.get("env") or {}, dict):
+        raise Stop(f'{CLAUDE} is not a JSON object with an object "env"; fix it by hand, then re-run')
+    return body, stat.S_IMODE(os.stat(CLAUDE).st_mode), data
+
+
+def put_back(before: bytes | None, mode: int, link: str | None) -> str:
+    """Return settings.json to what this run found, and say what that left."""
+    if link is not None:
+        # The cutover replaced the link with a file and never wrote its target.
+        unbrick.place_link(link, CLAUDE)
+    elif before is None:
+        if os.path.exists(CLAUDE):
+            os.remove(CLAUDE)
+    else:
+        write_private(CLAUDE, before, mode)
+    now = None
+    if os.path.exists(CLAUDE):
+        with open(CLAUDE, "rb") as handle:
+            now = handle.read()
+    if now != before:
+        return "putting settings.json back FAILED: run subrouter-unbrick to take it off the daemon"
+    if before is None and link is None:
+        return "it was removed: there was no settings.json before this run, so Claude Code is on its own login"
+    if before is not None and points_at_daemon(json.loads(before)):
+        return ("settings.json was put back exactly as this run found it, which already pointed at the "
+                "daemon: subrouter-unbrick takes it off")
+    return "settings.json was put back exactly as this run found it"
+
+
+def cutover(check: bool) -> None:
+    phase(6, "cut over")
+    if check:
+        say(
+            f"  would back up and write ANTHROPIC_BASE_URL/AUTH_TOKEN into {CLAUDE}, and "
+            f"{CACHE_TTL_ENV}=1h unless a prompt-cache TTL is already chosen"
+        )
+        return
+    token = local_proxy_token()
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    backup = f"{CLAUDE}{BAK}{stamp}"
+    # What this run found, to put back if the re-proof fails: the bytes and
+    # mode, or None for no file, and where it linked to. Never "the newest
+    # backup", which can be another run's, and when there was no file there is
+    # nothing to restore.
+    before, mode, data = read_settings()
+    link = os.readlink(CLAUDE) if os.path.islink(CLAUDE) else None
+    already = points_at_daemon(data)
+    if already:
+        # A re-run. A backup of the cut-over file is one --rollback skips.
+        source = rollback_source()
+        kept = "it already pointed here, so no backup was taken; " + (
+            f"--rollback restores {os.path.basename(source)}" if source
+            else "no backup is off the daemon, so subrouter-unbrick takes it off")
+    elif link is not None:
+        # The backup is the link, so --rollback puts the dotfile manager's link
+        # back rather than a copy of what it pointed at.
+        unbrick.place_link(link, backup)
+        kept = f"backup {os.path.basename(backup)}, a link to {link} as settings.json was"
+    elif before is None:
+        # --rollback restores a backup, so a machine with no settings.json gets
+        # an empty one: restoring it is Claude Code on its own login.
+        os.makedirs(os.path.dirname(CLAUDE), exist_ok=True)
+        with open(backup, "w") as handle:
+            handle.write("{}\n")
+        kept = f"there was none; backup {os.path.basename(backup)} is an empty one, for --rollback"
+    else:
+        shutil.copy2(CLAUDE, backup)
+        kept = f"backup {os.path.basename(backup)}"
+    env = data.get("env") or {}
+    env["ANTHROPIC_BASE_URL"] = ADDR  # no /v1 -- Claude Code appends its own
+    env["ANTHROPIC_AUTH_TOKEN"] = token
+    ask_for_one_hour_cache(data, env)
+    # ENABLE_TOOL_SEARCH is deliberately not written here: this file is the one
+    # plain `claude` reads, and a client-config writer there is a known brick
+    # class. `sr claude` sets it per launch instead (PATCHES §29.9.1).
+    data["env"] = env
+    # A link is replaced, not written through: the token stays out of the
+    # dotfiles repo a link usually points into.
+    write_private(CLAUDE, json.dumps(data, indent=2).encode())
+    written = (json.load(open(CLAUDE)).get("env") or {}).get("ANTHROPIC_BASE_URL")
+    if written != ADDR:
+        raise Stop("the write did not stick; settings.json still does not point at the daemon")
+    say(f"  claude:  settings.json -> {ADDR} ({kept})")
+
+    try:
+        ok, why, where = claude_turn()
+    except subprocess.TimeoutExpired as expired:
+        # A turn that never finished is not one that served: put it back too.
+        ok, why = False, f"`claude -p` timed out after {expired.timeout:g} s"
+    if not ok:
+        raise Stop(f"the written config did not serve a turn ({why}), so {put_back(before, mode, link)}")
+    say(f"  proved:  a fresh process read settings.json and was served -- {where}")
+    if link is not None:
+        # Only a link that was off the daemon got a backup --rollback restores.
+        back = f"to put the link back: ln -sf {link} {CLAUDE}" if already else "--rollback puts the link back"
+        say(f"  claude:  settings.json was a link to {link}; it is now a file of its own, {link} is unchanged, "
+            f"and {back}")
+    if os.path.exists(CODEX):
+        say("  codex:   left alone; `sr codex` starts Codex through the pool")
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(description="Local-first subrouter, installed without bricking the installer.")
+    parser.add_argument("--check", action="store_true", help="say what it would do; touch nothing of yours (phase 1 may fetch go.mod's Go into Go's cache)")
+    parser.add_argument("--no-cutover", action="store_true", help="stop after proving; leave clients alone")
+    parser.add_argument("--rollback", action="store_true", help="put settings.json back from its newest backup that is off the daemon")
+    parser.add_argument("--peer", metavar="URL", help="your box's address; the daemon also draws on its pool")
+    parser.add_argument("--peer-token-file", metavar="PATH", help="file holding the token the box minted for this daemon (--role peer), or its proxy token; required with --peer")
+    parser.add_argument("--peer-fingerprint", metavar="SHA256", help="pin for an https peer (self-signed by design; required for https)")
+    args = parser.parse_args(argv)
+
+    if args.rollback:
+        return rollback()
+
+    peer = None
+    if args.peer:
+        # A file, never a flag or a variable: argv is readable by every local
+        # user through `ps`, and a token in shell history outlives the install.
+        if not args.peer_token_file:
+            parser.error("--peer needs --peer-token-file")
+        fingerprint = (args.peer_fingerprint or "").strip()
+        # Here, not in phase 3: there setup would already have installed the daemon.
+        if args.peer.startswith("https://") and not fingerprint:
+            parser.error("an https peer is self-signed; pass --peer-fingerprint or it will fail CA validation")
+        try:
+            token = open(os.path.expanduser(args.peer_token_file)).read().strip()
+        except OSError as error:
+            parser.error(f"cannot read {args.peer_token_file}: {error.strerror}")
+        if not token:
+            parser.error(f"{args.peer_token_file} is empty; it holds the token the box minted for this daemon")
+        peer = {"url": args.peer, "token": token, "fingerprint": fingerprint}
+
+    stale = None
+    try:
+        preflight(args.check, peer)
+        build(args.check)
+        stale = install(args.check, peer)
+        accounts(args.check, peer is not None)
+        prove(args.check)
+        if args.no_cutover:
+            say("\n--no-cutover: the pool works and your clients are untouched.")
+            say(where_sr_is())
+            if stale:
+                say(stale)
+            return 0
+        cutover(args.check)
+    except Stop as stop:
+        say(f"\nSTOPPED: {stop}")
+        if stop.footer:
+            say(stop.footer)
+        return stop.code
+    except subprocess.TimeoutExpired as expired:
+        say(f"\nSTOPPED: `{expired.cmd[0]}` timed out")
+        return 1
+
+    if args.check:
+        say("\n--check: nothing was modified.")
+        return 0
+    say("\nDone. Fully quit and reopen Claude Code -- the base URL is read at process start.")
+    say("Your CURRENT session keeps its old auth until you do, which is why this was safe to run from one.")
+    say(f"Undo: {os.path.basename(sys.argv[0])} --rollback")
+    say(where_sr_is())
+    if stale:
+        say(stale)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

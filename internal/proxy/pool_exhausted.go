@@ -24,7 +24,9 @@ import (
 // The "(retry after <N>s)" token is a cross-repo contract: cmux's agent
 // auto-resume parses `retry after (\d+)s` from the agent's error text to wait
 // for capacity instead of re-sending on a blind backoff ladder. Do not change
-// its spelling. The same N goes into the 503's Retry-After header.
+// its spelling. The same N goes into the 503's Retry-After header, except
+// that an end client is told at most Server.ClientRetryAfterMax of it
+// (clientRetryAfter, PATCHES §78).
 type poolExhaustedError struct {
 	provider      accounts.Provider
 	nextAvailable time.Time
@@ -146,18 +148,19 @@ func accountSelectionFailureReason(err error) string {
 	return "account_selection"
 }
 
-// writeAccountSelectionUnavailable answers a request whose account selection
+// writeAccountSelectionUnavailable answers r, whose account selection
 // failed. An exhausted pool with a known recovery time sets Retry-After to the
-// same N its message carries. A hosted broker's Retry-After is relayed, and
-// because the broker error deliberately never copies the hosted body, the
-// "(retry after <N>s)" token is appended so agents see it in the error text.
-func writeAccountSelectionUnavailable(w http.ResponseWriter, err error) {
+// same N its message carries, capped for an end client (clientRetryAfter). A
+// hosted broker's Retry-After is relayed, and because the broker error
+// deliberately never copies the hosted body, the "(retry after <N>s)" token is
+// appended so agents see it in the error text.
+func (s Server) writeAccountSelectionUnavailable(w http.ResponseWriter, r *http.Request, err error) {
 	message := err.Error()
 	var exhausted *poolExhaustedError
 	var brokerHTTPError *broker.HTTPStatusError
 	switch {
 	case errors.As(err, &exhausted) && exhausted.retryAfterSeconds > 0:
-		w.Header().Set("Retry-After", strconv.FormatInt(exhausted.retryAfterSeconds, 10))
+		w.Header().Set("Retry-After", strconv.FormatInt(s.clientRetryAfter(r, exhausted.retryAfterSeconds), 10))
 	case errors.As(err, &brokerHTTPError) && brokerHTTPError.RetryAfter != "":
 		w.Header().Set("Retry-After", brokerHTTPError.RetryAfter)
 		now := time.Now()
@@ -172,12 +175,12 @@ func writeAccountSelectionUnavailable(w http.ResponseWriter, err error) {
 // writeAccountSelectionUnavailable. Failover discovers exhaustion after the
 // request has already entered ReverseProxy, so it must synthesize the same
 // local 503 instead of returning one account's provider 429 body.
-func poolExhaustedResponse(err error, req *http.Request) *http.Response {
+func (s Server) poolExhaustedResponse(err error, req *http.Request) *http.Response {
 	header := make(http.Header)
 	header.Set("Content-Type", "text/plain; charset=utf-8")
 	var exhausted *poolExhaustedError
 	if errors.As(err, &exhausted) && exhausted.retryAfterSeconds > 0 {
-		header.Set("Retry-After", strconv.FormatInt(exhausted.retryAfterSeconds, 10))
+		header.Set("Retry-After", strconv.FormatInt(s.clientRetryAfter(req, exhausted.retryAfterSeconds), 10))
 	}
 	return &http.Response{
 		StatusCode: http.StatusServiceUnavailable,

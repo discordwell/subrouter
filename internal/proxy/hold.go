@@ -11,6 +11,7 @@ import (
 	"math/rand/v2"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -88,11 +89,13 @@ const (
 	// cache it waits for is cold and a box chat's peer hold has lapsed, so the
 	// give-up answer comes before an attempt that would place it cold.
 	DefaultStrandedGiveUp = warmSessionIdleTTL
-	// strandedRetryAfter is the give-up answer's Retry-After. Claude Code
-	// shows a 503 whose Retry-After is over 60 s at once and does not retry
-	// it.
-	strandedRetryAfter   = "3600"
-	strandedGaveUpReason = "stranded_gave_up"
+	// strandedRetryAfterSeconds is the give-up answer's Retry-After with the
+	// cap off: over 60 s, so that Claude Code shows the 503 at once and does
+	// not retry it. With CLAUDE_CODE_RETRY_WATCHDOG it sleeps the hour
+	// instead, so an end client is told at most ClientRetryAfterMax (PATCHES
+	// §78).
+	strandedRetryAfterSeconds = 3600
+	strandedGaveUpReason      = "stranded_gave_up"
 	// heldChainSlack is how long past a hold's deadline a chain of held
 	// turns lasts with no held attempt (HoldPolicy.chainGap). An attempt can
 	// run until the deadline before it fails, and Claude Code resends the
@@ -970,10 +973,11 @@ func (s Server) holdOnTransientFailure(next http.Handler) http.Handler {
 			}
 			if giveUp == strandedGaveUpReason {
 				s.unlinkStranded(last)
-				w.Header().Set("Retry-After", strandedRetryAfter)
+				retryAfter := strconv.FormatInt(s.clientRetryAfter(r, strandedRetryAfterSeconds), 10)
+				w.Header().Set("Retry-After", retryAfter)
 				w.Header().Set(subrouterReasonHeader, strandedGaveUpReason)
 				http.Error(w, last.stranded.gaveUpMessage(), http.StatusServiceUnavailable)
-				s.logStrandedGaveUp(r, last, attemptNo, policy.GiveUp)
+				s.logStrandedGaveUp(r, last, attemptNo, policy.GiveUp, retryAfter)
 				if release != nil {
 					s.logHoldEnded(r, first, last, giveUp, http.StatusServiceUnavailable, attemptNo, heldSince)
 				}
@@ -1020,13 +1024,14 @@ func (s Server) logHoldEnded(r *http.Request, first, last holdMark, outcome stri
 			"last_reason", last.reason)...)
 }
 
-// logStrandedGaveUp is the line for a stranded chat's give-up answer.
-func (s Server) logStrandedGaveUp(r *http.Request, last holdMark, attempts int, giveUp time.Duration) {
+// logStrandedGaveUp is the line for a stranded chat's give-up answer, with
+// the Retry-After it was sent.
+func (s Server) logStrandedGaveUp(r *http.Request, last holdMark, attempts int, giveUp time.Duration, retryAfter string) {
 	if s.Logger == nil {
 		return
 	}
 	s.Logger.Warn("stranded chat gave up; answered 503",
-		holdLogAttrs(r, last, "attempts", attempts, "give_up", giveUp.String(), "retry_after", strandedRetryAfter)...)
+		holdLogAttrs(r, last, "attempts", attempts, "give_up", giveUp.String(), "retry_after", retryAfter)...)
 }
 
 // noteAnswered records that one of the session's model turns was answered:

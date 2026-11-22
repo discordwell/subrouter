@@ -1,0 +1,502 @@
+#!/usr/bin/env python3
+"""privacy-check -- the pre-commit, commit-msg and pre-push hooks in ops/hooks, which are symlinks to it.
+
+Each hook refuses a change that adds a private value of the machine it runs on. It prints only
+where the value is (file:line, "in the path", or "commit message"), never the value. The values
+come live from this machine, so the repo keeps no list of them. ops/hooks/README.md names the
+sources and the rules. The matching is ops/bin/public-scrub's.
+"""
+import hashlib, importlib.machinery, importlib.util, ipaddress, json, os, pwd, re, shutil, socket, subprocess, sys, time
+
+ZERO = "0" * 40
+CACHE_TTL = 600
+MIN_LEN = 4
+
+# Values that name no one: system and device defaults, the repo's placeholder machine names, and the
+# user that tailscale gives a tailnet's tagged devices.
+GENERIC = {
+    "user", "users", "admin", "administrator", "root", "guest", "agent", "runner", "ubuntu",
+    "debian", "ec2-user", "localhost", "iphone", "ipad", "android", "raspberrypi", "macbook",
+    "macbook-pro", "macbook-air", "imac", "desktop", "laptop", "server", "router", "default", "home",
+    "tagged-devices", "tagged devices",
+}
+# The documentation ranges, which no machine uses. A tailnet address is real even where it equals one
+# of the repo's placeholders, such as 100.64.0.1, because a hook matches only the values a source reports.
+PLACEHOLDER_NETS = [ipaddress.ip_network(n) for n in (
+    "192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24", "2001:db8::/32")]
+PLACEHOLDER_DOMAIN = re.compile(r"(^|\.)(example\.(com|net|org)|example|invalid|localhost|test)$")
+DNS_NAME = re.compile(r"(?:[a-z0-9-]+\.)+[a-z][a-z0-9-]*", re.I)
+WORD = re.compile(rb"[A-Za-z0-9]+")
+# A hunk header, with a range for each parent: one in a commit's diff, one per parent in a merge's.
+HUNK = re.compile(rb"(@@+)(?: -\d+(?:,\d+)?)+ \+(\d+)")
+# The escapes in a path that git writes in C-style quotes.
+C_ESCAPE = re.compile(rb'\\([0-7]{3}|[abtnvfr"\\])')
+C_CHARS = dict(zip(b'abtnvfr"\\', b'\a\b\t\n\v\f\r"\\'))
+
+# Where internal/tailnet and cmd/subrouter look for the tailscale CLI after SUBROUTER_TAILSCALE_BIN. A git client
+# that an app starts often has only /usr/bin:/bin:/usr/sbin:/sbin on PATH.
+TAILSCALE_CLIS = ("tailscale", "/opt/homebrew/bin/tailscale", "/usr/local/bin/tailscale",
+                  "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
+                  "/Applications/Tailscale.app/Contents/MacOS/tailscale")
+# Set to the clone hook that a hook here runs, so that a clone hook which runs a hook here does not loop.
+RUNNING = "SUBROUTER_PRIVACY_HOOK"
+
+GIT = ["git", "-c", "core.quotePath=false"]
+# A merge's diff under -U0 numbers its lines wrong where it hides a line that every side holds, and patch_targets
+# skips context lines, so one line of context costs little.
+DIFF_FLAGS = ["-U1", "--no-color", "--no-ext-diff", "--no-textconv", "--no-renames", "--no-relative", "--text",
+              "--submodule=short", "--src-prefix=a/", "--dst-prefix=b/"]
+
+
+def load_scrub():
+    sys.dont_write_bytecode = True
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "bin", "public-scrub")
+    loader = importlib.machinery.SourceFileLoader("public_scrub", path)
+    module = importlib.util.module_from_spec(importlib.util.spec_from_loader("public_scrub", loader))
+    loader.exec_module(module)
+    return module
+
+
+scrub = load_scrub()
+
+
+def git(*args, check=True, stdin=None):
+    return subprocess.run([*GIT, *args], input=stdin, capture_output=True, check=check)
+
+
+def cached(name, key, fetch, ttl=CACHE_TTL):
+    """fetch()'s answer, kept for ttl seconds (None: while key holds) in a mode-600 file. A failed fetch is not kept."""
+    path = os.path.join(os.path.expanduser("~/.cache/subrouter-hooks"), name + ".json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            entry = json.load(f)
+        if entry["key"] == key and (ttl is None or 0 <= time.time() - entry["at"] < ttl):
+            return entry["values"]
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    values = fetch()
+    try:
+        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+        tmp = f"{path}.{os.getpid()}"
+        with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w", encoding="utf-8") as f:
+            json.dump({"key": key, "at": time.time(), "values": values}, f)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+    return values
+
+
+def get_json(url, timeout):
+    import urllib.request
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open(url, timeout=timeout) as res:
+        return json.load(res)
+
+
+def optional_json(url, timeout):
+    try:
+        return get_json(url, timeout)
+    except Exception:
+        return None
+
+
+def account_fields(rows):
+    if not isinstance(rows, list):
+        return []
+    return [row.get(f) for row in rows if isinstance(row, dict) for f in ("id", "label", "email", "account_identity")]
+
+
+def daemon():
+    """The pool's account ids, labels and emails, and each peer's name, host and accounts."""
+    import urllib.parse
+    base = os.environ.get("SUBROUTER_ADDR", "127.0.0.1:31415").rstrip("/")
+    # The systemd environment file and ops/deploy/macos use host:port, and srq reads a URL.
+    base = base if "://" in base else "http://" + base
+
+    def fetch():
+        # Probe first, because importing urllib.request loads ssl, which can take half a second.
+        # A literal address skips getaddrinfo, which can take as long on macOS.
+        addr = urllib.parse.urlsplit(base)
+        try:
+            family = socket.AF_INET6 if ipaddress.ip_address(addr.hostname).version == 6 else socket.AF_INET
+        except ValueError:
+            family = None
+        if family is None:
+            socket.create_connection((addr.hostname, addr.port or 80), timeout=1).close()
+        else:
+            with socket.socket(family) as probe:
+                probe.settimeout(1)
+                probe.connect((addr.hostname, addr.port or 80))
+        found = account_fields(get_json(base + "/_subrouter/accounts", 5))
+        found += account_fields(optional_json(base + "/_subrouter/usage-status?snapshot=1", 5))
+        peers = optional_json(base + "/_subrouter/peers/usage-status", 8)
+        for peer in (peers.get("peers") or []) if isinstance(peers, dict) else []:
+            found += [peer.get("name"), urllib.parse.urlsplit(peer.get("url") or "").hostname]
+            found += account_fields(peer.get("accounts"))
+        return [v for v in found if isinstance(v, str)]
+    return classify(cached("daemon", base, fetch))
+
+
+def tailscale():
+    """This node's and every peer's addresses and names, the tailnet's name, its MagicDNS suffix, and each user's
+    login and display name."""
+    # A configured CLI is the only one, as for sr, so one that does not run leaves this source out.
+    exe = (os.environ.get("SUBROUTER_TAILSCALE_BIN", "").strip()
+           or next(filter(None, map(shutil.which, TAILSCALE_CLIS)), None))
+    if not exe:
+        return []
+
+    def fetch():
+        status = json.loads(subprocess.run([exe, "status", "--json"], capture_output=True, timeout=10).stdout)
+        tailnet = status.get("CurrentTailnet") or {}
+        found = [*(status.get("TailscaleIPs") or []), status.get("MagicDNSSuffix"),
+                 tailnet.get("Name"), tailnet.get("MagicDNSSuffix")]
+        for node in [status.get("Self") or {}, *(status.get("Peer") or {}).values()]:
+            dns = (node.get("DNSName") or "").rstrip(".")
+            found += [*(node.get("TailscaleIPs") or []), node.get("HostName"), dns, dns.split(".")[0]]
+        found += [user.get(f) for user in (status.get("User") or {}).values() for f in ("LoginName", "DisplayName")]
+        return [v for v in found if isinstance(v, str)]
+    return classify(cached("tailscale", exe, fetch))
+
+
+def git_email():
+    return classify([git("config", "user.email").stdout.decode().strip()])
+
+
+def login():
+    names = [os.environ.get("LOGNAME") or "", os.environ.get("USER") or ""]
+    homes = [os.environ.get("HOME") or ""]
+    try:
+        me = pwd.getpwuid(os.getuid())
+        names.append(me.pw_name)
+        homes.append(me.pw_dir)
+    except KeyError:
+        pass
+    # A home path names someone only through its last part: /root and /home/ubuntu name no one.
+    return classify(names + [h for h in homes if not names_no_one(os.path.basename(h.rstrip("/")))])
+
+
+def private_values():
+    path = os.path.expanduser("~/.config/subrouter/private-values")
+    with open(path, encoding="utf-8") as f:
+        return classify([line.strip() for line in f if not line.lstrip().startswith("#")])
+
+
+def legacy_map():
+    rows, _ = scrub.read_map(scrub.map_path())
+    return [(r[0], r[1]) for r in rows]
+
+
+SOURCES = (daemon, tailscale, git_email, login, private_values, legacy_map)
+
+
+def kind_of(value):
+    try:
+        return "ip" if ipaddress.ip_address(value).version == 4 else "ip6"
+    except ValueError:
+        pass
+    if "@" in value:
+        return "email"
+    return "dns" if DNS_NAME.fullmatch(value) else "label"
+
+
+def classify(values):
+    return [(kind_of(v.strip()), v.strip()) for v in values if v.strip()]
+
+
+def placeholder(kind, value):
+    if kind in ("ip", "ip6"):
+        try:
+            ip = ipaddress.ip_address(value)
+        except ValueError:
+            return False
+        return ip.is_loopback or ip.is_unspecified or ip.is_link_local or any(ip in n for n in PLACEHOLDER_NETS)
+    return kind in ("email", "dns") and bool(PLACEHOLDER_DOMAIN.search(value.rsplit("@", 1)[-1].lower()))
+
+
+def collect():
+    """Every source's (kind, value) rows, less placeholders. A source that fails adds nothing."""
+    rows = {}
+    for source in SOURCES:
+        try:
+            found = source()
+        except Exception:
+            continue
+        for kind, value in found:
+            if "\n" not in value and "\t" not in value and not placeholder(kind, value):
+                rows.setdefault((kind, value.lower()), (kind, value))
+    return list(rows.values())
+
+
+def first_tree(refs):
+    for ref in refs:
+        found = git("rev-parse", "-q", "--verify", ref + "^{tree}", check=False)
+        if found.returncode == 0:
+            return found.stdout.decode().strip()
+    return None
+
+
+def in_base(needles, tree):
+    """The one-word needles the base tree holds: common words in this repo, or values public already."""
+    words = [n for n in needles if WORD.fullmatch(n[0])]
+    if tree is None or not words:
+        return set()
+
+    def fetch():
+        data = b"\n".join(d for _, d in scrub.commit_files(tree) if b"\0" not in d[:8192])
+        # The words are ASCII, so data.lower() finds them as scrub.fold(data) would, much faster on a whole tree.
+        lower = data.lower()
+        return [n[0].decode() for n in words if scrub.hits(data, [n], lower)]
+    key = hashlib.sha256(b"\0".join([tree.encode(), *sorted(n[0] for n in words)])).hexdigest()
+    return {w.encode() for w in cached("base", key, fetch, ttl=None)}
+
+
+def names_no_one(word):
+    # Tailscale tells devices of the same name apart with a suffix, as in macbook-pro-2.
+    return len(word) < MIN_LEN or re.sub(r"-\d+$", "", word.lower()) in GENERIC
+
+
+def usable_needles(rows, tree):
+    needles = [n for n in scrub.compile_needles(rows) if not names_no_one(n[0].decode("utf-8", "replace"))]
+    present = in_base(needles, tree)
+    return [n for n in needles if n[0] not in present]
+
+
+def diff_path(header):
+    """The path in a "diff --git a/P b/P" line or a merge's "diff --cc P". --no-renames makes both sides the same.
+    A path that git quotes keeps its prefix inside the quotes: "a/P" "b/P"."""
+    if header.startswith(b"diff --cc "):
+        path = header[len(b"diff --cc "):]
+    elif header.startswith(b'diff --git "'):
+        rest = header[len(b"diff --git "):]
+        path = b'"' + rest[len(b'"a/'):(len(rest) - 1) // 2]
+    else:
+        rest = header[len(b"diff --git a/"):]
+        n = (len(rest) - 3) // 2
+        path = rest[:n] if rest[n:n + 3] == b" b/" else rest
+    return unquoted(path).decode("utf-8", "replace")
+
+
+def unquoted(path):
+    """path as it is on disk. git writes a path that holds ", \\ or a control character in C-style quotes,
+    even with core.quotePath=false."""
+    if not path.startswith(b'"'):
+        return path
+    return C_ESCAPE.sub(lambda m: bytes([int(m[1], 8) if len(m[1]) == 3 else C_CHARS[m[1][0]]]), path[1:-1])
+
+
+def patch_targets(patch, prefix):
+    """A target per file with added lines (its line numbers), and one per new file's path.
+
+    A hunk line starts with a mark for each parent: one in a commit's diff, one per parent in a merge's.
+    "-" is a parent's line that the result lacks, "+" a result line that the parent lacks, and " " a
+    result line that the parent has. A line is added when no parent has it, so a merge adds only what
+    none of its parents holds. Context lines also come from a user's diff.interHunkContext or
+    $GIT_DIFF_OPTS.
+
+    A hunk ends at the first line without marks, so its header's counts are not needed. Under -U0, git
+    gets them wrong for a merge whose result is empty."""
+    added, targets = {}, []
+    path, parents, line = None, 0, 0
+    for raw in patch.split(b"\n"):
+        # diff.suppressBlankEmpty writes an empty context line without its space.
+        if parents and raw[:1] in (b"+", b"-", b" ", b"\\", b""):
+            marks = raw[:parents].ljust(parents, b" ")
+            if raw.startswith(b"\\") or b"-" in marks:  # \ No newline at end of file, or a parent's line
+                continue
+            if b" " not in marks:
+                added.setdefault(path, []).append((line, raw[parents:]))
+            line += 1
+            continue
+        parents = 0
+        if raw.startswith((b"diff --git ", b"diff --cc ")):
+            path = diff_path(raw)
+        elif raw.startswith(b"new file mode"):
+            targets.append((f"{prefix}{path}: in the path", path.encode(), None))
+        elif m := HUNK.match(raw):
+            parents, line = len(m[1]) - 1, int(m[2])
+    for path, lines in added.items():
+        # --text shows a text file that an attribute marks as binary. A file whose lines hold a NUL byte
+        # is binary, and public-scrub --check skips it too.
+        if not any(b"\0" in t for _, t in lines):
+            targets.append((prefix + path, b"\n".join(t for _, t in lines), [n for n, _ in lines]))
+    return targets
+
+
+def without_own_identity(message, emails):
+    """A trailer such as Signed-off-by: Name <email> repeats the commit's own author or committer."""
+    for email in filter(None, emails):
+        message = re.sub(b"<" + re.escape(email.encode()) + b">", b"<>", message, flags=re.I)
+    return message
+
+
+# The base a hook asks "does it already hold this word?". For a commit: origin's default branch,
+# else the branch's upstream, else HEAD. For a push, only the pushed remote's refs: its default
+# branch, else its tip of a pushed branch, else the upstream if it is on that remote. Never the
+# local tip for a push, which holds the very commits it checks.
+COMMIT_BASE = ["refs/remotes/origin/HEAD", "@{upstream}", "HEAD"]
+
+
+def pre_commit(args, stdin):
+    # A merge's staged tree is diffed against each parent, as pre-push diffs a merge.
+    merge_head = git("rev-parse", "--path-format=absolute", "--git-path", "MERGE_HEAD").stdout.decode().strip()
+    try:
+        with open(merge_head, encoding="ascii") as f:
+            merged = f.read().split()
+    except OSError:
+        merged = []
+    if merged:
+        tree = git("write-tree").stdout.decode().strip()
+        patch = git("diff", "--cc", *DIFF_FLAGS, tree, "HEAD", *merged).stdout
+    else:
+        patch = git("diff", "--cached", *DIFF_FLAGS).stdout
+    return patch_targets(patch, ""), COMMIT_BASE
+
+
+def as_edited(text):
+    """A message as git stores it after an editor: without comment lines and what follows the scissors line."""
+    comment = git("config", "core.commentChar", check=False).stdout.strip() or b"#"
+    comment = b"#" if comment == b"auto" else comment
+    kept = []
+    for line in text.split(b"\n"):
+        if line.startswith(comment + b" ------------------------ >8 ------------------------"):
+            break
+        if not line.startswith(comment):
+            kept.append(line)
+    return b"\n".join(kept)
+
+
+def commit_msg(args, stdin):
+    with open(args[0], "rb") as f:
+        text = f.read()
+    # git sets GIT_EDITOR=: when it opens no editor, as for commit -m, and then keeps comment lines.
+    if os.environ.get("GIT_EDITOR") != ":":
+        text = as_edited(text)
+    emails = [os.environ.get("GIT_AUTHOR_EMAIL"), os.environ.get("GIT_COMMITTER_EMAIL"),
+              git("config", "user.email", check=False).stdout.decode().strip()]
+    return [("commit message", without_own_identity(text, emails), None)], COMMIT_BASE
+
+
+def is_commit(sha):
+    return git("cat-file", "-e", sha + "^{commit}", check=False).returncode == 0
+
+
+def tag_messages(sha):
+    """The message of the annotated tag sha, and of each tag that it points to in turn."""
+    targets = []
+    while git("cat-file", "-t", sha).stdout.strip() == b"tag":
+        header, _, message = git("cat-file", "tag", sha).stdout.partition(b"\n\n")
+        targets.append((f"{sha[:12]} tag message", message, None))
+        sha = header.split(b"\n", 1)[0].split()[1].decode()
+    return targets
+
+
+def pre_push(args, stdin):
+    """Each new ref's name, each pushed tag's message, and each pushed commit not yet on the remote:
+    its added lines, new paths and message."""
+    remote = args[0] if args else ""
+    # A commit on one of the remote's tracking branches is on the remote already, as when a rebase moves
+    # a branch onto commits that the remote's main holds.
+    tracking = [f"--remotes={remote}"] if remote else []
+    targets, tips, seen = [], [], set()
+    for line in stdin.decode().splitlines():
+        parts = line.split()
+        if len(parts) != 4 or parts[1] == ZERO:
+            continue
+        local, remote_ref, remote_sha = parts[1], parts[2], parts[3]
+        if remote_sha == ZERO:
+            targets.append((f"{remote_ref}: in the ref name", remote_ref.encode(), None))
+        targets += tag_messages(local)
+        exclude = tracking
+        if remote_sha != ZERO and is_commit(remote_sha):
+            exclude = [remote_sha, *tracking]
+            tips.append(remote_sha)
+        # --root and --encoding undo a user's log.showRoot=false and i18n.logOutputEncoding.
+        log = git("log", "-p", "--root", "--diff-merges=dense-combined", "--encoding=UTF-8", "--no-show-signature",
+                  *DIFF_FLAGS, "--format=%x00%x1e%H%x00%ae%x00%ce%x00%B%x00", local, "--not", *exclude).stdout
+        # A binary file's bytes can hold the marker, but a patch line never starts with one.
+        for record in (b"\n" + log).split(b"\n\0\x1e")[1:]:
+            sha, author, committer, body, patch = record.split(b"\0", 4)
+            sha = sha.decode()
+            if sha in seen:
+                continue
+            seen.add(sha)
+            message = without_own_identity(body, [author.decode(), committer.decode()])
+            targets.append((f"{sha[:12]} commit message", message, None))
+            targets += patch_targets(patch, f"{sha[:12]} ")
+    # Another remote's tree, such as a private one's, says nothing about what the pushed remote holds.
+    upstream = git("rev-parse", "--symbolic-full-name", "@{upstream}", check=False).stdout.decode().strip()
+    upstream = [upstream] if upstream.startswith(f"refs/remotes/{remote}/") else []
+    return targets, [f"refs/remotes/{remote}/HEAD", *tips, *upstream]
+
+
+HOOKS = {"pre-commit": pre_commit, "commit-msg": commit_msg, "pre-push": pre_push}
+
+
+def findings(targets, needles):
+    for where, data, lines in targets:
+        found = scrub.hit_lines(data, needles)
+        if lines is None:
+            if found:
+                yield masked(where, needles)
+        else:
+            yield from (f"{masked(where, needles)}:{lines[i - 1]}" for i in found)
+
+
+def masked(where, needles):
+    """where with each value in it, as a file's path can hold one, written as <private>."""
+    data = where.encode()
+    hidden = [False] * len(data)
+    for n in needles:
+        for i in scrub.hits(data, [n]):
+            hidden[i:i + len(n[0])] = [True] * len(n[0])
+    out = re.sub(rb"\x00+", b"<private>", bytes(0 if h else c for c, h in zip(data, hidden)))
+    return out.decode("utf-8", "replace")
+
+
+def run_legacy(hook, args, stdin):
+    """The clone's own .git/hooks/<hook>, when core.hooksPath made git skip it."""
+    found = git("rev-parse", "--path-format=absolute", "--git-common-dir", "--git-path", "hooks")
+    common, hooks = found.stdout.decode().splitlines()
+    path = os.path.join(common, "hooks", hook)
+    # Without core.hooksPath, git ran that hook, and it is this one or runs this one.
+    if os.path.realpath(hooks) == os.path.realpath(os.path.dirname(path)) or os.environ.get(RUNNING) == path:
+        return 0
+    if not (os.path.isfile(path) and os.access(path, os.X_OK)):
+        return 0
+    return subprocess.run([path, *args], input=stdin, env={**os.environ, RUNNING: path}).returncode
+
+
+def main(hook, args):
+    stdin = sys.stdin.buffer.read() if hook == "pre-push" else None
+    rc = run_legacy(hook, args, stdin)
+    if rc:
+        return rc
+    rows = collect()
+    if not rows:
+        return 0
+    targets, base = HOOKS[hook](args, stdin)
+    found = list(dict.fromkeys(findings(targets, usable_needles(rows, first_tree(base)))))
+    if not found:
+        return 0
+    print(f"{hook}: refused. A private value of this machine is in:", file=sys.stderr)
+    for where in found:
+        print(f"  {where}", file=sys.stderr)
+    print("Replace each with a placeholder. ops/hooks/README.md says where the values come from.", file=sys.stderr)
+    if hook == "pre-push":
+        print("Rewrite those commits and tags, and rename those refs. A later commit that removes a value"
+              " leaves it in the history.", file=sys.stderr)
+    return 1
+
+
+if __name__ == "__main__":
+    hook = os.path.basename(sys.argv[0])
+    if hook not in HOOKS:
+        sys.exit(f"privacy-check: run it as one of the hooks {', '.join(HOOKS)}; see ops/hooks/README.md")
+    try:
+        sys.exit(main(hook, sys.argv[1:]))
+    except Exception as e:
+        # A traceback can quote a value, so name only the error's type.
+        print(f"{hook}: refused, because the privacy check failed ({type(e).__name__}). See ops/hooks/README.md.",
+              file=sys.stderr)
+        sys.exit(1)

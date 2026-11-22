@@ -1477,6 +1477,7 @@ func serve(args []string) error {
 		Hold:                      holdSettings.policy(slog.Default()),
 		OutageSpill:               outage.apply(slog.Default()),
 		PeerDownGrace:             outage.peerDownGrace,
+		ClientRetryAfterMax:       resolveClientRetryAfterMax(os.Getenv, slog.Default()),
 		AdminToken:                *adminToken,
 		AllowUnauthenticatedAdmin: *allowUnauthenticatedAdmin,
 		ShadowHealthKey:           shadowHealthKey,
@@ -1529,6 +1530,7 @@ func serve(args []string) error {
 		// session store and the box identity. No file means none.
 		AccessTokens: serveAccessTokens(filepath.Dir(*sessionPath), slog.Default()),
 	}
+	logClientRetryAfterMax(server.ClientRetryAfterMax, slog.Default())
 	if err := server.ValidateCredentialUpstreams(); err != nil {
 		return err
 	}
