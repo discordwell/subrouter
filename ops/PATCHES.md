@@ -2341,3 +2341,28 @@ the cap's line taken out of serve's Server literal, the default and 90 s cases f
   `internal/proxy/pool_exhausted.go`, `internal/proxy/hold.go`, `internal/proxy/refugee.go`,
   `cmd/subrouter/hold_config.go` (`resolveClientRetryAfterMax`, `logClientRetryAfterMax`).
 - Related: §58 (the hold), §67.5 (the give-up).
+
+## 82. Main holds what one person needs to run their own subrouter
+
+`ops/` held the laptop's tools and this log. The box deploy, the setup tools, the docs a newcomer needs and the agent skill lived outside the repository, written for a team that shared one pool. Main is now canonical for one person running their own subrouter: a Mac laptop daemon and, optionally, a Linux box of their own on Tailscale.
+
+§82.1 Docs. `ops/GETTING-STARTED.md` is the tutorial, from a fresh Mac to a working pool and a box. `ops/OPERATING.md` is the reference for day-to-day work. `ops/docscheck` fails when either names a repository path, link, setting or route that the tree does not have.
+
+§82.2 The box. `ops/deploy/lightsail/bootstrap.sh` sets a box up, `deploy-box.sh` deploys a build to it with a drain, checks and rollback, and `push-box.sh` runs the deploy over ssh. Nothing real is hardcoded. Bootstrap prints the laptop's `sr server add` with the box's `--tailscale-node-id`, without which `sr claude move` to a plain `http` URL sends nothing. It prints no `--default`, which would rewrite the laptop's Codex config and `cloud.json` and restart its daemon outside `deploy-laptop.sh`. Under §76.2 the box cases give the box's loopback listener the test address. A box's own daemon listens on `:31415` at the box's address, so for those cases only a loopback or wildcard `:31415` counts as this machine's live daemon.
+
+§82.3 Setup tools.
+- `ops/bin/subrouter-quickstart` takes a Mac from nothing to a laptop daemon every client uses. It points no client at the daemon until a separate process has proved a real turn through it, and it refuses an empty pool unless a peer serves it (§3). Its peer step restarts the job under the laptop scripts' mutation lock.
+- `ops/bin/subrouter-remote-key` mints, checks and removes `remote.key` (§17).
+- `ops/bin/subrouter-unbrick` undoes client settings that point at a daemon that does not answer.
+
+The quickstart and remote-key take `SUBROUTER_LABEL` and `SUBROUTER_PLIST`. Like the laptop scripts under §76.1, the quickstart restarts only a job that launchd loaded from its own plist, and otherwise refuses before it writes anything. Their tests follow §76: every case uses a test-only label, a case fails when its stubs see the live job, and on macOS the cases run only inside the harness's sandbox.
+
+§82.4 The skill. `ops/skills/subrouter/SKILL.md` is for agents that inspect or operate an install. `skill_test.go` fails when the skill names a path, section, route, setting, command, flag, column or quoted string that the tree does not have.
+
+§82.5 Privacy hooks. `pre-commit`, `commit-msg` and `pre-push` in `ops/hooks/` refuse a value read live from the contributor's own machine, and print only where it is. The sources are the daemon's accounts, tailscale, git's email, the login name and home path, and an optional values file. The diff they read ignores the user's git diff settings. Install them with `git config core.hooksPath ops/hooks`.
+
+§82.6 `AGENTS.md` says main is canonical and maps where things live. `README.md` points at the tutorial.
+
+- Code: `ops/deploy/lightsail/`, `ops/bin/subrouter-quickstart`, `ops/bin/subrouter-remote-key`, `ops/bin/subrouter-unbrick`, `ops/hooks/`, `ops/skills/subrouter/`
+- Tests: `ops/docscheck/`, `ops/skills/skill_test.go`, `ops/hooks/hooks_test.go`, `ops/deploy/tests/deploy-scripts-test.sh` (the box cases), `ops/deploy/tests/setup-tools-test.sh`, `ops/deploy/tests/setup_tools_test.go`
+- Docs: `ops/GETTING-STARTED.md`, `ops/OPERATING.md`, `ops/deploy/lightsail/README.md`, `ops/skills/README.md`, `ops/hooks/README.md`, `AGENTS.md`, `README.md`, `ops/README.md`

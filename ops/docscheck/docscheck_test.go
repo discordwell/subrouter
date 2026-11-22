@@ -12,31 +12,12 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
-	"slices"
 	"strings"
 	"testing"
 )
 
 // The docs this package checks, relative to ops/.
 var docs = []string{"GETTING-STARTED.md", "OPERATING.md"}
-
-// plannedUnit is a pending change whose paths the docs may name before it
-// lands. Until landed is in the tree, its paths resolve. After that each path
-// must be in the tree, so a file the change shipped under another name fails as
-// missing. An entry for a merged change is dead weight; delete it.
-type plannedUnit struct {
-	landed string
-	paths  []string
-}
-
-var plannedUnits = []plannedUnit{
-	{"ops/deploy/lightsail", []string{
-		"ops/deploy/lightsail/README.md",
-		"ops/deploy/lightsail/deploy-box.sh",
-		"ops/deploy/lightsail/bootstrap.sh",
-	}},
-	{"ops/bin/subrouter-quickstart", []string{"ops/bin/subrouter-remote-key"}},
-}
 
 var (
 	repoPathRE = regexp.MustCompile(`(?:^|[\s` + "`" + `\[])((?:ops|cmd|internal|selectacct|docs|deploy)/[A-Za-z0-9._/-]*[A-Za-z0-9_/-])`)
@@ -167,13 +148,7 @@ func clonePaths(root string, files []string) map[string]bool {
 }
 
 func pathExists(clone map[string]bool, p string) bool {
-	p = path.Clean(p)
-	for _, unit := range plannedUnits {
-		if slices.Contains(unit.paths, p) && !clone[unit.landed] {
-			return true
-		}
-	}
-	return clone[p]
+	return clone[path.Clean(p)]
 }
 
 func tokenSet(corpus []byte, re *regexp.Regexp) map[string]bool {

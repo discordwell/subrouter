@@ -2,6 +2,27 @@
 
 Go service for routing AI coding-agent traffic across subscription accounts and API keys.
 
+## This fork
+
+This repository is a maintained fork of manaflow-ai/subrouter (see `README.md`). Its `main` is canonical: it holds everything one person needs to run their own subrouter, on a Mac and optionally on a Linux box of their own. Every change lands on `main` through a pull request, and `ops/PATCHES.md` records each one against upstream by § number.
+
+Where things live:
+
+| Path | What it holds |
+|---|---|
+| `cmd/`, `internal/` and the other Go packages | subrouter itself: upstream's code with the fork's patches. |
+| `ops/GETTING-STARTED.md` | The tutorial: from a fresh Mac to a working pool, and adding a box. |
+| `ops/OPERATING.md` | Day-to-day operation: status and meters, dangerous commands, deploys, peers, troubleshooting. |
+| `ops/LAPTOP.md`, `ops/deploy/macos/` | The laptop's LaunchAgent and supervisor, and its deploy and rollback scripts. |
+| `ops/deploy/lightsail/` | Bootstrap and deploy for the box. |
+| `ops/deploy/tests/` | The tests for the deploy scripts and the setup tools. |
+| `ops/bin/` | Operator tools: `srq`, `claude-route`, `sr-local-ci`, `subrouter-quickstart`, `subrouter-remote-key` and the rest (`ops/README.md` lists them). |
+| `ops/skills/` | Claude Code skills for agents that operate subrouter. |
+| `ops/hooks/` | Privacy hooks. Install them with `git config core.hooksPath ops/hooks`. |
+| `ops/PATCHES.md`, `ops/KNOWN-ISSUES.md` | Every change against upstream and why; known problems and misleading meters. |
+
+The repository is public. Never commit a real account name or email, tailnet or public address, hostname, token, or a path under your own home. Use placeholders: `100.64.x.x` for tailnet addresses, `203.0.113.x` for public ones, `example.com`, and names like `box` and `laptop`. The hooks in `ops/hooks/` refuse a commit or push that adds a value they can find on your machine.
+
 ## Development
 
 - Before handing off changes, run the tests in Docker: `make docker-test` for the Go suite, and `ops/bin/sr-local-ci --docker deploy` for the deploy-script tests in `ops/`. Never run `go test` in `ops/` on a Mac outside a sandbox: those tests drive the laptop's launchd scripts, and a stopped plain run once unloaded the developer's live service (`ops/PATCHES.md` §76). On a Mac, `ops/bin/sr-local-ci` runs them sandboxed, and their Go test refuses to run there without a sandbox.
