@@ -35,7 +35,8 @@ set -u
 HERE=$(cd "$(dirname "$0")" && pwd -P)
 MACOS=$(cd "$HERE/../macos" && pwd -P)
 mkdir -p "$1" && ROOT=$(cd "$1" && pwd -P) || exit 2
-case "$ROOT/" in "$HOME/"|"$HOME/.subrouter/"*|"$HOME/.claude/"*|"$HOME/Library/"*|"$HOME/bin/"*|/)
+# pwd spells the root / or //, so "$ROOT/" is then // or ///.
+case "$ROOT/" in "$HOME/"|"$HOME/.subrouter/"*|"$HOME/.claude/"*|"$HOME/Library/"*|"$HOME/bin/"*|//|///)
     echo "refusing scratch dir $ROOT" >&2; exit 2 ;;
 esac
 BIN_IN=$2 TOKENS_IN=$3 PEERS=$4
@@ -198,7 +199,7 @@ P
 # One turn as Claude Code sends it, through the path, in the background.
 send_turn() {
     local sid
-    sid=$(od -An -tx1 -N16 /dev/urandom | tr -d ' \n' | sed 's/^\(........\)\(....\)\(....\)\(....\)\(............\).*/\1-\2-4\3-8\4-\5/' | cut -c1-36)
+    sid=$(od -An -tx1 -N16 /dev/urandom | tr -d ' \n' | sed 's/^\(........\)\(....\).\(...\).\(...\)\(............\).*/\1-\2-4\3-8\4-\5/')
     TURN_SID=$sid TURN_MARK="REHEARSAL-$$-$1"
     ( start=$(now)
       curl -sS -m 200 --unix-socket "$SOCK" http://api.anthropic.com/v1/messages \
