@@ -77,6 +77,8 @@ var requiredSetupToolCases = []string{
 	// (PATCHES §76.1).
 	"quickstart-peer-refuses-a-job-from-another-plist",
 	"quickstart-peer-refuses-a-job-with-no-plist",
+	"quickstart-peer-announces-its-bootout-to-the-watchdog",
+	"quickstart-peer-leaves-a-short-marker-when-its-bootstrap-fails",
 	"quickstart-peer-failed-bootstrap-says-the-daemon-is-down",
 	"quickstart-peer-step-takes-the-mutation-lock",
 	"quickstart-peer-restart-waits-for-a-slow-worker",

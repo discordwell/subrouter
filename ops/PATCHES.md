@@ -2532,7 +2532,7 @@ It never restarts a loaded job. Two watchers that restart each other is the patt
 - `ops/bin/subrouter-remote-key` mints, checks and removes `remote.key` (§17).
 - `ops/bin/subrouter-unbrick` undoes client settings that point at a daemon that does not answer.
 
-The quickstart and remote-key take `SUBROUTER_LABEL` and `SUBROUTER_PLIST`. Like the laptop scripts under §76.1, the quickstart restarts only a job that launchd loaded from its own plist, and otherwise refuses before it writes anything. Their tests follow §76: every case uses a test-only label, a case fails when its stubs see the live job, and on macOS the cases run only inside the harness's sandbox.
+The quickstart and remote-key take `SUBROUTER_LABEL` and `SUBROUTER_PLIST`. Like the laptop scripts under §76.1, the quickstart restarts only a job that launchd loaded from its own plist, and otherwise refuses before it writes anything. It announces that restart's bootout to the watchdog (§81) and withdraws it once its bootstrap worked, as `laptop-deploy-lib.sh` does. Their tests follow §76: every case uses a test-only label, a case fails when its stubs see the live job, and on macOS the cases run only inside the harness's sandbox.
 
 §82.4 The skill. `ops/skills/subrouter/SKILL.md` is for agents that inspect or operate an install. `skill_test.go` fails when the skill names a path, section, route, setting, command, flag, column or quoted string that the tree does not have.
 

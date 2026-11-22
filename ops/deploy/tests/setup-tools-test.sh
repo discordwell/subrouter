@@ -1044,6 +1044,68 @@ exit 0'
   finish
 fi
 
+# --- the watchdog's stop marker (PATCHES §81) ----------------------------------
+# The peer step's bootout is a stop on purpose, so it announces it to the
+# watchdog first and withdraws it once its own bootstrap worked, as
+# laptop-deploy-lib.sh does. The fake launchd restarts the job as
+# quickstart-peer-restart-waits-for-launchd's does, and FAKE_BOOTSTRAP_FAILS
+# makes it refuse the bootstrap. A wrapper logs the marker each verb finds.
+stub_marker_launchd() {
+  stub launchctl.rig 'echo "launchctl $*" >> "$FAKE_LOG"
+prints=$(grep -c "^launchctl print" "$FAKE_LOG")
+case "$1" in
+  managername) echo Aqua ;;
+  print)
+    [ "$prints" -gt "$FAKE_HELD" ] && exit 113
+    printf "%s = {\n\tpath = %s\n}\n" "$2" "$HOME/Library/LaunchAgents/$SUBROUTER_LABEL.plist"; exit 0 ;;
+  bootstrap)
+    [ -z "${FAKE_BOOTSTRAP_FAILS:-}" ] || { echo "Bootstrap failed: 125: Domain does not support specified action" >&2; exit 125; }
+    : > "$FAKE_DAEMON_FILE"; exit 0 ;;
+esac
+exit 0'
+  stub launchctl '
+case "$1" in bootout|bootstrap)
+  m="$HOME/.subrouter/watchdog-stop.$SUBROUTER_LABEL"
+  if [ -f "$m" ]; then echo "marker at $1: $(tr "\n" " " < "$m")now=$(date +%s)" >> "$FAKE_LOG"
+  else echo "marker at $1: none" >> "$FAKE_LOG"; fi ;;
+esac
+exec "$(dirname "$0")/launchctl.rig" "$@"'
+}
+marker_seconds_left() { # log line regex: until minus now, as that line logged them
+  grep -E -- "$1" "$C/log" | head -1 | sed -n 's/.*until=\([0-9]*\) .*now=\([0-9]*\).*/\1 \2/p' | { read -r u n; echo $((u - n)); }
+}
+
+if begin quickstart-peer-announces-its-bootout-to-the-watchdog; then
+  qs_setup; seed_remote_key "$H/.subrouter"; write_plist "{\"EnvironmentVariables\": {\"HOME\": \"$H\"}}"
+  stub_marker_launchd
+  run_qs FAKE_QS_CALL=configure_peer FAKE_HELD=8 FAKE_DAEMON_FILE="$C/daemon-up"
+  expect_rc 0; expect_out "restarted and healthy"
+  expect_log "^marker at bootout: label=$TEST_LABEL until=[0-9]+ by=subrouter-quickstart "
+  expect_log "^marker at bootstrap: label=$TEST_LABEL until=[0-9]+ "
+  # Before the bootout it covers the whole wait for launchd (600 s here) and
+  # the bootstrap after it; once the job is gone, three minutes.
+  left=$(marker_seconds_left "^marker at bootout: ")
+  [ "$left" -gt 600 ] && [ "$left" -le 790 ] && ok || bad "the marker at the bootout had ${left}s left, want 601 to 790"
+  left=$(marker_seconds_left "^marker at bootstrap: ")
+  [ "$left" -gt 0 ] && [ "$left" -le 180 ] && ok || bad "the marker at the bootstrap had ${left}s left, want 1 to 180"
+  expect_no_file "$H/.subrouter/watchdog-stop.$TEST_LABEL"
+  finish
+fi
+
+if begin quickstart-peer-leaves-a-short-marker-when-its-bootstrap-fails; then
+  # A run that cannot load the job again leaves the marker to expire within
+  # three minutes, and the watchdog then loads the job.
+  qs_setup; seed_remote_key "$H/.subrouter"; write_plist "{\"EnvironmentVariables\": {\"HOME\": \"$H\"}}"
+  stub_marker_launchd
+  run_qs FAKE_QS_CALL=configure_peer FAKE_HELD=8 FAKE_BOOTSTRAP_FAILS=1 FAKE_DAEMON_FILE="$C/daemon-up"
+  expect_rc 1; expect_out "The daemon is DOWN"
+  M="$H/.subrouter/watchdog-stop.$TEST_LABEL"
+  expect_file "$M"
+  left=$(( $(sed -n 's/^until=//p' "$M" 2>/dev/null) - $(date +%s) ))
+  [ "$left" -gt 0 ] && [ "$left" -le 180 ] && ok || bad "the marker left behind has ${left}s left, want 1 to 180"
+  finish
+fi
+
 # launchctl as a session sees it: managername prints FAKE_MANAGER (Background,
 # as from ssh) and exits FAKE_MANAGER_RC, print answers FAKE_PRINT_RC until a
 # bootout and 113 after it, and launchd refuses the bootstrap. A loaded job is
