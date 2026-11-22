@@ -45,9 +45,14 @@ const claudeSocketEnv = "SUBROUTER_CLAUDE_SOCKET"
 // path. unavailable is a path refused at start, which is never tried again, or
 // a path the keeper could not bind again, which it keeps trying.
 //
+// yielded is the supervisor's alone (claude_socket_yield.go, PATCHES section
+// 77.3): it let go of the socket and its lock on purpose and is not asking
+// for them yet.
+//
 // Fixed since 2026-11-21: the deploy scripts and a process that stands in on
 // the socket path match these words, and the supervisor-status fields
-// claude_socket_waits_for_lock and claude_socket_rebinds, by name.
+// claude_socket_waits_for_lock, claude_socket_rebinds and claude_socket_yield,
+// by name.
 const (
 	claudeSocketServing     = "serving"
 	claudeSocketUnavailable = "unavailable"
@@ -55,6 +60,7 @@ const (
 	claudeSocketSupervised  = "owned_by_supervisor"
 	claudeSocketWaiting     = "waiting"
 	claudeSocketDisplaced   = "displaced"
+	claudeSocketYielded     = "yielded"
 )
 
 // claudeSocket owns the opt-in listener and its health word.
@@ -68,12 +74,16 @@ const (
 type claudeSocket struct {
 	path       string
 	supervised bool
-	state      atomic.Value // string
+	state      atomic.Value // claudeSocketStatus
 	// open binds the path under its lock; the keeper calls it until it works.
-	open     func(string) (leasedListener, error)
-	keeper   *socketKeeper
-	listener net.Listener
-	served   chan struct{}
+	open   func(string) (leasedListener, error)
+	keeper atomic.Pointer[socketKeeper]
+	// clock and yieldExits are the supervisor's, for the keeper: its clock
+	// and its --claude-socket-yield-exits. A plain serve sets neither.
+	clock      func() time.Time
+	yieldExits int
+	listener   net.Listener
+	served     chan struct{}
 	// guard keeps every 401 from the socket's clients, which Claude Code
 	// would answer by sending the human's own stored login, and counts the
 	// clients that already send one (proxy.ClaudeSocketGuard). startGuarded
@@ -108,9 +118,9 @@ func newClaudeSocket(flagValue string, getenv func(string) string) *claudeSocket
 		open:       openLeasedClaudeSocket,
 		guard:      proxy.NewClaudeSocketGuard(nil),
 	}
-	socket.state.Store(claudeSocketUnavailable)
+	socket.state.Store(socketWord(claudeSocketUnavailable))
 	if socket.supervised {
-		socket.state.Store(claudeSocketSupervised)
+		socket.state.Store(socketWord(claudeSocketSupervised))
 	}
 	return socket
 }
@@ -118,7 +128,7 @@ func newClaudeSocket(flagValue string, getenv func(string) string) *claudeSocket
 // Status is the health word. It is only handed to the proxy when the socket is
 // configured, so an unconfigured daemon's health body is unchanged.
 func (c *claudeSocket) Status() string {
-	return c.state.Load().(string)
+	return c.state.Load().(claudeSocketStatus).word
 }
 
 func (c *claudeSocket) statusFunc() func() string {
@@ -190,8 +200,9 @@ func (c *claudeSocket) start(serve func(net.Listener) error, localDataSocket str
 		logger.Error("claude socket not served; TCP is unaffected", "path", c.path, "error", err)
 		return
 	}
-	c.keeper = keepSocket(c.path, c.open, logger, func(word string) { c.state.Store(word) })
-	listener := loopbackTCPListener{Listener: c.keeper, addr: c.keeper.Addr()}
+	keeper := keepSocket(c.path, c.open, logger, func(found claudeSocketStatus) { c.state.Store(found) }, c.clock, c.yieldExits)
+	c.keeper.Store(keeper)
+	listener := loopbackTCPListener{Listener: keeper, addr: keeper.Addr()}
 	c.listener = listener
 	c.served = make(chan struct{})
 	go func() {
@@ -200,7 +211,7 @@ func (c *claudeSocket) start(serve func(net.Listener) error, localDataSocket str
 		// Whatever ended serve, nobody accepts now: give up the path and
 		// the lock, and only then say so, after the keeper's last word.
 		_ = listener.Close()
-		c.state.Store(claudeSocketStopped)
+		c.state.Store(socketWord(claudeSocketStopped))
 		if err != nil && !errors.Is(err, http.ErrServerClosed) && !errors.Is(err, net.ErrClosed) {
 			// Never fatal (see claudeSocket). Health now says "stopped", which is
 			// what deploy-laptop.sh and anyone polling health will see.
@@ -218,10 +229,11 @@ func (c *claudeSocket) close() {
 
 // rebinds counts the times the keeper bound the path after the first.
 func (c *claudeSocket) rebinds() int {
-	if c.keeper == nil {
+	keeper := c.keeper.Load()
+	if keeper == nil {
 		return 0
 	}
-	return c.keeper.rebinds()
+	return keeper.rebinds()
 }
 
 // openPrivateServedSocket opens a socket serve serves beside TCP: the Claude
