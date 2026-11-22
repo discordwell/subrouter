@@ -730,6 +730,26 @@ func TestTheTokenTestRepeatsOnlyWhileTheBoxIsIdle(t *testing.T) {
 	}
 }
 
+// With no TestEvery set, a box's token is tested 10 minutes after the set
+// last heard from the box, and not before.
+func TestTheTokenIsTestedEveryTenMinutesByDefault(t *testing.T) {
+	box := startBox(t, okBox)
+	f := newBoxSetFixture(t, peerOf("a", box))
+	f.writeToken(t, "a", box.token, 0o600)
+	set := startSet(t, f, "", 0, &lockedBuffer{})
+	eventually(t, "the first token test", func() bool {
+		return tokenTests(box) == 1 && boxState(set, "a").Token == standby.StateOK
+	})
+
+	set.Age(9*time.Minute + 30*time.Second)
+	time.Sleep(500 * time.Millisecond)
+	if got := tokenTests(box); got != 1 {
+		t.Fatalf("%d token tests 9 min 30 s after the first, want 1", got)
+	}
+	set.Age(time.Minute)
+	eventually(t, "a second token test 10 min 30 s after the first", func() bool { return tokenTests(box) == 2 })
+}
+
 type fileState struct {
 	mode    fs.FileMode
 	size    int64
