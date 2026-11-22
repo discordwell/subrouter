@@ -65,9 +65,11 @@ T=$(cd "$T0" && pwd -P) && [ -d "$T" ] && [ "$T" != / ] || { echo "cannot resolv
 [ -n "${KEEP:-}" ] && echo "keeping $T" || trap 'chmod -R u+rwx "$T" 2>/dev/null; rm -rf "$T"' EXIT
 PASS=0; FAILED=0; FAIL_LIST=""; CASE=""; C=""; RC=0
 # A run that outlived its stubs once reached the real launchctl with the live
-# job's label (PATCHES §76). So every tool gets this label (run_sandboxed), and
-# the quickstart a closed port for its daemon (run_qs).
+# job's label (PATCHES §76). So every tool gets this label (run_sandboxed), the
+# quickstart a closed port for its daemon (run_qs), and finish fails a case
+# whose stubs were handed the live ones.
 TEST_LABEL="test.subrouter.setuptools.$$"
+LIVE_NAMES='ai\.manaflow\.subrouter|:31415([^0-9]|$)'
 
 SANDBOX=""
 if [ "${SETUP_TOOLS_SANDBOX:-1}" = 1 ] && command -v sandbox-exec >/dev/null 2>&1; then
@@ -172,6 +174,9 @@ begin() { # case name; returns 1 when filtered out
 }
 
 finish() {
+  if grep -Eq -- "$LIVE_NAMES" "$C/log" 2>/dev/null; then
+    bad "a stub was handed the live job's label or port: $(grep -Em1 -- "$LIVE_NAMES" "$C/log")"
+  fi
   if [ -n "$FAIL_LIST" ] && [ "${FAIL_LIST##* }" = "$CASE" ]; then
     echo "  --- $CASE output (tail) ---"; tail -25 "$C/out" | sed 's/^/  | /'
     echo "  --- $CASE log (tail) ---"; tail -15 "$C/log" | sed 's/^/  | /'
@@ -207,6 +212,29 @@ run_tool() { # tool [env-assignments...] [-- args...]
 # The key goes where the daemon's gate reads it (cmd/subrouter/remote_gate.go,
 # PATCHES §17), and --check applies the gate's four rules.
 run_remote_key() { run_tool "$REMOTE_KEY" "$@"; }
+
+echo "== the harness"
+
+# What finish prints for a case named probe whose stubs logged this line.
+finish_on() { # stub log line
+  (C="$C/probe"; CASE=probe; FAIL_LIST=""; mkdir -p "$C"; : > "$C/out"; printf '%s\n' "$1" > "$C/log"; finish)
+}
+
+if begin harness-fails-a-stub-handed-the-live-job; then
+  for line in "launchctl bootout gui/501/ai.manaflow.subrouter" \
+    "claude -p | settings-file=none env=none base=http://127.0.0.1:31415 token=daemon"; do
+    case "$(finish_on "$line")" in
+      *"FAIL probe: a stub was handed the live job's label or port: $line"*) ok ;;
+      *) bad "finish passed a case whose stub logged: $line" ;;
+    esac
+  done
+  # Calibration: the label and port the tools get here pass.
+  for line in "launchctl bootout gui/501/$TEST_LABEL" \
+    "claude -p | settings-file=none env=none base=http://127.0.0.1:1 token=daemon"; do
+    [ "$(finish_on "$line")" = "  ok   probe" ] && ok || bad "finish failed a case whose stub logged: $line"
+  done
+  finish
+fi
 
 echo "== subrouter-remote-key"
 

@@ -15,6 +15,9 @@ import (
 // subrouter-unbrick and subrouter-quickstart. Removing one from the harness
 // fails this test, so a behaviour cannot lose its test silently.
 var requiredSetupToolCases = []string{
+	// The harness fails a case whose stubs were handed the live job's label or
+	// port (PATCHES §76).
+	"harness-fails-a-stub-handed-the-live-job",
 	// subrouter-remote-key: the key goes where the gate reads it, and --check
 	// applies the gate's rules (PATCHES §17).
 	"remote-key-mints-where-the-gate-reads",
