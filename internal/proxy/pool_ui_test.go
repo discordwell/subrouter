@@ -36,14 +36,16 @@ func claudeWeekly(usedPercent float64, resetAfter int64) accounts.UsageWindow {
 
 // A Codex weekly window is a tumbling fuse. Both accounts below read 100% left
 // on any headroom meter; only one of them has anything at risk. If this test
-// stops distinguishing them the board has lost its whole reason to exist.
+// stops distinguishing them the board has lost its whole reason to exist. The
+// board reads it as the score does, the fact ranking reads (PATCHES §86).
 func TestFuseSeparatesPristineFromRunning(t *testing.T) {
-	pristine := readFuse([]accounts.UsageWindow{weeklyWindow(0, 604800)}, "")
+	_, row := classifyFor(t, accounts.ProviderCodex, []accounts.UsageWindow{weeklyWindow(0, 604800)})
+	pristine := row.Fuse
 	if pristine == nil {
 		t.Fatal("no fuse read from a weekly window")
 	}
-	if pristine.State != poolFusePristine {
-		t.Fatalf("reset == window length must read pristine, got %q", pristine.State)
+	if pristine.State != poolFusePristine || !row.WeeklyUnstarted {
+		t.Fatalf("reset == window length must read pristine, got %q (weekly_unstarted %v)", pristine.State, row.WeeklyUnstarted)
 	}
 	if pristine.Elapsed != 0 || pristine.Forfeit != 0 {
 		t.Fatalf("a pristine fuse has burned nothing: elapsed=%v forfeit=%v", pristine.Elapsed, pristine.Forfeit)
@@ -51,9 +53,9 @@ func TestFuseSeparatesPristineFromRunning(t *testing.T) {
 
 	// One second off the full window and the clock is lit: the remaining budget
 	// now forfeits at the roll whether or not anyone spends it.
-	running := readFuse([]accounts.UsageWindow{weeklyWindow(0, 604799)}, "")
-	if running.State != poolFuseRunning {
-		t.Fatalf("reset one second below the window must read running, got %q", running.State)
+	_, row = classifyFor(t, accounts.ProviderCodex, []accounts.UsageWindow{weeklyWindow(0, 604799)})
+	if row.Fuse.State != poolFuseRunning || row.WeeklyUnstarted {
+		t.Fatalf("reset one second below the window must read running, got %q (weekly_unstarted %v)", row.Fuse.State, row.WeeklyUnstarted)
 	}
 }
 
@@ -62,7 +64,7 @@ func TestFuseSeparatesPristineFromRunning(t *testing.T) {
 // at an even pace.
 func TestFuseForfeitIsElapsedMinusSpent(t *testing.T) {
 	// Half the week gone, a tenth of the budget spent.
-	fuse := readFuse([]accounts.UsageWindow{weeklyWindow(10, 302400)}, "")
+	fuse := readFuse([]accounts.UsageWindow{weeklyWindow(10, 302400)}, "", false)
 	if fuse.State != poolFuseRunning {
 		t.Fatalf("state = %q", fuse.State)
 	}
@@ -77,7 +79,7 @@ func TestFuseForfeitIsElapsedMinusSpent(t *testing.T) {
 	}
 
 	// Spending FASTER than the clock is not a negative forfeit, it is none.
-	ahead := readFuse([]accounts.UsageWindow{weeklyWindow(80, 302400)}, "")
+	ahead := readFuse([]accounts.UsageWindow{weeklyWindow(80, 302400)}, "", false)
 	if ahead.Forfeit != 0 {
 		t.Fatalf("forfeit = %v, want 0 when spending outruns the clock", ahead.Forfeit)
 	}
@@ -91,19 +93,18 @@ func TestFuseReadsSparkIndependently(t *testing.T) {
 		weeklyWindow(35, 200000),
 		{Name: "primary", UsedPercent: 0, LimitWindowSeconds: 604800, ResetAfterSeconds: 604800, Feature: sparkFeature},
 	}
-	primary := readFuse(windows, "")
-	spark := readFuse(windows, sparkFeature)
-	if primary.State != poolFuseRunning {
-		t.Fatalf("primary = %q, want running", primary.State)
+	_, row := classifyFor(t, accounts.ProviderCodex, windows)
+	if row.Fuse == nil || row.Fuse.State != poolFuseRunning {
+		t.Fatalf("primary = %+v, want running", row.Fuse)
 	}
-	if spark.State != poolFusePristine {
-		t.Fatalf("spark = %q, want pristine: priming primary does not arm spark", spark.State)
+	if row.Spark == nil || row.Spark.State != poolFusePristine {
+		t.Fatalf("spark = %+v, want pristine: priming primary does not arm spark", row.Spark)
 	}
 }
 
 // A 5h window is not a fuse and must not be read as one.
 func TestFuseIgnoresShortWindows(t *testing.T) {
-	if fuse := readFuse([]accounts.UsageWindow{shortWindow(50, 9000)}, ""); fuse != nil {
+	if fuse := readFuse([]accounts.UsageWindow{shortWindow(50, 9000)}, "", false); fuse != nil {
 		t.Fatalf("a 5h window produced a fuse reading: %+v", fuse)
 	}
 }
@@ -844,7 +845,7 @@ func TestSpendCapIsNotAFuse(t *testing.T) {
 		t.Fatalf("state = %q (%s), want %q", state, row.StateNote, poolStateOK)
 	}
 	for _, windows := range [][]accounts.UsageWindow{{spend(40, 2656800)}, {spend(10, 15*24*60*60)}} {
-		if fuse := readFuse(windows, ""); fuse != nil {
+		if fuse := readFuse(windows, "", false); fuse != nil {
 			t.Fatalf("spend window %+v read as a fuse: %+v", windows[0], fuse)
 		}
 	}
@@ -865,9 +866,9 @@ func TestFuseOfAnUntouchedWindowStaysPristineThroughUsageStatus(t *testing.T) {
 		AccountStatus: AccountStatus{ID: "box@example.com", Provider: accounts.ProviderCodex},
 		Windows:       []accounts.UsageWindow{untouched},
 	}})
-	fuse := readFuse(served[0].Windows, "")
-	if fuse == nil || fuse.State != poolFusePristine {
-		t.Fatalf("fuse = %+v, want an untouched window to stay pristine through usage-status", fuse)
+	_, row := classifyFor(t, accounts.ProviderCodex, served[0].Windows)
+	if row.Fuse == nil || row.Fuse.State != poolFusePristine {
+		t.Fatalf("fuse = %+v, want an untouched window to stay pristine through usage-status", row.Fuse)
 	}
 	// A running window still counts down to now.
 	running := untouched
@@ -884,11 +885,11 @@ func TestFuseOfAnUntouchedWindowStaysPristineThroughUsageStatus(t *testing.T) {
 // weekly fuse.
 func TestFuseIgnoresADailyCap(t *testing.T) {
 	daily := accounts.UsageWindow{Name: "daily", UsedPercent: 30, LimitWindowSeconds: 86400, ResetAfterSeconds: 3600}
-	if fuse := readFuse([]accounts.UsageWindow{daily}, ""); fuse != nil {
+	if fuse := readFuse([]accounts.UsageWindow{daily}, "", false); fuse != nil {
 		t.Fatalf("daily cap read as a weekly fuse: %+v", fuse)
 	}
 	weekly := weeklyWindow(10, 302400)
-	if fuse := readFuse([]accounts.UsageWindow{daily, weekly}, ""); fuse == nil || fuse.WindowSeconds != 604800 {
+	if fuse := readFuse([]accounts.UsageWindow{daily, weekly}, "", false); fuse == nil || fuse.WindowSeconds != 604800 {
 		t.Fatalf("fuse = %+v, want the weekly window beside the daily cap", fuse)
 	}
 }

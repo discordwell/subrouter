@@ -75,6 +75,18 @@ type contractBox struct {
 	turns []boxTurn
 	pool  *RemotePool
 	srv   *httptest.Server
+	// provider is the box's accounts' provider; empty is Claude.
+	provider accounts.Provider
+	// withholdUnstarted: a box from before PATCHES §86, which publishes no
+	// weekly_unstarted.
+	withholdUnstarted bool
+}
+
+func (b *contractBox) accountProvider() accounts.Provider {
+	if b.provider == "" {
+		return accounts.ProviderClaude
+	}
+	return b.provider
 }
 
 func newContractBox(t *testing.T, accounts ...boxAccount) *contractBox {
@@ -92,9 +104,9 @@ func (b *contractBox) scheduler() selectacct.Scheduler {
 	live := map[string]int{}
 	for _, a := range b.accounts {
 		score := a.Score
-		score.Provider = accounts.ProviderClaude
+		score.Provider = b.accountProvider()
 		scores = append(scores, score)
-		live[selectacct.ScoreKey(accounts.ProviderClaude, score.AccountID)] = a.Live
+		live[selectacct.ScoreKey(score.Provider, score.AccountID)] = a.Live
 	}
 	return selectacct.NewScheduler(scores).WithLiveSessionCounts(live)
 }
@@ -125,10 +137,13 @@ func (b *contractBox) usageBody() []byte {
 			normalized["seconds_to_short_reset"] = s.ShortResetAfterSeconds
 		}
 		if !b.legacy {
-			normalized["new_session"] = scheduler.NewSessionVerdict(accounts.ProviderClaude, s.AccountID, now)
+			normalized["new_session"] = scheduler.NewSessionVerdict(b.accountProvider(), s.AccountID, now)
+		}
+		if s.WeeklyUnstarted && !b.withholdUnstarted {
+			normalized["weekly_unstarted"] = true
 		}
 		rows = append(rows, map[string]any{
-			"id": s.AccountID, "provider": "claude", "auth_mode": "oauth",
+			"id": s.AccountID, "provider": string(b.accountProvider()), "auth_mode": "oauth",
 			"auth_checked": true, "auth_valid": true, "normalized": normalized,
 		})
 	}
@@ -179,7 +194,7 @@ func (b *contractBox) serve(w http.ResponseWriter, r *http.Request) {
 			writeTargetRefusal(w, target, "unknown_account", false, nil)
 			return
 		}
-		verdict := b.scheduler().NewSessionVerdict(accounts.ProviderClaude, target, time.Now())
+		verdict := b.scheduler().NewSessionVerdict(b.accountProvider(), target, time.Now())
 		continuing := b.pins[sessionID] == target
 		if reason, refused := b.refuse[target]; refused {
 			record(http.StatusConflict, "")

@@ -2147,6 +2147,14 @@ type NormalizedUsage struct {
 	// the account's, and a peer reads a pool entry with its account's
 	// (inheritPeerAccountFacts).
 	FableWeekSpent float64 `json:"fable_week_spent,omitempty"`
+	// WeeklyUnstarted is Score.WeeklyUnstarted: the binding weekly window's
+	// reading gives its whole length as left, so the next new session goes
+	// here first to start its clock (PATCHES §86). A peer ranks the account
+	// on it with its own switch. Published as read, whatever this daemon's
+	// switch and start marks say: the deciding daemon keeps its own marks.
+	// Absent is false -- a running week, no weekly window, or a daemon from
+	// before §86. A pool entry carries its own pool's week.
+	WeeklyUnstarted bool `json:"weekly_unstarted,omitempty"`
 	// Fresh distinguishes a score computed from a current usage fetch from one
 	// carried forward as a seed after a failed fetch. A stale reading is still
 	// the scheduler's working belief, but it is not evidence.
@@ -2186,6 +2194,7 @@ func normalizedFromScore(score selectacct.Score, now time.Time) NormalizedUsage 
 		WeeklyHeadroom:      score.WeeklyHeadroom,
 		Fresh:               score.Fresh,
 		FableWeekSpent:      score.FableSpent,
+		WeeklyUnstarted:     score.WeeklyUnstarted,
 	}
 	if !score.WeeklyResetAt.IsZero() {
 		if remaining := score.WeeklyResetAt.Sub(now); remaining > 0 {
@@ -12938,12 +12947,18 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 			*options.pendingSessionMoveReason = moveReason
 		}
 		s.logAccountMove(agentType, sessionID, model, previousAccountID, account.ID, provider, moveReason, &scheduler, true)
+		s.noteNewLocalSession(options.crossPool, scheduler, account, agentType, sessionID)
 		return account, sessionID, userEmail, capacity, nil
 	}
 	s.logAccountMove(agentType, sessionID, model, previousAccountID, account.ID, provider, moveReason, &scheduler, false)
 	assignment, err := s.Sessions.Put(agentType, sessionID, account.ID, userEmail)
 	if err != nil {
 		return accounts.Account{}, sessionID, userEmail, routingCapacity{}, err
+	}
+	if previousAccountID != account.ID {
+		// A new session here: it starts the account's week if that has not
+		// started (PATCHES §86.2).
+		s.noteNewLocalSession(options.crossPool, scheduler, account, agentType, sessionID)
 	}
 	if previousAccountID == "" && s.SchedulerRef != nil {
 		// Placement statistics (upstream #388); they decide nothing.

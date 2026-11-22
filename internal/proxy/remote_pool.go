@@ -689,6 +689,12 @@ type remotePoolNormalized struct {
 	// 1x. The peer publishes it at the top level only; a pool entry takes its
 	// account's.
 	FableWeekSpent float64 `json:"fable_week_spent"`
+	// WeeklyUnstarted is the peer's reading that the account's weekly window
+	// has not started (PATCHES §86): this daemon's clause then gives the
+	// account the next new session, unless this daemon marked it for one it
+	// sent there. Absent -- a running week, or a peer before §86 -- is false.
+	// A pool entry's is its own pool's week, never its account's.
+	WeeklyUnstarted bool `json:"weekly_unstarted"`
 	// NewSession is the peer's OWN verdict on a new session placed on this
 	// account now (PATCHES §31): computed by its selection scheduler, with
 	// the live session counts and reserves this daemon cannot see. A
@@ -858,6 +864,7 @@ func (n remotePoolNormalized) score(id string, now time.Time) (selectacct.Score,
 		score.LiveSessions = verdict.LiveSessions
 	}
 	score.FableSpent = min(max(n.FableWeekSpent, 0), 1)
+	score.WeeklyUnstarted = n.WeeklyUnstarted
 	return score, true
 }
 
@@ -2278,6 +2285,8 @@ func (s Server) forwardToPeer(pool *RemotePool, r *http.Request, agentType, sess
 		s.noteAnswered(agentType, sessionID)
 	}
 	pool.routed.note(string(providerForRequest(agentType, clientPath)), target, time.Now())
+	// A new session placed on the target starts its week (PATCHES §86.2).
+	notePeerTargetServed(r.Context(), pool, target, out)
 	if target != "" && served != "" && !strings.EqualFold(served, target) {
 		// A peer that ignores targets (an older daemon, or one that failed over
 		// on its own) served the turn on an account this daemon never ranked.
@@ -2661,6 +2670,9 @@ func (s Server) serveWebSocketToPeer(w http.ResponseWriter, r *http.Request, poo
 		pool.delegations.release(key, claimed)
 		return out
 	}
+	// A new session placed on the target starts its week (PATCHES §86.2):
+	// marked now, not when the socket closes.
+	notePeerTargetServed(r.Context(), pool, target, out)
 	defer clientConn.Close()
 	clientConn.SetReadLimit(maxWebSocketMessageBytes)
 	peerConn.SetReadLimit(maxWebSocketMessageBytes)
