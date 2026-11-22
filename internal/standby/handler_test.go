@@ -3,6 +3,7 @@ package standby_test
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -571,6 +572,107 @@ func TestAFailureAfterTheFirstResponseByteIsNotRetried(t *testing.T) {
 	if n := second.connections.Load(); n != 0 {
 		t.Fatalf("second box got %d connections, want none", n)
 	}
+}
+
+// silentRelay passes TCP between the stand-in and a box until it falls
+// silent. Then it keeps every connection open and passes no byte either way,
+// as a path does once the Mac slept or a gateway dropped its state.
+type silentRelay struct {
+	listener net.Listener
+	silent   atomic.Bool
+}
+
+func startSilentRelay(t *testing.T, target string) *silentRelay {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	relay := &silentRelay{listener: listener}
+	var mu sync.Mutex
+	var open []net.Conn
+	t.Cleanup(func() {
+		_ = listener.Close()
+		mu.Lock()
+		defer mu.Unlock()
+		for _, conn := range open {
+			_ = conn.Close()
+		}
+	})
+	go func() {
+		for {
+			client, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			upstream, err := net.Dial("tcp", target)
+			if err != nil {
+				_ = client.Close()
+				continue
+			}
+			mu.Lock()
+			open = append(open, client, upstream)
+			mu.Unlock()
+			go relay.pipe(upstream, client)
+			go relay.pipe(client, upstream)
+		}
+	}()
+	return relay
+}
+
+func (r *silentRelay) pipe(dst, src net.Conn) {
+	defer dst.Close()
+	buf := make([]byte, 32<<10)
+	for {
+		n, err := src.Read(buf)
+		if n > 0 && !r.silent.Load() {
+			if _, err := dst.Write(buf[:n]); err != nil {
+				return
+			}
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+
+// Every session the stand-in moves to a box shares one HTTP/2 connection. A
+// connection that falls silent is given up after an unanswered ping, about
+// 20 s, not after the 150 s header bound, so its sessions get an answer they
+// can retry.
+func TestAConnectionThatFallsSilentIsGivenUpBeforeTheHeaderBound(t *testing.T) {
+	box := startBox(t, okBox)
+	relay := startSilentRelay(t, box.server.Listener.Addr().String())
+	through, err := standby.NewBox("a", "https://"+relay.listener.Addr().String(), box.token, box.pin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	front, _ := startStandIn(t, boxList{through})
+	if resp := send(t, front, http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"m"}`), claudeHeaders()); resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 before the path fell silent", resp.StatusCode)
+	}
+	if seen := box.requests(); len(seen) != 1 || seen[0].Proto != "HTTP/2.0" {
+		t.Fatalf("the box saw %+v, want one HTTP/2 request", seen)
+	}
+
+	relay.silent.Store(true)
+	started := time.Now()
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, front.URL+"/v1/messages", strings.NewReader(`{"model":"m"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header = claudeHeaders()
+	resp, err := front.Client().Do(req)
+	if err != nil {
+		t.Fatalf("no answer after %v: %v", time.Since(started).Round(time.Second), err)
+	}
+	defer resp.Body.Close()
+	if elapsed := time.Since(started); elapsed > 45*time.Second {
+		t.Fatalf("answered after %v, want about 20 s", elapsed.Round(time.Second))
+	}
+	assertUnavailable(t, resp, "standby_box_failed")
 }
 
 // A request pinned to an account is answered 503 and never
