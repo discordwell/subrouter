@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Continue Claude Code workflow agents that died mid-work, and carry their runs on.
 
-  wf_revive.py list  [--session <id>] [--runs wf_a,wf_b] [--hours 6]
+  wf_revive.py list  [--session <id>] [--runs wf_a,wf_b] [--hours 6] [--restarted <time>]
   wf_revive.py plan  [--runs ...] [--reports <dir>]
   wf_revive.py stage [--runs ...] [--ids a1,a2 | --all-dead] [--reports <dir>]
   wf_revive.py check --ids a1,a2
@@ -10,9 +10,9 @@
 
 list   one row per agent that started and returned no result, with a state:
          dead           the run gave up on it (a `failed` row in the journal), or the run is over
-                        (finished or stopped) and it never returned. Revive it.
+                        (finished, stopped, or dead with its session) and it never returned. Revive it.
          quiet          its run is going, it has no `failed` row, and it wrote nothing for two
-                        minutes. It is inside a long tool call, or its whole session died.
+                        minutes. It is inside a long tool call, or waits for the model.
          never-started  one turn at most. Nothing to continue: its stage starts fresh.
          revived        its transcript is staged; SendMessage has continued it, or can.
          live           wrote in the last two minutes. Leave it alone.
@@ -43,6 +43,12 @@ that label with no number started before it and every agent before it under that
 it started. Agents numbered `#<N>` with no unnumbered first, like a review panel, or that ran side by
 side, or after one of them returned, are stages of their own.
 
+A run is over when the session wrote its record, or when it has none and nothing in its folder was written
+since the session's Claude Code process started: a run dies with the process that started it, and a session
+that dies writes no record. The tool reads that start from the process it runs under when --session is its own
+session. Give it with --restarted <time>, as 2026-11-22T16:44:14Z, when the tool runs anywhere else. For such
+a run, rerun takes the script and the arguments from the Workflow call in the session's transcript.
+
 The session id defaults to $CLAUDE_CODE_SESSION_ID. Reports default to <session>/subagents/revived/.
 Read SKILL.md beside this file first.
 """
@@ -55,6 +61,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import time
 
@@ -66,6 +73,7 @@ STAMP = re.compile(r'"timestamp":"(\d{4}-\d\d-\d\dT[0-9:]+)')
 MARK = "// wf-revive:done"
 QUIET_S = 120
 IGNORED = ("retry", "superseded")
+RESTARTED: float | None = None      # when this session's Claude Code process started; main() sets it
 
 
 def subagents_dir(session: str) -> str:
@@ -128,8 +136,65 @@ def in_tool(log: str) -> str:
 
 
 def record_of(run: str, base: str) -> str:
-    """The session writes this file when a run ends, finished or stopped. A run with none is going."""
+    """The session writes this file when a run ends, finished or stopped."""
     return os.path.join(os.path.dirname(base), "workflows", f"{os.path.basename(run)}.json")
+
+
+def process_started() -> float | None:
+    """When the Claude Code process this tool runs under started, or None when it runs under none."""
+    pid = os.getppid()
+    for _ in range(16):
+        found = subprocess.run(["ps", "-o", "ppid=,lstart=,comm=", "-p", str(pid)], capture_output=True, text=True,
+                               env={**os.environ, "LC_ALL": "C"}).stdout.split()
+        if len(found) < 7:
+            return None
+        if os.path.basename(" ".join(found[6:])) == "claude":
+            return time.mktime(time.strptime(" ".join(found[1:6]), "%a %b %d %H:%M:%S %Y"))
+        pid = int(found[0])
+        if pid <= 1:
+            return None
+    return None
+
+
+def over(run: str, base: str) -> bool:
+    """Whether a run has ended. A run lives in the process that started it, and a session that dies writes no
+    record. So a run with no record is also over when nothing in its folder was written since the session's
+    process started. Silence alone never ends a run: one written since that start is going."""
+    if os.path.exists(record_of(run, base)):
+        return True
+    if RESTARTED is None:
+        return False
+    written = [os.path.join(run, "journal.jsonl"), *glob.glob(os.path.join(run, "agent-*.jsonl"))]
+    return max(os.path.getmtime(path) for path in written) < RESTARTED
+
+
+def launch_of(run: str, base: str) -> dict | None:
+    """What started a run: its record, or for a run that died with its session, the input of the Workflow
+    call in the session's transcript whose result names the run (`Run ID: <run>`, Claude Code 2.1.328)."""
+    record = record_of(run, base)
+    if os.path.exists(record):
+        return json.load(open(record, encoding="utf-8"))
+    name, calls = os.path.basename(run), {}
+    try:
+        lines = open(os.path.dirname(base) + ".jsonl", encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    with lines:
+        for line in lines:
+            if '"Workflow"' not in line and name not in line:
+                continue
+            try:
+                content = json.loads(line)["message"]["content"]
+            except (ValueError, KeyError, TypeError):
+                continue
+            for part in content if isinstance(content, list) else []:
+                if not isinstance(part, dict):
+                    continue
+                if part.get("type") == "tool_use" and part.get("name") == "Workflow":
+                    calls[part.get("id")] = part.get("input") or {}
+                elif part.get("tool_use_id") in calls and f"Run ID: {name}" in json.dumps(part.get("content")):
+                    return calls[part["tool_use_id"]]
+    return None
 
 
 def unfinished(run: str, base: str) -> list[dict]:
@@ -147,7 +212,7 @@ def unfinished(run: str, base: str) -> list[dict]:
         elif kind == "failed":
             failed.add(agent)
     finished = {stage[a] for a in done if a in stage}
-    over = os.path.exists(record_of(run, base))
+    ended_run = over(run, base)
     rows = []
     for agent in order:
         if agent in done:
@@ -169,10 +234,10 @@ def unfinished(run: str, base: str) -> list[dict]:
         if stamps:
             first, last = (datetime.datetime.fromisoformat(s) for s in (min(stamps), max(stamps)))
             row["minutes"], row["last"] = int((last - first).total_seconds() // 60), max(stamps)[11:16]
-        ended = over or agent in failed
+        ended = ended_run or agent in failed
         if os.path.exists(os.path.join(base, f"agent-{agent}.jsonl")):
             row["state"] = "revived"
-        elif not over and time.time() - os.path.getmtime(log) < QUIET_S:
+        elif not ended_run and time.time() - os.path.getmtime(log) < QUIET_S:
             row["state"] = "live"
         elif row["stage"] in finished:
             row["state"] = "superseded"
@@ -287,7 +352,7 @@ def plan_of(run: str, base: str, reports: str) -> list[dict]:
             continue
         if row["stage"] not in held or held[row["stage"]]["state"] == "no-transcript":
             held[row["stage"]] = row
-    over = os.path.exists(record_of(run, base))
+    ended_run = over(run, base)
     steps = []
     for name in dict.fromkeys(stage.values()):
         row = held.get(name, {})
@@ -302,7 +367,7 @@ def plan_of(run: str, base: str, reports: str) -> list[dict]:
                 step = {"action": "wait", "id": row["id"], "why": f"its revived agent's report {got['$wait']} {why}"}
             else:
                 step = {"action": "reuse", "id": row["id"], "why": "its revived agent's report"}
-        elif not over:
+        elif not ended_run:
             step = {"action": "leave", "id": row["id"], "why": f"its run is going and its script owns it ({row['state']})"}
         elif row["state"] == "dead":
             step = {"action": "revive", "id": row["id"], "why": f"it died after {row['turns']} turns"}
@@ -316,13 +381,15 @@ def plan_of(run: str, base: str, reports: str) -> list[dict]:
 def rerun(run: str, base: str, reports: str, out_dir: str, wait: bool) -> dict | None:
     """The Workflow input that carries one finished run on, or why there is none."""
     name = os.path.basename(run)
-    record_path = record_of(run, base)
     open_rows = [r for r in unfinished(run, base) if r["state"] not in IGNORED]
     if not open_rows:
         return None
-    if not os.path.exists(record_path):
+    if not over(run, base):
         return {"run": name, "skipped": "the run is still going: leave it alone"}
-    record = json.load(open(record_path, encoding="utf-8"))
+    record = launch_of(run, base)
+    if record is None:
+        return {"run": name, "skipped": "the run died with its session, and the session's transcript holds no Workflow "
+                "call that started it. Start each unit's remaining stages by hand; `done` prints the finished results."}
     source_path = record.get("scriptPath", "")
     source = open(source_path, encoding="utf-8").read() if os.path.exists(source_path) else record.get("script", "")
     finished = done_map(run, base, reports)
@@ -364,10 +431,16 @@ def main() -> int:
     parser.add_argument("--reports", default="")
     parser.add_argument("--out", default="")
     parser.add_argument("--wait", action="store_true")
+    parser.add_argument("--restarted", default="")
     args = parser.parse_args()
     if not args.session:
         sys.exit("wf_revive: no session id; give --session")
     base = subagents_dir(args.session)
+    global RESTARTED
+    if args.restarted:
+        RESTARTED = datetime.datetime.fromisoformat(args.restarted.replace("Z", "+00:00")).timestamp()
+    elif args.session == os.environ.get("CLAUDE_CODE_SESSION_ID"):
+        RESTARTED = process_started()
     reports = args.reports or os.path.join(base, "revived")
     runs = runs_of(base, args.runs, args.hours)
     ids = set(filter(None, args.ids.split(",")))

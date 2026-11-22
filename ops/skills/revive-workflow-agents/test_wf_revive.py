@@ -306,6 +306,57 @@ class Revive(unittest.TestCase):
         self.assertIn("finished stages would run again", plan["skipped"])
         self.assertNotIn("workflow", plan)
 
+    def transcript(self, launch):
+        """The session's own transcript: the Workflow call that started the run, and the result that names it."""
+        rows = [{"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "t1", "name": "Workflow", "input": launch}]}},
+                {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "t1",
+                                                          "content": f"Workflow launched in background.\nRun ID: {RUN}\n"}]}}]
+        with open(self.session + ".jsonl", "w") as handle:
+            handle.write("\n".join(json.dumps(row) for row in rows) + "\n")
+
+    def restarted(self, seconds_ago):
+        when = time.gmtime(time.time() - seconds_ago)
+        return ("--restarted", time.strftime("%Y-%m-%dT%H:%M:%SZ", when))
+
+    def test_a_run_not_written_since_its_session_restarted_is_over(self):
+        self.agent("a1", "build:u1", 5, None, last_tool="Bash")     # ten minutes inside one Bash call
+        self.agent("a2", "build:u2", 1, None)
+        self.write(finished=False)                                   # the session died: no record that the run ended
+        os.utime(os.path.join(self.run, "journal.jsonl"), (time.time() - 600,) * 2)
+        self.assertEqual(self.states(), {"a1": "quiet", "a2": "quiet"})
+        before = self.restarted(3600)                                # the run was written after this start: it is going
+        self.assertIn("quiet", self.tool("list", *before))
+        self.assertIn("still going", self.tool("rerun", *before))
+        after = self.restarted(60)
+        listed = self.tool("list", *after)
+        self.assertIn("a1  dead", listed)
+        self.assertIn("a2  never-started", listed)
+        steps = [json.loads(line) for line in self.tool("plan", *after).splitlines()[:-1]]
+        self.assertEqual({step["stage"]: step["action"] for step in steps}, {"build:u1": "revive", "build:u2": "start fresh"})
+        self.assertIn("1 staged", self.tool("stage", "--all-dead", *after))
+
+    def test_rerun_carries_on_a_run_whose_session_died_from_the_call_in_the_transcript(self):
+        self.agent("a1", "build:u1", 5, "result")
+        self.agent("a2", "build:u2", 1, None)
+        self.write(finished=False)
+        os.utime(os.path.join(self.run, "journal.jsonl"), (time.time() - 600,) * 2)
+        after = self.restarted(60)
+        self.assertIn("holds no Workflow call", json.loads(self.tool("rerun", *after))["skipped"])
+        script = os.path.join(self.home.name, "script.js")
+        with open(script, "w") as handle:
+            handle.write(SCRIPT)
+        self.transcript({"scriptPath": script, "args": {"units": ["a", "b"]}})
+        plan = json.loads(self.tool("rerun", *after))
+        self.assertEqual((plan["finished"], plan["starts fresh"]), (1, ["build:u2"]))
+        self.assertEqual(plan["workflow"]["args"], {"units": ["a", "b"]})
+        with open(plan["workflow"]["scriptPath"]) as handle:
+            self.assertIn('"build:u1": {"value": "build:u1"}', handle.read())
+        self.transcript({"script": SCRIPT})                         # a script passed inline has no file to read
+        plan = json.loads(self.tool("rerun", *after))
+        self.assertNotIn("args", plan["workflow"])
+        with open(plan["workflow"]["scriptPath"]) as handle:
+            self.assertTrue(handle.read().startswith("export const meta"))
+
 
 if __name__ == "__main__":
     unittest.main()
