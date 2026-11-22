@@ -236,11 +236,13 @@ func TestANewSessionOnAnUnstartedWeekMarksItForTenMinutes(t *testing.T) {
 	accts := []account.Account{codexAccount("midweek"), codexAccount("lastday"), codexAccount("fresh"),
 		{ID: "holder", Provider: account.ProviderClaude, AuthMode: account.AuthModeOAuth}}
 	ref := NewSchedulerRef(NewScheduler(scores))
-	// todaysOrder is the ranking with §86 switched off, in both modes.
+	// todaysOrder is the ranking with §86 switched off and no start mark, in
+	// both modes: a marked account must rank as if neither existed.
 	todaysOrder := func(at time.Time) [2][]string {
 		SetStartUnstartedWeek(false)
 		defer SetStartUnstartedWeek(true)
-		return [2][]string{rankedIDs(t, ref.Get(), at, true, accts...), rankedIDs(t, ref.Get(), at, false, accts...)}
+		unmarked := ref.Get().withStartSent(nil)
+		return [2][]string{rankedIDs(t, unmarked, at, true, accts...), rankedIDs(t, unmarked, at, false, accts...)}
 	}
 	ranking := func(at time.Time) [2][]string {
 		return [2][]string{rankedIDs(t, ref.Get(), at, true, accts...), rankedIDs(t, ref.Get(), at, false, accts...)}
