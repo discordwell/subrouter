@@ -44,7 +44,7 @@ The reasons are `eligible`, `burndown`, `exhausted`, `holdout`, `at_cap`, `short
 | Codex | `reached` | The limit is reached. |
 | Codex | `spend`, `spend/reached` | A usage-based seat's monthly spend cap (§42). |
 
-Prefer each row's `normalized` block, which is the scheduler's own reading: `headroom`, `short_headroom`, `weekly_headroom`, `seconds_to_weekly_reset`, and `fresh` (§13). `srq` already does this.
+Prefer each row's `normalized` block, which is the scheduler's own reading: `headroom`, `short_headroom`, `weekly_headroom`, `seconds_to_weekly_reset`, `fresh` (§13), and `weekly_unstarted` (§86). `srq` already does this.
 
 ### A missing window means unknown
 
@@ -56,6 +56,19 @@ A window that is absent means the daemon has no reading. It never means unspent,
 - `normalized.weekly_headroom` is not the week left. It is the measured week less this daemon's live debit since its last reading. Read the week from `windows`.
 - A new subscription inherits the account's running week. It can arrive with a day of week left and go straight into burndown.
 - A Claude account carries an email in `/_subrouter/accounts` only when its profile is named after one. The profile name is the identity. Codex accounts carry their email.
+
+### An unstarted week takes the next new session
+
+A Codex weekly window starts on the account's first request, then counts down whether or not anyone spends. Until then the account reads its whole week as left: the reset equals the window's length. The router gives such an account the next new session ahead of every other account that can take one, on this daemon or on a peer, so that its clock starts (§86). Only machine policy, a worse selection tier, a capacity or rate-limit mark, the new-session test, and the machine-binding clauses rank above it. After that session the daemon marks the account for 10 minutes, and the account ranks on its pace like any other. If a reading still says unstarted when the mark expires, the account takes the next new session first again. A warm session never moves for this. Only a new session, or a cold session that ranks again anyway, goes there.
+
+To see it:
+
+- `srq pool` prints `unstarted` beside the account's roll.
+- The account's `usage-status` row has `"weekly_unstarted": true` in `normalized`. A quota pool's entry has it for that pool's own week, such as the Spark pool's. It is left out when false.
+- `GET /_subrouter/pool.json` gives the row `"weekly_unstarted": true` and the state `pristine`. Its `state_note` says whether the next new session goes there or one was already sent, and until when the priority is off. Its `reason` is `its weekly window has not started; one new session starts its clock` where that clause set its rank.
+- Each session sent to start a week logs `weekly window not started; this new session starts its clock`, with `account`, `peer` for a peer's account, and `priority_off_until`. The `remote pool decision` line names the same clause in `clause`.
+
+`SUBROUTER_START_UNSTARTED_WEEK=0` turns the priority and the marks off. The daemon still reads and publishes the fact, and a peer ranks on it by its own switch.
 
 ## Avoid the dangerous commands
 
@@ -141,7 +154,7 @@ The daemon logs to `~/Library/Logs/subrouter.err.log`. The daemon caps the file 
 grep -h 'proxy request' ~/Library/Logs/subrouter.err.log* | tail -20
 ```
 
-Each `proxy request` line names the `agent`, `session`, `account`, `path`, and `upstream`. A `remote pool decision` line says why a turn went to a peer, with `target_peer`, `target_account`, and `session_state`. A turn kept on its account logs that line at Debug. To see those, set `SUBROUTER_LOG_LEVEL=debug` in the daemon's environment.
+Each `proxy request` line names the `agent`, `session`, `account`, `path`, and `upstream`. A `remote pool decision` line says why a turn went to a peer, with `target_peer`, `target_account`, and `session_state`. A `weekly window not started; this new session starts its clock` line names each account a new session was sent to so that its week starts (§86). A turn kept on its account logs that line at Debug. To see those, set `SUBROUTER_LOG_LEVEL=debug` in the daemon's environment.
 
 ## Point clients at the pool
 

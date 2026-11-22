@@ -516,6 +516,18 @@ def _held_reset_hours(norm):
     return round(secs / 3600, 1)
 
 
+def _weekly_unstarted(norm):
+    """normalized.weekly_unstarted as published: True when the account's weekly
+    window has not started, else False.
+
+    PATCHES §86: the daemon gives such an account the next new session first,
+    to start its clock. Absent is False: a week that runs, no weekly window,
+    or a daemon from before §86. Read as published, never recomputed from the
+    windows.
+    """
+    return isinstance(norm, dict) and norm.get("weekly_unstarted") is True
+
+
 def _fable_week_spent_percent(norm):
     """The account's Fable meter, percent used, as its daemon publishes it, else None.
 
@@ -554,6 +566,7 @@ def _verdicts(norm):
         "fable_new_session_allowed_sessions": fable_allowed,
         "fable_new_session_burndown_cause": _burndown_cause(fable),
         "held_reset_expires_in_hours": _held_reset_hours(norm),
+        "weekly_unstarted": _weekly_unstarted(norm),
     }
 
 
@@ -762,6 +775,8 @@ def _render_sections(rows, where, peer=False):
         # daemon before §56 (and every pool past the grant's expiry) reads as
         # before.
         show_hold = any(r["held_reset_expires_in_hours"] is not None for r in sub)
+        # Likewise a column only where an account's week has not started (§86).
+        show_unstarted = any(r["weekly_unstarted"] for r in sub)
         lines, any_slots, any_reset = [], False, False
         # A column only where the daemon published a spent Fable meter (§65),
         # so a section from an older daemon, or with no Fable spent, reads as
@@ -780,6 +795,8 @@ def _render_sections(rows, where, peer=False):
             roll = "    -" if r["weekly_reset_hours"] is None else f"{r['weekly_reset_hours']:>5.0f}h"
             if show_hold:
                 roll += "  2x" if r["held_reset_expires_in_hours"] is not None else "    "
+            if show_unstarted:
+                roll += "  unstarted" if r["weekly_unstarted"] else " " * 11
             fallback = not peer and local_fallback(r)
             slots = _slots(r)
             any_slots = any_slots or bool(slots)
@@ -832,6 +849,14 @@ def _render_sections(rows, where, peer=False):
             extra.append("2x = the peer says it holds an unclaimed saved reset; ranked 2x here only on §56 with its switch on"
                          if peer else
                          "2x = holds an unclaimed saved reset: ranked at twice a local non-holder until claimed or expired")
+        if show_unstarted:
+            # The fact is published whatever the owner's switch says; the
+            # daemon that places the session ranks on it with its own switch.
+            extra.append("unstarted = the peer reads its weekly window as not started; a new session from here goes"
+                         " there first only on §86 with its switch on"
+                         if peer else
+                         "unstarted = its weekly window has not started: it takes the next new session first, to start"
+                         " its clock, while SUBROUTER_START_UNSTARTED_WEEK is on")
         end = ";" if extra else ")"
         if peer:
             print(f"      ({fable_legend}new = would this peer take a NEW session placed from here{end}")
@@ -1509,6 +1534,40 @@ def cmd_selftest(_argv):
         single = remote_configs({"SUBROUTER_REMOTE_POOL": "http://single:9"})
         check("no file: the single peer, unchanged",
               [c["url"] for c in single] == ["http://single:9"])
+
+    print("an unstarted week is marked beside its roll; an older daemon reads as before (PATCHES §86)")
+    # A Codex account whose week has not started takes the next new session
+    # first, and its row read exactly like one with a full week left.
+
+    def codex_row(i, used, roll_secs, **norm_extra):
+        norm = {"headroom": 1 - used / 100, "fresh": True, "usable": True, "seconds_to_weekly_reset": roll_secs,
+                "new_session": {"eligible": True, "reason": "eligible", "evicted": False}}
+        norm.update(norm_extra)
+        return {"id": f"cx{i}", "provider": "codex", "auth_valid": True, "normalized": norm,
+                "windows": [{"Name": "primary", "UsedPercent": used, "LimitWindowSeconds": 604800,
+                             "ResetAfterSeconds": roll_secs}]}
+
+    unstarted = [codex_row(0, 0, 604800, weekly_unstarted=True), codex_row(1, 20, 300000)]
+    text = rendered([summarize(r) for r in unstarted])
+    lines = [ln for ln in text.splitlines() if ln.startswith("  cx")]
+    check("an unstarted week reads unstarted beside its roll", "rolls   168h  unstarted  new=yes\n" in text)
+    check("a week that runs in the same section keeps the columns aligned",
+          len(lines) == 2 and "unstarted" not in lines[0] and lines[0].index("new=") == lines[1].index("new="))
+    check("the legend explains unstarted",
+          "\n       unstarted = its weekly window has not started: it takes the next new session first, to start"
+          " its clock, while SUBROUTER_START_UNSTARTED_WEEK is on)\n" in text)
+    remote = rendered([summarize(r) for r in unstarted], peer=True)
+    check("peer: unstarted is the peer's reading, first here only on §86 with its switch on",
+          "rolls   168h  unstarted  new=yes\n" in remote
+          and "\n       unstarted = the peer reads its weekly window as not started; a new session from here goes"
+              " there first only on §86 with its switch on)\n" in remote)
+    check("--json carries the published fact",
+          summarize(unstarted[0])["weekly_unstarted"] is True and summarize(unstarted[1])["weekly_unstarted"] is False)
+    check("false, a string or a number is not unstarted",
+          not any(summarize(codex_row(0, 0, 604800, weekly_unstarted=v))["weekly_unstarted"] for v in (False, "true", 1)))
+    older = rendered([summarize(codex_row(0, 0, 604800)), summarize(codex_row(1, 20, 300000))])
+    check("a daemon from before §86 (no field) prints no column and no legend",
+          "unstarted" not in older and "rolls   168h  new=yes\n" in older)
 
     print("reauth: the dir comes from the DAEMON, never from `sr claude env`")
     rows = [{"id": "main", "source": "/x/_p1787439913450"},
