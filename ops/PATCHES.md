@@ -2405,6 +2405,15 @@ A request that already waits on the silent worker is not moved. Its client gives
 timer and sends the request again on a new connection, which reaches the new worker. Claude Code
 2.1.330 does that 183 s after it sent a request that got no response headers.
 
+A worker that is stopped or stuck never closes a connection. The router (`front.Router`) kept a
+connection for as long as the worker's side stayed open, even after the client had gone. Such a
+worker never went idle, so the supervisor never stopped it. The router now drops a connection 15
+minutes after its client ended its side if the worker has not ended its own (`workerCloseGrace`).
+A worker that runs ends its side at once, because net/http drops the request when it reads the
+client's end. The limit is long so that a client that has only half-closed can still read a
+stream. A stopped worker is therefore killed at the latest 15 minutes and `--worker-stop-grace`
+after its last client left. A deploy over a stuck worker gets the same limit.
+
 The misses belong to one worker. An answer sets the count to 0, and so does a switch to another
 worker. The supervisor skips a round in three cases:
 
@@ -2436,22 +2445,26 @@ With the probe off, `worker_probe` is `{"enabled": false, "misses": 0}`.
   so the plist does not change, and the probe starts at the supervisor's next restart.
 - Code: `cmd/subrouter/supervisor_worker_probe.go` (`runWorkerProbe`, `probeActiveWorker`,
   `probeTargetLocked`, `replaceSilentWorker`), `cmd/subrouter/supervisor.go` (the flags,
-  `readyStatus`, supervisor-status)
-- Tests, in Docker (`./deploy/docker/test.sh ./cmd/subrouter -run 'TestSupervisor.*(Probe|Unresponsive|Unready|Misses|SilentWorker|WhoseSocketIsGone)|WorkerProbeDefaults'`),
+  `readyStatus`, supervisor-status), `internal/front/router.go` (`workerCloseGrace`)
+- Tests, in Docker (`./deploy/docker/test.sh ./cmd/subrouter -run 'TestSupervisor.*(Probe|Unresponsive|Unready|Misses|SilentWorker|StoppedWorker|WhoseSocketIsGone)|WorkerProbeDefaults'`),
   each seen failing with its part of the change taken out. They run a real supervisor over real
   worker processes, and a worker is silenced while it stays alive and keeps accepting connections.
   `TestSupervisorReplacesUnresponsiveWorker` runs on real time. It checks that another worker
   answers on the port, that a stream the silent worker was sending finishes, and that the silent
   worker's process is gone afterwards. The others move an injected clock one tick at a time:
   `TestSupervisorKeepsAWorkerThatAnswersUnready`, `TestSupervisorDoesNotReadALateProbeTickAsAHang`,
-  `TestSupervisorReplacesAWorkerWhoseSocketIsGone`,
+  `TestSupervisorReplacesAWorkerWhoseSocketIsGone`, `TestSupervisorReplacesAndEndsAStoppedWorker`
+  (a worker under `SIGSTOP` is replaced, and killed once `--worker-stop-grace` has passed),
   `TestSupervisorForgetsMissesOnceTheWorkerAnswers`, `TestSupervisorCountsMissesPerWorker`,
   `TestSupervisorDoesNotReplaceAWorkerItDidNotProbe`, `TestSupervisorSkipsAProbeRound` (the lock,
   a canary, a shutdown), `TestSupervisorKeepsRunningWhenTheSilentWorkerCannotBeReplaced`,
   `TestSupervisorWorkerProbeIsOffAtIntervalZero` and
-  `TestParseSupervisorConfigWorkerProbeDefaultsAndLimits`. A real sleep is not tested. The
-  late-tick test moves the injected clock, and no test shows that the wall clock of a Mac jumps
-  over its sleep while Go's monotonic clock does not. Not tested on macOS.
+  `TestParseSupervisorConfigWorkerProbeDefaultsAndLimits`. In `./internal/front`,
+  `TestRouterReleasesAClientThatLeftAWorkerThatNeverCloses` sets the router's limit to 500 ms. No
+  test runs the 15 minutes with a real supervisor, because the stopped worker in the supervisor
+  test holds no connection. A real sleep is not tested. The late-tick test moves the injected clock, and no
+  test shows that the wall clock of a Mac jumps over its sleep while Go's monotonic clock does
+  not. Not tested on macOS.
 - Related: builds on §69 (the supervisor and its upgrade path). The probe asks the route that
   gates every new generation, and it ignores whether the answer says ready.
 
