@@ -1124,9 +1124,32 @@ time.sleep(60)' "$P.supervisor-mutation.lock" "$C/held" &
   expect_rc 1; expect_out "another deploy, rollback or update holds $P.supervisor-mutation.lock"
   expect_no_log "launchctl"
   cmp -s "$P" "$C/plist-before" && ok || bad "the plist was written while another run held the lock"
-  # Calibration: once the lock is free, the step goes on to the restart.
-  run_qs FAKE_QS_CALL=configure_peer
-  expect_log "^launchctl bootstrap"
+  # Once the lock is free the step goes on, and restarts the job still holding
+  # it: this launchctl tries the lock at the bootout and at the bootstrap.
+  { printf '#!%s\n' "$PY3"; cat <<'PY'; } > "$C/bin/launchctl"
+import fcntl, os, sys
+args = sys.argv[1:]
+verb = args[0] if args else ""
+lock = ""
+if verb in ("bootout", "bootstrap"):
+    fd = os.open(os.environ["FAKE_LOCK"], os.O_RDONLY)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        lock = " lock=free"
+    except BlockingIOError:
+        lock = " lock=held"
+    os.close(fd)
+with open(os.environ["FAKE_LOG"], "a") as log:
+    log.write("launchctl " + " ".join(args) + lock + "\n")
+if verb == "managername":
+    print("Aqua")
+elif verb == "print":
+    sys.exit(113)
+PY
+  chmod 755 "$C/bin/launchctl"
+  run_qs FAKE_QS_CALL=configure_peer FAKE_LOCK="$P.supervisor-mutation.lock" FAKE_DAEMON_UP=1
+  expect_rc 0; expect_out "restarted and healthy"
+  expect_log "^launchctl bootout .* lock=held$"; expect_log "^launchctl bootstrap .* lock=held$"
   finish
 fi
 
