@@ -21,6 +21,7 @@ type localDataSocketLease struct{}
 func acquireLocalDataSocketLease(string) (*localDataSocketLease, error) {
 	return nil, errors.New("local data sockets are unsupported on Windows")
 }
+func socketLockHeldElsewhere(error) bool                       { return false }
 func (l *localDataSocketLease) Close() error                   { return nil }
 func (l *localDataSocketLease) parentMatches(os.FileInfo) bool { return false }
 func (l *localDataSocketLease) removeStaleSocket() error {

@@ -68,6 +68,7 @@ func openLeasedClaudeSocket(socket string) (leasedListener, error) {
 // looking: without the lock it asks for it, and with the lock it makes sure
 // its own socket is the one at the path. Each look ends in one word:
 //
+//	let go on purpose, and the time is not up          yielded (section 77.3)
 //	no lock, the last try to take the path failed      waiting
 //	lock, and our socket is at the path                serving
 //	lock, and a socket somebody else answers on        displaced
@@ -80,7 +81,8 @@ type socketKeeper struct {
 	path   string
 	open   func(string) (leasedListener, error)
 	logger *slog.Logger
-	report func(word string)
+	report func(claudeSocketStatus)
+	clock  func() time.Time
 
 	mu sync.Mutex
 	// held is nil while this process does not hold the lock.
@@ -90,8 +92,15 @@ type socketKeeper struct {
 	closed  bool
 	binds   int
 
-	// lastLogged is the keep goroutine's alone.
+	// The fields down to requests are the keep goroutine's alone. Another
+	// goroutine changes them by handing ask a func.
 	lastLogged string
+	// yield is set while the keeper stays away from the socket on purpose.
+	yield *socketYield
+	guard exitGuard
+	// standby is whether another process was seen holding the socket's lock.
+	standby  standbyKnowledge
+	requests chan keeperRequest
 
 	stop      chan struct{}
 	done      chan struct{}
@@ -101,15 +110,25 @@ type socketKeeper struct {
 
 // keepSocket takes its first look before it returns, so a socket that can be
 // served at once is, as before a keeper existed.
-func keepSocket(path string, open func(string) (leasedListener, error), logger *slog.Logger, report func(string)) *socketKeeper {
+//
+// clock is the supervisor's, and exitsToYield its --claude-socket-yield-exits.
+// A plain serve passes neither, and then nothing ever asks its keeper to yield.
+func keepSocket(path string, open func(string) (leasedListener, error), logger *slog.Logger, report func(claudeSocketStatus), clock func() time.Time, exitsToYield int) *socketKeeper {
+	if clock == nil {
+		clock = time.Now
+	}
 	k := &socketKeeper{
-		path:    path,
-		open:    open,
-		logger:  logger,
-		report:  report,
-		changed: make(chan struct{}),
-		stop:    make(chan struct{}),
-		done:    make(chan struct{}),
+		path:     path,
+		open:     open,
+		logger:   logger,
+		report:   report,
+		clock:    clock,
+		guard:    exitGuard{exitsToYield: exitsToYield, steady: yieldSteadyWindow},
+		standby:  standbyUnknown,
+		requests: make(chan keeperRequest),
+		changed:  make(chan struct{}),
+		stop:     make(chan struct{}),
+		done:     make(chan struct{}),
 	}
 	k.look()
 	go k.keep()
@@ -124,9 +143,13 @@ func (k *socketKeeper) keep() {
 		select {
 		case <-k.stop:
 			return
+		case request := <-k.requests:
+			request.change(k.now())
+			k.look()
+			close(request.done)
 		case <-timer.C:
+			k.look()
 		}
-		k.look()
 		timer.Reset(k.nextLook())
 	}
 }
@@ -146,19 +169,23 @@ func (k *socketKeeper) current() leasedListener {
 
 func (k *socketKeeper) look() {
 	held := k.current()
-	if held == nil {
-		next, err := k.open(k.path)
-		if err != nil {
-			k.say(claudeSocketWaiting, slog.LevelWarn, "claude socket not served yet: waiting for its path; TCP is unaffected", err)
+	if k.yield != nil {
+		if held != nil {
+			k.install(nil)
+			_ = held.Close()
+			held = nil
+		}
+		if k.lookWhileYielded() {
 			return
 		}
-		k.install(next)
-		k.say(claudeSocketServing, slog.LevelInfo, "subrouter claude socket", nil)
+	}
+	if held == nil {
+		k.took(k.take())
 		return
 	}
 	switch held.pathState(k.path) {
 	case socketPathOurs:
-		k.report(claudeSocketServing)
+		k.tell(claudeSocketServing)
 		k.lastLogged = ""
 	case socketPathForeign:
 		// Never stolen: whoever answers there is serving somebody.
@@ -181,6 +208,28 @@ func (k *socketKeeper) look() {
 	}
 }
 
+// take is one try to bind the path. A try that fails because another process
+// holds the lock is also how the keeper learns that one stands by.
+func (k *socketKeeper) take() error {
+	next, err := k.open(k.path)
+	if err != nil {
+		if socketLockHeldElsewhere(err) {
+			k.standby = standbySeen
+		}
+		return err
+	}
+	k.install(next)
+	return nil
+}
+
+func (k *socketKeeper) took(err error) {
+	if err != nil {
+		k.say(claudeSocketWaiting, slog.LevelWarn, "claude socket not served yet: waiting for its path; TCP is unaffected", err)
+		return
+	}
+	k.say(claudeSocketServing, slog.LevelInfo, "subrouter claude socket", nil)
+}
+
 func (k *socketKeeper) install(next leasedListener) {
 	k.mu.Lock()
 	defer k.mu.Unlock()
@@ -199,7 +248,7 @@ func (k *socketKeeper) wakeLocked() {
 // say reports the word and logs the message, once for as long as the keeper
 // keeps finding the same thing.
 func (k *socketKeeper) say(word string, level slog.Level, message string, err error) {
-	k.report(word)
+	k.tell(word)
 	logged := message
 	if err != nil {
 		logged += ": " + err.Error()

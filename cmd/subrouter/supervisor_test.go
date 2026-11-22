@@ -980,6 +980,9 @@ type supervisorControlStatus struct {
 
 	ClaudeSocketRebinds int `json:"claude_socket_rebinds"`
 
+	ClaudeSocketYield     *claudeSocketYieldView `json:"claude_socket_yield"`
+	ClaudeSocketExitGuard exitGuardView          `json:"claude_socket_exit_guard"`
+
 	WorkerProbe workerProbeView `json:"worker_probe"`
 }
 

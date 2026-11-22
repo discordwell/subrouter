@@ -148,6 +148,7 @@ func (s *supervisor) probeActiveWorker() {
 	// long as it runs and still serve every request (see generationRole).
 	if _, err := readyStatus(worker, s.config.WorkerProbeTimeout); err != nil {
 		misses := s.probe.missed(worker.id)
+		s.claudeSocket.workerFaltered()
 		slog.Warn("active subrouter worker did not answer its probe",
 			"generation", worker.id, "misses", misses, "replace_at", s.config.WorkerProbeMisses, "error", err)
 		if misses >= s.config.WorkerProbeMisses {

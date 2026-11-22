@@ -85,6 +85,12 @@ func acquireLocalDataSocketLease(socket string) (*localDataSocketLease, error) {
 	}, nil
 }
 
+// socketLockHeldElsewhere reports whether err is acquireLocalDataSocketLease
+// finding the lock held by another process.
+func socketLockHeldElsewhere(err error) bool {
+	return errors.Is(err, unix.EWOULDBLOCK)
+}
+
 func (l *localDataSocketLease) Close() error {
 	if l == nil || l.file == nil {
 		return nil

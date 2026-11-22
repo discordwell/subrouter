@@ -46,7 +46,11 @@ type supervisorConfig struct {
 	WorkerProbeInterval time.Duration
 	WorkerProbeTimeout  time.Duration
 	WorkerProbeMisses   int
-	WorkerArgs          []string
+	// ClaudeSocketYieldExits is the number of active-worker exits within 10
+	// minutes at which the supervisor lets go of the Claude socket. 0 turns
+	// that off.
+	ClaudeSocketYieldExits int
+	WorkerArgs             []string
 }
 
 type workerGeneration struct {
@@ -132,14 +136,19 @@ func newSupervisor(config supervisorConfig, initial *workerGeneration) (*supervi
 		return nil, err
 	}
 	router.SetSessionKey(session.ExtractRoutingID)
-	return &supervisor{
+	s := &supervisor{
 		config:       config,
 		router:       router,
 		fatal:        make(chan error, 1),
 		claudeSocket: newClaudeSocket("", os.Getenv),
 		retireCh:     make(chan struct{}),
 		workers:      map[string]*workerGeneration{initial.id: initial},
-	}, nil
+	}
+	if s.claudeSocket != nil {
+		s.claudeSocket.clock = s.now
+		s.claudeSocket.yieldExits = config.ClaudeSocketYieldExits
+	}
+	return s, nil
 }
 
 func parseSupervisorConfig(args []string) (supervisorConfig, error) {
@@ -163,6 +172,7 @@ func parseSupervisorConfig(args []string) (supervisorConfig, error) {
 	flags.DurationVar(&config.WorkerProbeInterval, "worker-probe-interval", 15*time.Second, "how often the active worker's readiness route is asked whether the worker still answers; 0 turns the probe off")
 	flags.DurationVar(&config.WorkerProbeTimeout, "worker-probe-timeout", 10*time.Second, "how long one probe of the active worker waits for an answer")
 	flags.IntVar(&config.WorkerProbeMisses, "worker-probe-misses", 3, "unanswered probes in a row after which the active worker is replaced")
+	flags.IntVar(&config.ClaudeSocketYieldExits, "claude-socket-yield-exits", 3, "exits of the active worker within 10 minutes at which the supervisor lets go of the Claude socket, so that a process standing by on its lock serves it; 0 turns this off")
 	if err := flags.Parse(args); err != nil {
 		return supervisorConfig{}, err
 	}
@@ -213,6 +223,9 @@ func validateSupervisorConfig(config supervisorConfig) error {
 	}
 	if config.WorkerProbeInterval > 0 && (config.WorkerProbeTimeout <= 0 || config.WorkerProbeMisses < 1) {
 		return errors.New("worker-probe-timeout must be positive and worker-probe-misses at least 1")
+	}
+	if config.ClaudeSocketYieldExits < 0 {
+		return errors.New("claude-socket-yield-exits must not be negative; 0 turns the yield for worker exits off")
 	}
 	return validateWorkerArgs(config.WorkerArgs)
 }
@@ -823,6 +836,9 @@ func (s *supervisor) monitorWorker(worker *workerGeneration) {
 		return
 	}
 	slog.Error("active subrouter worker exited", "generation", worker.id, "pid", worker.command.Process.Pid, "error", err)
+	// Before the replacement starts: a process standing by for the socket
+	// serves it sooner than a new worker reports ready. PATCHES section 77.3.
+	s.claudeSocket.workerFailed()
 	if s.canary != nil {
 		// The replacement starts from --worker-bin, which during a rollout is
 		// the unproven candidate. End the rollout as aborted so the host
@@ -922,12 +938,7 @@ func (s *supervisor) controlHandler() http.Handler {
 			"worker_probe":      s.workerProbeStatus(),
 		}
 		if s.claudeSocket != nil {
-			status["claude_socket"] = s.claudeSocket.Status()
-			// A process that stands in on the socket path checks this before it
-			// takes the lock: a supervisor without it tries the socket once at
-			// start and would never take the path back. PATCHES section 77.1.
-			status["claude_socket_waits_for_lock"] = true
-			status["claude_socket_rebinds"] = s.claudeSocket.rebinds()
+			s.claudeSocket.describe(status)
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(status)
@@ -941,6 +952,7 @@ func (s *supervisor) controlHandler() http.Handler {
 		_ = json.NewEncoder(w).Encode(map[string]any{"active": s.router.Active()})
 	})
 	s.registerCanaryHandlers(mux)
+	s.registerClaudeSocketHandlers(mux)
 	if s.config.ExpectProxyProtocol {
 		mux.HandleFunc("POST /_subrouter/retire", func(w http.ResponseWriter, _ *http.Request) {
 			if err := s.requestRetirement(); err != nil {
