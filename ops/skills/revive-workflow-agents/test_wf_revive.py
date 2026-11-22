@@ -37,7 +37,7 @@ class Revive(unittest.TestCase):
     def tearDown(self):
         self.home.cleanup()
 
-    def agent(self, agent, label, turns, outcome=None, last_tool="", age_s=600):
+    def agent(self, agent, label, turns, outcome=None, last_tool="", age_s=600, schema=None):
         """One agent of the run: its started row, its log, and how the run saw it end."""
         self.rows.append({"type": "started", "agentId": agent, "label": label})
         if outcome == "result":
@@ -45,6 +45,9 @@ class Revive(unittest.TestCase):
         elif outcome == "failed":
             self.rows.append({"type": "failed", "agentId": agent})
         lines = [turn("user", "go", 0)]
+        if schema:
+            lines.append(json.dumps({"type": "api-request-shape", "shape": {"tools": [
+                {"name": "Bash"}, {"name": "StructuredOutput", "input_schema": schema}]}}, separators=(",", ":")))
         for n in range(turns):
             last = n == turns - 1
             content = [{"type": "tool_use", "name": last_tool, "input": {}}] if last and last_tool else [{"type": "text", "text": "x"}]
@@ -108,8 +111,10 @@ class Revive(unittest.TestCase):
 
     def test_done_holds_finished_results_and_waits_for_revived_agents(self):
         self.agent("a1", "build:u1:wait:try2", 3, "result")    # a waiting agent's result is its stage's
-        self.agent("a2", "verify:u1", 4, "failed")
-        self.agent("b1", "build:u2", 3, "failed")
+        verdict = {"type": "object", "properties": {"verdict": {"type": "string"}}, "required": ["verdict"]}
+        built = {"type": "object", "properties": {"value": {"type": "string"}}, "required": ["value"]}
+        self.agent("a2", "verify:u1", 4, "failed", schema=verdict)
+        self.agent("b1", "build:u2", 3, "failed", schema=built)
         self.agent("b2", "build:u2:try2", 1, "failed")
         self.agent("c1", "build:u3", 1, "failed")
         self.write()
@@ -141,6 +146,31 @@ class Revive(unittest.TestCase):
         self.assertEqual((plan["finished"], plan["waiting"]), (3, []))
         with open(plan["workflow"]["scriptPath"]) as handle:
             self.assertNotIn("$wait", handle.read())
+
+    def test_a_report_in_a_shape_of_its_own_holds_the_rerun(self):
+        schema = {"type": "object", "properties": {"done": {"type": "array"}, "lines": {"type": "integer"}},
+                  "required": ["done", "lines"]}
+        self.agent("a1", "build:u1", 4, "failed", schema=schema)
+        self.agent("b1", "notes:u1", 4, "failed")                 # no schema: its result is text
+        self.write()
+        staged = self.tool("stage", "--all-dead")
+        reports = os.path.join(self.base, "revived")
+        with open(os.path.join(reports, "a1.schema.json")) as handle:
+            self.assertEqual(json.load(handle), schema)
+        self.assertIn("(its result is text)", staged)
+        with open(os.path.join(reports, "a1.json"), "w") as handle:
+            json.dump({"status": "all good", "lines": "many"}, handle)
+        with open(os.path.join(reports, "b1.json"), "w") as handle:
+            handle.write("Three notes, as plain text.")
+        held = json.loads(self.tool("rerun", "--wait"))
+        self.assertEqual(held["misfit"], {"build:u1": ["lacks done", "wrong type for lines"]})
+        self.assertNotIn("workflow", held)
+        self.assertIn("report does not fit: lacks done; wrong type for lines", self.tool("check", "--ids", "a1"))
+
+        with open(os.path.join(reports, "a1.json"), "w") as handle:
+            json.dump({"done": ["x"], "lines": 3}, handle)
+        self.assertEqual(json.loads(self.tool("done")),
+                         {"build:u1": {"done": ["x"], "lines": 3}, "notes:u1": "Three notes, as plain text."})
 
     def test_rerun_leaves_a_run_that_is_still_going_and_a_script_with_no_mark(self):
         self.agent("a1", "build:u1", 5, "failed")
