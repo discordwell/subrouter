@@ -164,6 +164,7 @@ var requiredCases = []string{
 	"boot-default-name-is-box",
 	"boot-bad-box-name-refused",
 	"boot-prints-the-laptop-configuration",
+	"boot-node-id-unknown-prints-where-to-find-it",
 	"boot-public-ip-lookup-failure-still-finishes",
 	"boot-rerun-keeps-the-tokens",
 	"boot-refused-while-a-deploy-runs",

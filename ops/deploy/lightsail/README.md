@@ -81,10 +81,12 @@ The laptop uses the box in two ways, and each has its own configuration. Both wo
 `sr` runs admin commands against the box, such as account moves and status. Paste the command that bootstrap printed:
 
 ```bash
-sr server add box --url http://100.64.0.10:31415 \
-  --admin-token '<admin token>' --account-import-token '<import token>' --default
+sr server add box --url http://100.64.0.10:31415 --tailscale-node-id '<node-id>' \
+  --admin-token '<admin token>' --account-import-token '<import token>'
 curl -fsS http://100.64.0.10:31415/_subrouter/health
 ```
+
+Bootstrap fills in the box's node ID. Without it, and with no public admin path, `sr claude move` to a plain `http` URL sends nothing. Leave out `--default`: it rewrites the laptop's Codex config and `cloud.json`, and restarts the daemon outside `deploy-laptop.sh`.
 
 The health route answers without a token, so it works as a liveness check from any machine on the tailnet.
 
