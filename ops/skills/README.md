@@ -3,7 +3,7 @@
 Two Claude Code skills:
 
 - `subrouter/SKILL.md` is for agents that inspect or operate a subrouter install. It covers the traps in `sr`, the JSON routes and `srq`, how to read the meters, held turns, and saved resets.
-- `revive-workflow-agents/SKILL.md` continues Claude Code workflow agents that died mid-work, for example when the pool was unreachable, from their saved transcripts.
+- `revive-workflow-agents/SKILL.md` continues Claude Code workflow agents that died mid-work, for example when the pool was unreachable, from their saved transcripts. It also holds the standard prefix for workflow scripts, which stops a unit at its first stage with no result and holds new stages until the API answers.
 
 ## Install a skill
 
@@ -30,6 +30,9 @@ The link follows the checkout, so a `git pull` updates the skill. Start a new Cl
 ```bash
 (cd ops && go test -count=1 ./skills)
 python3 ops/skills/revive-workflow-agents/test_wf_revive.py
+node --test ops/skills/revive-workflow-agents/test_wf_prefix.mjs
 ```
 
 The Go test checks the subrouter skill. It fails when the skill names a repository path, a PATCHES section, a route, an environment variable, an `srq` subcommand or flag, an `sr` flag, a table column, or a quoted string that the tree does not have. Each `sr` verb must appear quoted in the CLI's source. A verb path such as `sr claude reset` must start a line of a string literal there, as a help listing does, or follow `usage:`. A comment or an error message that mentions it does not count. The test reads text only, so it cannot prove that a verb path dispatches.
+
+The Node test takes the workflow-script prefix from the revive skill's SKILL.md and runs it against a stand-in for the workflow runtime with a virtual clock, so a change to the prefix is tested as it is printed. It uses only Node's own modules. The Go test image has no Node; `revive-workflow-agents/SKILL.md` gives the Docker command.

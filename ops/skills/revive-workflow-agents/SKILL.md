@@ -1,6 +1,6 @@
 ---
 name: revive-workflow-agents
-description: Continue Claude Code Workflow agents that died mid-work (an API outage, "Unable to connect to API", a 503 from the pool, a crash or a killed session) from their saved transcripts, then carry their runs on without redoing finished stages. Use when a workflow result or its journal shows failed agents, before any resumeFromRunId, and whenever the user says "resume the failed workflows", "revive the agents" or "resume from transcripts".
+description: Continue Claude Code Workflow agents that died mid-work (an API outage, "Unable to connect to API", a 503 from the pool, a crash or a killed session) from their saved transcripts, then carry their runs on without redoing finished stages. Holds the standard prefix every workflow script starts with. Use when a workflow result shows failed agents or a `stopped` list, or its journal has `failed` rows, before any resumeFromRunId, when writing a workflow script, and whenever the user says "resume the failed workflows", "revive the agents" or "resume from transcripts".
 ---
 
 # Revive workflow agents
@@ -24,6 +24,9 @@ ln -s <a checkout of this repository>/ops/skills/revive-workflow-agents ~/.claud
 - A workflow result lists `failed:` agents, `journal.jsonl` has `failed` rows, or a run was stopped with agents mid-work.
 - The cause was outside the agents: the model could not be reached, the pool answered 503, the machine slept, the session was killed.
 - The agent had done real work. One that died on its first turn has nothing to continue: its stage starts fresh.
+- A run ended with a `stopped` list that is not empty. The prefix in "Make a script revivable" writes it, one `{label, why}` for each unit that stopped.
+
+For a `stopped` list, start at step 1: the daemon and the network must both answer. Then revive with steps 2 to 7. Never give a stopped stage to a fresh agent. An entry whose `why` starts with `not started` has no agent behind it, and its stage starts in step 7.
 
 ## Before anything: do not resume a run with several units
 
@@ -31,7 +34,7 @@ ln -s <a checkout of this repository>/ops/skills/revive-workflow-agents ~/.claud
 
 On 2026-11-21 five such runs were resumed with the exact script and arguments. Within two minutes they were verifying and merging units that were already merged. They had to be stopped.
 
-- Resume is safe for a run with one chain of calls (one unit, or `maxActive` 1 from the start).
+- Resume only a run of one unit, whose calls form one chain.
 - For a run with several units, use the steps below.
 - If a resume was already started wrongly: stop it with `TaskStop` on its task id, check that no `agent-*.jsonl` in its run folder was written after the stop, and remove any worktree or folder its agents made.
 
@@ -100,22 +103,96 @@ On 2026-11-21 five such runs were resumed with the exact script and arguments. W
 
 ## Make a script revivable
 
-A few lines at the top of the script body, and `step` wherever the script called `agent`:
+Paste this prefix after `export const meta = {...}` in every workflow script, and call `step` wherever the script would call `agent`. A script cannot read files, so the prefix cannot be imported. `test_wf_prefix.mjs` runs this block as it stands here.
 
 ```js
+// ---- Standard workflow prefix: outage-safe and revivable (2026-11-21) ----
+// Paste after `export const meta = {...}`. Call step() wherever the script would call agent().
+// Keep the DONE line exactly as it is: `wf_revive.py rerun` replaces that one line.
 const DONE = (args && args.done) || {} // wf-revive:done
-const step = (label, prompt, opts = {}) => {
-  const had = DONE[label]
-  if (had === undefined) return agent(prompt, { ...opts, label })
-  if (!had || !had.$wait) return Promise.resolve(had)
-  return agent(`An agent outside this run is finishing the stage "${label}". Wait for the file ${had.$wait}: run \`until [ -s ${had.$wait} ]; do sleep 20; done; cat ${had.$wait}\` as one Bash call with a ten-minute limit, and again each time it times out. The file holds one JSON object, which is this stage's result. Return that same object as your result: the same keys with the same values. Do nothing else.`,
-    { schema: opts.schema, phase: opts.phase, label: `${label}:wait` })
+const STOPPED = []          // { label, why } for every unit that stopped; return it with the results
+const PROBE_WAIT_MIN = [2, 5, 10, 20, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30] // about 5.5 h, plus each probe's own retries
+const sleep = (ms) => new Promise((done) => setTimeout(done, ms))
+let gate = null             // while set, the API is thought to be down; resolves true when a probe answers
+let apiGone = false         // set when the last probe failed: no new stage starts in this run
+let probes = 0             // probe labels end in :tryN so wf_revive.py treats them as one stage, "probe"
+
+function waitForApi(why) {
+  if (gate) return gate
+  log(`[outage] ${why}. New stages wait until a probe answers.`)
+  gate = (async () => {
+    for (const minutes of PROBE_WAIT_MIN) {
+      const ok = await agent('Reply with the single word: ok', { label: `probe:try${++probes}`, model: 'haiku', effort: 'low' }).catch(() => null)
+      if (ok !== null) return true
+      await sleep(minutes * 60000)
+    }
+    return false
+  })().then((up) => {
+    gate = null
+    apiGone = !up
+    log(up ? `[outage] the API answers again (probe ${probes}).` : '[outage] still down after the last probe: remaining stages stop.')
+    return up
+  })
+  return gate
 }
+
+function stop(label, why) {
+  STOPPED.push({ label, why })
+  log(`[stopped] ${label}: ${why}. Its unit goes no further; revive it with revive-workflow-agents.`)
+  const e = new Error(`unit stopped at ${label}: ${why}`)
+  e.unitStopped = true
+  throw e
+}
+
+// One stage of one unit. Labels must be stable and unique: `build:<unit>`, `verify:<unit>:r2`.
+// Returns the agent's result. Never returns null: a stage without a result throws, so no later stage runs.
+// In pipeline() that drops the item and skips its remaining stages; in parallel() the thunk resolves to null;
+// in plain sequential code wrap each unit in unit().
+async function step(label, prompt, opts = {}) {
+  const had = DONE[label]
+  if (had !== undefined && !(had && had.$wait)) return had
+  while (gate) await gate
+  if (apiGone) stop(label, 'not started: the API did not come back')
+  const call = had === undefined
+    ? agent(prompt, { ...opts, label })
+    : agent(`An agent outside this run is finishing the stage "${label}". Wait for the file ${had.$wait}: run \`until [ -s ${had.$wait} ]; do sleep 20; done; cat ${had.$wait}\` as one Bash call with a ten-minute limit, and again each time it times out. The file holds one JSON object, which is this stage's result. Return that same object as your result: the same keys with the same values. Do nothing else.`,
+      { schema: opts.schema, phase: opts.phase, label: `${label}:wait` })
+  let value = null
+  let why = 'no result (an API error, an outage, or a skip)'
+  try { value = await call } catch (e) {
+    why = String((e && e.message) || e)
+    if (!/^agent (stalled|lost its reply|abandoned)/.test(why)) throw e   // a script or spawn error: fail loudly
+  }
+  if (value === null || value === undefined) {
+    waitForApi(`${label} returned no result`)
+    stop(label, why)
+  }
+  return value
+}
+
+// For sequential code: `const a = await unit(async () => { ...one unit's step() calls... })`.
+// A stop becomes null, so the other units go on.
+async function unit(run) {
+  try { return await run() } catch (e) { if (e && e.unitStopped) return null; throw e }
+}
+// End the script with `return finish({ ...results })`. If a probe is out, the run ends when the API answers,
+// so the run's completion notice tells the main session that it can revive the stopped units now.
+async function finish(result) {
+  if (gate) await gate
+  return { ...result, stopped: STOPPED }
+}
+// ---- end of prefix
 ```
 
+**A stage with no result stops its unit.** It is never retried with a fresh agent, and nothing is passed on to the unit's next stage. Revive the stopped stage from its transcript with the steps above. A fresh agent gives up the dead agent's context, and once the dead agent is revived, both work in one worktree. On 2026-11-21 scripts that retried after waits of 1, 3 and 10 minutes put 210 fresh agents into the outage and passed empty results on to later stages.
+
+- `step(label, prompt, opts)` runs one stage of one unit and returns its result. A stage in `DONE` returns its old result and calls no agent. A `{"$wait": <file>}` entry starts one agent that waits for that report. A stage that ends with no result goes into `stopped` and throws, so nothing after it in that unit runs. A stall (`agent stalled on all 6 attempts`) counts as no result. Any other throw is a script or spawn error, and `step` throws it again.
+- `unit(run)` holds one unit's `step` calls in sequential code. A stop becomes `null` for that unit, and the other units go on. In `parallel()` and `pipeline()` the runtime does this itself: a stopped thunk or item becomes `null`, and a pipeline item's later stages are skipped. There the runtime also turns a script error into `null` and logs `parallel[<n>] failed: ...`. So a unit that is `null` and not in `stopped` failed for another reason: read the run's logs.
+- `finish(result)` ends the script: `return finish({ ...results })`. It adds `stopped`. While a probe is out it waits, so the run ends when the API answers, and its completion notice starts a turn in the main session.
+- **The probe gate.** The first stage with no result opens one gate for the whole run. Stages already running carry on. A new stage waits while one small probe agent at a time asks for one word, with waits of 2 to 30 minutes between probes, about 5.5 hours in all. When a probe answers, the waiting stages start. When the last probe fails, every stage that has not started stops with `not started: the API did not come back`.
 - Keep the comment `// wf-revive:done` on the `DONE` line. `rerun` replaces that one line.
 - The waiting agent runs on the session's model, on purpose. On 2026-11-22 the smallest model at low effort copied a one-key report wrongly three times out of three (the file's text inside a string field twice, the bare value once). The default model copied it right once out of once. Without `--wait` no model copies anything.
-- Give every stage a label that is the same on each run and names one stage of one unit: `build:<unit>`, `verify:<unit>:r2`. A retry may add `:try2`; the tool ignores that suffix.
+- Give every stage a label that is the same on each run and names one stage of one unit: `build:<unit>`, `verify:<unit>:r2`. Probes are labelled `probe:try<N>`. The tool ignores a `:try<N>` suffix, so it counts all probes as one stage, `probe`.
 - A stage's result must be all the next stage needs. The new run has the old result, not the old agent.
 - The map can also be passed as `args.done`, from `wf_revive.py done`.
 
@@ -124,18 +201,22 @@ const step = (label, prompt, opts = {}) => {
 - One full cache write of the agent's context for each revived agent. A workflow agent's cache lasts five minutes and is gone by the time anyone notices an outage.
 - Each revived agent's last message lands in the main session. Thirty long ones are tens of thousands of tokens, which is why step 5 asks for six lines and a file.
 - With `--wait`, one agent for each stage that is waited for: about 55,000 tokens of fixed prompt each.
+- With the prefix, a probe that fails costs no tokens, and the one that answers costs one small agent.
 
 ## Make the next outage cheaper
 
-- **Retry waits must outlast an outage.** Waits of 1, 3 and 10 minutes gave up after 25 minutes of a 137-minute outage, and each script then went on to its next stage, which failed too. Use waits that add up to hours, or end the unit at the first stage that returns null.
-- **Agents keep a notes file** and write to it as they go, so that even a fresh agent can pick up.
-- **Long units run as separate runs.** A run with one chain of calls can also be resumed safely.
+- **Start every script with the prefix.** Waits of 1, 3 and 10 minutes gave up after 25 minutes of a 137-minute outage, and each script then went on to its next stage, which failed too. The prefix stops a unit at its first stage with no result, and holds new stages behind one probe for hours.
+- **Agents keep a notes file** and write to it as they go, so the work survives even a damaged transcript.
+- **Long units run as separate runs.** A run of one unit can also be resumed safely.
 
 ## Test
 
 ```
 python3 ops/skills/revive-workflow-agents/test_wf_revive.py
+node --test ops/skills/revive-workflow-agents/test_wf_prefix.mjs
 ```
+
+The second runs the prefix from this file against a stand-in runtime. It needs Node and nothing else. The repository's Go test image has no Node, so to run it in Docker use the Node image: `docker run --rm --network none -v "${PWD}:/src:ro" -w /src node:26.13.1-bookworm-slim node --test ops/skills/revive-workflow-agents/test_wf_prefix.mjs`.
 
 ## Related
 
