@@ -94,12 +94,17 @@ func validFingerprint(fingerprint string) bool {
 	return true
 }
 
-// Boxes is the set of boxes the handler may use (PATCHES §79.2 builds the
-// real one).
+// Boxes is the set of boxes the handler may use; Set (PATCHES §79.2) is the
+// real one.
 type Boxes interface {
 	// Candidates lists, best first, the boxes a request of this session may
 	// be sent to; sessionID is "" when the request names none. The handler
 	// sends to the first, and to the next only when nothing reached the one
 	// before. An empty list means no box is usable now.
 	Candidates(sessionID string) []*Box
+	// Answered reports the status a box answered a request with.
+	Answered(box *Box, status int)
+	// Unreachable reports a box that failed before the request was sent to
+	// it: a dial, TLS or pin failure.
+	Unreachable(box *Box)
 }

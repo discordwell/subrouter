@@ -188,6 +188,7 @@ func (h *Handler) send(out *http.Request) (*http.Response, error) {
 		attempt.Header.Set("Authorization", "Bearer "+box.token)
 		response, err := box.transport.RoundTrip(attempt)
 		if err == nil {
+			h.boxes.Answered(box, response.StatusCode)
 			h.logger.Info("standby: a box answered", "box", box.name, "session", sessionID,
 				"method", out.Method, "path", out.URL.Path, "status", response.StatusCode)
 			return response, nil
@@ -200,6 +201,7 @@ func (h *Handler) send(out *http.Request) (*http.Response, error) {
 				"box", box.name, "session", sessionID, "method", out.Method, "path", out.URL.Path, "error", err)
 			return nil, errSentThenFailed{err}
 		}
+		h.boxes.Unreachable(box)
 		h.logger.Warn("standby: a box could not be reached; trying the next",
 			"box", box.name, "session", sessionID, "error", err)
 		last = err

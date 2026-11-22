@@ -2442,11 +2442,19 @@ the id). So a session lands on the same box every time, after a restart of the s
 goes down moves only its own sessions. A box that refused its token gets no request. A box that could not
 be reached is tried only after every other box, because it may be back.
 
-Every 10 minutes the set tests each box's token with `HEAD /`, the cheapest request a box authenticates.
-The box's proxy answers 204 to a token it takes and 401 to one it refuses, and sends nothing upstream. The
-result per box (`ok`, `refused` or `unreachable`) and its time are in `Set.Status()`, for a status body. A
-box not tested yet shows `untested` and is used. So a token that lapses is found within 10 minutes, not on
-the day the stand-in needs it.
+The set tests a box's token with `HEAD /`, the cheapest request a box authenticates. The box's proxy answers
+204 to a token it takes and 401 to one it refuses, and sends nothing upstream. The result per box (`ok`,
+`refused` or `unreachable`) and its time are in `Set.Status()`, for a status body. A box not tested yet
+shows `untested` and is used. The box handler reports each box's answer to the set (`Boxes.Answered`,
+`Boxes.Unreachable`), and an answer counts as a test. So a box gets a token test only when nothing has
+reached it for 10 minutes: every 10 minutes while the stand-in is idle, and not while it serves. A token
+that lapses is found within 10 minutes, not on the day the stand-in needs it.
+
+A box's 401 to a request marks it refused at once, so the client's retry goes to another box. Without that
+report, every retry of a session whose hash names that box would go back to it until its next test, 10
+minutes later. An address that fails before a request is sent goes after its box's other addresses for a
+minute, as the peer link's tailnet cooldown does, and a box is unreachable only once all its addresses have
+failed. So a box whose tailnet address fails while its URL works is never shown unreachable.
 
 Not done: the stand-in command must take `SUBROUTER_PEER_TAILNET` from the daemon's worker config, and must
 apply the daemon's `remote.key` gate before it builds the set. Both belong to the part that adds
