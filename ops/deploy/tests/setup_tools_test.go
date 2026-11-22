@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -121,11 +122,70 @@ var requiredSetupToolCases = []string{
 	"quickstart-done-sr-on-path",
 }
 
-// TestSetupTools runs each case of setup-tools-test.sh as its own subtest:
+// On macOS the harness runs each tool inside sandbox-exec, which refuses exec
+// of launchctl. Without it only the stubs keep a tool off this Mac's launchd,
+// and a stopped deploy test once outlived its stubs and unloaded the live
+// service (PATCHES §76). So, as for the deploy cases, a Mac runs these cases
+// only sandboxed.
+func setupToolsFenceRefusal(goos string, getenv func(string) string, lookPath func(string) (string, error)) string {
+	if goos != "darwin" {
+		return ""
+	}
+	var why string
+	if v := getenv("SETUP_TOOLS_SANDBOX"); v != "" && v != "1" {
+		why = "SETUP_TOOLS_SANDBOX=" + v + " turns off the harness's sandbox"
+	} else if _, err := lookPath("sandbox-exec"); err != nil {
+		why = "there is no sandbox-exec on PATH for the harness's sandbox"
+	} else {
+		return ""
+	}
+	return "refusing to run the setup tool cases on macOS outside a sandbox: " + why +
+		", which refuses exec of launchctl (ops/PATCHES.md §76). Leave SETUP_TOOLS_SANDBOX unset, or run them on Linux."
+}
+
+func TestSetupToolsRefuseAMacOutsideTheirSandbox(t *testing.T) {
+	sandbox := func(value string) func(string) string {
+		return func(key string) string {
+			if key == "SETUP_TOOLS_SANDBOX" {
+				return value
+			}
+			return ""
+		}
+	}
+	found := func(string) (string, error) { return "/usr/bin/sandbox-exec", nil }
+	missing := func(string) (string, error) { return "", exec.ErrNotFound }
+	for _, c := range []struct {
+		run     string
+		goos    string
+		value   string
+		look    func(string) (string, error)
+		refused bool
+	}{
+		{"a Mac, by default", "darwin", "", found, false},
+		{"a Mac, SETUP_TOOLS_SANDBOX=1", "darwin", "1", found, false},
+		{"a Mac, SETUP_TOOLS_SANDBOX=0", "darwin", "0", found, true},
+		{"a Mac without sandbox-exec", "darwin", "", missing, true},
+		{"Linux, SETUP_TOOLS_SANDBOX=0", "linux", "0", missing, false},
+	} {
+		why := setupToolsFenceRefusal(c.goos, sandbox(c.value), c.look)
+		if c.refused && why == "" {
+			t.Errorf("%s would run the cases", c.run)
+		}
+		if !c.refused && why != "" {
+			t.Errorf("%s was refused: %s", c.run, why)
+		}
+	}
+}
+
+// TestSetupTools runs each case of setup-tools-test.sh as its own subtest, on
+// macOS only inside the harness's sandbox (setupToolsFenceRefusal):
 //
 //	cd ops && go test -count=1 -run TestSetupTools ./deploy/tests
 //	cd ops && go test -count=1 -run 'TestSetupTools/remote-key-remove$' ./deploy/tests
 func TestSetupTools(t *testing.T) {
+	if why := setupToolsFenceRefusal(runtime.GOOS, os.Getenv, exec.LookPath); why != "" {
+		t.Fatal(why)
+	}
 	for _, tool := range []string{"bash", "python3"} {
 		if _, err := exec.LookPath(tool); err != nil {
 			t.Fatalf("%s is required to run the setup tool harness: %v", tool, err)
