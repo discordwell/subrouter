@@ -247,6 +247,8 @@ var requiredCases = []string{
 	// installed, or says how to; the harness signals only its own runs; and
 	// one case reads the scripts' default label and address (PATCHES §76.6).
 	"laptop-refusal-that-cannot-put-the-build-back-says-how",
+	"laptop-refusal-puts-the-edited-plist-back",
+	"sup-restart-supervisor-refusal-puts-both-builds-back",
 	"act-refusal-at-the-restart-puts-the-files-back",
 	"harness-cleanup-signals-only-its-own-runs",
 	"scripts-default-to-the-live-job",
@@ -872,14 +874,17 @@ func (b *syncBuffer) String() string {
 // A call is launchctl, by name or by path, where a command starts: at the
 // start of a line, after ; & | ( ) { } ! a backquote or $(, or after a
 // keyword; behind any of command, exec, env, nohup, nice, time, sudo and
-// timeout with their options, an option's value included, and behind variable
-// assignments. Its verb is
-// one that loads, unloads, starts, stops or signals a job (PATCHES §76.6). A
-// line that ends in a backslash goes on into the next.
+// timeout with their options, an option's value included, behind launchctl
+// asuser or bsexec and its argument, and behind variable assignments, quoted
+// or not. Its verb is one that loads, unloads, starts, stops or signals a job,
+// or reboot (PATCHES §76.6). A line that ends in a backslash goes on into the
+// next.
 var (
 	launchdChange = regexp.MustCompile(`(?:^|[;&|(){}!` + "`" + `]|\$\(|\b(?:then|do|else|if|elif|while|until)\b)\s*` +
-		`(?:(?:[A-Za-z_][A-Za-z0-9_]*=\S*|(?:\S*/)?(?:command|exec|env|nohup|nice|time|sudo|timeout)|-\S+(?:\s+(?:"[^"]*"|'[^']*'|[^-\s]\S*))?|[0-9][0-9.]*[smhd]?)\s+)*` +
-		`["']?(?:\S*/)?launchctl["']?\s+["']?(?:kickstart|bootout|bootstrap|load|unload|remove|kill|stop|start|enable|disable|submit)\b`)
+		`(?:(?:[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|\S*)|"[A-Za-z_][A-Za-z0-9_]*=[^"]*"|'[A-Za-z_][A-Za-z0-9_]*=[^']*'|` +
+		`(?:\S*/)?(?:command|exec|env|nohup|nice|time|sudo|timeout)|(?:\S*/)?launchctl\s+(?:asuser|bsexec)\s+\S+|` +
+		`-\S+(?:\s+(?:"[^"]*"|'[^']*'|[^-\s]\S*))?|[0-9][0-9.]*[smhd]?)\s+)*` +
+		`["']?(?:\S*/)?launchctl["']?\s+["']?(?:kickstart|bootout|bootstrap|load|unload|remove|kill|stop|start|enable|disable|submit|reboot)\b`)
 	shellFunc    = regexp.MustCompile(`^([A-Za-z_][A-Za-z0-9_]*)\(\) *\{`)
 	guardedCalls = map[string]bool{"kickstart_job": true, "bootout_and_wait": true, "bootstrap_job": true}
 )
@@ -989,6 +994,10 @@ func TestLaunchdChangeScanCatchesEverySpelling(t *testing.T) {
 		`launchctl disable "$LABEL"`,
 		`launchctl enable "$LABEL"`,
 		`launchctl submit -l x -- /bin/true`,
+		`env "PATH=/bin" launchctl bootout "$LABEL"`,
+		`FOO="a b" launchctl bootout "$LABEL"`,
+		`launchctl asuser 501 launchctl bootout "$LABEL"`,
+		`launchctl reboot userspace`,
 	} {
 		if got := launchdChanges(line); len(got) != 1 {
 			t.Errorf("not taken for a launchd change: %s", line)
