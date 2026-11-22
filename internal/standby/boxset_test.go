@@ -591,7 +591,7 @@ func TestTheTailnetAddressIsTriedFirstThenTheURL(t *testing.T) {
 	f.writeToken(t, "b", other.token, 0o600)
 
 	logs := &lockedBuffer{}
-	set := newSet(t, f, "a=100.64.0.7, b=fd7a:115c:a1e0::7", time.Hour, logs)
+	set := newSet(t, f, "a=100.64.0.7, b=fd7a:115c:a1e0::10:7", time.Hour, logs)
 	onA := sessionsFirstOn(t, set, "a/tailnet", 1)[0]
 	if got := names(set.Candidates(onA)); strings.Join(got, " ") != "a/tailnet a b/tailnet b" {
 		t.Fatalf("Candidates = %v, want each box's tailnet address before its URL", got)
