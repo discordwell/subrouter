@@ -955,6 +955,8 @@ type supervisorControlStatus struct {
 	Version      string                    `json:"version"`
 	Inhibited    bool                      `json:"upgrade_inhibited"`
 	ClaudeSocket string                    `json:"claude_socket"`
+
+	ClaudeSocketRebinds int `json:"claude_socket_rebinds"`
 }
 
 func waitForSupervisorStatus(t *testing.T, client *http.Client, runDone <-chan error) supervisorControlStatus {

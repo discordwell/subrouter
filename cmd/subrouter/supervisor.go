@@ -885,6 +885,11 @@ func (s *supervisor) controlHandler() http.Handler {
 		}
 		if s.claudeSocket != nil {
 			status["claude_socket"] = s.claudeSocket.Status()
+			// A process that stands in on the socket path checks this before it
+			// takes the lock: a supervisor without it tries the socket once at
+			// start and would never take the path back. PATCHES section 77.1.
+			status["claude_socket_waits_for_lock"] = true
+			status["claude_socket_rebinds"] = s.claudeSocket.rebinds()
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(status)

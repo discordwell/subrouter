@@ -57,6 +57,17 @@ func claudeSocketTestDir(t *testing.T) string {
 	return dir
 }
 
+// openPrivateClaudeSocketListener is the socket as start serves it, opened
+// once and without a keeper: the opener's own rules, and peers that report
+// loopback.
+func openPrivateClaudeSocketListener(socket string) (net.Listener, error) {
+	owned, err := openLeasedClaudeSocket(socket)
+	if err != nil {
+		return nil, err
+	}
+	return loopbackTCPListener{Listener: owned, addr: &net.UnixAddr{Name: socket, Net: "unix"}}, nil
+}
+
 func claudeSocketEnvFor(values map[string]string) func(string) string {
 	return func(key string) string { return values[key] }
 }
@@ -486,31 +497,62 @@ func TestClaudeSocketLeftToTheSupervisorInSupervisedWorker(t *testing.T) {
 	}
 }
 
-// Two processes naming one path: the second reports unavailable and leaves the
-// first serving, rather than failing either one.
+// Two processes naming one path: the second waits and leaves the first
+// serving, rather than failing either one, and serves the path once the first
+// lets go of it. PATCHES section 77.1: it used to report unavailable and never
+// try again.
 func TestClaudeSocketSecondOwnerIsSoft(t *testing.T) {
 	socketPath := filepath.Join(claudeSocketTestDir(t), "claude.sock")
 	env := claudeSocketEnvFor(map[string]string{claudeSocketEnv: socketPath})
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	first, second := newClaudeSocket("", env), newClaudeSocket("", env)
-	firstServer := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = io.WriteString(w, "first")
-	}), ReadHeaderTimeout: 10 * time.Second}
-	secondServer := &http.Server{Handler: http.NotFoundHandler(), ReadHeaderTimeout: 10 * time.Second}
-	t.Cleanup(func() { _ = firstServer.Close(); _ = secondServer.Close() })
+	answering := func(body string) *http.Server {
+		return &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = io.WriteString(w, body)
+		}), ReadHeaderTimeout: 10 * time.Second}
+	}
+	firstServer, secondServer := answering("first"), answering("second")
+	t.Cleanup(func() {
+		_ = firstServer.Close()
+		_ = secondServer.Close()
+		first.close()
+		second.close()
+	})
 	first.start(firstServer.Serve, "", logger)
 	second.start(secondServer.Serve, "", logger)
-	if first.Status() != claudeSocketServing || second.Status() != claudeSocketUnavailable {
-		t.Fatalf("statuses = %q, %q; want serving, unavailable", first.Status(), second.Status())
+	if first.Status() != claudeSocketServing || second.Status() != "waiting" {
+		t.Fatalf("statuses = %q, %q; want serving, waiting", first.Status(), second.Status())
 	}
-	response, err := unixClient(socketPath).Get("http://api.anthropic.com/")
-	if err != nil {
-		t.Fatal(err)
+	answer := func() (string, error) {
+		client := unixClient(socketPath)
+		defer client.CloseIdleConnections()
+		response, err := client.Get("http://api.anthropic.com/")
+		if err != nil {
+			return "", err
+		}
+		defer response.Body.Close()
+		body, err := io.ReadAll(response.Body)
+		return string(body), err
 	}
-	body, _ := io.ReadAll(response.Body)
-	response.Body.Close()
-	if string(body) != "first" {
-		t.Fatalf("socket answered %q, want the first owner", body)
+	if body, err := answer(); err != nil || body != "first" {
+		t.Fatalf("socket answered %q, %v; want the first owner", body, err)
+	}
+
+	_ = firstServer.Close()
+	first.close()
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		body, err := answer()
+		if err == nil && body == "second" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("after the first owner let go the socket answered %q, %v; want the second owner (status %q)", body, err, second.Status())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if got := second.Status(); got != claudeSocketServing {
+		t.Fatalf("second owner's status = %q once it serves, want %q", got, claudeSocketServing)
 	}
 }
 
