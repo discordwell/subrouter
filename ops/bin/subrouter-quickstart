@@ -517,6 +517,25 @@ def require_own_job() -> None:
                    f"and this script's plist is {PLIST}. launchd was not changed.")
 
 
+# The watchdog job loads the daemon's job again whenever launchd has no job for
+# it (PATCHES §81). This bootout is a stop on purpose, so it is announced first,
+# for the whole wait and three minutes more, shortened to three minutes once the
+# job is gone, and withdrawn when the bootstrap worked, as laptop-deploy-lib.sh
+# does. A run that dies in between leaves a marker that expires.
+WATCHDOG = os.path.join(SRC, "ops", "deploy", "macos", "subrouter-watchdog.sh")
+STOP_HOLD = 180
+
+
+def announce_stop(seconds: int) -> None:
+    held = run(["/bin/bash", WATCHDOG, "hold", LABEL, str(seconds), "--by", f"subrouter-quickstart (pid {os.getpid()})"])
+    if held.returncode != 0:
+        say(f"  could not tell the watchdog this stop is on purpose; it may load {LABEL} again first")
+
+
+def withdraw_stop() -> None:
+    run(["/bin/bash", WATCHDOG, "release", LABEL])
+
+
 def reload_job(data: dict) -> None:
     """Restart the LaunchAgent so it reads the plist `data` came from again.
 
@@ -529,12 +548,14 @@ def reload_job(data: dict) -> None:
     exit_timeout = data.get("ExitTimeOut")
     limit = max(600, exit_timeout + 60) if isinstance(exit_timeout, int) else 600
     start = f"launchctl bootstrap {DOMAIN} {PLIST}"
+    announce_stop(limit + STOP_HOLD)
     run(["launchctl", "bootout", JOB])
     for waited in range(limit + 1):
         rc = run(["launchctl", "print", JOB]).returncode
         if rc != 0 or waited == limit:
             break
         time.sleep(1)
+    announce_stop(STOP_HOLD)
     if rc != 113:
         held = (f"launchd still holds {LABEL} {limit} s after the bootout" if rc == 0 else
                 f"`launchctl print` answered rc {rc} after the bootout, not 113, the answer for a job that is gone")
@@ -545,6 +566,7 @@ def reload_job(data: dict) -> None:
         raise daemon_down("launchctl bootstrap failed: " + (result.stderr or result.stdout).strip() + "\n"
                           "  The daemon is DOWN: it was booted out to read the peer env, and launchd did not start it again.\n"
                           f"  Start it from a new Terminal.app window: {start}")
+    withdraw_stop()
     # A supervised job's first worker has its --ready-timeout to come up (2m
     # from activate-laptop-supervisor.sh, PATCHES §69.1). deploy-laptop.sh
     # waits 120 s, or that timeout plus 60 s when that is longer.
