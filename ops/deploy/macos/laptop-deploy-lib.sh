@@ -1,5 +1,5 @@
 # shellcheck shell=bash
-# shellcheck disable=SC2034 # LAUNCHD_FIX, SOCKET_INCOMPLETE and the job facts are read by the scripts that source this
+# shellcheck disable=SC2034 # LAUNCHD_FIX, SOCKET_INCOMPLETE, SOCKET_WHY and the job facts are read by the scripts that source this
 
 LAPTOP_LIB_DIR=$(dirname "${BASH_SOURCE[0]}")
 
@@ -364,7 +364,7 @@ control() { # method path max-seconds -> the body, then the HTTP code on a line 
     curl -s -m "$3" -w '\n%{http_code}' --unix-socket "$CONTROL_SOCKET" -X "$1" "http://supervisor$2" 2>/dev/null
 }
 
-status_field() { # name | active_identity
+status_field() { # name | active_identity | claude_socket_yield (as "<reason>|<until>")
     control GET /_subrouter/supervisor-status 5 | sed '$d' | python3 -c '
 import json, sys
 try:
@@ -373,6 +373,9 @@ except Exception:
     sys.exit(0)
 if sys.argv[1] == "active_identity":
     print((s.get("active_worker") or {}).get("executable_identity") or "")
+elif sys.argv[1] == "claude_socket_yield":
+    y = s.get("claude_socket_yield") or {}
+    print("%s|%s" % (y.get("reason") or "", y.get("until") or ""))
 else:
     v = s.get(sys.argv[1])
     print(str(v).lower() if isinstance(v, bool) else v or "")
@@ -453,27 +456,61 @@ probe_identity() {
     else echo "rotating"; fi
 }
 
-# <socket> -> serving | down:<why>
+# <socket> -> serving | down:<why> | standby:<why> | waiting:<why> | displaced:<why> | yielded:<why>
 #
 # Probed THROUGH the socket, because nothing on TCP proves it: the daemon fails
 # the socket soft and keeps serving TCP, and a client in socket mode that finds
 # the path dead or missing does not fall back to TCP -- it retries silently for
 # minutes (measured against Claude Code 2.1.284: no output for 60-90 s, zero TCP
 # requests). So "healthy" above can be true while every socket-mode session
-# hangs. Host is api.anthropic.com, as Claude Code sends it. The daemon's own
-# word for the socket (health `claude_socket` on TCP) rides along to say why.
+# hangs. Host is api.anthropic.com, as Claude Code sends it. The owner's word
+# for the socket (supervisor-status `claude_socket`, or a plain serve's health
+# on TCP) rides along to say why.
+#
+# An answer at the path is not the daemon owning it (PATCHES §84). A stand-in
+# holds the path while the daemon is away and answers health with "ok": true,
+# so that new launches still take the pool route; its body says claude_socket
+# "standby". And the owner can serve TCP while it waits for the socket's lock,
+# finds a listener it does not own at the path, or has let go of the path on
+# purpose. Each of those is its own first word, never serving.
 probe_claude_socket() {
-    local ok word
-    ok=$(curl -s -m 5 --unix-socket "$1" "http://api.anthropic.com/_subrouter/health" 2>/dev/null \
-        | python3 -c 'import json,sys; print(json.load(sys.stdin).get("ok") is True)' 2>/dev/null)
-    if [ "$ok" = True ]; then echo "serving"; return; fi
+    local answer owner word reason ends says
+    answer=$(curl -s -m 5 --unix-socket "$1" "http://api.anthropic.com/_subrouter/health" 2>/dev/null \
+        | python3 -c 'import json, sys
+b = json.load(sys.stdin)
+print("none" if b.get("ok") is not True else "stand-in" if b.get("claude_socket") == "standby" else "other")' 2>/dev/null)
     if [ "${SUPERVISED:-0}" = 1 ]; then
-        echo "down:no health answer on $1 (supervisor says: $(status_field claude_socket || echo no answer))"
-        return
+        owner=supervisor; word=$(status_field claude_socket)
+    else
+        owner=daemon
+        word=$(curl -s -m 3 "http://$ADDR/_subrouter/health" 2>/dev/null \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin).get("claude_socket") or "not reported")' 2>/dev/null)
     fi
-    word=$(curl -s -m 3 "http://$ADDR/_subrouter/health" 2>/dev/null \
-        | python3 -c 'import json,sys; print(json.load(sys.stdin).get("claude_socket") or "not reported")' 2>/dev/null)
-    echo "down:no health answer on $1 (daemon says: ${word:-no answer})"
+    says="$owner says: ${word:-no answer}"
+    case "$word/${answer:-none}" in
+        yielded/*)
+            IFS='|' read -r reason ends <<<"$(status_field claude_socket_yield)"
+            case "$reason" in operator) reason="an operator asked" ;; worker_exits) reason="its workers kept exiting" ;; esac
+            echo "yielded:the $owner let go of $1 on purpose (${reason:-no reason given})${ends:+ until $ends}; $(at_the_path "$answer"). Wait for the yield to end, or end it" ;;
+        waiting/stand-in)
+            echo "standby:a stand-in answers on $1, not the daemon. The $owner is asking for the path back, and the stand-in hands it over once it sees the daemon ready: check again in a minute" ;;
+        */stand-in)
+            echo "standby:a stand-in answers on $1, not the daemon, and the $owner is not asking for the path back ($says). It keeps the path until the $owner asks; the $owner's log says why it does not" ;;
+        waiting/*)
+            echo "waiting:another process holds $1.lock, and the $owner is asking for it; $(at_the_path "$answer"). The $owner takes the path as soon as the lock is free; lsof $1.lock lists who has it open" ;;
+        displaced/*)
+            echo "displaced:a listener the $owner does not own answers on $1. The $owner binds the path once nothing answers there; lsof $1 names the listener" ;;
+        */other) echo "serving" ;;
+        *) echo "down:no health answer on $1 ($says)" ;;
+    esac
+}
+
+at_the_path() { # none | stand-in | other
+    case "$1" in
+        stand-in) echo "a stand-in answers at the path" ;;
+        other) echo "another process answers at the path" ;;
+        *) echo "nothing answers at the path" ;;
+    esac
 }
 
 # GET /_subrouter/accounts -> how many accounts the daemon loaded
@@ -511,18 +548,28 @@ verify_routes() { # $1 = provider baseline, $2 = identity baseline, $3 = account
     # not, and the old binary cannot fix it (a pre-section-29 build ignores the
     # variable), so it is INCOMPLETE rather than a rollback -- the usual cause is
     # a plist edit that a plain kickstart never read (rerun with RELOAD=1).
+    #
+    # A path the daemon does not own (PATCHES §84) is INCOMPLETE whatever the
+    # baseline: a rollback would not give the daemon the path back, and it would
+    # restart what the deploy did not need to.
     if [ -n "$CLAUDE_SOCKET" ]; then
         local sock; sock=$(probe_claude_socket "$CLAUDE_SOCKET")
-        echo "   claude socket              -> $sock${base_socket:+   (before: $base_socket)}"
-        if [ "$sock" != "serving" ]; then
-            if [ -n "$base_socket" ] && [ "$base_socket" != "serving" ]; then
-                echo "      ^ not served before the swap either; this build did not cause it. Every"
-                echo "        socket-mode Claude session hangs until it is. If the plist was just edited: RELOAD=1"
-                SOCKET_INCOMPLETE=1
-            else
-                bad=1
-            fi
-        fi
+        echo "   claude socket              -> $sock${base_socket:+   (before: ${base_socket%%:*})}"
+        case "$sock" in
+            serving) ;;
+            standby:*|waiting:*|displaced:*|yielded:*)
+                echo "      ^ the daemon is not serving its Claude socket, so this is not OK. A rollback would not"
+                echo "        give it the path back, so nothing is rolled back or restarted for it"
+                SOCKET_INCOMPLETE=1; SOCKET_WHY="not owned by the daemon: ${sock%%:*}" ;;
+            *)
+                if [ -n "$base_socket" ] && [ "$base_socket" != "serving" ]; then
+                    echo "      ^ not served before the swap either; this build did not cause it. Every"
+                    echo "        socket-mode Claude session hangs until it is. If the plist was just edited: RELOAD=1"
+                    SOCKET_INCOMPLETE=1; SOCKET_WHY="not served"
+                else
+                    bad=1
+                fi ;;
+        esac
     fi
 
     local provider; provider=$(probe_provider)

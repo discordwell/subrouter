@@ -194,7 +194,7 @@ make build
 ops/deploy/macos/deploy-laptop.sh bin/subrouter
 ```
 
-The script installs the build where the job runs it, restarts the job or upgrades the supervised worker, and checks the routes. It ends with `DEPLOY OK`, or it restores this run's backup and exits 1. Exit 3 (`INCOMPLETE`) keeps the new build. It names Codex accounts that fail its credential-isolation check, with the fix. It also exits 3, with `claude socket not served`, when the plist names a Claude socket that neither build serves. `ops/deploy/macos/deploy-laptop.sh bin/subrouter --check` verifies the running daemon and changes nothing.
+The script installs the build where the job runs it, restarts the job or upgrades the supervised worker, and checks the routes. It ends with `DEPLOY OK`, or it restores this run's backup and exits 1. Exit 3 (`INCOMPLETE`) keeps the new build. It names Codex accounts that fail its credential-isolation check, with the fix. It also exits 3, with `claude socket not served`, when the plist names a Claude socket that neither build serves. It exits 3, with `claude socket not owned by the daemon`, when something other than the daemon holds that socket: a stand-in, or another process, or the supervisor let go of it on purpose (PATCHES §84). Its message says which, and what to do. `ops/deploy/macos/deploy-laptop.sh bin/subrouter --check` verifies the running daemon and changes nothing, and ends with `CHECK OK`, `CHECK FAILED` or `CHECK INCOMPLETE`.
 
 Each run that changes the job continues in a detached process and logs to `~/.subrouter/transitions/<script>-<stamp>-<pid>.log`, with the exit code in `.rc`. Closing the terminal does not stop it.
 

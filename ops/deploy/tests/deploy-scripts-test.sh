@@ -317,6 +317,12 @@ exec "$@"'
   # One curl for both machines. The daemon that answers is whichever build id
   # is in $FAKE_RUNNING (empty = down); FAKE_* scenario knobs apply only while
   # the NEW build ($FAKE_NEW_ID) is the one running, so a rollback heals.
+  # Who owns the Claude socket (PATCHES §84) holds for the whole run:
+  #   FAKE_CLAUDE_WORD         the claude_socket word of a health answer at the
+  #                            path (standby is a stand-in)
+  #   FAKE_SV_SOCKET           supervisor-status claude_socket (default serving)
+  #   FAKE_SV_YIELD=<reason> <until>  supervisor-status claude_socket_yield
+  #   FAKE_DAEMON_SOCKET_WORD  claude_socket in a plain serve's TCP health
   stub curl '
 url=""; out=""; fmt=""; auth=""; import=""; failflag=0; sock=""; method=GET; maxtime=""
 while [ $# -gt 0 ]; do
@@ -358,6 +364,7 @@ if [ -n "$sock" ]; then
           "GET /_subrouter/supervisor-status")
             [ -z "${FAKE_SV_STATUS_DOWN:-}" ] || up=0
             owner=", \"claude_socket\": \"${FAKE_SV_SOCKET:-serving}\""
+            [ -z "${FAKE_SV_YIELD:-}" ] || owner="$owner, \"claude_socket_yield\": {\"reason\": \"${FAKE_SV_YIELD%% *}\", \"until\": \"${FAKE_SV_YIELD#* }\"}"
             [ -e "$FAKE_LAUNCHD/supervisor-lacks-socket" ] && owner=""
             body=$(printf "{\"accepting\": true, \"active_worker\": {\"executable_identity\": \"%s\"}%s, \"version\": \"%s\"}" "$running" "$owner" "$sup") ;;
           "POST /_subrouter/upgrade")
@@ -383,7 +390,7 @@ if [ -n "$sock" ]; then
         [ -n "$running" ] || up=0
         late=$(cat "$FAKE_LAUNCHD/socket-late" 2>/dev/null || echo 0)
         if [ "$up" = 1 ] && [ "$late" -gt 0 ]; then echo $((late - 1)) > "$FAKE_LAUNCHD/socket-late"; up=0; fi
-        word=serving; [ -n "$sup" ] && word=owned_by_supervisor
+        word=serving; [ -n "$sup" ] && word=owned_by_supervisor; word=${FAKE_CLAUDE_WORD:-$word}
         case "$lpath" in /_subrouter/health) body="{\"ok\": true, \"claude_socket\": \"$word\"}" ;; *) code=404 ;; esac ;;
       drain)
         { [ -z "$sup" ] && [ -n "$running" ] && [ "$lpath" = /_subrouter/drain-status ]; } || up=0
@@ -492,7 +499,7 @@ if [ "$scheme" = https ]; then
   esac
 else
   case "$path" in
-    /_subrouter/health) body=$(printf "{\n  \"ok\": true\n}") ;;
+    /_subrouter/health) body=$(printf "{\n  \"ok\": true%s\n}" "${FAKE_DAEMON_SOCKET_WORD:+, \"claude_socket\": \"$FAKE_DAEMON_SOCKET_WORD\"}") ;;
     /_subrouter/ready) m=ok; [ "$new" = 1 ] && m=${FAKE_READY_PRIVATE:-ok}; ready "$m" ;;
     /v1/messages) code=401 ;;
     /_subrouter/accounts)
@@ -3429,6 +3436,77 @@ if begin sup-claude-socket-down-names-the-supervisor-state; then
   finish
 fi
 
+# Answering at the path is not owning it (PATCHES §84). A stand-in answers
+# health there with "ok": true while the daemon is away, and a supervisor can
+# serve TCP while it waits for the socket's lock, finds a listener it does not
+# own at the path, or has let go of the path. None of these is DEPLOY OK, and
+# none is a rollback: the build is kept and nothing more is restarted.
+no_owner_kept() { # the state word
+  expect_rc 3; expect_out "the daemon is not serving its Claude socket"
+  expect_out "DEPLOY INCOMPLETE (claude socket not owned by the daemon: $1)"
+  expect_no_out "DEPLOY OK"; expect_no_out "ROLLING BACK"; expect_build "$CUR" new
+}
+
+if begin sup-stand-in-at-the-claude-socket-is-not-the-daemon; then
+  sup_setup post post SUBROUTER_CLAUDE_SOCKET="$C/home/.subrouter/claude.sock"
+  run_laptop FAKE_CLAUDE_WORD=standby FAKE_SV_SOCKET=waiting
+  no_owner_kept standby; expect_out "claude-socket=standby"
+  expect_out "claude socket              -> standby:a stand-in answers on $H/.subrouter/claude.sock, not the daemon. The supervisor is asking for the path back"
+  expect_no_restart
+  [ "$(count_upgrades)" = 1 ] && ok || bad "$(count_upgrades) upgrades, want 1"
+  finish
+fi
+
+if begin sup-check-stand-in-the-supervisor-does-not-ask-back; then
+  sup_setup post post SUBROUTER_CLAUDE_SOCKET="$C/home/.subrouter/claude.sock"
+  run_laptop FAKE_CLAUDE_WORD=standby FAKE_SV_SOCKET=unavailable -- "$CUR" --check
+  expect_rc 3; expect_out "CHECK INCOMPLETE (claude socket not owned by the daemon: standby)"; expect_no_out "CHECK OK"
+  expect_out "the supervisor is not asking for the path back (supervisor says: unavailable)"
+  finish
+fi
+
+if begin sup-claude-socket-waiting-is-not-deploy-ok; then
+  sup_setup post post SUBROUTER_CLAUDE_SOCKET="$C/home/.subrouter/claude.sock"
+  run_laptop FAKE_CLAUDE_WORD=serving FAKE_SV_SOCKET=waiting
+  no_owner_kept waiting
+  expect_out "waiting:another process holds $H/.subrouter/claude.sock.lock, and the supervisor is asking for it; another process answers at the path"
+  expect_out "lsof $H/.subrouter/claude.sock.lock"
+  finish
+fi
+
+if begin sup-claude-socket-displaced-is-not-deploy-ok; then
+  sup_setup post post SUBROUTER_CLAUDE_SOCKET="$C/home/.subrouter/claude.sock"
+  run_laptop FAKE_CLAUDE_WORD=serving FAKE_SV_SOCKET=displaced
+  no_owner_kept displaced
+  expect_out "displaced:a listener the supervisor does not own answers on $H/.subrouter/claude.sock"
+  expect_out "lsof $H/.subrouter/claude.sock"
+  finish
+fi
+
+if begin sup-claude-socket-yielded-says-until-when; then
+  sup_setup post post SUBROUTER_CLAUDE_SOCKET="$C/home/.subrouter/claude.sock"
+  run_laptop FAKE_CLAUDE_WORD=standby FAKE_SV_SOCKET=yielded FAKE_SV_YIELD="operator 2026-11-21T23:30:00Z"
+  no_owner_kept yielded
+  expect_out "yielded:the supervisor let go of $H/.subrouter/claude.sock on purpose (an operator asked) until 2026-11-21T23:30:00Z; a stand-in answers at the path. Wait for the yield to end, or end it"
+  # Nothing answers at the path, and the workers' exits were the reason.
+  run_laptop FAKE_CLAUDE_SOCKET=/nonexistent/claude.sock FAKE_SV_SOCKET=yielded FAKE_SV_YIELD="worker_exits 2026-11-21T23:40:00Z" -- "$CUR" --check
+  expect_rc 3; expect_out "CHECK INCOMPLETE (claude socket not owned by the daemon: yielded)"
+  expect_out "on purpose (its workers kept exiting) until 2026-11-21T23:40:00Z; nothing answers at the path"
+  finish
+fi
+
+if begin laptop-stand-in-at-the-claude-socket-is-not-the-daemon; then
+  # A plain serve: its restart is the window a stand-in takes the path in.
+  laptop_setup pre post
+  "$PY3" -c 'import plistlib, sys; p = plistlib.load(open(sys.argv[1], "rb")); p["EnvironmentVariables"]["SUBROUTER_CLAUDE_SOCKET"] = sys.argv[2]; plistlib.dump(p, open(sys.argv[1], "wb"))' \
+    "$H/Library/LaunchAgents/$TEST_JOB.plist" "$H/.subrouter/claude.sock"
+  load_plist "$H/Library/LaunchAgents/$TEST_JOB.plist"
+  run_laptop FAKE_CLAUDE_WORD=standby FAKE_DAEMON_SOCKET_WORD=waiting
+  no_owner_kept standby
+  expect_out "standby:a stand-in answers on $H/.subrouter/claude.sock, not the daemon. The daemon is asking for the path back"
+  finish
+fi
+
 if begin sup-restart-supervisor-refused-outside-the-gui-session; then
   sup_setup post post; run_laptop FAKE_MANAGER=Background -- "$NEWBIN" --restart-supervisor
   expect_rc 1; expect_out "launchd's 'Background' session, not the logged-in GUI (Aqua) session"
@@ -4759,6 +4837,22 @@ PY
   else
     bad "the hung sr never ran"
   fi
+  finish
+fi
+
+if begin triage-tells-a-stand-in-from-the-daemon; then
+  # A stand-in at the job's Claude socket is its own state: not OK, not down (PATCHES §84).
+  triage_setup
+  "$PY3" -c 'import os, plistlib, sys; plistlib.dump({"Label": os.environ["TEST_JOB"], "ProgramArguments": ["/nonexistent/subrouter", "serve"], "EnvironmentVariables": {"SUBROUTER_CLAUDE_SOCKET": sys.argv[2]}}, open(sys.argv[1], "wb"))' \
+    "$H/Library/LaunchAgents/$TEST_JOB.plist" "$H/.subrouter/claude.sock"
+  echo new > "$C/running"
+  run_triage FAKE_RUNNING="$C/running" FAKE_CLAUDE_SOCKET="$H/.subrouter/claude.sock" FAKE_CLAUDE_WORD=standby
+  expect_rc 0; expect_out "socket:   STAND-IN at $H/.subrouter/claude.sock"; expect_no_out "socket:   OK"
+  run_triage FAKE_RUNNING="$C/running" FAKE_CLAUDE_SOCKET="$H/.subrouter/claude.sock"
+  expect_rc 0; expect_out "socket:   OK ($H/.subrouter/claude.sock)"; expect_no_out "STAND-IN"
+  : > "$C/running"
+  run_triage FAKE_RUNNING="$C/running" FAKE_CLAUDE_SOCKET="$H/.subrouter/claude.sock"
+  expect_rc 0; expect_out "socket:   NOT answering at $H/.subrouter/claude.sock"
   finish
 fi
 
