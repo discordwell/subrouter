@@ -2,6 +2,7 @@ package selectacct
 
 import (
 	"math/rand"
+	"strings"
 	"testing"
 	"time"
 
@@ -82,26 +83,43 @@ func TestCodexWeeklyGateIsAThinExhaustionFloor(t *testing.T) {
 	}
 }
 
-// "First to refresh, we exhaust first." Among accounts holding equal budget,
-// the one whose window rolls soonest must win, because its budget is the only
-// one with a deadline. A pristine account (reset == length == 604800) has not
-// started its clock and loses nothing by waiting, so it ranks last.
+// "First to refresh, we exhaust first." Among accounts whose weeks run and
+// hold equal budget, the one whose window rolls soonest must win, because the
+// soonest deadline is the budget that cannot wait. A pristine account (reset
+// == length == 604800) has not started its clock: it takes the next new
+// session first, which starts it (PATCHES §86). With
+// SUBROUTER_START_UNSTARTED_WEEK=0 it loses nothing by waiting and ranks last,
+// as it did before §86.
 func TestCodexPrefersTheSoonestRefresh(t *testing.T) {
 	scheduler := NewScheduler([]Score{
 		ScoreFromLimitWindows("pristine", 0, codexWindows(0, 604800)),
 		ScoreFromLimitWindows("closing-soon", 0, codexWindows(0, 200000)),
 		ScoreFromLimitWindows("mid-week", 0, codexWindows(0, 400000)),
 	})
-	got, err := scheduler.Pick([]account.Account{
+	candidates := []account.Account{
 		{ID: "pristine", AuthMode: account.AuthModeOAuth},
 		{ID: "mid-week", AuthMode: account.AuthModeOAuth},
 		{ID: "closing-soon", AuthMode: account.AuthModeOAuth},
-	})
-	if err != nil {
-		t.Fatalf("pick: %v", err)
 	}
-	if got.ID != "closing-soon" {
-		t.Fatalf("picked %q, want closing-soon (its budget is the only one with a deadline)", got.ID)
+	for _, tc := range []struct {
+		on   bool
+		want []string
+	}{
+		{true, []string{"pristine", "closing-soon", "mid-week"}},
+		{false, []string{"closing-soon", "mid-week", "pristine"}},
+	} {
+		setStartUnstartedWeekForTest(t, tc.on)
+		explained, err := scheduler.Explain(candidates)
+		if err != nil {
+			t.Fatalf("explain: %v", err)
+		}
+		got := make([]string, 0, len(explained))
+		for _, row := range explained {
+			got = append(got, row.Account.ID)
+		}
+		if strings.Join(got, ",") != strings.Join(tc.want, ",") {
+			t.Fatalf("switch on=%v: ranked %v, want %v", tc.on, got, tc.want)
+		}
 	}
 }
 

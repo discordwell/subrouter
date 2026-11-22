@@ -111,6 +111,11 @@ type SchedulerRef struct {
 	// request-rate refusal that ranks the account last for new placements
 	// and never evicts (rate_limit_marks.go). Never persisted either.
 	rateLimitedUntil map[string]time.Time
+	// startSentUntil holds start marks per account (ScoreKey): a new session
+	// was given to an account whose week had not started, so the priority of
+	// PATCHES §86 is off it until the mark expires (unstarted_week.go). Never
+	// cleared early and never persisted.
+	startSentUntil map[string]time.Time
 	// placementReservations counts picks that have been made but have not yet
 	// crossed the caller's upstream-success boundary (PickAndReserve, upstream
 	// #642). They steer concurrent placements immediately, then become
@@ -160,6 +165,11 @@ func (r *SchedulerRef) Get() Scheduler {
 	}
 	if paces := r.pace.snapshot.Load(); paces != nil {
 		scheduler = scheduler.withPaces(*paces)
+	}
+	// Like the aliases, the start marks ride on every read: they live beside
+	// the snapshot, so a refresh cannot drop them.
+	if marks := r.startSentLocked(now); marks != nil {
+		scheduler = scheduler.withStartSent(marks)
 	}
 	return scheduler
 }

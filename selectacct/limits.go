@@ -313,6 +313,9 @@ func claudeReservationDecay(resetAfterSeconds int64) float64 {
 type weeklyBinding struct {
 	remaining float64
 	reset     int64
+	// unstarted is Score.WeeklyUnstarted: the binding window's reading gives
+	// its whole length as left (PATCHES §86).
+	unstarted bool
 	found     bool
 }
 
@@ -323,11 +326,14 @@ func bindingWeekly(windows []LimitWindow, now time.Time) weeklyBinding {
 			continue
 		}
 		remaining := 1 - clampPercent(window.UsedPercent)/100
+		// >=, as the pool board's fuse reads it: a second of upstream clock
+		// skew must not turn an untouched week into a running one.
+		unstarted := window.ResetAfterSeconds >= window.LimitWindowSeconds
 		switch {
 		case !binding.found || remaining < binding.remaining:
-			binding = weeklyBinding{remaining: remaining, reset: window.ResetAfterSeconds, found: true}
+			binding = weeklyBinding{remaining: remaining, reset: window.ResetAfterSeconds, unstarted: unstarted, found: true}
 		case remaining == binding.remaining && betterWeeklyReset(window.ResetAfterSeconds, binding.reset):
-			binding.reset = window.ResetAfterSeconds
+			binding.reset, binding.unstarted = window.ResetAfterSeconds, unstarted
 		}
 	}
 	return binding
@@ -494,6 +500,7 @@ func scoreFromLimitWindows(accountID string, sessions int, windows []LimitWindow
 			score.WeeklyHeadroom = spendable
 			score.WeeklyRemaining = binding.remaining
 			score.WeeklyResetAt = now.Add(time.Duration(binding.reset) * time.Second)
+			score.WeeklyUnstarted = binding.unstarted
 		}
 		return score
 	}
@@ -512,6 +519,7 @@ func scoreFromLimitWindows(accountID string, sessions int, windows []LimitWindow
 		score.WeeklyHeadroom = binding.remaining
 		score.WeeklyRemaining = binding.remaining
 		score.WeeklyResetAt = now.Add(time.Duration(binding.reset) * time.Second)
+		score.WeeklyUnstarted = binding.unstarted
 		// A weekly meter with no short window beside it is the whole shape of
 		// the account. Recorded here, where the window set is in hand, because
 		// a Claude account with no 5h reading lacks a short window too and is
