@@ -492,6 +492,29 @@ def require_launchd() -> None:
     if why:
         raise Stop(f"--peer restarts the daemon, and {why}. Nothing was changed.\n"
                    "  Run this from a new Terminal.app window: `launchctl managername` must print Aqua.")
+    require_own_job()
+
+
+def require_own_job() -> None:
+    """laptop-deploy-lib.sh's own_job_or_exit (PATCHES §76.1).
+
+    The peer step boots JOB out and bootstraps PLIST. For a job launchd loaded
+    from another plist, that restarts the job and loads a different one in its
+    place. A job that is not loaded is this script's to start, and a print
+    launchd refuses proves nothing either way: launchd_blocker refuses on it.
+    """
+    printed = run(["launchctl", "print", JOB])
+    if printed.returncode != 0:
+        return
+    found = re.search(r"^\tpath = (.*)$", printed.stdout, re.M)
+    loaded = found.group(1) if found else ""
+    try:
+        ours = loaded == PLIST or os.path.samefile(loaded, PLIST)
+    except OSError:
+        ours = False
+    if not ours:
+        raise Stop(f"refusing to restart {JOB}: launchd loaded it from {loaded or 'a plist it does not name'}, "
+                   f"and this script's plist is {PLIST}. launchd was not changed.")
 
 
 def reload_job(data: dict) -> None:
