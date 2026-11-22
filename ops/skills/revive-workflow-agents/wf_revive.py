@@ -19,7 +19,8 @@ list   one row per agent that started and returned no result, with a state:
          superseded     another agent finished its stage. Ignore it.
 stage  copies agent-<id>.jsonl and .meta.json from the run folder into <session>/subagents/, never
        over an existing copy. After that, SendMessage(to=<id>) continues the agent. Prints the file
-       each agent's message should name for its report.
+       each agent's message should name for its report, and writes beside it the JSON Schema that
+       report must fit: the one the agent's own StructuredOutput tool had.
 check  after the SendMessage calls: how many turns each revived copy has taken since.
 done   prints {label: result} for the chosen runs: every finished stage's result from the journal,
        and each revived agent's report, or {"$wait": <file>} while that report is not written.
@@ -168,6 +169,53 @@ def report_of(reports: str, agent: str) -> str:
     return os.path.join(reports, f"{agent}.json")
 
 
+def schema_of(log: str) -> dict | None:
+    """The JSON Schema of the result an agent owes, from the StructuredOutput tool its log records."""
+    with open(log, encoding="utf-8", errors="replace") as lines:
+        for line in lines:
+            if '"api-request-shape"' not in line or "StructuredOutput" not in line:
+                continue
+            try:
+                tools = json.loads(line)["shape"]["tools"]
+            except (ValueError, KeyError, TypeError):
+                continue
+            for tool in tools:
+                if isinstance(tool, dict) and tool.get("name") == "StructuredOutput":
+                    return tool.get("input_schema")
+    return None
+
+
+KINDS = {"string": str, "integer": int, "number": (int, float), "boolean": bool, "array": list, "object": dict}
+
+
+def misfit(value, schema: dict) -> list[str]:
+    """Why a report cannot stand in for the stage's result: its top level against the schema's."""
+    if not isinstance(value, dict):
+        return ["it is not a JSON object"]
+    lacks = [key for key in schema.get("required", []) if key not in value]
+    wrong = [key for key, rule in schema.get("properties", {}).items()
+             if key in value and isinstance(rule, dict) and rule.get("type") in KINDS
+             and (not isinstance(value[key], KINDS[rule["type"]]) or isinstance(value[key], bool) != (rule["type"] == "boolean"))]
+    return ([f"lacks {', '.join(lacks)}"] if lacks else []) + ([f"wrong type for {', '.join(wrong)}"] if wrong else [])
+
+
+def report(reports: str, row: dict):
+    """A revived agent's result, or {"$wait": file} while its report is not there or does not fit."""
+    path, schema = report_of(reports, row["id"]), schema_of(row["log"])
+    try:
+        text = open(path, encoding="utf-8").read()
+    except OSError:
+        return {"$wait": path}
+    if schema is None:              # the stage returns its last message as text
+        return text if text.strip() else {"$wait": path}
+    try:
+        value = json.loads(text)
+    except ValueError:
+        return {"$wait": path, "$misfit": ["it is not JSON"]}
+    problems = misfit(value, schema)
+    return {"$wait": path, "$misfit": problems} if problems else value
+
+
 def done_map(run: str, base: str, reports: str) -> dict:
     """A run's stages that need no agent: label to result, or to the report a revived agent will write."""
     label, out = {}, {}
@@ -179,11 +227,7 @@ def done_map(run: str, base: str, reports: str) -> dict:
     for row in unfinished(run, base):
         if row["state"] != "revived" or row["stage"] in out:
             continue
-        report = report_of(reports, row["id"])
-        try:
-            out[row["stage"]] = json.load(open(report, encoding="utf-8"))
-        except (OSError, ValueError):      # not written yet, or half written
-            out[row["stage"]] = {"$wait": report}
+        out[row["stage"]] = report(reports, row)
     return out
 
 
@@ -203,6 +247,11 @@ def rerun(run: str, base: str, reports: str, out_dir: str, wait: bool) -> dict |
     waiting = [label for label, value in finished.items() if isinstance(value, dict) and "$wait" in value]
     plan = {"run": name, "finished": len(finished) - len(waiting), "waiting": waiting,
             "starts fresh": [r["stage"] for r in open_rows if r["state"] != "revived"]}
+    bad = {label: finished[label]["$misfit"] for label in waiting if "$misfit" in finished[label]}
+    if bad:
+        return {**plan, "misfit": bad, "skipped": "these reports do not fit their stage's schema, so the next "
+                "stage could not read them. Send each agent one message: its report must fit the schema "
+                "file that stage printed for it."}
     if waiting and not wait:
         return {**plan, "skipped": "the revived agents of these stages have not written their reports. "
                 "Run rerun again when they have, or pass --wait to start now with one waiting agent a stage."}
@@ -281,8 +330,12 @@ def main() -> int:
                 target = os.path.join(base, os.path.basename(source))
                 if os.path.exists(source) and not os.path.exists(target):
                     shutil.copy2(source, target)
-            print(f"staged  {row['label']:26} {row['id']}  ({row['minutes']} min, {row['turns']} turns)  "
-                  f"report: {report_of(reports, row['id'])}")
+            where, schema = report_of(reports, row["id"]), schema_of(row["log"])
+            if schema is not None:
+                with open(where[:-len(".json")] + ".schema.json", "w", encoding="utf-8") as handle:
+                    json.dump(schema, handle, indent=1)
+            print(f"staged  {row['label']:26} {row['id']}  ({row['minutes']} min, {row['turns']} turns)  report: {where}"
+                  + (f"  schema: {where[:-len('.json')]}.schema.json" if schema is not None else "  (its result is text)"))
         print(f"{len(chosen) - len(refused)} staged in {base}. Now: SendMessage(to=<id>) for each, "
               "naming its report file.")
         return 0
@@ -295,7 +348,10 @@ def main() -> int:
             continue
         meta_path = log[:-len(".jsonl")] + ".meta.json"
         meta = json.load(open(meta_path)) if os.path.exists(meta_path) else {}
-        written = "report written" if os.path.exists(report_of(reports, agent)) else "no report yet"
+        got = report(reports, {"id": agent, "log": original[0]})
+        written = ("no report yet" if got == {"$wait": report_of(reports, agent)} else
+                   f"report does not fit: {'; '.join(got['$misfit'])}" if isinstance(got, dict) and "$misfit" in got
+                   else "report written")
         print(f"{meta.get('description', ''):26} {agent}  {turns_since_revival(log, original[0]):4} turns since revival  {written}")
     return 0
 

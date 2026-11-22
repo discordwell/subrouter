@@ -9,7 +9,7 @@ A workflow agent that dies mid-work loses nothing on disk. Claude Code writes it
 
 Measured on 2026-11-21 (Claude Code 2.1.328), after the pool was unreachable for 137 minutes: 28 agents of 10 runs, each 7 to 65 minutes into its work, were all continued. Each one's first action was the check its message asked for, in its own worktree. None started over.
 
-The whole chain was run on 2026-11-22 on a run of two units and four stages, stopped with one agent mid-stage: the agent was revived and wrote its report, and the run started again by step 7 called 0 agents and returned all four results in 16 ms.
+The whole chain was run twice on 2026-11-22 on small runs stopped with one agent mid-stage. Each time the agent was revived and wrote its report, and the run started again by step 7 called 0 agents and returned every stage's result in under 20 ms. The second time the agent was given its schema file, and its report fit.
 
 `wf_revive.py` is beside this file. Run it from any directory; the session id comes from `$CLAUDE_CODE_SESSION_ID`.
 
@@ -63,13 +63,15 @@ On 2026-11-21 five such runs were resumed with the exact script and arguments. W
    python3 ~/.claude/skills/revive-workflow-agents/wf_revive.py stage --all-dead      # or --ids a1,a2 --runs wf_x
    ```
 
-   It copies `agent-<id>.jsonl` and `.meta.json` from the run folder into `<session>/subagents/`, and prints the report file for each agent. Without the copy, SendMessage answers "No transcript found".
+   It copies `agent-<id>.jsonl` and `.meta.json` from the run folder into `<session>/subagents/`. For each agent it prints the report file, and the schema file it wrote beside it from the agent's own log. Without the copy, SendMessage answers "No transcript found".
 
 5. **Continue each agent with `SendMessage(to=<agentId>)`.** The tool answers `Resuming agent <id>`. Send several in one turn; revive one first if the mechanism is in doubt. The message says, in this order:
    - What happened and when: the connection dropped at HH:MM and is back. "You are the same agent, continuing the same task with your whole conversation; nothing of your instructions has changed."
    - What to check first: `git status --short`, `git log --oneline -5`, the tail of its notes file. A command that was running when the connection dropped may have been cut off half way.
    - What changed while it was away, if it matters to this agent.
-   - How to end: "Finish your task as your instructions say. Write your final result, in the JSON shape your instructions asked for and nothing else, to `<the report file stage printed>`. Make your last message at most six lines: done or not, what did not run, and that path." The revived copy has no StructuredOutput tool, and its last message lands whole in the main session.
+   - How to end: "Finish your task as your instructions say. You no longer have the StructuredOutput tool. Write your final result as one JSON object to `<the report file stage printed>`. It must fit the JSON Schema in `<the schema file stage printed>`, which is the schema that tool had: every required key, each with the type the schema gives. Make your last message at most six lines: done or not, what did not run, and that path." The revived copy's last message lands whole in the main session, so keep it short. For an agent whose result is text, `stage` prints no schema: its report file is that text.
+
+   The schema matters. On 2026-11-21 the message said only "in the JSON shape your instructions asked for", and three of three reports checked afterwards had keys of the agent's own choosing. The next stage could not have read them.
 
    Say all of it in the first message. A later message to a working agent is queued for its next tool round and moves a tool call it is running to the background. Give each role its own wording: a builder should not merge the main line now, and a lander must fetch the main line again before it trusts anything fetched earlier.
 
@@ -79,7 +81,7 @@ On 2026-11-21 five such runs were resumed with the exact script and arguments. W
    python3 ~/.claude/skills/revive-workflow-agents/wf_revive.py check --ids a1,a2,...
    ```
 
-   Each revived agent shows turns since revival within two minutes, and later `report written`.
+   Each revived agent shows turns since revival within two minutes, and later `report written`. `report does not fit: lacks ...` means the agent wrote a shape of its own: send it one message that names the schema file and the keys it lacks.
 
 7. **Carry the runs on.** A revived agent is a subagent of the main session. Its run is over, so no later stage follows by itself.
 
@@ -92,7 +94,7 @@ On 2026-11-21 five such runs were resumed with the exact script and arguments. W
    - a stage that a revived agent finished returns that agent's report;
    - a stage that never started, and everything after, runs as usual.
 
-   `rerun` holds a run back while one of its revived agents has not written its report, and names the stages it waits for. Run it again when their notifications arrive. With `--wait` it does not hold back: the new run starts now, and one agent for each such stage waits for the report file and returns it. Use that when a run has units that can go on while a slow builder finishes. Start a run once.
+   `rerun` holds a run back while one of its revived agents has not written its report, or wrote one that does not fit its schema, and names those stages. Run it again when their notifications arrive. With `--wait` it does not hold back: the new run starts now, and one agent for each such stage waits for the report file and returns it. Use that when a run has units that can go on while a slow builder finishes. Start a run once.
 
    This needs a script written as the next section says. For a script without the mark, `rerun` says so and writes nothing. Then start each unit's remaining stages by hand: for a revived builder a verifier, for a revived verifier that passed a lander, for one that failed a fix round. `wf_revive.py done` prints every finished result to work from.
 
