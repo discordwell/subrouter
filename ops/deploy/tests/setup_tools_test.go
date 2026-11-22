@@ -65,6 +65,7 @@ var requiredSetupToolCases = []string{
 	"quickstart-peers-file-is-a-pool",
 	"quickstart-peer-step-rechecks-the-plist-it-writes",
 	"quickstart-peer-step-writes-with-key",
+	"quickstart-peer-step-writes-the-plist-it-is-given",
 	"quickstart-peer-restart-waits-for-launchd",
 	"quickstart-peer-rerun-leaves-a-peered-daemon-alone",
 	"quickstart-peer-restart-needs-the-gui-session",

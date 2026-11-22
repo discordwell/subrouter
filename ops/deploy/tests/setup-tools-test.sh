@@ -64,6 +64,10 @@ T=$(cd "$T0" && pwd -P) && [ -d "$T" ] && [ "$T" != / ] || { echo "cannot resolv
 # early, and rm -rf cannot always remove those.
 [ -n "${KEEP:-}" ] && echo "keeping $T" || trap 'chmod -R u+rwx "$T" 2>/dev/null; rm -rf "$T"' EXIT
 PASS=0; FAILED=0; FAIL_LIST=""; CASE=""; C=""; RC=0
+# A run that outlived its stubs once reached the real launchctl with the live
+# job's label (PATCHES §76). So every tool gets this label (run_sandboxed), and
+# the quickstart a closed port for its daemon (run_qs).
+TEST_LABEL="test.subrouter.setuptools.$$"
 
 SANDBOX=""
 if [ "${SETUP_TOOLS_SANDBOX:-1}" = 1 ] && command -v sandbox-exec >/dev/null 2>&1; then
@@ -119,9 +123,9 @@ mode_of() { "$PY3" -c 'import os, sys; print(oct(os.stat(sys.argv[1]).st_mode & 
 # A LaunchAgent at the path the tools read, from a JSON dict of its keys.
 write_plist() { # json
   mkdir -p "$H/Library/LaunchAgents"
-  "$PY3" - "$H/Library/LaunchAgents/ai.manaflow.subrouter.plist" "$1" <<'PY'
+  "$PY3" - "$H/Library/LaunchAgents/$TEST_LABEL.plist" "$1" "$TEST_LABEL" <<'PY'
 import json, plistlib, sys
-body = {"Label": "ai.manaflow.subrouter"}
+body = {"Label": sys.argv[3]}
 body.update(json.loads(sys.argv[2]))
 with open(sys.argv[1], "wb") as f:
     plistlib.dump(body, f)
@@ -177,7 +181,7 @@ finish() {
 }
 
 run_sandboxed() { # env-assignments... -- command...
-  local envs=() e
+  local envs=(SUBROUTER_LABEL="$TEST_LABEL") e
   while [ $# -gt 0 ] && [ "$1" != -- ]; do envs+=("$1"); shift; done
   shift
   for e in "${envs[@]}"; do case "$e" in PATH=*) assert_shadowed "${e#PATH=}" ;; esac; done
@@ -372,7 +376,7 @@ if begin remote-key-restart-hint-with-launchagent; then
   expect_rc 0
   # Only the key is new, so a restart that does not re-read the plist is enough,
   # and it has no bootout to wait out before a bootstrap.
-  expect_line "  launchctl kickstart -k gui/\$(id -u)/ai.manaflow.subrouter"
+  expect_line "  launchctl kickstart -k gui/\$(id -u)/$TEST_LABEL"
   expect_no_out "bootstrap"
   expect_no_log .
   finish
@@ -403,7 +407,7 @@ if begin remote-key-hint-names-the-daemon-store; then
   expect_rc 0; expect_out "$H/alt-state/codex/remote.key: absent -- this machine is local-only (the LaunchAgent's daemon reads this one)"
   # Minted where the daemon reads it, the restart is what is left.
   run_remote_key SUBROUTER_STATE_DIR="$H/alt-state"
-  expect_rc 0; expect_line "  launchctl kickstart -k gui/\$(id -u)/ai.manaflow.subrouter"
+  expect_rc 0; expect_line "  launchctl kickstart -k gui/\$(id -u)/$TEST_LABEL"
   expect_no_out "not this file"
   finish
 fi
@@ -671,9 +675,9 @@ if call:
 sys.exit(qs.main(sys.argv[1:]))
 PY
 }
-qs_plist_has() { # key
+qs_plist_has() { # key [plist]
   "$PY3" -c 'import plistlib, sys; sys.exit(0 if sys.argv[2] in (plistlib.load(open(sys.argv[1], "rb")).get("EnvironmentVariables") or {}) else 1)' \
-    "$H/Library/LaunchAgents/ai.manaflow.subrouter.plist" "$1"
+    "${2:-$H/Library/LaunchAgents/$TEST_LABEL.plist}" "$1"
 }
 seed_remote_key() { # state-dir [mode] [contents]
   mkdir -p "$1/codex"
@@ -866,7 +870,7 @@ if begin quickstart-peer-defers-to-a-peers-file; then
   # (PATCHES §31). So --peer stops before the build, and the peer step before
   # it writes, and both name the file the box goes in.
   qs_setup; seed_remote_key "$H/.subrouter"
-  P="$H/Library/LaunchAgents/ai.manaflow.subrouter.plist"
+  P="$H/Library/LaunchAgents/$TEST_LABEL.plist"
   write_plist "{\"EnvironmentVariables\": {\"HOME\": \"$H\", \"SUBROUTER_REMOTE_POOLS_FILE\": \"$H/.subrouter/peers.json\"}}"
   cp "$P" "$C/plist-before"
   run_qs FAKE_DAEMON_UP=1
@@ -895,7 +899,7 @@ if begin quickstart-peer-key-before-the-peers-file; then
   # no key ignores the file too. So a keyless machine hears about the key
   # first, in phase 1 and in the peer step. The case above is the calibration.
   qs_setup
-  P="$H/Library/LaunchAgents/ai.manaflow.subrouter.plist"
+  P="$H/Library/LaunchAgents/$TEST_LABEL.plist"
   write_plist "{\"EnvironmentVariables\": {\"HOME\": \"$H\", \"SUBROUTER_REMOTE_POOLS_FILE\": \"$H/.subrouter/peers.json\"}}"
   cp "$P" "$C/plist-before"
   run_qs FAKE_DAEMON_UP=1
@@ -955,8 +959,19 @@ if begin quickstart-peer-step-writes-with-key; then
   done
   # Claude Code presents the proxy token, so the loopback exemption stays off.
   qs_plist_has SUBROUTER_ALLOW_LOOPBACK_PROXY && bad "the loopback exemption was turned on" || ok
-  expect_mode "$H/Library/LaunchAgents/ai.manaflow.subrouter.plist" 0o600
+  expect_mode "$H/Library/LaunchAgents/$TEST_LABEL.plist" 0o600
   expect_log "launchctl bootstrap"
+  finish
+fi
+
+if begin quickstart-peer-step-writes-the-plist-it-is-given; then
+  # SUBROUTER_PLIST names the LaunchAgent, as it does for deploy-laptop.sh: the
+  # peer goes into that plist, and that is the one launchd is handed.
+  qs_setup; seed_remote_key "$H/.subrouter"; write_plist "{\"EnvironmentVariables\": {\"HOME\": \"$H\"}}"
+  mv "$H/Library/LaunchAgents/$TEST_LABEL.plist" "$C/job.plist"
+  run_qs FAKE_QS_CALL=configure_peer SUBROUTER_PLIST="$C/job.plist"
+  qs_plist_has SUBROUTER_REMOTE_POOL "$C/job.plist" && ok || bad "the peer was not written into SUBROUTER_PLIST"
+  expect_log "^launchctl bootstrap gui/[0-9]+ $C/job.plist$"
   finish
 fi
 
@@ -983,7 +998,7 @@ exit 0'
   rm -f "$C/daemon-up"; : > "$C/log"
   run_qs FAKE_QS_CALL=configure_peer FAKE_HELD=3 FAKE_GONE_RC=5 FAKE_DAEMON_FILE="$C/daemon-up"
   expect_rc 1; expect_no_log "^launchctl bootstrap"
-  expect_out "launchctl bootstrap gui/$(id -u) $H/Library/LaunchAgents/ai.manaflow.subrouter.plist"
+  expect_out "launchctl bootstrap gui/$(id -u) $H/Library/LaunchAgents/$TEST_LABEL.plist"
   finish
 fi
 
@@ -1025,9 +1040,9 @@ elif verb == "bootout":
         os.remove(state)
 elif verb == "bootstrap":
     with open(args[2], "rb") as handle:
-        env = plistlib.load(handle).get("EnvironmentVariables") or {}
+        plist = plistlib.load(handle)
     with open(state, "w") as out:
-        json.dump(dict(env, XPC_SERVICE_NAME="ai.manaflow.subrouter"), out)
+        json.dump(dict(plist.get("EnvironmentVariables") or {}, XPC_SERVICE_NAME=plist["Label"]), out)
 else:
     sys.exit(1)
 PY
@@ -1041,7 +1056,7 @@ if begin quickstart-peer-rerun-leaves-a-peered-daemon-alone; then
   # when the loaded job lacks it.
   qs_setup; seed_remote_key "$H/.subrouter"; stub_launchd
   write_plist "{\"EnvironmentVariables\": {\"HOME\": \"$H\"}}"
-  P="$H/Library/LaunchAgents/ai.manaflow.subrouter.plist"
+  P="$H/Library/LaunchAgents/$TEST_LABEL.plist"
   printf '{"HOME": "%s"}\n' "$H" > "$C/launchd.json"
   run_qs FAKE_QS_CALL=configure_peer FAKE_LAUNCHD="$C/launchd.json" FAKE_DAEMON_UP=1
   expect_rc 0; expect_out "restarted and healthy"; expect_log "^launchctl bootstrap"
@@ -1069,7 +1084,7 @@ if begin quickstart-peer-restart-needs-the-gui-session; then
   # and the peer step still restarts it. So --peer checks it in phase 1,
   # before the build, and the peer step again before it writes the plist.
   qs_setup; seed_remote_key "$H/.subrouter"; write_plist "{\"EnvironmentVariables\": {\"HOME\": \"$H\"}}"
-  P="$H/Library/LaunchAgents/ai.manaflow.subrouter.plist"; cp "$P" "$C/plist-before"
+  P="$H/Library/LaunchAgents/$TEST_LABEL.plist"; cp "$P" "$C/plist-before"
   stub_launchd_session
   run_qs FAKE_DAEMON_UP=1 FAKE_QS_STUB=build -- --peer "$PEER_URL" --peer-fingerprint ab12 --peer-token-file "$C/peer-token"
   expect_rc 1; expect_out "this shell is in launchd's 'Background' session"; expect_out "new Terminal.app window"
@@ -1099,7 +1114,7 @@ if begin quickstart-peer-failed-bootstrap-says-the-daemon-is-down; then
   run_qs FAKE_DAEMON_UP=1 FAKE_QS_STUB=build FAKE_MANAGER=Aqua -- --peer "$PEER_URL" --peer-fingerprint ab12 --peer-token-file "$C/peer-token"
   expect_rc 1; expect_out "launchctl bootstrap failed: Bootstrap failed: 125"
   expect_out "The daemon is DOWN"
-  expect_out "launchctl bootstrap gui/$(id -u) $H/Library/LaunchAgents/ai.manaflow.subrouter.plist"
+  expect_out "launchctl bootstrap gui/$(id -u) $H/Library/LaunchAgents/$TEST_LABEL.plist"
   expect_out "Claude Code is down with it; $OPS/bin/subrouter-unbrick takes it off"
   expect_no_out "Your clients were not left half-configured"
   finish
@@ -1111,7 +1126,7 @@ if begin quickstart-peer-step-takes-the-mutation-lock; then
   # The peer step takes it too, so none of them writes over its plist edit or
   # restarts the job under it.
   qs_setup; seed_remote_key "$H/.subrouter"; write_plist "{\"EnvironmentVariables\": {\"HOME\": \"$H\"}}"
-  P="$H/Library/LaunchAgents/ai.manaflow.subrouter.plist"; cp "$P" "$C/plist-before"
+  P="$H/Library/LaunchAgents/$TEST_LABEL.plist"; cp "$P" "$C/plist-before"
   "$PY3" -c 'import fcntl, os, sys, time
 fd = os.open(sys.argv[1], os.O_WRONLY | os.O_CREAT, 0o600)
 fcntl.flock(fd, fcntl.LOCK_EX)
@@ -1175,17 +1190,17 @@ if begin quickstart-peer-token-never-world-readable; then
   # setup leaves a plist with no token at 0644. The peer token must not sit in
   # it at that mode, even when the run is killed partway through the write.
   qs_setup; write_plist "{\"EnvironmentVariables\": {\"HOME\": \"$H\"}}"; seed_remote_key "$H/.subrouter"
-  chmod 644 "$H/Library/LaunchAgents/ai.manaflow.subrouter.plist"
+  chmod 644 "$H/Library/LaunchAgents/$TEST_LABEL.plist"
   run_qs FAKE_QS_CALL=configure_peer FAKE_DIE_AT=chmod
   # The run must get as far as the kill: a script that does not load also exits 1.
   expect_rc 1; expect_out "killed at chmod"
   if qs_plist_has SUBROUTER_REMOTE_POOL_TOKEN; then
-    expect_mode "$H/Library/LaunchAgents/ai.manaflow.subrouter.plist" 0o600
+    expect_mode "$H/Library/LaunchAgents/$TEST_LABEL.plist" 0o600
   else
     ok
   fi
-  left=$(ls -A "$H/Library/LaunchAgents" | grep -vx 'ai.manaflow.subrouter.plist.supervisor-mutation.lock')
-  [ "$left" = ai.manaflow.subrouter.plist ] && ok || bad "files left beside the plist: $(echo "$left" | tr '\n' ' ')"
+  left=$(ls -A "$H/Library/LaunchAgents" | grep -vx "$TEST_LABEL.plist.supervisor-mutation.lock")
+  [ "$left" = "$TEST_LABEL.plist" ] && ok || bad "files left beside the plist: $(echo "$left" | tr '\n' ' ')"
   finish
 fi
 

@@ -47,8 +47,11 @@ import sys
 KEY_NAME = "remote.key"
 # cmd/subrouter/remote_gate.go remoteKeyMinLength.
 MIN_LENGTH = 16
-LABEL = "ai.manaflow.subrouter"
-PLIST = pathlib.Path.home() / "Library" / "LaunchAgents" / f"{LABEL}.plist"
+# The LaunchAgent, by deploy-laptop.sh's SUBROUTER_LABEL and SUBROUTER_PLIST.
+# The tests give it a label of their own, so no run of theirs names the live
+# job (PATCHES §76).
+LABEL = os.environ.get("SUBROUTER_LABEL") or "ai.manaflow.subrouter"
+PLIST = pathlib.Path(os.environ.get("SUBROUTER_PLIST") or pathlib.Path.home() / "Library" / "LaunchAgents" / f"{LABEL}.plist")
 TOOL = pathlib.Path(os.path.realpath(__file__))
 
 
