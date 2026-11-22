@@ -1,26 +1,29 @@
 #!/usr/bin/env bash
-# Tests for macos/deploy-laptop.sh and the isolation guard in
-# macos/rollback-laptop-peer.sh -- the Codex credential-isolation branches added
-# for the 2026-09 upstream merge, and the paths they must not break -- plus
-# deploy-laptop.sh's step 7 (old backups, the ops tools checkout, PATCHES §40)
-# and bin/sr-triage (PATCHES §48). The step-7 cases build throwaway git repos
-# under the test dir with the real git, never reading this machine's git config.
+# Tests for lightsail/deploy-box.sh, lightsail/bootstrap.sh, macos/deploy-laptop.sh,
+# and the isolation guard in macos/rollback-laptop-peer.sh -- the Codex
+# credential-isolation branches added for the 2026-09 upstream merge, and the
+# paths they must not break -- plus lightsail/push-box.sh, deploy-laptop.sh's
+# step 7 (old backups, the ops tools checkout, PATCHES §40) and bin/sr-triage
+# (PATCHES §48). The step-7 cases build throwaway git repos under the test dir
+# with the real git, never reading this machine's git config.
 #
 #   bash ops/deploy/tests/deploy-scripts-test.sh              all cases, in parallel
 #   bash ops/deploy/tests/deploy-scripts-test.sh <substring>  matching cases, in order
 #   bash ops/deploy/tests/deploy-scripts-test.sh '=<case>'    exactly that case (quote it in zsh)
 #
 # Every external effect is a stub on PATH: sudo, systemctl, launchctl, curl,
-# codesign, ss, lsof, journalctl, sleep, the subrouter binary itself (a script
-# whose build id and isolation era the stubs read back). Before each script
+# codesign, ss, lsof, journalctl, sleep, ssh, the subrouter binary itself (a
+# script whose build id and isolation era the stubs read back). Before each script
 # runs, the harness checks that every one of those names resolves to its stub
 # and aborts the whole run otherwise. Each script runs under `env -i` with HOME in the
 # test dir, so this shell's CODEX_HOME / SUBROUTER_STATE_DIR cannot leak in
-# except where a case plants them on purpose. Each script also gets a label and
-# an address that only this test uses, and a case fails if a stub records the
-# live job's label or port. When this test ends, by itself or on HUP, INT or
-# TERM, it kills every detached run its case started before it removes the
-# test dir (PATCHES §76).
+# except where a case plants them on purpose, and every fixed path the box
+# scripts touch is relocated under the test dir (DEPLOY_BOX_TEST_ROOT,
+# BOOTSTRAP_TEST_ROOT). Each script also gets a label and an address that
+# only this test uses, and a case fails if a stub records the live job's label
+# or port. When this test ends, by itself or on HUP, INT or TERM, it kills
+# every detached run its case started before it removes the test dir
+# (PATCHES §76).
 #
 # DEPLOY_TESTS_SANDBOX=1 (macOS) additionally runs each script inside
 # sandbox-exec: writes outside the test dir, network, exec of the real
@@ -31,6 +34,9 @@ set -uo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd -P)
 DEPLOY=$(cd "$HERE/.." && pwd -P)
+BOX_SH="$DEPLOY/lightsail/deploy-box.sh"
+BOOT_SH="$DEPLOY/lightsail/bootstrap.sh"
+PUSH_SH="$DEPLOY/lightsail/push-box.sh"
 LAPTOP_SH="$DEPLOY/macos/deploy-laptop.sh"
 LEASE_LIB="$(cd "$DEPLOY/../.." && pwd -P)/deploy/macos/mutation-lease-lib.sh"
 FILTER="${1:-}"
@@ -87,6 +93,10 @@ T=$(cd "$T0" && pwd -P) && [ -d "$T" ] && [ "$T" != / ] || { echo "cannot resolv
 TEST_JOB="test.subrouter.deploytests.$$"
 TEST_ADDR="127.0.0.1:31497"
 LIVE_NAMES='ai\.manaflow\.subrouter|:31415([^0-9]|$)'
+# The box scripts run against a box whose own daemon listens on :31415 at the
+# box's address, so for them only a loopback or wildcard :31415 is this
+# machine's live daemon. Their cases give the box's loopback listener TEST_ADDR.
+BOX_LIVE_NAMES='ai\.manaflow\.subrouter|(127\.0\.0\.1|localhost|\[::1\]|0\.0\.0\.0):31415([^0-9]|$)'
 export TEST_JOB TEST_ADDR
 # And no detached run outlives the dir: each one still running is killed
 # first. A detached run ignores HUP, INT and TERM, so it gets SIGKILL, and its
@@ -140,7 +150,7 @@ stub() { # name body
 
 # Abort the whole run unless every command that could touch this machine
 # resolves to its stub under the PATH the scripts get.
-SHADOWED="sudo systemctl launchctl codesign curl ss lsof journalctl kill timeout sleep chown tailscale"
+SHADOWED="sudo systemctl launchctl codesign curl ss lsof journalctl kill timeout sleep chown tailscale ssh"
 assert_shadowed() { # PATH
   local name got
   for name in $SHADOWED; do
@@ -191,17 +201,27 @@ case " $* " in
 esac'
   # FAKE_SS_TAIL: many more listeners after the public one, more than a pipe
   # holds, so a reader that stops at the match leaves ss/awk still writing.
-  stub ss 'printf "State Recv-Q Send-Q Local Address:Port Peer Address:Port\nLISTEN 0 4096 *:31416 *:*\n"
+  # FAKE_NO_PUBLIC: nothing listens on :31416. FAKE_BAD=public-unbound: the
+  # NEW build does not bind it.
+  stub ss 'pub="LISTEN 0 4096 *:31416 *:*"
+[ -n "${FAKE_NO_PUBLIC:-}" ] && pub=""
+case " ${FAKE_BAD:-} " in *" public-unbound "*) [ "$(cat "$FAKE_RUNNING" 2>/dev/null)" = "${FAKE_NEW_ID:-new}" ] && pub="" ;; esac
+printf "State Recv-Q Send-Q Local Address:Port Peer Address:Port\n"
+[ -n "$pub" ] && echo "$pub"
 [ -n "${FAKE_SS_TAIL:-}" ] && awk "BEGIN { for (i = 0; i < 50000; i++) printf \"LISTEN 0 4096 127.0.0.1:%d *:*\\n\", 100000 + i }"
 exit 0'
   # A build named by FAKE_RESTART_DRAINS drains on SIGTERM (PATCHES §38): its
   # main PID stays alive until kill -9 reaches it, which leaves $FAKE_SYSTEMD/killed,
-  # or until its drain ends by itself (FAKE_DRAIN_SECS).
+  # or until its drain ends by itself (FAKE_DRAIN_SECS). Every build answers as
+  # pid 4242, so the pid a script read is alive only while no process has
+  # started since the read (box_setup's systemctl counts starts in gen): a
+  # restart that already started the next build must not read it as draining.
   stub kill '
 echo "kill $*" >> "$FAKE_LOG"
 case "$1" in
   -0)
     [ -n "${FAKE_RESTART_DRAINS:-}" ] && [ "$(cat "$FAKE_RUNNING" 2>/dev/null)" = "$FAKE_RESTART_DRAINS" ] &&
+      [ "$(cat "$FAKE_SYSTEMD/gen" 2>/dev/null)" = "$(cat "$FAKE_SYSTEMD/mainpid-gen" 2>/dev/null)" ] &&
       [ ! -e "$FAKE_SYSTEMD/killed" ] && exit 0
     exit 1 ;;
   -9) echo "killed at=$(date +%s)" >> "$FAKE_LOG"
@@ -209,9 +229,20 @@ case "$1" in
 esac
 exit 0'
   stub timeout 'shift; exec "$@"'
+  # flock -n <fd>, as util-linux runs it: an exclusive lock on the open file
+  # the caller holds as <fd>, which outlives this process while the caller
+  # keeps the descriptor.
+  stub flock 'nb=0; [ "$1" = -n ] && { nb=1; shift; }
+exec python3 -c "import fcntl, sys
+try:
+    fcntl.flock(int(sys.argv[1]), fcntl.LOCK_EX | (fcntl.LOCK_NB if sys.argv[2] == \"1\" else 0))
+except OSError:
+    sys.exit(1)" "$1" "$nb"'
   stub tailscale 'echo "tailscale $*" >> "$FAKE_LOG"; exit 1'
-  # The service managers default to refusing; laptop_setup installs the working
-  # fakes. Either way the real one is never on PATH.
+  # push_setup installs the working fake; no case reaches a real host.
+  stub ssh 'echo "UNEXPECTED ssh $*" >> "$FAKE_LOG"; exit 97'
+  # The service managers default to refusing; box_setup / laptop_setup install
+  # the working fakes. Either way the real one is never on PATH.
   stub systemctl 'echo "UNEXPECTED systemctl $*" >> "$FAKE_LOG"; exit 97'
   stub launchctl 'echo "UNEXPECTED launchctl $*" >> "$FAKE_LOG"; exit 97'
   stub lsof 'echo "UNEXPECTED lsof $*" >> "$FAKE_LOG"; exit 97'
@@ -395,7 +426,7 @@ if [ "$scheme" = https ]; then
       if [ -n "${FAKE_PUBLIC_ADMIN:-}" ] && ! bad public-admin-unmounted && ! bad public-reset-unmounted; then
         if [ -n "$auth" ] && bad public-admin-static; then code=405; else code=401; fi
       else code=404; body="404 page not found"; fi ;;
-    /_subrouter/session-leases)
+    /internal/v1/session-leases)
       if bad public-leases; then code=401; else code=404; body="404 page not found"; fi ;;
     /_subrouter/health) body=$(printf "{\n  \"ok\": true\n}") ;;
     /_subrouter/ready) m=ok; [ "$new" = 1 ] && m=${FAKE_READY_PUBLIC:-ok}; ready "$m" ;;
@@ -411,7 +442,7 @@ else
       if bad accounts-404; then code=404; body="404 page not found"
       elif [ "$auth" != "$FAKE_ADMIN" ]; then code=401
       else
-        n=12; bad few-accounts && n=3
+        n=${FAKE_POOL_SIZE:-12}; bad few-accounts && n=3
         body="["; i=0
         while [ $i -lt $n ]; do body="$body{\"provider\":\"claude\"},"; i=$((i+1)); done
         body="${body%,}]"
@@ -528,6 +559,18 @@ time.sleep(300)' "$1" "$C/lock-held" &
   while [ ! -e "$C/lock-held" ]; do /bin/sleep 0.05; done
 }
 release_lock() { kill "$LOCK_HOLDER" 2>/dev/null; wait "$LOCK_HOLDER" 2>/dev/null; }
+# The box's deploy lock, held as a running deploy holds it, with its
+# description in the file.
+hold_deploy_lock() { # description
+  "$PY3" -c 'import fcntl, os, sys, time
+fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o644)
+fcntl.flock(fd, fcntl.LOCK_EX)
+os.ftruncate(fd, 0); os.write(fd, sys.argv[2].encode() + b"\n")
+open(sys.argv[3], "w").close()
+time.sleep(300)' "$R/run/lock/subrouter-deploy.lock" "$1" "$C/lock-held" &
+  LOCK_HOLDER=$!
+  while [ ! -e "$C/lock-held" ]; do /bin/sleep 0.05; done
+}
 expect_lock_refusal() { expect_rc 1; expect_out "another deploy, rollback or update holds $1.supervisor-mutation.lock"; }
 run_killable() { # runner args...
   local runner="$1" fg; shift
@@ -598,8 +641,10 @@ begin() { # case name; returns 1 when filtered out
 }
 
 finish() {
-  if grep -Eq -- "$LIVE_NAMES" "$C/log" 2>/dev/null; then
-    bad "a stub was handed the live job's label or port: $(grep -Em1 -- "$LIVE_NAMES" "$C/log")"
+  local live=$LIVE_NAMES
+  case "$CASE" in box-*|boot-*|push-*) live=$BOX_LIVE_NAMES ;; esac
+  if grep -Eq -- "$live" "$C/log" 2>/dev/null; then
+    bad "a stub was handed the live job's label or port: $(grep -Em1 -- "$live" "$C/log")"
   fi
   if [ -n "$FAIL_LIST" ] && [ "${FAIL_LIST##* }" = "$CASE" ]; then
     echo "  --- $CASE output (tail) ---"; tail -25 "$C/out" | sed 's/^/  | /'
@@ -619,12 +664,1474 @@ run_sandboxed() { # env-assignments... -- command...
   shift
   for e in "${envs[@]}"; do case "$e" in PATH=*) assert_shadowed "${e#PATH=}" ;; esac; done
   if [ -n "$SANDBOX" ]; then
-    env -i "${envs[@]}" sandbox-exec -p "$SANDBOX" "$@" > "$C/out" 2>&1
+    env -i "${envs[@]}" sandbox-exec -p "$SANDBOX" "$@" > "${OUT:-$C/out}" 2>&1
   else
-    env -i "${envs[@]}" "$@" > "$C/out" 2>&1
+    env -i "${envs[@]}" "$@" > "${OUT:-$C/out}" 2>&1
   fi
   RC=$?
 }
+
+# --- the box ------------------------------------------------------------------
+box_setup() { # old-era new-era
+  R="$C/root"; H="$C/home"
+  mkdir -p "$R/etc/default" "$R/tmp" "$R/run/lock" "$R/usr/local/bin" "$R/var/lib/subrouter/.codex" "$C/systemd"
+  DEST="$R/usr/local/bin/subrouter"
+  NEWBIN="$R/tmp/subrouter.new"
+  make_build "$DEST" "$1" old
+  make_build "$NEWBIN" "$2" new
+  cat > "$R/etc/default/subrouter" <<EOF
+SUBROUTER_ADDR=$TEST_ADDR
+SUBROUTER_PROXY_TOKEN=proxy-tok
+SUBROUTER_ACCOUNT_IMPORT_TOKEN=import-tok
+SUBROUTER_EXTRA_ARGS="--public-addr 0.0.0.0:31416"
+SUBROUTER_STATE_DIR=$R/var/lib/subrouter
+EOF
+  echo active > "$C/systemd/subrouter.service"
+  echo active > "$C/systemd/subrouter.socket"
+  echo old > "$C/systemd/running"
+  echo 0 > "$C/systemd/gen"
+  echo 0 > "$R/var/lib/subrouter/fake-codex-needing-migration"
+  # FAKE_KILL_FG: the ssh connection drops at the first restart (or, with
+  # FAKE_KILL_FG_AT=stop, the first stop), which kills the foreground's
+  # process group, as run_killable sets it up.
+  stub systemctl '
+echo "systemctl $*" >> "$FAKE_LOG"
+S="$FAKE_SYSTEMD"
+kill_fg() {
+  [ -n "${FAKE_KILL_FG:-}" ] && [ "$1" = "${FAKE_KILL_FG_AT:-restart}" ] && [ ! -e "$S/fg-killed" ] || return 0
+  : > "$S/fg-killed"
+  for _ in $(seq 1 100); do [ -s "$FAKE_KILL_FG" ] && break; /bin/sleep 0.05; done
+  echo "SIGKILL the foreground process group" >> "$FAKE_LOG"
+  kill -9 -- "-$(cat "$FAKE_KILL_FG")"
+}
+start_service() {
+  id=$(sed -n "s/^# fake subrouter build \([^ ]*\).*/\1/p" "$FAKE_DEST" 2>/dev/null)
+  # A new process starts undrained, and is the next generation.
+  rm -f "$S/drained-$id" "$S/sigterm-$id"
+  echo $(( $(cat "$S/gen") + 1 )) > "$S/gen"
+  if [ -n "${FAKE_CRASH_BUILD:-}" ] && [ "$id" = "$FAKE_CRASH_BUILD" ]; then
+    echo failed > "$S/subrouter.service"; : > "$S/running"
+  else
+    echo active > "$S/subrouter.service"; echo "$id" > "$S/running"
+  fi
+  echo active > "$S/subrouter.socket"
+}
+case "$1" in
+  show)
+    case "$*" in
+      *MainPID*) cp "$S/gen" "$S/mainpid-gen"; echo 4242 ;;
+      *TimeoutStopUSec*) echo "${FAKE_UNIT_STOP-10min}" ;;
+      *"-p User"*) echo "$FAKE_SVC_USER" ;;
+      *Environment*) echo "HOME=$FAKE_SVC_HOME${FAKE_UNIT_ENV:+ $FAKE_UNIT_ENV}" ;;
+    esac ;;
+  is-active)
+    shift; rc=0
+    for u in "$@"; do s=$(cat "$S/$u" 2>/dev/null || echo inactive); echo "$s"; [ "$s" = active ] || rc=3; done
+    exit $rc ;;
+  restart)
+    kill_fg restart
+    echo "restart began at=$(date +%s)" >> "$FAKE_LOG"
+    # FAKE_RESTART_FAILS: the restart fails and the running process stays.
+    [ -n "${FAKE_RESTART_FAILS:-}" ] && exit 1
+    running=$(cat "$S/running" 2>/dev/null)
+    : > "$S/sigterm-$running"
+    # A build named by FAKE_RESTART_DRAINS drains its turns on SIGTERM, and the
+    # stop -- so the restart -- waits until kill -9 reaches it, or until its
+    # drain ends by itself after FAKE_DRAIN_SECS. The 120 s cap only keeps a
+    # script that never forces it from hanging the harness; every case that
+    # drains sets a grace far below it.
+    if [ -n "${FAKE_RESTART_DRAINS:-}" ] && [ "$running" = "$FAKE_RESTART_DRAINS" ]; then
+      until [ -e "$S/killed" ]; do
+        if [ -n "${FAKE_DRAIN_SECS:-}" ] && [ "$SECONDS" -ge "$FAKE_DRAIN_SECS" ]; then
+          echo "the drain finished by itself after ${SECONDS}s" >> "$FAKE_LOG"; break
+        fi
+        if [ "$SECONDS" -ge 120 ]; then echo "systemctl restart waited out the whole drain" >> "$FAKE_LOG"; break; fi
+        /bin/sleep 0.05
+      done
+      rm -f "$S/killed"
+    fi
+    rm -f "$S/sigterm-$running"
+    start_service ;;
+  start)
+    shift
+    for u in "$@"; do
+      case "$u" in subrouter.service) start_service ;; subrouter.socket) echo active > "$S/subrouter.socket" ;; esac
+    done ;;
+  stop)
+    kill_fg stop
+    [ -n "${FAKE_STOP_STUCK:-}" ] && exit 1
+    shift
+    for u in "$@"; do echo inactive > "$S/$u"; done
+    : > "$S/running" ;;
+esac
+exit 0'
+}
+
+# BOX_WRAP: a command the script runs under, given the script's argv.
+# BOX_BIN_ARG: the script's third argument, the build to install.
+run_box() { # extra env assignments...
+  local sha; sha=$(shasum -a 256 "$NEWBIN" | awk '{print $1}')
+  run_sandboxed PATH="$C/bin:/usr/bin:/bin:/usr/sbin:/sbin" HOME="$C/home" TMPDIR="$C/tmp" \
+    CODEX_HOME=/leaked/codex-home SUBROUTER_CODEX_SERVER=leaked \
+    FAKE_LOG="$C/log" FAKE_SYSTEMD="$C/systemd" FAKE_RUNNING="$C/systemd/running" \
+    FAKE_DAEMON="$C/systemd/subrouter.service" FAKE_DEST="$DEST" FAKE_NEW_ID=new \
+    FAKE_SVC_USER=subrouter FAKE_SVC_HOME="$R/var/lib/subrouter" \
+    FAKE_ADMIN=admin-tok FAKE_PROXY=proxy-tok FAKE_IMPORT=import-tok \
+    DEPLOY_BOX_TEST_ROOT="$R" READY_WAIT_SECS=3 "$@" \
+    -- ${BOX_WRAP:+"$BOX_WRAP"} "$BASH5" "$BOX_SH" "$sha" "${BOX_ADMIN_ARG-admin-tok}" ${BOX_BIN_ARG:+"$BOX_BIN_ARG"}
+}
+
+SVC_ENV_RE="sudo_user=subrouter HOME=[^ ]*/root/var/lib/subrouter STATE=[^ ]*/root/var/lib/subrouter CODEX_HOME=<unset>"
+
+echo "== deploy-box.sh"
+
+if begin box-default-ok; then
+  box_setup pre post; run_box
+  expect_rc 0; expect_out "DEPLOY OK"; expect_build "$DEST" new
+  # The gate ran with the NEW binary, as the service user, with the service's
+  # HOME and state dir, and without the operator's CODEX_HOME.
+  expect_log "exec build=new bin=[^ ]*/usr/local/bin/subrouter args=codex isolation-check --json $SVC_ENV_RE"
+  # The default path never stops the socket and never attests.
+  expect_no_log "systemctl stop"; expect_no_log "args=codex attest-legacy"
+  expect_log "systemctl restart subrouter.service"
+  finish
+fi
+
+# "-" reads the admin token from the env file, like the proxy and import
+# tokens, so it is never in argv (visible in `ps`) for the whole deploy
+# (PATCHES §43.2). The admin checks then pass with the file's token.
+if begin box-admin-token-from-env-file; then
+  box_setup pre post; echo "SUBROUTER_ADMIN_TOKEN=admin-tok" >> "$R/etc/default/subrouter"
+  BOX_ADMIN_ARG=- run_box
+  expect_rc 0; expect_out "DEPLOY OK"; expect_build "$DEST" new
+  expect_out "admin token: from "; expect_out "/etc/default/subrouter (SUBROUTER_ADMIN_TOKEN)"
+  finish
+fi
+
+# "-" with no SUBROUTER_ADMIN_TOKEN in the file stops before anything changes.
+if begin box-admin-token-dash-without-one-refused; then
+  box_setup pre post
+  BOX_ADMIN_ARG=- run_box
+  expect_rc 1; expect_out "no admin token"; expect_out "Nothing was changed"
+  expect_build "$DEST" old; expect_no_log "systemctl restart"
+  finish
+fi
+
+# --public-admin (PATCHES §43.1). Whether it is on is what the NEW daemon
+# logged (PUBLIC ADMIN IS ON), wherever it was set. Off, the private-only
+# routes must be 404 on the public listener exactly as before: a daemon that
+# mounts them without saying so rolls back. On, the four it mounts must refuse
+# the static admin and import tokens, and the rest must still be 404. The flag
+# form in SUBROUTER_EXTRA_ARGS is refused before anything changes.
+if begin box-public-admin-off-still-demands-404; then
+  box_setup pre post; run_box FAKE_PUBLIC_ADMIN=1 FAKE_BAD=public-admin-silent
+  expect_rc 1; expect_out "ROLLING BACK"
+  expect_out "/_subrouter/sessions is reachable on the public listener (got 401)"
+  expect_no_out "public admin: ON"; expect_build "$DEST" old
+  finish
+fi
+
+if begin box-public-admin-env-ok; then
+  box_setup pre post; echo "SUBROUTER_PUBLIC_ADMIN=1" >> "$R/etc/default/subrouter"
+  run_box FAKE_PUBLIC_ADMIN=1
+  expect_rc 0; expect_out "DEPLOY OK"; expect_out "public admin: ON (pid 4242 logged PUBLIC ADMIN IS ON)"
+  expect_out "/_subrouter/sessions -> 401"; expect_out "/internal/v1/session-leases -> 404"
+  expect_out "/_subrouter/transcripts -> 404"
+  expect_out "/_subrouter/account-import -> 401"; expect_out "/_subrouter/account-import + IMPORT token -> 401"
+  expect_out "/_subrouter/claude-reset -> 401"; expect_out "/_subrouter/claude-reset (no token) -> 401"
+  expect_no_out "WARNING"; expect_log "sudo journalctl _PID=4242 --since @[0-9]+ "
+  expect_build "$DEST" new
+  finish
+fi
+
+# The box scripts run under pipefail, where `producer | grep -q` (any flag
+# spelling with q) reports a match as a failure if the producer is still
+# writing (SIGPIPE). None may come back (PATCHES §43.3).
+if begin box-scripts-never-pipe-into-grep-q; then
+  for f in "$BOX_SH" "$BOOT_SH" "$PUSH_SH"; do
+    if grep -nE '\|[[:space:]]*grep[[:space:]]+-[A-Za-z]*q' "$f" | grep -vE '^[0-9]+:[[:space:]]*#' > "$C/grepq"; then
+      bad "$(basename "$f") pipes into grep -q: $(head -1 "$C/grepq")"
+    else
+      ok
+    fi
+  done
+  finish
+fi
+
+# By step 8 the new daemon has logged far more than the line step 8 looks for.
+# Read through `grep -q` under pipefail, journalctl died of SIGPIPE and step 8
+# called public admin off (2026-10-01, a live box deploy).
+if begin box-public-admin-long-journal; then
+  box_setup pre post; echo "SUBROUTER_PUBLIC_ADMIN=1" >> "$R/etc/default/subrouter"
+  run_box FAKE_PUBLIC_ADMIN=1 FAKE_JOURNAL_TAIL=1
+  expect_rc 0; expect_out "DEPLOY OK"; expect_out "public admin: ON (pid 4242 logged PUBLIC ADMIN IS ON)"
+  expect_no_out "WARNING"
+  finish
+fi
+
+# Many listeners after the public one: the public surface is still checked,
+# never skipped as "no public listener configured".
+if begin box-public-listener-among-many; then
+  box_setup pre post
+  run_box FAKE_SS_TAIL=1
+  expect_rc 0; expect_out "DEPLOY OK"; expect_out "usage-status + PROXY token -> 200"
+  expect_no_out "no public listener configured"
+  finish
+fi
+
+# The public port is the one the env file tells the daemon to bind. A variable
+# from the deploying shell, such as bootstrap.sh's SUBROUTER_PUBLIC_PORT=off,
+# never moves or skips step 8.
+if begin box-public-port-variable-ignored; then
+  for v in off 31417; do
+    box_setup pre post; run_box SUBROUTER_PUBLIC_PORT=$v FAKE_BAD=public-leases
+    expect_rc 1; expect_out "/internal/v1/session-leases is reachable on the public listener (got 401)"
+    expect_no_out "skipping"; expect_build "$DEST" old
+  done
+  finish
+fi
+
+if begin box-configured-public-listener-down-rolls-back; then
+  box_setup pre post; run_box FAKE_BAD=public-unbound
+  expect_rc 1; expect_out "!! ROLLING BACK: nothing listens on :31416, where SUBROUTER_EXTRA_ARGS in"
+  expect_no_out "skipping"; expect_build "$DEST" old
+  finish
+fi
+
+# With no --public-addr in the env file and nothing on :31416, the box has no
+# public listener, and step 8 has nothing to check.
+if begin box-private-only-skips-the-public-checks; then
+  box_setup pre post; sed -i.orig '/^SUBROUTER_EXTRA_ARGS=/d' "$R/etc/default/subrouter"
+  run_box FAKE_NO_PUBLIC=1
+  expect_rc 0; expect_out "no public listener configured; skipping (private-only deployment)"
+  expect_out "DEPLOY OK"; expect_no_log "curl https://"; expect_build "$DEST" new
+  finish
+fi
+
+# Set in a systemd drop-in, not the env file: the daemon says it is on, and
+# that is what step 8 believes.
+if begin box-public-admin-dropin-ok; then
+  box_setup pre post
+  run_box FAKE_PUBLIC_ADMIN=1 FAKE_UNIT_ENV=SUBROUTER_PUBLIC_ADMIN=1
+  expect_rc 0; expect_out "DEPLOY OK"; expect_out "public admin: ON"; expect_no_out "ROLLING BACK"
+  expect_build "$DEST" new
+  finish
+fi
+
+# On, from a build before PATCHES §46.9: the Claude reset claim is still
+# private there. A warning, not a rollback (PATCHES §46.9).
+if begin box-public-admin-reset-unmounted-warns; then
+  box_setup pre post; echo "SUBROUTER_PUBLIC_ADMIN=1" >> "$R/etc/default/subrouter"
+  run_box FAKE_PUBLIC_ADMIN=1 FAKE_BAD=public-reset-unmounted
+  expect_rc 0; expect_out "DEPLOY OK"; expect_no_out "ROLLING BACK"
+  expect_out "WARNING: /_subrouter/claude-reset is not mounted on the public listener"
+  expect_out "/_subrouter/sessions -> 401"
+  finish
+fi
+
+# Asked for, but the daemon never said so (a build without it): every marked
+# route 404s, which is right for that build, and the run says it was not on.
+if begin box-public-admin-asked-not-confirmed-warns; then
+  box_setup pre post; echo "SUBROUTER_PUBLIC_ADMIN=1" >> "$R/etc/default/subrouter"
+  run_box
+  expect_rc 0; expect_out "DEPLOY OK"; expect_no_out "public admin: ON"
+  expect_out "did not log PUBLIC ADMIN IS ON"; expect_out "/_subrouter/sessions -> 404"
+  finish
+fi
+
+# On by the daemon's own word, yet nothing mounted: a warning, not a rollback.
+if begin box-public-admin-on-but-unmounted-warns; then
+  box_setup pre post; echo "SUBROUTER_PUBLIC_ADMIN=1" >> "$R/etc/default/subrouter"
+  run_box FAKE_PUBLIC_ADMIN=1 FAKE_BAD=public-admin-unmounted
+  expect_rc 0; expect_out "DEPLOY OK"; expect_out "public admin: ON"
+  expect_out "WARNING: /_subrouter/sessions is not mounted on the public listener"
+  finish
+fi
+
+if begin box-public-admin-flag-refused; then
+  box_setup pre post
+  sed -i.orig 's|^SUBROUTER_EXTRA_ARGS=.*|SUBROUTER_EXTRA_ARGS="--public-addr 0.0.0.0:31416 --public-admin"|' "$R/etc/default/subrouter"
+  run_box FAKE_PUBLIC_ADMIN=1
+  expect_rc 1; expect_out "DEPLOY FAILED"; expect_out "carries --public-admin"
+  expect_out "set SUBROUTER_PUBLIC_ADMIN=1"; expect_out "Nothing was changed"
+  expect_no_log "systemctl (restart|stop|start)"; expect_build "$DEST" old
+  finish
+fi
+
+if begin box-public-admin-flag-false-refused; then
+  box_setup pre post
+  sed -i.orig 's|^SUBROUTER_EXTRA_ARGS=.*|SUBROUTER_EXTRA_ARGS="--public-addr 0.0.0.0:31416 --public-admin=false"|' "$R/etc/default/subrouter"
+  run_box
+  expect_rc 1; expect_out "carries --public-admin"
+  expect_no_log "systemctl (restart|stop|start)"; expect_build "$DEST" old
+  finish
+fi
+
+if begin box-public-admin-static-token-rolls-back; then
+  box_setup pre post; echo "SUBROUTER_PUBLIC_ADMIN=1" >> "$R/etc/default/subrouter"
+  run_box FAKE_PUBLIC_ADMIN=1 FAKE_BAD=public-admin-static
+  expect_rc 1; expect_out "ROLLING BACK"
+  expect_out "answered 200 to the STATIC admin token on the public listener"
+  expect_build "$DEST" old
+  finish
+fi
+
+if begin box-public-admin-import-token-rolls-back; then
+  box_setup pre post; echo "SUBROUTER_PUBLIC_ADMIN=1" >> "$R/etc/default/subrouter"
+  run_box FAKE_PUBLIC_ADMIN=1 FAKE_BAD=public-import-static
+  expect_rc 1; expect_out "ROLLING BACK"
+  expect_out "/_subrouter/account-import answered 405 to the static IMPORT token"
+  expect_build "$DEST" old
+  finish
+fi
+
+# Transcripts stay private with public admin on (PATCHES §43.2): a build
+# that still mounts them on the public listener rolls back.
+if begin box-public-admin-transcripts-mounted-rolls-back; then
+  box_setup pre post; echo "SUBROUTER_PUBLIC_ADMIN=1" >> "$R/etc/default/subrouter"
+  run_box FAKE_PUBLIC_ADMIN=1 FAKE_BAD=public-transcripts
+  expect_rc 1; expect_out "ROLLING BACK"
+  expect_out "/_subrouter/transcripts is reachable on the public listener (got 401)"
+  expect_build "$DEST" old
+  finish
+fi
+
+if begin box-public-admin-unmarked-route-rolls-back; then
+  box_setup pre post; echo "SUBROUTER_PUBLIC_ADMIN=1" >> "$R/etc/default/subrouter"
+  run_box FAKE_PUBLIC_ADMIN=1 FAKE_BAD=public-leases
+  expect_rc 1; expect_out "ROLLING BACK"
+  expect_out "/internal/v1/session-leases is reachable on the public listener (got 401)"
+  expect_build "$DEST" old
+  finish
+fi
+
+if begin box-ready-startup-503-accepted; then
+  box_setup pre post; run_box FAKE_READY_PUBLIC=startup FAKE_READY_PRIVATE=startup
+  expect_rc 0; expect_out "DEPLOY OK"; expect_no_out "ROLLING BACK"
+  expect_out "503 startup_ready:false"
+  expect_out "WARNING: /_subrouter/ready is still not ok"
+  expect_build "$DEST" new
+  finish
+fi
+
+if begin box-ready-startup-then-flips; then
+  box_setup pre post; run_box FAKE_READY_PUBLIC=startup FAKE_READY_PRIVATE=ok
+  expect_rc 0; expect_out "/_subrouter/ready: ok"; expect_no_out "WARNING"
+  finish
+fi
+
+if begin box-ready-draining-rolls-back; then
+  box_setup post post; run_box FAKE_READY_PUBLIC=draining
+  expect_rc 1; expect_out "ROLLING BACK"; expect_out "draining"
+  expect_build "$DEST" old
+  finish
+fi
+
+if begin box-ready-missing-rolls-back; then
+  box_setup post post; run_box FAKE_READY_PUBLIC=missing
+  expect_rc 1; expect_out "ROLLING BACK"; expect_out "/_subrouter/ready is not served publicly (got 404)"
+  expect_build "$DEST" old
+  finish
+fi
+
+if begin box-ready-draining-with-startup-key-rolls-back; then
+  # Not a body the handler emits today; pins that a DRAINING 503 rolls back even
+  # if a future body also carries startup_ready:false.
+  box_setup post post; run_box FAKE_READY_PUBLIC=draining-startup
+  expect_rc 1; expect_out "ROLLING BACK"; expect_build "$DEST" old
+  finish
+fi
+
+if begin box-isolation-incomplete; then
+  box_setup pre post; echo 8 > "$R/var/lib/subrouter/fake-codex-needing-migration"
+  run_box
+  expect_rc 3; expect_out "DEPLOY INCOMPLETE"; expect_no_out "DEPLOY OK"; expect_no_out "ROLLING BACK"
+  expect_out "8 Codex account(s) fail the credential-isolation gate"
+  expect_out "codex attest-legacy"; expect_out "migrate-isolation"
+  expect_build "$DEST" new
+  finish
+fi
+
+if begin box-isolation-check-cannot-run; then
+  box_setup pre post; run_box FAKE_ISO_BROKEN=1
+  expect_rc 3; expect_out "DEPLOY INCOMPLETE"; expect_out "the isolation check could not run"
+  expect_out "permission denied"; expect_build "$DEST" new
+  finish
+fi
+
+if begin box-unit-env-honored; then
+  # systemd resolves the service's environment from the unit's Environment= and
+  # its EnvironmentFile=, the file winning. The gate must inspect THAT store and
+  # THAT CODEX_HOME -- here the state dir comes from the env file and CODEX_HOME
+  # from the unit, while this shell exports different ones.
+  box_setup pre post
+  mkdir -p "$R/alt-state"; echo 2 > "$R/alt-state/fake-codex-needing-migration"
+  sed -i.orig "s|^SUBROUTER_STATE_DIR=.*|SUBROUTER_STATE_DIR=$R/alt-state|" "$R/etc/default/subrouter"
+  run_box FAKE_UNIT_ENV="CODEX_HOME=$R/unit-codex SUBROUTER_STATE_DIR=$R/var/lib/subrouter"
+  expect_rc 3; expect_out "2 Codex account(s) fail the credential-isolation gate"
+  expect_log "args=codex isolation-check --json sudo_user=subrouter HOME=[^ ]*/root/var/lib/subrouter STATE=[^ ]*/root/alt-state CODEX_HOME=[^ ]*/root/unit-codex"
+  expect_no_log "CODEX_HOME=/leaked"
+  expect_out "$R/unit-codex/auth.json"
+  finish
+fi
+
+if begin box-rollback-refused-pre-isolation; then
+  # A record the new build logged in isolated: the old binary would damage it.
+  box_setup pre post
+  seed_record "$R/var/lib/subrouter" a@x isolated-server-login
+  seed_record "$R/var/lib/subrouter" b@x ""
+  run_box FAKE_BAD=few-accounts
+  expect_rc 1; expect_out "NOT ROLLING BACK"; expect_out "predates Codex credential isolation"
+  expect_out "1 Codex record(s) in $R/var/lib/subrouter/codex/accounts carry oauthCredentialOrigin"
+  expect_out "ALLOW_PRE_ISOLATION_ROLLBACK=1"; expect_no_out "DEPLOY OK"
+  expect_build "$DEST" new
+  finish
+fi
+
+if begin box-rollback-allowed-by-override; then
+  # Migrated records present, so only the override lets it through.
+  box_setup pre post; seed_record "$R/var/lib/subrouter" a@x isolated-server-login
+  run_box FAKE_BAD=few-accounts ALLOW_PRE_ISOLATION_ROLLBACK=1
+  expect_rc 1; expect_out "!! ROLLING BACK"; expect_no_out "NOT ROLLING BACK"
+  expect_build "$DEST" old
+  finish
+fi
+
+if begin box-rollback-refused-service-down; then
+  # Compact JSON: the origin match tolerates no whitespace around the colon.
+  box_setup pre post; seed_record "$R/var/lib/subrouter" a@x server-attested-transfer compact
+  run_box FAKE_CRASH_BUILD=new
+  expect_rc 1; expect_out "NOT ROLLING BACK: service is not active"; expect_build "$DEST" new
+  expect_out "1 Codex record(s) in"
+  finish
+fi
+
+if begin box-rollback-no-migrated-records; then
+  # The defect this pins: a genuinely broken FIRST post-isolation build, no
+  # record migrated, no override. Nothing crossed the boundary, so the backup
+  # is restored and the service comes back on it.
+  box_setup pre post; run_box FAKE_CRASH_BUILD=new
+  expect_rc 1; expect_out "!! ROLLING BACK: service is not active"; expect_no_out "NOT ROLLING BACK"
+  expect_out "no Codex record in $R/var/lib/subrouter/codex/accounts carries a migrated origin; restoring it is safe"
+  expect_build "$DEST" old; expect_out "service=active"
+  finish
+fi
+
+if begin box-rollback-interactive-only-records; then
+  # A store that exists and holds records, none of them migrated.
+  box_setup pre post
+  seed_record "$R/var/lib/subrouter" a@x interactive-import
+  seed_record "$R/var/lib/subrouter" b@x ""
+  seed_record "$R/var/lib/subrouter" c@x interactive-import compact
+  run_box FAKE_BAD=few-accounts
+  expect_rc 1; expect_out "!! ROLLING BACK: only 3 accounts visible"; expect_no_out "NOT ROLLING BACK"
+  expect_out "no Codex record in"; expect_build "$DEST" old
+  finish
+fi
+
+if begin box-rollback-refused-store-unreadable; then
+  # The store exists but cannot be listed: nothing proves it holds no migrated
+  # record, so the rollback is refused and the message says why.
+  box_setup pre post; seed_record "$R/var/lib/subrouter" a@x interactive-import
+  if make_unreadable "$R/var/lib/subrouter/codex/accounts"; then
+    run_box FAKE_BAD=few-accounts
+    chmod 755 "$R/var/lib/subrouter/codex/accounts"
+    expect_rc 1; expect_out "NOT ROLLING BACK: only 3 accounts visible"; expect_no_out "!! ROLLING BACK"
+    expect_out "the Codex store could not be read ($R/var/lib/subrouter/codex/accounts exists but cannot be read)"
+    expect_build "$DEST" new
+  fi
+  finish
+fi
+
+if begin box-rollback-refused-unit-state-dir; then
+  # The store is the service's state dir from its env file, not HOME: the
+  # migrated record lives only there.
+  box_setup pre post
+  mkdir -p "$R/alt-state"; echo 0 > "$R/alt-state/fake-codex-needing-migration"
+  sed -i.orig "s|^SUBROUTER_STATE_DIR=.*|SUBROUTER_STATE_DIR=$R/alt-state|" "$R/etc/default/subrouter"
+  seed_record "$R/alt-state" a@x isolated-server-login
+  run_box FAKE_BAD=few-accounts
+  expect_rc 1; expect_out "NOT ROLLING BACK"; expect_out "1 Codex record(s) in $R/alt-state/codex/accounts"
+  expect_build "$DEST" new
+  finish
+fi
+
+if begin box-rollback-post-to-post-unaffected; then
+  box_setup post post; run_box FAKE_BAD=few-accounts
+  expect_rc 1; expect_out "!! ROLLING BACK"; expect_build "$DEST" old
+  finish
+fi
+
+if begin box-restart-bounded; then
+  # Step 4 forces the old build when it is still draining at the end of its
+  # wall-clock grace.
+  box_setup post post; run_box FAKE_RESTART_DRAINS=old DRAIN_GRACE_SECONDS=1
+  expect_rc 0; expect_out "DEPLOY OK"; expect_build "$DEST" new
+  expect_out "old pid 4242 still draining after 1s (DRAIN_GRACE_SECONDS) -- forcing it"
+  expect_log "kill -9 4242"; expect_no_log "waited out the whole drain"
+  finish
+fi
+
+if begin box-rollback-restart-bounded; then
+  # PATCHES §38: the build being rolled back drains its streams and turns on
+  # SIGTERM, possibly the very ones it is rolled back for. rollback()'s restart
+  # is bounded like step 4's; a bare one waited out the whole drain, up to
+  # TimeoutStopSec=10min, with :31416 closed.
+  box_setup post post; run_box FAKE_BAD=few-accounts FAKE_RESTART_DRAINS=new DRAIN_GRACE_SECONDS=1
+  expect_rc 1; expect_out "!! ROLLING BACK: only 3 accounts visible"; expect_build "$DEST" old
+  expect_out "old pid 4242 still draining after 1s (ROLLBACK_DRAIN_GRACE_SECONDS) -- forcing it"
+  expect_log "kill -9 4242"; expect_no_log "waited out the whole drain"
+  expect_out "service=active"
+  finish
+fi
+
+# The seconds between the restart and the kill -9, from the stubs' timestamps.
+restart_to_kill() {
+  local began killed
+  began=$(sed -n 's/^restart began at=//p' "$C/log" | head -1)
+  killed=$(sed -n 's/^killed at=//p' "$C/log" | head -1)
+  [ -n "$began" ] && [ -n "$killed" ] && echo $((killed - began))
+}
+
+if begin box-drain-grace-is-wall-clock; then
+  # PATCHES §38.1. The grace is seconds on the clock, not a count of health
+  # probes: a drain that ends inside it is never forced. The 25 probes the
+  # grace used to be took 2-3 s against these stubs, which answer at once (on
+  # the box each hung up to 2 s on the queued socket): far short of this 10 s
+  # drain, which they cut.
+  box_setup post post; run_box FAKE_RESTART_DRAINS=old FAKE_DRAIN_SECS=10 DRAIN_GRACE_SECONDS=20
+  expect_rc 0; expect_out "DEPLOY OK"; expect_build "$DEST" new
+  expect_log "the drain finished by itself"; expect_no_log "kill -9"; expect_no_out "forcing it"
+  expect_out "the old process may drain for 20s before it is forced (DRAIN_GRACE_SECONDS=20)"
+  finish
+fi
+
+if begin box-drain-grace-forces-at-the-deadline; then
+  # A drain that outlasts the grace is forced -- and not before the grace is up.
+  box_setup post post; run_box FAKE_RESTART_DRAINS=old DRAIN_GRACE_SECONDS=3
+  expect_rc 0; expect_out "DEPLOY OK"; expect_log "kill -9 4242"
+  expect_out "still draining after 3s (DRAIN_GRACE_SECONDS) -- forcing it"
+  waited=$(restart_to_kill)
+  [ -n "$waited" ] && [ "$waited" -ge 2 ] && [ "$waited" -le 6 ] && ok ||
+    bad "forced ${waited:-?}s after the restart, want the 3 s grace (2-6 at date's resolution and a 1 s poll)"
+  finish
+fi
+
+if begin box-drain-grace-default-is-the-ceiling; then
+  # Unset, the grace is the drain ceiling: the daemon's default
+  # --shutdown-timeout (10m), the unit's TimeoutStopSec being no shorter.
+  box_setup post post; run_box FAKE_UNIT_STOP=10min
+  expect_rc 0; expect_out "may drain for 600s before it is forced (DRAIN_GRACE_SECONDS unset: the drain ceiling, the daemon's default --shutdown-timeout, 10m)"
+  finish
+fi
+
+if begin box-drain-grace-ceiling-is-the-unit-timeout; then
+  # systemd kills the old process at TimeoutStopSec whatever the daemon's own
+  # timeout, so a shorter unit timeout is the ceiling.
+  box_setup post post
+  sed -i.orig 's|^SUBROUTER_EXTRA_ARGS=.*|SUBROUTER_EXTRA_ARGS="--public-addr 0.0.0.0:31416 --shutdown-timeout=20m"|' "$R/etc/default/subrouter"
+  run_box "FAKE_UNIT_STOP=1min 30s"
+  expect_rc 0; expect_out "may drain for 90s before it is forced (DRAIN_GRACE_SECONDS unset: the drain ceiling, the unit's TimeoutStopSec, 1min 30s)"
+  finish
+fi
+
+if begin box-drain-grace-ceiling-is-the-daemon-timeout; then
+  # The daemon exits at its own --shutdown-timeout, so a shorter one is the
+  # ceiling; a unit timeout systemd prints as infinity sets none.
+  box_setup post post
+  sed -i.orig 's|^SUBROUTER_EXTRA_ARGS=.*|SUBROUTER_EXTRA_ARGS="--shutdown-timeout 2m0s --public-addr 0.0.0.0:31416"|' "$R/etc/default/subrouter"
+  run_box FAKE_UNIT_STOP=infinity
+  expect_rc 0; expect_out "may drain for 120s before it is forced (DRAIN_GRACE_SECONDS unset: the drain ceiling, the daemon's --shutdown-timeout 2m0s)"
+  finish
+fi
+
+if begin box-drain-grace-clamped-to-the-ceiling; then
+  # Past the ceiling the old process is gone anyway: the grace is the ceiling,
+  # and the output says so.
+  box_setup post post; run_box DRAIN_GRACE_SECONDS=601
+  expect_rc 0; expect_out "may drain for 600s before it is forced (DRAIN_GRACE_SECONDS=601 is past the drain ceiling"
+  finish
+fi
+
+if begin box-drain-grace-overflow-clamped; then
+  # A number too long for shell arithmetic must not wrap into a short grace:
+  # 2^64 + 5 is 5 to bash.
+  box_setup post post; run_box DRAIN_GRACE_SECONDS=18446744073709551621
+  expect_rc 0; expect_out "may drain for 600s before it is forced (DRAIN_GRACE_SECONDS=18446744073709551621 is past the drain ceiling"
+  finish
+fi
+
+if begin box-drain-grace-not-a-number-refused; then
+  # Refused before anything changes: no backup, no stage, no restart.
+  box_setup post post; run_box DRAIN_GRACE_SECONDS=10m
+  expect_rc 1; expect_out "DRAIN_GRACE_SECONDS must be a whole number of seconds, got '10m'. Nothing was changed."
+  expect_build "$DEST" old; expect_no_log "systemctl (restart|stop|start)"
+  if any_exists "$R/usr/local/bin/"*bak-*; then bad "a backup was taken before the refusal"; else ok; fi
+  finish
+fi
+
+if begin box-drains-over-the-socket-first; then
+  # PATCHES §38.1. The running build serves a drain socket: the restart drains
+  # it there first, as root and with no token, and the new process starts
+  # undrained, so nothing is resumed.
+  box_setup post post; run_box FAKE_DRAIN_SOCKET="old new"
+  expect_rc 0; expect_out "DEPLOY OK"; expect_build "$DEST" new
+  expect_log "sudo curl -s -m 5 --unix-socket [^ ]*/root/var/lib/subrouter/drain.sock -X POST"
+  expect_log "curl unix [^ ]*/root/var/lib/subrouter/drain.sock POST /_subrouter/drain auth=none"
+  expect_order "curl unix .* POST /_subrouter/drain auth" "systemctl restart subrouter.service"
+  expect_out "drained the running build over $R/var/lib/subrouter/drain.sock (no token): new sessions get 503; 0 websocket turn(s) in flight"
+  expect_no_log "POST /_subrouter/resume"; expect_no_out "WARNING: the restart did not replace"
+  finish
+fi
+
+if begin box-drain-socket-reports-the-drain; then
+  # The old process answers its drain socket through its SIGTERM drain, so the
+  # wait reports what it is waiting for, and the force says what it cut. A 6 s
+  # grace leaves a report 5 s to land: with 3 s, a loaded machine skipped it.
+  box_setup post post
+  run_box FAKE_DRAIN_SOCKET="old new" FAKE_RESTART_DRAINS=old FAKE_TURNS=2 DRAIN_GRACE_SECONDS=6 DRAIN_REPORT_SECONDS=1
+  expect_rc 0; expect_out "DEPLOY OK"
+  expect_out "old pid 4242 draining, "; expect_out "of 6s: 2 websocket turn(s) in flight, 3 proxy request(s) open"
+  expect_out "old pid 4242 still draining after 6s (DRAIN_GRACE_SECONDS) with 2 websocket turn(s) in flight"
+  expect_log "curl unix .* GET /_subrouter/drain-status"
+  finish
+fi
+
+if begin box-no-drain-socket-falls-back; then
+  # A running build from before the drain socket: restarted as before.
+  box_setup post post; run_box FAKE_DRAIN_SOCKET="new"
+  expect_rc 0; expect_out "DEPLOY OK"; expect_build "$DEST" new
+  expect_out "no drain socket answered at $R/var/lib/subrouter/drain.sock: the running build predates it (or serves none); restarting without a pre-drain"
+  expect_log "systemctl restart subrouter.service"
+  finish
+fi
+
+if begin box-drain-socket-off; then
+  # SUBROUTER_DRAIN_SOCKET=off in the service's env file: nothing is asked, and
+  # the output says the socket is off rather than that the build is old.
+  box_setup post post; echo "SUBROUTER_DRAIN_SOCKET=off" >> "$R/etc/default/subrouter"
+  run_box FAKE_DRAIN_SOCKET="old new"
+  expect_rc 0; expect_out "DEPLOY OK"; expect_no_log "curl unix"
+  expect_out "no pre-drain: SUBROUTER_DRAIN_SOCKET=off in the service's environment turns the drain socket off"
+  expect_no_out "predates it"
+  finish
+fi
+
+if begin box-drain-socket-off-any-spelling; then
+  # The daemon lowercases and trims the value (drainSocketDisabled), so None
+  # turns its socket off. The script used to curl a relative path named None,
+  # from whatever directory it ran in.
+  box_setup post post; echo "SUBROUTER_DRAIN_SOCKET=None" >> "$R/etc/default/subrouter"
+  run_box FAKE_DRAIN_SOCKET="old new"
+  expect_rc 0; expect_out "DEPLOY OK"; expect_no_log "curl unix"
+  expect_out "no pre-drain: SUBROUTER_DRAIN_SOCKET=None in the service's environment turns the drain socket off"
+  finish
+fi
+
+if begin box-drain-socket-relative-path-ignored; then
+  # The daemon refuses a relative path and serves no socket. A relative path
+  # handed to `sudo curl --unix-socket` resolves in the operator's directory,
+  # where another user could have bound it.
+  box_setup post post; echo "SUBROUTER_DRAIN_SOCKET=drain.sock" >> "$R/etc/default/subrouter"
+  run_box FAKE_DRAIN_SOCKET="old new"
+  expect_rc 0; expect_out "DEPLOY OK"; expect_no_log "curl unix"
+  expect_out "no pre-drain: SUBROUTER_DRAIN_SOCKET=drain.sock in the service's environment is not an absolute path, so the daemon serves no drain socket"
+  finish
+fi
+
+if begin box-failed-restart-resumes-the-drain; then
+  # The restart failed and the drained process is still the one running. It
+  # must not be left refusing every new session until the next restart.
+  box_setup post post; run_box FAKE_DRAIN_SOCKET="old new" FAKE_RESTART_FAILS=1
+  expect_out "WARNING: the restart did not replace the drained process; resumed it over"
+  expect_order "curl unix .* POST /_subrouter/drain auth" "curl unix .* POST /_subrouter/resume"
+  [ -e "$C/systemd/drained-old" ] && bad "the old process was left drained" || ok
+  finish
+fi
+
+if begin box-operator-drain-is-not-lifted; then
+  # An operator drained the box (sudo subrouter drain) before deploying. The
+  # restart fails and the old process survives: the script must leave that
+  # drain alone. It used to resume whatever it found draining, putting the box
+  # back in rotation against the operator's intent.
+  box_setup post post; : > "$C/systemd/drained-old"
+  run_box FAKE_DRAIN_SOCKET="old new" FAKE_RESTART_FAILS=1
+  expect_out "the running build was already draining, and not by this script (an operator's drain?): left as it is"
+  expect_no_log "POST /_subrouter/resume"; expect_no_log "POST /_subrouter/drain auth"
+  [ -e "$C/systemd/drained-old" ] && ok || bad "the operator's drain was lifted"
+  expect_no_out "resumed it over"
+  finish
+fi
+
+if begin box-drain-report-seconds-leading-zero; then
+  # 08 is 8 seconds, not an octal error. The script used to validate it with a
+  # pattern and then do $((started + every)): "08: value too great for base"
+  # aborted restart_bounded after the pre-drain and before the restart, and the
+  # deploy went on to verify the old, drained process.
+  box_setup post post
+  run_box FAKE_DRAIN_SOCKET="old new" FAKE_RESTART_DRAINS=old DRAIN_GRACE_SECONDS=2 DRAIN_REPORT_SECONDS=08
+  expect_rc 0; expect_out "DEPLOY OK"; expect_no_out "value too great"
+  expect_log "systemctl restart subrouter.service"; expect_build "$DEST" new
+  [ "$(cat "$C/systemd/running")" = new ] && ok || bad "running: $(cat "$C/systemd/running"), want new: the drained old process was left serving"
+  expect_log "kill -9 4242"
+  finish
+fi
+
+if begin box-drain-report-seconds-not-a-number-refused; then
+  # Refused before anything changes, as DRAIN_GRACE_SECONDS is.
+  box_setup post post; run_box DRAIN_REPORT_SECONDS=30s
+  expect_rc 1; expect_out "DRAIN_REPORT_SECONDS must be a whole number of seconds, got '30s'. Nothing was changed."
+  expect_build "$DEST" old; expect_no_log "systemctl (restart|stop|start)"; expect_no_log "curl unix"
+  if any_exists "$R/usr/local/bin/"*bak-*; then bad "a backup was taken before the refusal"; else ok; fi
+  finish
+fi
+
+if begin box-ready-wait-not-a-number-refused; then
+  box_setup post post; run_box READY_WAIT_SECS=abc
+  expect_rc 1; expect_out "READY_WAIT_SECS must be a whole number of seconds, got 'abc'. Nothing was changed."
+  expect_build "$DEST" old; expect_no_log "systemctl (restart|stop|start)"
+  if any_exists "$R/usr/local/bin/"*bak-*; then bad "a backup was taken before the refusal"; else ok; fi
+  finish
+fi
+
+if begin box-drain-report-hung-socket-does-not-delay-the-force; then
+  # The old process's drain socket accepts but stalls. A report's curl waits at
+  # most the time left before the deadline, and the force line's at most 1 s,
+  # so the kill -9 lands on time. With -m 5 on each it came about 8 s late.
+  box_setup post post
+  run_box FAKE_DRAIN_SOCKET="old new" FAKE_RESTART_DRAINS=old FAKE_STATUS_HANGS=30 DRAIN_GRACE_SECONDS=3 DRAIN_REPORT_SECONDS=1
+  expect_rc 0; expect_out "DEPLOY OK"; expect_log "kill -9 4242"
+  expect_log "drain-status hung for 1s \\(curl -m 1\\)"
+  waited=$(restart_to_kill)
+  [ -n "$waited" ] && [ "$waited" -ge 2 ] && [ "$waited" -le 6 ] && ok ||
+    bad "forced ${waited:-?}s after the restart, want the 3 s grace (2-6), not held up by the stalled socket"
+  finish
+fi
+
+if begin box-drain-grace-fractional-unit-timeout; then
+  # systemd prints a fractional TimeoutStopUSec as "1min 30.500000s". It used
+  # to fail to parse, so the ceiling silently stayed 600 s while systemd killed
+  # at 90.5 s.
+  box_setup post post; run_box "FAKE_UNIT_STOP=1min 30.500000s"
+  expect_rc 0; expect_out "may drain for 90s before it is forced (DRAIN_GRACE_SECONDS unset: the drain ceiling, the unit's TimeoutStopSec, 1min 30.500000s)"
+  finish
+fi
+
+if begin box-drain-grace-fractional-daemon-timeout; then
+  # Go prints the same as 1m30.5s.
+  box_setup post post
+  sed -i.orig 's|^SUBROUTER_EXTRA_ARGS=.*|SUBROUTER_EXTRA_ARGS="--public-addr 0.0.0.0:31416 --shutdown-timeout=1m30.5s"|' "$R/etc/default/subrouter"
+  run_box FAKE_UNIT_STOP=infinity
+  expect_rc 0; expect_out "may drain for 90s before it is forced (DRAIN_GRACE_SECONDS unset: the drain ceiling, the daemon's --shutdown-timeout 1m30.5s)"
+  finish
+fi
+
+if begin box-drain-grace-sub-second-timeout-is-one-second; then
+  # A timeout under a second is 1 s, not 0: a 0 grace would kill -9 the old
+  # process as the restart begins.
+  box_setup post post
+  sed -i.orig 's|^SUBROUTER_EXTRA_ARGS=.*|SUBROUTER_EXTRA_ARGS="--public-addr 0.0.0.0:31416 --shutdown-timeout=500ms"|' "$R/etc/default/subrouter"
+  run_box FAKE_UNIT_STOP=infinity
+  expect_rc 0; expect_out "may drain for 1s before it is forced (DRAIN_GRACE_SECONDS unset: the drain ceiling, the daemon's --shutdown-timeout 500ms)"
+  finish
+fi
+
+if begin box-drain-grace-hard-cap; then
+  # The ceiling comes from config, and config can make it hours: a 2h
+  # --shutdown-timeout under TimeoutStopSec=infinity. The script's own cap,
+  # 900 s, holds whatever the config says.
+  box_setup post post
+  sed -i.orig 's|^SUBROUTER_EXTRA_ARGS=.*|SUBROUTER_EXTRA_ARGS="--public-addr 0.0.0.0:31416 --shutdown-timeout=2h"|' "$R/etc/default/subrouter"
+  run_box FAKE_UNIT_STOP=infinity DRAIN_GRACE_SECONDS=5000
+  expect_rc 0; expect_out "may drain for 900s before it is forced (DRAIN_GRACE_SECONDS=5000 is past the drain ceiling, this script's hard cap of 900s (the daemon's --shutdown-timeout 2h is longer)"
+  finish
+fi
+
+if begin box-rollback-grace-defaults-short; then
+  # A rollback abandons a build that failed its checks, and every second it
+  # drains is a second before the old build serves again: by default it gets
+  # 60 s, not the restart's 600.
+  box_setup post post; run_box FAKE_BAD=few-accounts
+  expect_rc 1; expect_out "!! ROLLING BACK: only 3 accounts visible"
+  expect_out "the old process may drain for 600s before it is forced (DRAIN_GRACE_SECONDS unset"
+  expect_out "the old process may drain for 60s before it is forced (ROLLBACK_DRAIN_GRACE_SECONDS unset: 60s, or DRAIN_GRACE_SECONDS's grace when that is shorter)"
+  finish
+fi
+
+if begin box-rollback-grace-forces-the-abandoned-build; then
+  # The build being rolled back drains for 12 s. Under a 30 s restart grace
+  # and a 2 s rollback grace it is forced at 2 s.
+  box_setup post post
+  run_box FAKE_BAD=few-accounts FAKE_RESTART_DRAINS=new FAKE_DRAIN_SECS=12 DRAIN_GRACE_SECONDS=30 ROLLBACK_DRAIN_GRACE_SECONDS=2
+  expect_rc 1; expect_build "$DEST" old; expect_out "service=active"
+  expect_out "old pid 4242 still draining after 2s (ROLLBACK_DRAIN_GRACE_SECONDS) -- forcing it"
+  expect_log "kill -9 4242"; expect_no_log "the drain finished by itself"
+  finish
+fi
+
+if begin box-rollback-grace-not-a-number-refused; then
+  box_setup post post; run_box ROLLBACK_DRAIN_GRACE_SECONDS=1m
+  expect_rc 1; expect_out "ROLLBACK_DRAIN_GRACE_SECONDS must be a whole number of seconds, got '1m'. Nothing was changed."
+  expect_build "$DEST" old; expect_no_log "systemctl (restart|stop|start)"
+  finish
+fi
+
+if begin box-rollback-drains-the-new-build-over-its-socket; then
+  # rollback() restarts through the same function: it drains the build it
+  # abandons over that build's own socket.
+  box_setup post post; run_box FAKE_BAD=few-accounts FAKE_DRAIN_SOCKET="old new"
+  expect_rc 1; expect_out "!! ROLLING BACK: only 3 accounts visible"; expect_build "$DEST" old
+  n=$(grep -c "curl unix .* POST /_subrouter/drain auth=none" "$C/log")
+  [ "$n" = 2 ] && ok || bad "drained $n time(s) over the socket, want 2: the old build before step 4, the new one before the rollback"
+  finish
+fi
+
+if begin box-downgrade-refused; then
+  box_setup post pre; seed_record "$R/var/lib/subrouter" a@x server-attested-transfer
+  run_box
+  expect_rc 1; expect_out "refusing to replace a post-isolation build with a pre-isolation one: 1 Codex record(s)"
+  expect_build "$DEST" old; expect_no_log "systemctl (restart|stop|start)"
+  if any_exists "$R/usr/local/bin/"*bak-*; then bad "a backup was taken before the refusal"; else ok; fi
+  finish
+fi
+
+if begin box-downgrade-allowed-by-override; then
+  box_setup post pre; seed_record "$R/var/lib/subrouter" a@x server-attested-transfer
+  run_box ALLOW_PRE_ISOLATION_ROLLBACK=1
+  expect_rc 0; expect_out "DEPLOY OK"; expect_out "n/a: this build predates the isolation gate"
+  expect_build "$DEST" new
+  finish
+fi
+
+if begin box-downgrade-no-migrated-records; then
+  # Nothing was ever migrated: going back to a pre-isolation build is safe.
+  box_setup post pre; seed_record "$R/var/lib/subrouter" a@x interactive-import
+  run_box
+  expect_rc 0; expect_out "DEPLOY OK"; expect_no_out "refusing to replace"
+  expect_out "replacing a post-isolation build with a pre-isolation one: allowed, no Codex record in"
+  expect_build "$DEST" new
+  finish
+fi
+
+if begin box-attest-first; then
+  box_setup pre post; echo 8 > "$R/var/lib/subrouter/fake-codex-needing-migration"
+  echo '{"passive":"copy"}' > "$R/var/lib/subrouter/.codex/auth.json"
+  run_box ATTEST_FIRST=1
+  expect_rc 0; expect_out "DEPLOY OK"; expect_build "$DEST" new
+  # preflight while the old daemon serves -> stop BOTH units -> attest with the
+  # staged NEW binary while nothing runs -> start both.
+  expect_log "exec build=new bin=[^ ]*subrouter.stage args=codex isolation-check --json $SVC_ENV_RE daemon=active"
+  expect_log "systemctl stop subrouter.service subrouter.socket"
+  expect_log "exec build=new bin=[^ ]*subrouter.stage args=codex attest-legacy $SVC_ENV_RE daemon=inactive"
+  expect_no_log "args=codex attest-legacy sudo_user.*daemon=active"
+  expect_log "systemctl start subrouter.socket subrouter.service"
+  expect_order "codex isolation-check" "systemctl stop"
+  expect_order "systemctl stop" "args=codex attest-legacy sudo_user"
+  expect_order "args=codex attest-legacy sudo_user" "systemctl start"
+  # The passive copy was moved aside, not deleted, and the attest covered all 8.
+  [ -e "$R/var/lib/subrouter/.codex/auth.json" ] && bad "passive auth.json still in place" || ok
+  if any_exists "$R/var/lib/subrouter/.codex/auth.json.pre-isolation-"*; then ok; else bad "no auth.json.pre-isolation-* copy"; fi
+  expect_out "Attested 8, skipped 0, failed 0."
+  finish
+fi
+
+if begin box-attest-first-says-the-grace-does-not-apply; then
+  # ATTEST_FIRST stops the old daemon with a fixed 30 s grace. An operator who
+  # sets DRAIN_GRACE_SECONDS is told it does not apply here.
+  box_setup pre post; echo 8 > "$R/var/lib/subrouter/fake-codex-needing-migration"
+  run_box ATTEST_FIRST=1 DRAIN_GRACE_SECONDS=300
+  expect_rc 0; expect_out "DEPLOY OK"
+  expect_out "DRAIN_GRACE_SECONDS=300 does not apply to this stop: ATTEST_FIRST gives the old daemon a fixed 30 s"
+  finish
+fi
+
+if begin box-attest-first-rollback-refused; then
+  # Once ATTEST_FIRST has attested the store, restoring the pre-isolation backup
+  # is exactly the crossing the guard exists for: a failed route check must
+  # leave the new build installed, and the old binary must never start again.
+  # The fake attest-legacy stamps no record in codex/accounts, so only the
+  # "attest ran in this deploy" flag can refuse here.
+  box_setup pre post; echo 8 > "$R/var/lib/subrouter/fake-codex-needing-migration"
+  run_box ATTEST_FIRST=1 FAKE_BAD=few-accounts
+  expect_rc 1; expect_out "Attested 8, skipped 0, failed 0."
+  expect_out "NOT ROLLING BACK: only 3 accounts visible"; expect_no_out "!! ROLLING BACK"
+  expect_out "codex attest-legacy ran in this deploy (ATTEST_FIRST)"
+  expect_build "$DEST" new
+  expect_no_log "systemctl restart"
+  finish
+fi
+
+if begin box-attest-first-preflight-ok-rolls-back; then
+  # ATTEST_FIRST whose preflight said ok attests nothing, so a broken build
+  # still rolls back like the default path.
+  box_setup pre post; run_box ATTEST_FIRST=1 FAKE_BAD=few-accounts
+  expect_rc 1; expect_out "nothing to attest"; expect_no_log "args=codex attest-legacy sudo_user"
+  expect_out "!! ROLLING BACK: only 3 accounts visible"; expect_no_out "NOT ROLLING BACK"
+  expect_build "$DEST" old
+  finish
+fi
+
+if begin box-attest-first-nothing-to-attest; then
+  box_setup pre post; run_box ATTEST_FIRST=1
+  expect_rc 0; expect_out "nothing to attest"; expect_out "DEPLOY OK"
+  expect_no_log "systemctl stop"; expect_no_log "args=codex attest-legacy"
+  expect_log "systemctl restart subrouter.service"
+  finish
+fi
+
+if begin box-attest-first-preflight-cannot-run; then
+  box_setup pre post; echo 8 > "$R/var/lib/subrouter/fake-codex-needing-migration"
+  run_box ATTEST_FIRST=1 FAKE_ISO_BROKEN=1
+  expect_rc 1; expect_out "did not run"; expect_out "Nothing was stopped or changed"
+  expect_no_log "systemctl (stop|restart|start)"; expect_no_log "args=codex attest-legacy"
+  expect_build "$DEST" old
+  [ -e "$DEST.stage" ] && bad "stage file left behind" || ok
+  finish
+fi
+
+if begin box-attest-first-stop-stuck; then
+  box_setup pre post; echo 8 > "$R/var/lib/subrouter/fake-codex-needing-migration"
+  run_box ATTEST_FIRST=1 FAKE_STOP_STUCK=1
+  expect_rc 1; expect_out "would not stop"; expect_no_log "args=codex attest-legacy sudo_user"
+  expect_build "$DEST" old
+  finish
+fi
+
+if begin box-attest-first-pre-isolation-candidate; then
+  box_setup pre pre; run_box ATTEST_FIRST=1
+  expect_rc 1; expect_out "ATTEST_FIRST needs a post-isolation build"
+  expect_no_log "systemctl (stop|restart|start)"; expect_build "$DEST" old
+  finish
+fi
+
+# The private listener the checks probe: SUBROUTER_BOX_ADDR, else the env
+# file's SUBROUTER_ADDR, and nothing guessed. Without one, or with one that is
+# not host:port, the run stops before the backup.
+if begin box-missing-address-refused; then
+  box_setup post post; sed -i.orig '/^SUBROUTER_ADDR=/d' "$R/etc/default/subrouter"
+  run_box
+  expect_rc 1; expect_out "no box address: SUBROUTER_BOX_ADDR is unset"; expect_out "Nothing was changed"
+  expect_build "$DEST" old; expect_no_log "systemctl (restart|stop|start)"; expect_no_log "curl http"
+  if any_exists "$R/usr/local/bin/"*bak-*; then bad "a backup was taken before the refusal"; else ok; fi
+  finish
+fi
+
+if begin box-malformed-address-refused; then
+  box_setup post post; run_box "SUBROUTER_BOX_ADDR=127.0.0.1:31415/_subrouter"
+  expect_rc 1; expect_out "the box address '127.0.0.1:31415/_subrouter'"; expect_out "is not host:port"
+  expect_out "Nothing was changed"; expect_build "$DEST" old; expect_no_log "systemctl (restart|stop|start)"
+  if any_exists "$R/usr/local/bin/"*bak-*; then bad "a backup was taken before the refusal"; else ok; fi
+  finish
+fi
+
+# A host is letters, digits, dots, dashes, colons and brackets. A slash would
+# move the port into the URL's path, and the checks would probe port 80.
+if begin box-address-host-with-a-path-refused; then
+  box_setup post post; run_box "SUBROUTER_BOX_ADDR=127.0.0.1/x:31415"
+  expect_rc 1; expect_out "the box address '127.0.0.1/x:31415'"; expect_out "is not host:port"
+  expect_out "Nothing was changed"; expect_build "$DEST" old; expect_no_log "systemctl (restart|stop|start)"
+  if any_exists "$R/usr/local/bin/"*bak-*; then bad "a backup was taken before the refusal"; else ok; fi
+  finish
+fi
+
+# An IPv6 host is accepted only in brackets.
+if begin box-unbracketed-ipv6-address-refused; then
+  box_setup post post; run_box "SUBROUTER_BOX_ADDR=2001:db8::1:31415"
+  expect_rc 1; expect_out "the box address '2001:db8::1:31415'"; expect_out "is not host:port"
+  expect_out "Nothing was changed"; expect_build "$DEST" old; expect_no_log "systemctl (restart|stop|start)"
+  finish
+fi
+
+if begin box-bracketed-ipv6-address-ok; then
+  box_setup post post; run_box "SUBROUTER_BOX_ADDR=[2001:db8::1]:31415"
+  expect_rc 0; expect_out "DEPLOY OK"; expect_log "^curl http://\\[2001:db8::1\\]:31415/_subrouter/accounts$"
+  finish
+fi
+
+if begin box-address-from-the-environment; then
+  box_setup post post; run_box SUBROUTER_BOX_ADDR=100.64.0.10:31415
+  expect_rc 0; expect_out "DEPLOY OK"; expect_out "private listener: 100.64.0.10:31415"
+  expect_log "curl http://100.64.0.10:31415/_subrouter/accounts"; expect_no_log "curl http://127.0.0.1"
+  finish
+fi
+
+# Step 7's floor is the pool the running build listed before the swap, so a
+# pool of any size deploys, an empty one included, and one that shrank, by a
+# single account too, rolls back.
+if begin box-small-pool-ok; then
+  box_setup post post; run_box FAKE_POOL_SIZE=2
+  expect_rc 0; expect_out "DEPLOY OK"; expect_out "accounts visible before the swap: 2"
+  expect_out "accounts visible: 2   (before the swap: 2)"; expect_no_out "ROLLING BACK"
+  finish
+fi
+
+if begin box-empty-pool-ok; then
+  box_setup post post; run_box FAKE_POOL_SIZE=0
+  expect_rc 0; expect_out "DEPLOY OK"; expect_out "accounts visible: 0   (before the swap: 0)"
+  finish
+fi
+
+# A lost ssh connection kills the foreground's process group. The deploy goes
+# on detached, still verifies and still rolls back, and says how it ended in
+# its log.
+if begin box-lost-connection-deploy-finishes; then
+  box_setup post post; run_killable run_box
+  expect_killed_and_finished "DEPLOY OK"
+  expect_build "$DEST" new
+  finish
+fi
+
+if begin box-lost-connection-still-rolls-back; then
+  box_setup post post; run_killable run_box FAKE_BAD=few-accounts
+  [ "$FG_RC" = 137 ] && ok || bad "the foreground exited $FG_RC, want 137 (SIGKILL)"
+  [ "$TRANSITION_RC" = 1 ] && ok || bad "the detached run exited '$TRANSITION_RC', want 1"
+  grep -Fq "!! ROLLING BACK: only 3 accounts visible" "$TRANSITION_LOG" && ok || bad "the detached run's log lacks the rollback"
+  expect_build "$DEST" old
+  finish
+fi
+
+# push-box.sh's ssh has no tty, so a drop closes the output: the reader is
+# gone, and the next write to it raises SIGPIPE.
+if begin box-closed-output-deploy-finishes; then
+  box_setup post post
+  printf '#!/bin/bash\n"$@" | head -2\n' > "$C/reader-gone"; chmod 755 "$C/reader-gone"
+  BOX_WRAP="$C/reader-gone" run_box
+  await_transitions
+  [ "$TRANSITION_RC" = 0 ] && ok || bad "the detached run exited '$TRANSITION_RC', want 0"
+  grep -Fq "DEPLOY OK" "$TRANSITION_LOG" && ok || bad "the detached run's log lacks: DEPLOY OK"
+  expect_no_out "DEPLOY OK"; expect_build "$DEST" new
+  finish
+fi
+
+# One deploy at a time. A second one, such as a retry after a dropped
+# connection, is refused before step 1 with the running one's log, and the
+# first still ends DEPLOY OK. The next deploy after it runs.
+if begin box-second-deploy-refused-while-one-runs; then
+  box_setup post post
+  ( OUT="$C/first.out" run_box FAKE_RESTART_DRAINS=old DRAIN_GRACE_SECONDS=4; echo "$RC" > "$C/first.rc" ) &
+  first=$!
+  n=0; until grep -q "^restart began" "$C/log" || [ "$n" -ge 400 ]; do /bin/sleep 0.05; n=$((n + 1)); done
+  run_box
+  expect_rc 1; expect_out "DEPLOY FAILED: another deploy is running (deploy-box.sh, pid "
+  expect_out "/.subrouter/transitions/deploy-box-"; expect_out "Nothing was changed."
+  expect_no_out "== 1. verify the payload"
+  wait "$first"
+  [ "$(cat "$C/first.rc")" = 0 ] && grep -Fq "DEPLOY OK" "$C/first.out" && ok || bad "the first deploy did not end DEPLOY OK"
+  [ "$(grep -c '^restart began' "$C/log")" = 1 ] && ok || bad "a second restart ran"
+  [ "$(grep -Ec '^sudo cp [^ ]*/usr/local/bin/subrouter [^ ]*\.bak-' "$C/log")" = 1 ] && ok || bad "a second backup was taken"
+  expect_build "$DEST" new
+  make_build "$NEWBIN" post newer; run_box
+  expect_rc 0; expect_out "DEPLOY OK"; expect_build "$DEST" newer
+  finish
+fi
+
+if begin box-refused-while-a-bootstrap-runs; then
+  box_setup post post; hold_deploy_lock "bootstrap.sh, pid 4321"
+  run_box
+  release_lock
+  expect_rc 1; expect_out "another deploy is running (bootstrap.sh, pid 4321)"
+  expect_build "$DEST" old; expect_no_log "systemctl (restart|stop|start)"
+  if any_exists "$R/usr/local/bin/"*bak-*; then bad "a backup was taken before the refusal"; else ok; fi
+  finish
+fi
+
+# push-box.sh names the build it uploaded to a directory of its own.
+if begin box-binary-path-argument; then
+  box_setup post post
+  mkdir -p "$C/push"; mv "$NEWBIN" "$C/push/subrouter.new"; NEWBIN="$C/push/subrouter.new"
+  BOX_BIN_ARG="$NEWBIN" run_box
+  expect_rc 0; expect_out "DEPLOY OK"; expect_build "$DEST" new
+  [ -e "$NEWBIN" ] && bad "the uploaded build was left behind" || ok
+  finish
+fi
+
+# ATTEST_FIRST's outage: dropped between its stop and its start, the deploy
+# still starts both units.
+if begin box-lost-connection-attest-first-starts-the-daemon; then
+  box_setup pre post; echo 8 > "$R/var/lib/subrouter/fake-codex-needing-migration"
+  run_killable run_box ATTEST_FIRST=1 FAKE_KILL_FG_AT=stop
+  expect_killed_and_finished "DEPLOY OK"
+  [ "$(cat "$C/systemd/subrouter.service") $(cat "$C/systemd/subrouter.socket")" = "active active" ] && ok ||
+    bad "the units were left stopped"
+  finish
+fi
+
+if begin box-pool-shrank-rolls-back; then
+  box_setup post post; run_box FAKE_POOL_SIZE=4 FAKE_BAD=few-accounts
+  expect_rc 1; expect_out "!! ROLLING BACK: only 3 accounts visible, 4 before the swap"
+  expect_build "$DEST" old
+  finish
+fi
+
+# --- bootstrap.sh -------------------------------------------------------------
+boot_setup() { # installed-era new-era
+  R="$C/root"; mkdir -p "$R/usr/local/bin" "$R/etc/default" "$R/run/lock"
+  make_build "$R/usr/local/bin/subrouter" "$1" old
+  make_build "$C/subrouter-upload" "$2" new
+  stub id '[ "${1:-}" = -u ] && { echo 0; exit 0; }; exec /usr/bin/id "$@"'
+}
+run_boot() {
+  run_sandboxed PATH="$C/bin:/usr/bin:/bin:/usr/sbin:/sbin" HOME="$C/home" TMPDIR="$C/tmp" \
+    FAKE_LOG="$C/log" BOOTSTRAP_TEST_ROOT="$R" FAKE_TS_UP="$C/ts-up" FAKE_RUNNING="$C/running" \
+    FAKE_PIN="$BOOT_PIN" "$@" \
+    -- "$BASH5" "$BOOT_SH" "$C/subrouter-upload"
+}
+
+# A box bootstrap.sh runs to the end on. Tailscale joins on `up` and then has
+# 100.64.0.10, and the daemon answers health once restarted. The upload carries
+# the guard (unless "unguarded"); its install-systemd writes the env file from
+# the three tokens on stdin, keeping SUBROUTER_EXTRA_ARGS when not passed, and
+# its fingerprint prints BOOT_PIN for the service's own store and fails for any
+# other, as the real ones do.
+BOOT_PIN=9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
+make_boot_build() { # path id guard|unguarded
+  local guard="; refusing to bind"; [ "$3" = unguarded ] && guard=""
+  { printf '#!/bin/bash\n# fake subrouter build %s (post-isolation: attest-legacy%s)\n' "$2" "$guard"
+    cat <<'EOF'
+echo "exec $(basename "$0") $*" >> "$FAKE_LOG"
+case "${1:-}" in
+  install-systemd)
+    shift; addr=""; extra=""; keep=1
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --addr) addr=$2; shift 2 ;;
+        --extra-args) extra=$2; keep=0; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    f="$BOOTSTRAP_TEST_ROOT/etc/default/subrouter"
+    [ "$keep" = 0 ] || extra=$(sed -n 's/^SUBROUTER_EXTRA_ARGS="\(.*\)"$/\1/p' "$f" 2>/dev/null)
+    read -r admin; read -r import; read -r proxy
+    printf 'SUBROUTER_ADDR=%s\nSUBROUTER_ADMIN_TOKEN=%s\nSUBROUTER_ACCOUNT_IMPORT_TOKEN=%s\nSUBROUTER_PROXY_TOKEN=%s\nSUBROUTER_EXTRA_ARGS="%s"\n' \
+      "$addr" "$admin" "$import" "$proxy" "$extra" > "$f" ;;
+  fingerprint)
+    if [ "$*" = "fingerprint --sessions $BOOTSTRAP_TEST_ROOT/var/lib/subrouter/sessions.json" ]; then echo "$FAKE_PIN"
+    else echo "subrouter: no TLS identity in $(dirname "${3:-.}")" >&2; exit 1; fi ;;
+esac
+exit 0
+EOF
+  } > "$1"
+  chmod 755 "$1"
+}
+boot_full_setup() { # [unguarded]
+  boot_setup post post
+  make_boot_build "$C/subrouter-upload" new "${1:-guard}"
+  stub tailscale 'echo "tailscale $*" >> "$FAKE_LOG"
+case "$1" in
+  status) [ -e "$FAKE_TS_UP" ] ;;
+  up) : > "$FAKE_TS_UP" ;;
+  ip) [ -e "$FAKE_TS_UP" ] && echo 100.64.0.10 ;;
+esac'
+  stub systemctl 'echo "systemctl $*" >> "$FAKE_LOG"; [ "$1" = restart ] && echo up > "$FAKE_RUNNING"; exit 0'
+  stub curl 'for url; do :; done
+echo "curl $url" >> "$FAKE_LOG"
+case "$url" in
+  http://100.64.0.10:31415/_subrouter/health) [ -s "$FAKE_RUNNING" ] && echo "{\"ok\": true}" ;;
+  https://checkip.amazonaws.com) [ -z "${FAKE_NO_CHECKIP:-}" ] && echo 203.0.113.10 ;;
+  *) false ;;
+esac || exit 7'
+  stub ss 'printf "State Recv-Q Send-Q Local Address:Port Peer Address:Port\nLISTEN 0 4096 100.64.0.10:31415 0.0.0.0:*\nLISTEN 0 4096 *:31416 *:*\n"'
+}
+# The one peers-file entry bootstrap printed, read as the daemon reads the
+# file: exactly these keys, with these values.
+expect_peers_entry() { # name url
+  local proxy why
+  proxy=$(sed -n 's/^SUBROUTER_PROXY_TOKEN=//p' "$R/etc/default/subrouter")
+  why=$("$PY3" - "$C/out" "$1" "$2" "$proxy" "$BOOT_PIN" 2>&1 <<'PY'
+import json, sys
+out, name, url, token, pin = sys.argv[1:]
+lines = [l.strip() for l in open(out) if l.lstrip().startswith('{"peers"')]
+if len(lines) != 1:
+    sys.exit("%d peers-file lines printed, want 1" % len(lines))
+try:
+    doc = json.loads(lines[0])
+except ValueError as e:
+    sys.exit("the peers-file line is not JSON (%s): %s" % (e, lines[0]))
+want = {"peers": [{"name": name, "url": url, "token": token, "fingerprint": pin}]}
+if doc != want:
+    sys.exit("the peers-file line is %s, want %s" % (json.dumps(doc), json.dumps(want)))
+PY
+  ) && ok || bad "$why"
+}
+expect_no_stage() { [ -e "$R/usr/local/bin/subrouter.stage" ] && bad "the staged build was left behind" || ok; }
+
+echo "== bootstrap.sh"
+
+if begin boot-refuses-isolation-crossing; then
+  boot_setup pre post; run_boot
+  expect_rc 1; expect_out "predates Codex credential isolation"; expect_out "ATTEST_FIRST=1"
+  expect_no_log "tailscale"
+  finish
+fi
+
+if begin boot-crossing-allowed-by-override; then
+  # Past the guard the script reaches the (stubbed, failing) tailscale step.
+  boot_setup pre post; run_boot ALLOW_UNATTESTED_UPGRADE=1
+  expect_no_out "predates Codex credential isolation"; expect_log "tailscale status"
+  finish
+fi
+
+if begin boot-same-era-unaffected; then
+  boot_setup post post; run_boot
+  expect_no_out "predates Codex credential isolation"; expect_log "tailscale status"
+  finish
+fi
+
+# SUBROUTER_BOX_NAME names the box on the tailnet and in the laptop's
+# configuration. One that cannot be all three is refused before anything runs.
+if begin boot-names-the-tailnet-host; then
+  boot_setup post post; run_boot SUBROUTER_BOX_NAME=box-2
+  expect_log "tailscale up --ssh --hostname box-2"
+  finish
+fi
+
+if begin boot-default-name-is-box; then
+  boot_setup post post; run_boot
+  expect_log "tailscale up --ssh --hostname box$"
+  finish
+fi
+
+if begin boot-bad-box-name-refused; then
+  label63=$(printf 'b%.0s' $(seq 1 63))
+  for name in My_Box -box box- "${label63}b"; do
+    boot_setup post post; : > "$C/log"; run_boot SUBROUTER_BOX_NAME="$name"
+    expect_rc 1; expect_out "Nothing was changed"; expect_no_log "tailscale"
+    expect_build "$R/usr/local/bin/subrouter" old
+    if [ "$name" = "${label63}b" ]; then expect_out "SUBROUTER_BOX_NAME is longer than 63 characters"
+    else expect_out "SUBROUTER_BOX_NAME must be lower-case letters, digits and hyphens, and must not start or end with a hyphen; got '$name'"; fi
+  done
+  boot_setup post post; run_boot SUBROUTER_BOX_NAME="$label63"
+  expect_log "tailscale up --ssh --hostname $label63$"
+  finish
+fi
+
+# The laptop configuration bootstrap prints is what the operator pastes, and
+# the daemon reads its peers file strictly: one wrong key arms no peer at all.
+if begin boot-prints-the-laptop-configuration; then
+  boot_full_setup; run_boot SUBROUTER_BOX_NAME=box-2 SUBROUTER_PUBLIC_PORT=31416
+  expect_rc 0; expect_out "== done"; expect_build "$R/usr/local/bin/subrouter" new
+  expect_out "sr reaches this box only on a laptop that holds remote.key"
+  [ "$(grep -Fxc '  sr server add box-2 --url http://100.64.0.10:31415 \' "$C/out")" = 2 ] && ok ||
+    bad "output lacks two 'sr server add box-2 --url http://100.64.0.10:31415' commands"
+  expect_line "    --public-url 'https://203.0.113.10:31416' \\"
+  expect_line "    --fingerprint '$BOOT_PIN'"
+  expect_out "SUBROUTER_PEER_TAILNET=box-2=100.64.0.10 "
+  expect_peers_entry box-2 https://100.64.0.10:31416
+  finish
+fi
+
+if begin boot-public-ip-lookup-failure-still-finishes; then
+  boot_full_setup; run_boot SUBROUTER_PUBLIC_PORT=31416 FAKE_NO_CHECKIP=1
+  expect_rc 0; expect_out "Public URL:  https://<public-ip>:31416"
+  expect_peers_entry box https://100.64.0.10:31416
+  finish
+fi
+
+# A re-run keeps the tokens every client holds, and never renames the box.
+if begin boot-rerun-keeps-the-tokens; then
+  boot_full_setup; run_boot SUBROUTER_PUBLIC_PORT=31416
+  grep TOKEN "$R/etc/default/subrouter" > "$C/first-tokens"
+  run_boot
+  expect_rc 0
+  grep TOKEN "$R/etc/default/subrouter" | cmp -s - "$C/first-tokens" && ok || bad "the re-run changed a token"
+  [ "$(grep -c '^tailscale up' "$C/log")" = 1 ] && ok || bad "the re-run ran tailscale up again"
+  expect_peers_entry box https://100.64.0.10:31416
+  finish
+fi
+
+# bootstrap.sh shares deploy-box.sh's lock: it changes nothing while a deploy
+# runs, and runs once that deploy has ended.
+if begin boot-refused-while-a-deploy-runs; then
+  boot_full_setup
+  hold_deploy_lock "deploy-box.sh, pid 4321, log /var/tmp/deploy-box-1.log"
+  run_boot SUBROUTER_PUBLIC_PORT=31416
+  release_lock
+  expect_rc 1
+  expect_out "a deploy or another bootstrap is running (deploy-box.sh, pid 4321, log /var/tmp/deploy-box-1.log). Let it end, then run this again. Nothing was changed."
+  expect_no_log "tailscale"; expect_no_log "install-systemd"; expect_build "$R/usr/local/bin/subrouter" old
+  run_boot SUBROUTER_PUBLIC_PORT=31416
+  expect_rc 0; expect_out "== done"; expect_build "$R/usr/local/bin/subrouter" new
+  finish
+fi
+
+# A build is checked before it replaces the installed one.
+if begin boot-unrunnable-build-refused; then
+  boot_full_setup
+  printf '\177ELF\002\001\001\000 a build for another machine; refusing to bind\n' > "$C/subrouter-upload"
+  run_boot
+  expect_rc 1; expect_out "does not run here"; expect_out "Nothing was installed"
+  expect_build "$R/usr/local/bin/subrouter" old; expect_no_stage; expect_no_log "install-systemd"
+  finish
+fi
+
+if begin boot-unguarded-build-refused; then
+  boot_full_setup unguarded; run_boot
+  expect_rc 1; expect_out "lacks the non-loopback admin-token guard"; expect_out "Nothing was installed"
+  expect_build "$R/usr/local/bin/subrouter" old; expect_no_stage; expect_no_log "install-systemd"
+  finish
+fi
+
+# --- push-box.sh --------------------------------------------------------------
+# The laptop side. The fake ssh plays the box: an upload (`cat > <path>`, the
+# first behind `mkdir -m 0700 <dir> &&`, which refuses a directory that exists)
+# lands under $C/remote, and `rm -rf` removes there. Any other command is the
+# box script: it is logged, $C/remote.at-run keeps what the box held as it
+# started, and it answers FAKE_REMOTE_RC. FAKE_SSH_FAILS lists the calls (1,
+# 2, ...) that fail as an unreachable host does.
+push_setup() {
+  mkdir -p "$C/remote/tmp"
+  BUILD="$C/subrouter-linux"
+  printf '\177ELF fake linux build %s\n' "$CASE" > "$BUILD"
+  stub ssh '
+n=$(( $(cat "$FAKE_SSH_N" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$FAKE_SSH_N"
+echo "ssh $*" >> "$FAKE_LOG"
+for cmd; do :; done
+case " ${FAKE_SSH_FAILS:-} " in *" $n "*) echo "ssh: connect to host: Operation timed out" >&2; exit 255 ;; esac
+case "$cmd" in
+  "mkdir -m 0700 /"*" && cat > /"*)
+    d=${cmd#mkdir -m 0700 }; d=${d%% && *}
+    mkdir -m 0700 "$FAKE_REMOTE$d" || exit 1
+    cat > "$FAKE_REMOTE${cmd##* && cat > }"; exit 0 ;;
+  "cat > /"*) cat > "$FAKE_REMOTE${cmd#cat > }"; exit 0 ;;
+  "rm -rf /tmp/"*) rm -rf "$FAKE_REMOTE${cmd#rm -rf }"; exit 0 ;;
+  *) rm -rf "$FAKE_REMOTE.at-run"; cp -R "$FAKE_REMOTE" "$FAKE_REMOTE.at-run"
+     echo "box ran: $cmd"; exit "${FAKE_REMOTE_RC:-0}" ;;
+esac'
+}
+run_push() { # [env assignments...] -- push-box.sh args...
+  local envs=()
+  while [ $# -gt 0 ] && [ "$1" != -- ]; do envs+=("$1"); shift; done
+  shift
+  run_sandboxed PATH="$C/bin:/usr/bin:/bin:/usr/sbin:/sbin" HOME="$C/home" TMPDIR="$C/tmp" \
+    FAKE_LOG="$C/log" FAKE_SSH_N="$C/ssh-calls" FAKE_REMOTE="$C/remote" ${envs[@]+"${envs[@]}"} \
+    -- "$BASH5" "$PUSH_SH" "$@" < /dev/null
+}
+build_sha() { shasum -a 256 "$BUILD" | awk '{print $1}'; }
+# Every path an upload wrote on the box, in order.
+push_uploads() { sed -n 's|^ssh -- [^ ]* .*cat > \(/[^ ]*\)$|\1|p' "$C/log"; }
+# The directory the nth push (default 1) made on the box.
+push_dir() { sed -n 's|^ssh -- [^ ]* mkdir -m 0700 \(/tmp/[^ ]*\) && cat > .*|\1|p' "$C/log" | sed -n "${1:-1}p"; }
+expect_uploaded() { # local-file remote-path: on the box as its script started
+  cmp -s "$1" "$C/remote.at-run$2" && ok || bad "$2 on the box is not $(basename "$1")"
+}
+expect_nothing_sent() { expect_rc 64; expect_out "Nothing was sent"; expect_no_log "ssh"; }
+
+echo "== push-box.sh"
+
+if begin push-deploy-ok; then
+  push_setup; run_push -- deploy "$BUILD" --host ubuntu@box
+  expect_rc 0; D=$(push_dir)
+  case "$D" in /tmp/subrouter-push-*) ok ;; *) bad "the push made no directory of its own on the box (got '$D')" ;; esac
+  expect_uploaded "$BUILD" "$D/subrouter.new"; expect_uploaded "$BOX_SH" "$D/deploy-box.sh"
+  # The box is told the sha of the bytes sent, and "-": the admin token stays
+  # in its env file, out of every argv.
+  expect_log "^ssh -- ubuntu@box env bash $D/deploy-box.sh $(build_sha) - $D/subrouter.new$"
+  expect_order "ssh -- ubuntu@box cat > $D/deploy-box.sh" "bash $D/deploy-box.sh"
+  # A box script that exits 0 leaves nothing behind.
+  [ -e "$C/remote$D" ] && bad "$D is still on the box" || ok
+  finish
+fi
+
+# A second push, such as a retry while the first deploy still runs, never
+# writes over the first one's files.
+if begin push-each-push-gets-its-own-directory; then
+  push_setup; run_push FAKE_SSH_FAILS=3 -- deploy "$BUILD" --host box
+  cp "$BUILD" "$C/first-build"; printf 'a second build\n' > "$BUILD"
+  run_push -- deploy "$BUILD" --host box
+  expect_rc 0
+  B1=$(push_uploads | sed -n 1p); S1=$(push_uploads | sed -n 2p); B2=$(push_uploads | sed -n 3p)
+  [ -n "$B1" ] && [ -n "$B2" ] && [ "$B1" != "$B2" ] && ok || bad "the second push wrote its build to the first one's path ('$B1')"
+  cmp -s "$C/first-build" "$C/remote$B1" && ok || bad "the second push changed the first one's build at $B1"
+  cmp -s "$BOX_SH" "$C/remote$S1" && ok || bad "the first push's script is gone from $S1"
+  expect_uploaded "$BUILD" "$B2"
+  finish
+fi
+
+# Kept for the commands a failed or incomplete deploy prints.
+if begin push-deploy-returns-the-box-exit-code; then
+  push_setup; run_push FAKE_REMOTE_RC=3 -- deploy "$BUILD" --host ubuntu@box
+  expect_rc 3
+  [ -e "$C/remote$(push_dir)/deploy-box.sh" ] && ok || bad "the push's directory was removed after exit 3"
+  finish
+fi
+
+if begin push-missing-host-refused; then
+  push_setup; run_push -- deploy "$BUILD"
+  expect_nothing_sent; expect_out "no box to push to: pass --host <ssh-target> or set SUBROUTER_BOX_SSH"
+  finish
+fi
+
+if begin push-host-from-the-environment; then
+  push_setup; run_push SUBROUTER_BOX_SSH=box -- deploy "$BUILD"
+  expect_rc 0; expect_log "^ssh -- box env bash /tmp/subrouter-push-[^ ]*/deploy-box.sh "
+  finish
+fi
+
+if begin push-host-flag-beats-the-environment; then
+  push_setup; run_push SUBROUTER_BOX_SSH=old-box -- deploy "$BUILD" --host=box
+  expect_rc 0; expect_log "^ssh -- box "; expect_no_log "old-box"
+  finish
+fi
+
+# ssh reads a destination that starts with '-' as an option.
+if begin push-host-that-is-an-option-refused; then
+  push_setup; run_push -- deploy "$BUILD" --host=-oProxyCommand=true
+  expect_nothing_sent; expect_out "'-oProxyCommand=true' is not an ssh destination"
+  finish
+fi
+
+if begin push-missing-build-refused; then
+  push_setup; run_push -- deploy "$C/no-such-build" --host box
+  expect_nothing_sent; expect_out "no build at $C/no-such-build"
+  finish
+fi
+
+if begin push-unknown-verb-refused; then
+  push_setup; run_push -- install "$BUILD" --host box
+  expect_rc 64; expect_out "usage: push-box.sh bootstrap|deploy"; expect_no_log "ssh"
+  finish
+fi
+
+# Only the box script's own knobs cross, quoted; this shell's CODEX_HOME does not.
+if begin push-deploy-passes-only-its-knobs; then
+  push_setup
+  run_push DRAIN_GRACE_SECONDS=60 ATTEST_FIRST=1 CODEX_HOME=/laptop/codex SUBROUTER_BOX_NAME=box SUBROUTER_PUBLIC_PORT=off -- deploy "$BUILD" --host box
+  expect_rc 0
+  expect_log "^ssh -- box env ATTEST_FIRST='1' DRAIN_GRACE_SECONDS='60' bash $(push_dir)/deploy-box.sh $(build_sha) - $(push_dir)/subrouter.new$"
+  expect_no_log "CODEX_HOME"; expect_no_log "SUBROUTER_BOX_NAME"; expect_no_log "SUBROUTER_PUBLIC_PORT"
+  finish
+fi
+
+if begin push-knob-the-box-shell-would-read-refused; then
+  push_setup; run_push "DRAIN_GRACE_SECONDS=60;reboot" -- deploy "$BUILD" --host box
+  expect_nothing_sent; expect_out "DRAIN_GRACE_SECONDS='60;reboot' holds a character the box's shell would read"
+  finish
+fi
+
+if begin push-bootstrap-ok; then
+  push_setup
+  run_push SUBROUTER_PUBLIC_PORT=31416 SUBROUTER_BOX_NAME=box DRAIN_GRACE_SECONDS=60 -- bootstrap "$BUILD" --host ubuntu@203.0.113.10
+  expect_rc 0; D=$(push_dir)
+  expect_uploaded "$BUILD" "$D/subrouter"; expect_uploaded "$BOOT_SH" "$D/bootstrap.sh"
+  expect_log "^ssh -- ubuntu@203.0.113.10 sudo env SUBROUTER_PUBLIC_PORT='31416' SUBROUTER_BOX_NAME='box' bash $D/bootstrap.sh $D/subrouter$"
+  finish
+fi
+
+if begin push-lost-connection-names-the-box-log; then
+  push_setup; run_push FAKE_SSH_FAILS=3 -- deploy "$BUILD" --host box
+  expect_rc 255; expect_out "A deploy that started goes on by itself on the box. Do not push again until it ends"
+  expect_line "  ssh box 'tail -f \"\$(ls -t ~/.subrouter/transitions/deploy-box-*.log | head -1)\"'"
+  [ -e "$C/remote$(push_dir)/deploy-box.sh" ] && ok || bad "the push's directory was removed while its deploy may run"
+  finish
+fi
+
+if begin push-failed-upload-runs-nothing; then
+  push_setup; run_push FAKE_SSH_FAILS=1 -- deploy "$BUILD" --host box
+  expect_rc 64; expect_out "could not write $(push_dir)/subrouter.new on box (ssh exited 255)"
+  expect_no_log "bash /tmp/"
+  finish
+fi
+
 
 # --- the laptop ---------------------------------------------------------------
 write_serve_plist() { # path home
