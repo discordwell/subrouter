@@ -393,6 +393,28 @@ A network that refuses new connections while old ones work can make a healthy bo
 
 When a box is found down, each of its chats becomes a refugee. It goes to another box first, and to the laptop only when no other box can take it. A refugee gives up after an hour with `stranded chat gave up; answered 503`, and resumes when room appears. A full admission queue also holds the turn, with `reason=admission_queue_full`, instead of answering 503.
 
+### The stand-in, when the daemon itself is gone
+
+None of the above helps when the supervisor is not running: a Claude Code session talks only to the daemon's socket. `subrouter standby` (§79.3) is a second process for that case. It waits on the lock of the Claude socket. When the supervisor lets go of the lock, the stand-in binds the same path, holds new requests for 30 seconds in case the daemon comes straight back, and after that sends turns to a box. It gives the path back when the supervisor asks for it and the daemon has answered ready 3 times in a row. Nothing installs or starts it yet.
+
+It needs the peers file, one `membership` token for each box in `~/.subrouter/standby-tokens/<box name>` (mode 0600, §79.2), the remote gate's key (§17), and a supervisor that waits for the socket's lock: `claude_socket_waits_for_lock` in `supervisor-status`. Beside an older supervisor it stays disarmed and touches nothing.
+
+```bash
+cat ~/.subrouter/standby-state.json                                          # its state, written at each change
+curl -s --unix-socket ~/.subrouter/claude.sock http://x/_subrouter/health    # "claude_socket": "standby" while it holds the path
+```
+
+`state` is `disarmed` (with a `reason`), `armed` (it waits on the lock), `holding` (it has the path, and requests wait), `serving` (requests go to a box), `yielding` or `stopped`. `boxes` gives the word for each box's token, tested every 10 minutes while the stand-in is idle, so a token that lapsed shows as `refused` before the day it is needed. `takes` counts the times it took the path in the last 10 minutes. From the third, it keeps the path until the daemon has stayed ready for a minute or more, shown as `hand_back_after_seconds`.
+
+To try it without breaking the daemon, let the supervisor yield its socket for a stated time, and end the yield early with `reclaim` (§77.3):
+
+```bash
+curl -s --unix-socket ~/.subrouter/supervisor.sock -X POST 'http://supervisor/_subrouter/claude-socket/yield?for=2m'
+curl -s --unix-socket ~/.subrouter/supervisor.sock -X POST http://supervisor/_subrouter/claude-socket/reclaim
+```
+
+A stand-in ends itself, which frees the lock, when it cannot free the lock within 5 seconds of setting out to give the path back, and when it stops answering its own health through the path. A launch pinned to one account gets a 503 for as long as a stand-in serves.
+
 ## Saved resets
 
 A saved reset clears an account's meters once. Anthropic has granted Claude accounts a one-time saved reset, and Codex accounts hold rate-limit reset credits. Each claim spends one for good, and it discards what is left of the account's current week. Never claim one unless the account owner asked for that claim.
@@ -451,6 +473,8 @@ An account that holds an unclaimed Claude reset ranks at twice a non-holder unti
 | `~/.subrouter/claude.sock` | The daemon's Claude socket. |
 | `~/.subrouter/supervisor.sock` | The supervisor's control socket. |
 | `~/.subrouter/worker-config.json` | The supervised worker's `serve` arguments and extra environment. |
+| `~/.subrouter/standby-tokens/<box name>` | The stand-in's `membership` token for one box (§79.2). |
+| `~/.subrouter/standby-state.json`, `~/.subrouter/standby-supervisor.json` | The stand-in's state, and the supervisor's last answer to it (§79.3). |
 | `~/.subrouter/transitions/` | Logs of deploy, activation, and rollback runs. |
 | `~/.claude-route/` | The shims, the mode files, and `claude-route`'s launch log. |
 | `~/.config/subrouter/cloud.json` | Written by `sr setup`. It holds the proxy token. |
