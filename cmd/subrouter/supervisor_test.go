@@ -170,7 +170,29 @@ func runFakeWorker() {
 		<-retired
 		_, _ = io.WriteString(w, "released")
 	})
-	server := &http.Server{Handler: mux}
+	// While the file SUBROUTER_TEST_FAKE_WORKER_HANG_FILE names holds this
+	// worker's pid, no handler answers: the worker is alive, accepts
+	// connections and says nothing. A stream already being sent goes on. The
+	// pid keeps the silence off the worker that replaces this one, which
+	// starts with the same environment.
+	handler := http.Handler(mux)
+	if hangFile := os.Getenv("SUBROUTER_TEST_FAKE_WORKER_HANG_FILE"); hangFile != "" {
+		handler = http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+			for {
+				silenced, _ := os.ReadFile(hangFile)
+				if strings.TrimSpace(string(silenced)) != pid {
+					break
+				}
+				select {
+				case <-request.Context().Done():
+					return
+				case <-time.After(5 * time.Millisecond):
+				}
+			}
+			mux.ServeHTTP(w, request)
+		})
+	}
+	server := &http.Server{Handler: handler}
 	claudeSock.startGuarded(server, "", nil)
 	if retireSignal != nil {
 		signals := make(chan os.Signal, 1)
@@ -957,6 +979,8 @@ type supervisorControlStatus struct {
 	ClaudeSocket string                    `json:"claude_socket"`
 
 	ClaudeSocketRebinds int `json:"claude_socket_rebinds"`
+
+	WorkerProbe workerProbeView `json:"worker_probe"`
 }
 
 func waitForSupervisorStatus(t *testing.T, client *http.Client, runDone <-chan error) supervisorControlStatus {
