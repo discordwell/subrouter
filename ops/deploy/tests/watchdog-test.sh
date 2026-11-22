@@ -12,7 +12,8 @@
 # notifier that writes each notification down. The `date` and `sleep` on PATH
 # are a clock the test moves: each sleep adds its seconds, so a run of checks
 # takes no real time. Every label is a scratch one, and a case fails if a
-# stand-in is ever handed the live job's label.
+# stand-in is ever handed the live job's label, or if the live job's stop
+# marker is written, changed or removed.
 #
 # Runs under macOS /bin/bash 3.2 as well as bash 5 (WATCHDOG_TEST_BASH picks
 # the bash the scripts run under). On macOS it runs only inside a sandbox that
@@ -61,6 +62,7 @@ check() { # what command...
 #   print-rc       print answers this rc (and print-msg) for every job
 #   boot-fails     every bootstrap fails with exit 5 and this message, and
 #                  boot-fails-left, when present, counts the failures left
+#   boot-fails.<label>, boot-fails.<label>-left   the same for one job only
 make_stubs() {
   mkdir -p "$C/bin" "$C/ld/jobs" "$C/home"
   echo "$START" > "$C/clock"
@@ -80,15 +82,17 @@ case "$1" in
     [ -e "$j" ] || { echo "Could not find service \"${2##*/}\" in domain for user gui: ${2#gui/}" >&2; exit 113; }
     printf '%s = {\n\tactive count = 1\n\tpath = %s\n\tstate = running\n\tpid = 4242\n}\n' "$2" "$(cat "$j")" ;;
   bootstrap)
-    if [ -e "$L/boot-fails" ]; then
-      left=$(cat "$L/boot-fails-left" 2>/dev/null || echo forever)
+    label=""; [ ! -f "$3" ] || label=$(label_of "$3")
+    for knob in "boot-fails.$label" boot-fails; do
+      [ -e "$L/$knob" ] || continue
+      left=$(cat "$L/$knob-left" 2>/dev/null || echo forever)
       if [ "$left" != 0 ]; then
-        [ "$left" = forever ] || echo $((left - 1)) > "$L/boot-fails-left"
-        cat "$L/boot-fails" >&2; exit 5
+        [ "$left" = forever ] || echo $((left - 1)) > "$L/$knob-left"
+        cat "$L/$knob" >&2; exit 5
       fi
-    fi
+      break
+    done
     [ -f "$3" ] || { echo "Bootstrap failed: 2: No such file or directory" >&2; exit 2; }
-    label=$(label_of "$3")
     [ -e "$L/jobs/$label" ] && { echo "Bootstrap failed: 5: Input/output error" >&2; exit 5; }
     echo "$3" > "$L/jobs/$label" ;;
   bootout)
@@ -102,9 +106,13 @@ SH
 for a in "$@"; do
   case "$a" in *ai.manaflow.subrouter[!-]*|*ai.manaflow.subrouter) echo "osascript $*" >> "$FAKE_LD/live"; exit 99 ;; esac
 done
-prev=""; last=""
-for a in "$@"; do prev=$last; last=$a; done
+prev=""; last=""; script=""; take=0
+for a in "$@"; do
+  prev=$last; last=$a
+  if [ "$take" = 1 ]; then script="$script${script:+; }$a"; take=0; elif [ "$a" = -e ]; then take=1; fi
+done
 printf '%s\n' "$prev" >> "$FAKE_LD/notes"
+printf '%s\n' "$script" >> "$FAKE_LD/scripts"
 SH
   cat > "$C/bin/date" <<'SH'
 #!/bin/bash
@@ -121,7 +129,7 @@ SH
 echo "launchctl from PATH: $*" >> "$FAKE_LD/path-launchctl"; exit 0
 SH
   chmod 755 "$C/bin/"*
-  : > "$C/ld/calls"; : > "$C/ld/notes"
+  : > "$C/ld/calls"; : > "$C/ld/notes"; : > "$C/ld/scripts"
 }
 
 begin() {
@@ -138,12 +146,40 @@ begin() {
   STOPS="$C/home/.subrouter"
   mkdir -p "$C/agents" "$STOPS"
   write_job_plist "$PLIST" "$JOB"
+  printf '%s\n' "$LIVE_CANARY" > "$STOPS/$LIVE_MARKER"
   return 0
 }
 
+# The live job's stop marker. Each case starts with this one in its stop dir,
+# which is also the default one, and no case may write, change or remove it:
+# the scripts must never be handed the live label, and that holds for hold and
+# release as much as for the stand-ins.
+LIVE_MARKER=watchdog-stop.ai.manaflow.subrouter
+LIVE_CANARY="label=ai.manaflow.subrouter
+until=0
+by=the watchdog tests, as a canary"
+
+# What fails a case whatever it tests, one line each.
+complaints() {
+  local f n
+  [ ! -s "$C/ld/live" ] || echo "a stand-in was handed the live job's label: $(head -1 "$C/ld/live")"
+  [ ! -s "$C/ld/path-launchctl" ] || echo "a script found launchctl on PATH: $(head -1 "$C/ld/path-launchctl")"
+  # A dialog or an alert waits for a click, so each event would leave an
+  # osascript hanging under the watchdog's job.
+  n=$(grep -cvF 'display notification' "$C/ld/scripts" 2>/dev/null)
+  [ "${n:-0}" = 0 ] || echo "$n notifications were not banners (display notification): $(grep -vF 'display notification' "$C/ld/scripts" | head -1)"
+  n=$(grep -cE 'display (dialog|alert)|choose ' "$C/ld/scripts" 2>/dev/null)
+  [ "${n:-0}" = 0 ] || echo "$n notifications wait for a click: $(grep -E 'display (dialog|alert)|choose ' "$C/ld/scripts" | head -1)"
+  f=$(find "$C" \( -name "$LIVE_MARKER" -o -name "$LIVE_MARKER.*" \) ! -path "$STOPS/$LIVE_MARKER" 2>/dev/null | head -1)
+  [ -z "$f" ] || echo "a stop marker for the live job was written: $f"
+  [ "$(cat "$STOPS/$LIVE_MARKER" 2>/dev/null)" = "$LIVE_CANARY" ] || echo "the live job's stop marker $STOPS/$LIVE_MARKER was changed or removed"
+}
+
 finish() {
-  if [ -s "$C/ld/live" ]; then bad "a stand-in was handed the live job's label: $(head -1 "$C/ld/live")"; fi
-  if [ -s "$C/ld/path-launchctl" ]; then bad "a script found launchctl on PATH: $(head -1 "$C/ld/path-launchctl")"; fi
+  local w
+  while IFS= read -r w; do [ -z "$w" ] || bad "$w"; done <<EOF
+$(complaints)
+EOF
   case " $FAIL_LIST " in
     *" $CASE "*)
       echo "  --- $CASE out ---"; tail -15 "$C/out" 2>/dev/null | sed 's/^/  | /'
@@ -213,6 +249,11 @@ expect_notes() { local n; n=$(notes); [ "$n" = "$1" ] && ok || bad "$n notificat
 expect_events() { local n; n=$(events "$1"); [ "$n" = "$2" ] && ok || bad "$n log lines match /$1/, want $2"; }
 expect_no_change() { expect_calls " (bootstrap|bootout|kickstart|enable|disable|remove|unload|load) " 0; }
 bootstrap_times() { sed -n 's/^launchctl bootstrap .* @\([0-9]*\)$/\1/p' "$C/ld/calls"; }
+tries_of() { # plist t0: when each bootstrap from that plist came, in seconds after t0
+  local t s=""
+  for t in $(grep -F "launchctl bootstrap gui/$UIDN $1 @" "$C/ld/calls" | sed 's/.* @//'); do s="$s${s:+ }$((t - $2))"; done
+  echo "$s"
+}
 
 echo "== the watchdog (under $WD_BASH)"
 
@@ -227,6 +268,7 @@ if begin unloaded-job-is-loaded-once; then
   check "the job is not loaded afterwards" loaded
   expect_notes 1
   grep -Fq "$JOB" "$C/ld/notes" && ok || bad "the notification does not name the job"
+  n=$(grep -cF 'display notification' "$C/ld/scripts"); [ "$n" = 1 ] && ok || bad "osascript was asked $n times to display a notification, want once"
   expect_events "$JOB is not loaded, and no stop is announced" 1
   finish
 fi
@@ -348,6 +390,51 @@ if begin failed-bootstrap-backs-off; then
   finish
 fi
 
+if begin every-watched-job-is-checked-and-repaired; then
+  # The real watchdog watches the daemon's job and, once it is added, the
+  # stand-in's. Each job is checked and repaired on its own. Here the first
+  # one is loaded from another plist while the second is down, so a watchdog
+  # that looks only at the first job repairs nothing.
+  JOB2="$PFX.standin"; PLIST2="$C/agents/$JOB2.plist"; write_job_plist "$PLIST2" "$JOB2"
+  mkdir -p "$C/elsewhere"; write_job_plist "$C/elsewhere/$JOB.plist" "$JOB"
+  load_job "$JOB" "$C/elsewhere/$JOB.plist"
+  watch 6 -- --watch "$JOB2=$PLIST2"
+  expect_rc 0
+  expect_calls "^launchctl print gui/$UIDN/$JOB @" 6
+  expect_calls "^launchctl print gui/$UIDN/$JOB2 @" 6
+  expect_calls "^launchctl bootstrap gui/$UIDN $PLIST2 @" 1
+  expect_calls " (bootout|kickstart) |^launchctl bootstrap gui/$UIDN $PLIST @" 0
+  [ "$(cat "$C/ld/jobs/$JOB")" = "$C/elsewhere/$JOB.plist" ] && ok || bad "the job loaded from another plist was changed"
+  check "the job that was down is loaded" loaded "$JOB2"
+  expect_notes 2
+  n=$(grep -cF "$JOB is loaded from $C/elsewhere/$JOB.plist" "$C/ld/notes"); [ "$n" = 1 ] && ok || bad "$n notifications report $JOB's other plist, want 1"
+  n=$(grep -cF "$JOB2 was not loaded" "$C/ld/notes"); [ "$n" = 1 ] && ok || bad "$n notifications say $JOB2 was loaded again, want 1"
+  # Events, not checks: the start line and three events in six checks.
+  n=$(grep -c . "$C/wd.log"); [ "$n" = 4 ] && ok || bad "the log has $n lines, want 4: $(sed -n '5p' "$C/wd.log")"
+  # Both down: each is loaded from its own plist, once.
+  rm -f "$C/ld/jobs/"*; : > "$C/ld/calls"; : > "$C/ld/notes"; rm -f "$C/wd.log"
+  watch 6 -- --watch "$JOB2=$PLIST2"
+  expect_calls "^launchctl bootstrap gui/$UIDN $PLIST @" 1
+  expect_calls "^launchctl bootstrap gui/$UIDN $PLIST2 @" 1
+  expect_events "$JOB is not loaded, and no stop is announced" 1
+  expect_events "$JOB2 is not loaded, and no stop is announced" 1
+  expect_notes 2
+  # Both down, and neither loads at first: each keeps its own pace. The first
+  # never loads and is tried 10, 20, 40 and 80 s apart; the second is tried at
+  # once all the same, and loads at its third try.
+  rm -f "$C/ld/jobs/"*; : > "$C/ld/calls"; : > "$C/ld/notes"; rm -f "$C/wd.log"
+  echo "Bootstrap failed: 5: Input/output error" > "$C/ld/boot-fails.$JOB"
+  echo "Bootstrap failed: 5: Input/output error" > "$C/ld/boot-fails.$JOB2"; echo 2 > "$C/ld/boot-fails.$JOB2-left"
+  t0=$(clock)
+  watch 40 -- --watch "$JOB2=$PLIST2"
+  got=$(tries_of "$PLIST" "$t0"); [ "$got" = "0 10 30 70 150" ] && ok || bad "$JOB was tried at ${got:-no time} s, want 0 10 30 70 150"
+  got=$(tries_of "$PLIST2" "$t0"); [ "$got" = "0 10 30" ] && ok || bad "$JOB2 was tried at ${got:-no time} s, want 0 10 30"
+  check "the job that loads at its third try is loaded" loaded "$JOB2"
+  expect_events "$JOB2 is loaded again from $PLIST2, after 2 failed tries" 1
+  expect_notes 3
+  finish
+fi
+
 if begin unclear-launchd-answer-changes-nothing; then
   # rc 141 is launchd refusing this shell, not a job that is gone.
   echo 141 > "$C/ld/print-rc"; echo "Could not print domain: 141: Reentrancy avoided" > "$C/ld/print-msg"
@@ -448,6 +535,47 @@ if begin log-stays-small; then
   finish
 fi
 
+if begin scripts-use-nothing-from-bash-4; then
+  # The Mac runs these under /bin/bash 3.2, Linux CI under bash 5, so a bash 4
+  # construct passes every case here and breaks on the Mac. The commonest ones,
+  # outside comments:
+  bash4='(\[\[?|test) +-[vR] |(declare|typeset|local) +-[A-Za-z]*[Agn]( |$)|\$\{[#!]?[A-Za-z_][A-Za-z0-9_]*(\[[^]]*\])?(\^|,|@[A-Za-z]\})|(^|[^A-Za-z0-9_-])(mapfile|readarray|coproc)( |$)|\|&|&>>|;;?&( |$)|\[-[0-9]+\]\}|wait +-[nfp]|EPOCH(SECONDS|REALTIME)|BASHPID|SRANDOM|shopt +-s +(globstar|lastpipe)|(^|[^$])\{[A-Za-z_][A-Za-z0-9_]*\}[<>]|%\([^)]*\)T'
+  for f in "$WATCHDOG" "$INSTALLER" "$HERE/rehearse-watchdog.sh"; do
+    hits=$(grep -nE -- "$bash4" "$f" | grep -vE '^[0-9]+:[[:space:]]*#')
+    [ -z "$hits" ] && ok || bad "${f##*/} uses bash 4 or later: $(printf '%s\n' "$hits" | head -1)"
+  done
+  # The pattern finds each one, and none of the bash 3.2 forms these use.
+  while IFS= read -r line; do
+    printf '%s\n' "$line" | grep -qE -- "$bash4" && ok || bad "the bash 4 pattern misses: $line"
+  done <<'EOF'
+[[ -v OBS_TEXT ]] && x=1
+declare -A seen
+local -n ref=$1
+echo "${label,,}" "${label^^}" "${W_LABEL[$i]^}" "${x@Q}"
+mapfile -t lines < f
+cmd |& tee f
+echo x &>> f
+  a) x ;;&
+echo "${W_LABEL[-1]}"
+wait -n
+echo $EPOCHSECONDS
+exec {fd}> f
+printf '%(%s)T' -1
+EOF
+  while IFS= read -r line; do
+    printf '%s\n' "$line" | grep -qE -- "$bash4" && bad "the bash 4 pattern flags bash 3.2: $line" || ok
+  done <<'EOF'
+case "$k" in label) m_label=$v ;; until) m_until=$v ;; esac
+s="$s${s:+, }${W_LABEL[$i]} (${W_PLIST[$i]})"
+e=("$line" ${e[@]+"${e[@]}"})
+[ -n "$x" ] || [ -e "$f" ] && echo "${#W_LABEL[@]}" "${x:-}" "${x%%=*}" "${!x}"
+local i=$1 label=${W_LABEL[$1]}
+cmd > /dev/null 2>&1 &
+echo "${f}>" ${x}< f
+EOF
+  finish
+fi
+
 if begin stand-ins-catch-the-live-label; then
   # The instrument itself: the live label reaches neither stand-in unseen.
   in_env -- "$C/bin/fake-launchctl" print "gui/$UIDN/ai.manaflow.subrouter" > /dev/null 2>&1
@@ -462,6 +590,24 @@ if begin stand-ins-catch-the-live-label; then
   in_env -- "$C/bin/fake-launchctl" print "gui/$UIDN/ai.manaflow.subrouter-watchdog" > /dev/null 2>&1
   check "the watchdog's own label is not the live job's" test ! -s "$C/ld/live"
   : > "$C/ld/calls"
+  # A notifier asked for a dialog, or for nothing it can show, is seen.
+  in_env -- "$C/bin/fake-osascript" -e 'on run argv' -e 'display dialog (item 1 of argv)' -e 'end run' "a test" t > /dev/null 2>&1
+  [ -n "$(complaints)" ] && ok || bad "a dialog went unseen"
+  : > "$C/ld/scripts"
+  in_env -- "$C/bin/fake-osascript" "a test" t > /dev/null 2>&1
+  [ -n "$(complaints)" ] && ok || bad "an osascript with no script went unseen"
+  : > "$C/ld/scripts"; : > "$C/ld/notes"
+  # A stop marker for the live job, written anywhere in the case's dir, or
+  # the canary changed or removed, is seen.
+  mkdir -p "$C/x"; : > "$C/x/$LIVE_MARKER.42"
+  [ -n "$(complaints)" ] && ok || bad "a live marker written elsewhere went unseen"
+  rm -f "$C/x/$LIVE_MARKER.42"
+  echo "until=1" >> "$STOPS/$LIVE_MARKER"
+  [ -n "$(complaints)" ] && ok || bad "a changed live marker went unseen"
+  rm -f "$STOPS/$LIVE_MARKER"
+  [ -n "$(complaints)" ] && ok || bad "a removed live marker went unseen"
+  printf '%s\n' "$LIVE_CANARY" > "$STOPS/$LIVE_MARKER"
+  [ -z "$(complaints)" ] && ok || bad "an untouched case has complaints: $(complaints)"
   finish
 fi
 
@@ -626,7 +772,7 @@ if begin installer-runs-launchctl-by-absolute-path; then
   # fails the case in finish). Here /bin/launchctl is missing or fenced off,
   # and status shows what running it answered.
   in_env -u SUBROUTER_WATCHDOG_LAUNCHCTL -- "$WD_BASH" "$INSTALLER" status --label "$PFX.wd" --dir "$C/wdhome" > "$C/out" 2>&1; RC=$?
-  expect_out "/bin/launchctl"
+  expect_out ": /bin/launchctl: "
   expect_calls . 0
   finish
 fi

@@ -122,7 +122,7 @@ bash ops/deploy/macos/install-watchdog.sh status
 bash ops/deploy/macos/install-watchdog.sh uninstall           # turns it off
 ```
 
-The deploy scripts and `sr daemon restart` announce their own stops. `sr daemon down` does not, on purpose: a stray one must not keep the watchdog away for long. To stop the daemon by hand, with `sr daemon down` or a `launchctl bootout`, or before `deploy/macos/migrate-launchagent-to-supervisor.sh` or `rollback-launchagent-supervisor.sh`, announce it first, for up to a day, or the watchdog loads it again:
+The deploy scripts and `sr daemon restart` announce their own stops. `sr daemon down` does not, on purpose: a stray one must not keep the watchdog away for long. To stop the daemon by hand, with `sr daemon down` or a `launchctl bootout`, or before `deploy/macos/migrate-launchagent-to-supervisor.sh`, `rollback-launchagent-supervisor.sh` or the peer step of `ops/bin/subrouter-quickstart`, announce it first, for up to a day, or the watchdog loads it again:
 
 ```bash
 bash ops/deploy/macos/subrouter-watchdog.sh hold ai.manaflow.subrouter 3600

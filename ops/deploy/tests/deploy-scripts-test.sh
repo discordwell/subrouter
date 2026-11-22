@@ -4636,6 +4636,25 @@ if begin laptop-leaves-a-short-marker-when-its-bootstrap-fails; then
   finish
 fi
 
+# No case may hand the marker code the live job's label: a marker for it is
+# the one the live watchdog reads. finish cannot see one, so each run looks
+# over its whole test dir after its cases.
+live_stop_markers() { # dir
+  find "$1" \( -name 'watchdog-stop.ai.manaflow.subrouter' -o -name 'watchdog-stop.ai.manaflow.subrouter.*' \) 2>/dev/null
+}
+
+if begin live-stop-marker-is-seen-anywhere-in-a-case; then
+  mkdir -p "$C/home/.subrouter"; : > "$C/home/.subrouter/watchdog-stop.ai.manaflow.subrouter.42"
+  [ -n "$(live_stop_markers "$T")" ] && ok || bad "a stop marker for the live job went unseen"
+  rm -f "$C/home/.subrouter/watchdog-stop.ai.manaflow.subrouter.42"
+  [ -z "$(live_stop_markers "$T")" ] && ok || bad "a removed marker is still reported"
+  finish
+fi
+
+CASE=no-case-wrote-a-stop-marker-for-the-live-job
+LIVE_STOP_MARKER=$(live_stop_markers "$T" | head -1)
+[ -z "$LIVE_STOP_MARKER" ] || bad "a case wrote a stop marker for the live job: ${LIVE_STOP_MARKER#"$T"/}"
+
 echo
 echo "deploy script tests: $PASS assertions passed, $FAILED failed"
 if [ "$FAILED" -ne 0 ]; then
