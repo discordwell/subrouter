@@ -1,6 +1,6 @@
 # Subrouter
 
-> **A maintained fork of [manaflow-ai/subrouter](https://github.com/manaflow-ai/subrouter).** Upstream has merged nothing since late October 2026, so maintenance continues here. This fork is not affiliated with or endorsed by Manaflow. Fixes that apply upstream are offered back as pull requests, and if upstream resumes, this fork follows it. [`ops/PATCHES.md`](ops/PATCHES.md) lists every change the fork makes, and [`ops/`](ops/) holds the tools that deploy and run it.
+> **A maintained fork of [manaflow-ai/subrouter](https://github.com/manaflow-ai/subrouter).** Upstream has merged nothing since late October 2026, so maintenance continues here. This fork is not affiliated with or endorsed by Manaflow. Fixes that apply upstream are offered back as pull requests, and if upstream resumes, this fork follows it. [`ops/PATCHES.md`](ops/PATCHES.md) lists every change the fork makes, and [`ops/`](ops/) holds the tools that deploy and run it. To run your own subrouter on a Mac, and optionally a Linux box of your own, start with [`ops/GETTING-STARTED.md`](ops/GETTING-STARTED.md).
 
 Subrouter is a local AI coding-agent proxy. It routes traffic across Codex accounts with sticky conversation-to-account assignment so cached context stays useful.
 
