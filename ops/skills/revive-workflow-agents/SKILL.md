@@ -50,13 +50,17 @@ On 2026-11-21 five such runs were resumed with the exact script and arguments. W
 
    | State | Meaning | Do |
    |---|---|---|
-   | `dead` | The run gave up on it (its journal has a `failed` row), or the run is over, finished or stopped, and the agent never returned. | Revive it. |
-   | `quiet` | Its run is going, it has no `failed` row, and it wrote nothing for two minutes. The row says `in Bash` (a long tool call) or `waiting for the model`. | Leave it. Revive it with `--ids` only when its whole session died, which leaves no record that the run ended. |
+   | `dead` | The run gave up on it (its journal has a `failed` row), or the run is over and the agent never returned. A run is over when it finished, was stopped, or died with its session. | Revive it. |
+   | `quiet` | Its run is going, it has no `failed` row, and it wrote nothing for two minutes. The row says `in Bash` (a long tool call) or `waiting for the model`. | Leave it. |
    | `never-started` | One turn at most. | Nothing to continue. Its stage starts fresh in step 7. |
    | `revived` | Its transcript is staged. | Already continued, or ready for step 5. |
    | `live` | Wrote in the last two minutes. | Leave it alone. |
 
    An agent ten minutes into one test run is `quiet`, not dead. A message to it starts a second copy in the same folder.
+
+   **A run that died with its session.** A run lives in the Claude Code process that started it. When that process dies (a reset, a crash, a killed session), the session writes no record that the run ended. The tool counts such a run as over when nothing in its folder was written since the session's process started, and reads that start from the process it runs under. So after a restart, run it from the restarted session and the dead runs' agents are `dead`, with nothing more to say. Run from anywhere else, it cannot know: pass `--restarted <time>`, as `--restarted 2026-11-22T16:44:14Z`. A run written since that start is going, however long it has been silent.
+
+   On 2026-11-22 a reset ended six runs with ten agents mid-work. Before this rule the tool listed all ten as `quiet`, `stage --all-dead` staged none, and `rerun` answered "still going" for every run, so the reruns were built by hand.
 
    Attempts at one stage count once, and the one that got furthest is the one shown. The tool drops these endings from a label: `:wait`, `:try<N>`, `-try<N>`, `-attempt<N>`, `-retry<N>` and ` (retry <N>)`. It drops `#<N>` only when an agent under that label with no number started before it, and every agent before it under that label had failed before it started: `fix:<unit>`, then `fix:<unit>#2`. A panel that numbers every member, like `review:<unit>#1` and `review:<unit>#2`, stays apart, even when a concurrency cap starts its members one at a time after the earlier ones died. So do agents numbered `#<N>` that ran side by side, or after one of them returned a result. In the journals read on 2026-11-21, every `#<N>` retry followed an unnumbered first attempt, and most `#<N>` labels numbered agents that ran side by side.
 
@@ -74,7 +78,7 @@ On 2026-11-21 five such runs were resumed with the exact script and arguments. W
    | `revive` | Its agent died after real work. Steps 4 to 6 continue it. |
    | `start fresh` | Its agent never got past its first turn, or left no transcript. Step 7 starts it. |
    | `wait` | Its revived agent has not written its report, or wrote one that does not fit. The line names the file. |
-   | `leave` | Its run is going, so the run's script still owns the stage. A run whose whole session died never ends: stage its agents with `--ids`. |
+   | `leave` | Its run is going, so the run's script still owns the stage. |
    | `ignore` | The prefix's probes of the API, `probe:try<N>`. They are not work. |
 
    Stages the run never reached have no line. Step 7 starts them.
@@ -113,7 +117,7 @@ On 2026-11-21 five such runs were resumed with the exact script and arguments. W
    python3 ~/.claude/skills/revive-workflow-agents/wf_revive.py rerun --hours 6       # or --runs wf_x
    ```
 
-   For each run that is over and has unfinished stages, it writes a copy of the run's script with a map in it, and prints `{"workflow": {"scriptPath": ..., "args": ...}}`. Call `Workflow` with that input. In the new run:
+   For each run that is over and has unfinished stages, it writes a copy of the run's script with a map in it, and prints `{"workflow": {"scriptPath": ..., "args": ...}}`. Call `Workflow` with that input. For a run that died with its session, the script and the arguments come from the `Workflow` call in the session's transcript. In the new run:
    - a stage that finished in the old run returns its old result and calls no agent, in any call order;
    - a stage that a revived agent finished returns that agent's report;
    - a stage that never started, and everything after, runs as usual.
