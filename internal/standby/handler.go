@@ -36,7 +36,7 @@ const (
 	routeBox           route = iota // sent to a box
 	routeHealth                     // the stand-in's own health body
 	routeDaemonSurface              // the daemon's other /_subrouter/ routes: 503
-	routeControlPlane               // /api/*, the client's account and policy calls: 503
+	routeControlPlane               // /api/* but policy_limits, the client's account calls: 503
 	routePinned                     // pinned to one account: 503, never sent
 )
 
@@ -45,7 +45,10 @@ const (
 // /api/* is the client's control plane. A box answers it with its own
 // identity account, the client caches whichever identity answered, and a
 // wrong one has hidden tools and models on this Mac before (control_plane.go).
-// A 503 keeps the box's identity out of every file on the Mac.
+// So it gets a 503, with one exception. A session that starts without a 200
+// on policy_limits withholds WebFetch, DesignSync and RemoteTrigger, and does
+// not ask again for an hour; a box's answer kept them and wrote no identity
+// to a file (PATCHES §79.1).
 //
 // A request that names an account (claude <account>) was promised that
 // account and no other, so it waits for the daemon.
@@ -56,6 +59,8 @@ func routeFor(r *http.Request) route {
 		return routeHealth
 	case clean == "/_subrouter" || strings.HasPrefix(clean, "/_subrouter/"):
 		return routeDaemonSurface
+	case clean == "/api/claude_code/policy_limits":
+		// To a box, unless it is pinned.
 	case clean == "/api" || strings.HasPrefix(clean, "/api/"):
 		return routeControlPlane
 	}
