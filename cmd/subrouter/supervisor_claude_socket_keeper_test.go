@@ -9,16 +9,20 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/manaflow-ai/subrouter/internal/front"
 )
@@ -118,9 +122,10 @@ func requireForeignAnswer(t *testing.T, socket, when string) {
 }
 
 // watchClaudeSocketLock blocks on the socket's lock the way a process standing
-// by for the path does: the kernel hands it the lock the moment the holder
-// lets go. The returned func stops the watch and reports whether that
-// happened.
+// by for the path does. The returned func stops the watch and reports whether
+// it got the lock. The kernel wakes a waiter when the holder lets go and does
+// not hand it the lock, so a holder that takes the lock again at once can beat
+// the waiter to it: sameClaudeSocketLock is the check that cannot be beaten.
 func watchClaudeSocketLock(t *testing.T, socket string) (released func() bool) {
 	t.Helper()
 	fd, err := syscall.Open(socket+".lock", syscall.O_RDWR|syscall.O_CLOEXEC, 0)
@@ -145,6 +150,46 @@ func watchClaudeSocketLock(t *testing.T, socket string) (released func() bool) {
 	return func() bool {
 		watching.Store(false)
 		return got.Load()
+	}
+}
+
+// sameClaudeSocketLock duplicates the handle the supervisor, which runs in this
+// process, holds on the socket's lock file. A flock lock belongs to the open
+// file and the duplicate is the same open file, so asking for the lock through
+// it succeeds only while the lock the supervisor held then is the lock that is
+// held now. A supervisor that let go and took the lock again holds it through
+// another open file, however short the time between.
+func sameClaudeSocketLock(t *testing.T, socket string) (stillHeld func() bool) {
+	t.Helper()
+	var lock unix.Stat_t
+	if err := unix.Stat(socket+".lock", &lock); err != nil {
+		t.Fatal(err)
+	}
+	open, err := os.ReadDir("/dev/fd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var handles []int
+	for _, entry := range open {
+		fd, err := strconv.Atoi(entry.Name())
+		if err != nil {
+			continue
+		}
+		var stat unix.Stat_t
+		if unix.Fstat(fd, &stat) == nil && stat.Dev == lock.Dev && stat.Ino == lock.Ino {
+			handles = append(handles, fd)
+		}
+	}
+	if len(handles) != 1 {
+		t.Fatalf("this process holds %d handles on the socket's lock file, want the supervisor's one", len(handles))
+	}
+	second, err := unix.FcntlInt(uintptr(handles[0]), unix.F_DUPFD_CLOEXEC, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = unix.Close(second) })
+	return func() bool {
+		return unix.Flock(second, unix.LOCK_EX|unix.LOCK_NB) == nil
 	}
 }
 
@@ -182,6 +227,7 @@ func TestSupervisorRecreatesDeletedClaudeSocket(t *testing.T) {
 		t.Fatalf("stream opened with %q, %v", line, err)
 	}
 
+	sameLock := sameClaudeSocketLock(t, socket)
 	lockReleased := watchClaudeSocketLock(t, socket)
 	if err := os.Remove(socket); err != nil {
 		t.Fatal(err)
@@ -189,6 +235,9 @@ func TestSupervisorRecreatesDeletedClaudeSocket(t *testing.T) {
 	waitForWorkerThroughClaudeSocket(t, socket, control)
 	if lockReleased() {
 		t.Fatal("the supervisor let go of the socket's lock while it re-created the path: a process standing by took it")
+	}
+	if !sameLock() {
+		t.Fatal("the supervisor let go of the socket's lock while it re-created the path: the lock it holds now is not the one it held before")
 	}
 	if status := getSupervisorStatus(t, control); status.ClaudeSocket != claudeSocketServing || status.ClaudeSocketRebinds != 1 {
 		t.Fatalf("after one re-created path: claude_socket = %q, claude_socket_rebinds = %d; want serving, 1",
@@ -287,6 +336,85 @@ func TestSupervisorWaitsWhileAnotherProcessListensAtTheClaudeSocket(t *testing.T
 
 	foreign.die()
 	waitForWorkerThroughClaudeSocket(t, socket, control)
+}
+
+// A folder that is not private, or is reached through a symlink, is a fault in
+// the configuration, as a relative path is: no process can serve a socket
+// there, whoever holds the lock. The supervisor does not wait for such a path.
+// It says unavailable and never looks again, so the socket stays unserved even
+// once the folder is put right.
+func TestSupervisorNeverTriesAClaudeSocketInAnUnsafeFolder(t *testing.T) {
+	writable := func(mode os.FileMode) func(*testing.T, string) func() {
+		return func(t *testing.T, folder string) func() {
+			if err := os.Mkdir(folder, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(folder, mode); err != nil {
+				t.Fatal(err)
+			}
+			return func() {
+				if err := os.Chmod(folder, 0o700); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+	}
+	cases := []struct {
+		name string
+		// makeUnsafe returns what puts the folder right.
+		makeUnsafe func(t *testing.T, folder string) (putRight func())
+	}{
+		{"its group can write to it", writable(0o770)},
+		{"anyone can write to it", writable(0o777)},
+		{"it is a symlink", func(t *testing.T, folder string) func() {
+			elsewhere := folder + "-elsewhere"
+			if err := os.Mkdir(elsewhere, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(elsewhere, folder); err != nil {
+				t.Fatal(err)
+			}
+			return func() {
+				if err := os.Remove(folder); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Rename(elsewhere, folder); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			dir := claudeSocketTestDir(t)
+			folder := filepath.Join(dir, "state")
+			putRight := c.makeUnsafe(t, folder)
+			socket := filepath.Join(folder, "claude.sock")
+			t.Setenv(claudeSocketEnv, socket)
+			config := testSupervisorConfig(t, dir)
+			startTestSupervisor(t, config)
+			control := unixHTTPClient(config.ControlSocket)
+
+			if got := getSupervisorStatus(t, control).ClaudeSocket; got != claudeSocketUnavailable {
+				t.Fatalf("supervisor-status claude_socket = %q for a socket in an unsafe folder, want %q", got, claudeSocketUnavailable)
+			}
+			putRight()
+			// The path can be served now, so a supervisor that still looked
+			// would take it within one claudeSocketLockPoll.
+			servable, err := openPrivateClaudeSocketListener(socket)
+			if err != nil {
+				t.Fatalf("with the folder put right the socket still cannot be served, so the rest would show nothing: %v", err)
+			}
+			_ = servable.Close()
+			time.Sleep(4 * claudeSocketLockPoll)
+			if _, err := os.Lstat(socket); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("the supervisor tried the path again once the folder was put right, and bound it: %v", err)
+			}
+			if got := getSupervisorStatus(t, control).ClaudeSocket; got != claudeSocketUnavailable {
+				t.Fatalf("supervisor-status claude_socket = %q once the folder was put right, want %q", got, claudeSocketUnavailable)
+			}
+		})
+	}
 }
 
 func TestSupervisorDoesNotStealALiveForeignSocket(t *testing.T) {
@@ -488,6 +616,127 @@ func TestSupervisorShutsDownCleanlyWhileDisplacedFromTheClaudeSocket(t *testing.
 	time.Sleep(claudeSocketPathCheck + claudeSocketPathCheck/2)
 	if now, err := os.Lstat(socket); err != nil || !os.SameFile(theirs, now) {
 		t.Fatalf("something replaced the socket at the path after the supervisor exited: %v", err)
+	}
+}
+
+// startServedClaudeSocket serves the socket as a plain serve does, through
+// open when one is given.
+func startServedClaudeSocket(t *testing.T, socketPath string, open func(string) (leasedListener, error)) *claudeSocket {
+	t.Helper()
+	sock := newClaudeSocket("", claudeSocketEnvFor(map[string]string{claudeSocketEnv: socketPath}))
+	if open != nil {
+		sock.open = open
+	}
+	server := &http.Server{Handler: http.NotFoundHandler(), ReadHeaderTimeout: 10 * time.Second}
+	t.Cleanup(func() { _ = server.Close() })
+	sock.start(server.Serve, "", slog.New(slog.NewTextHandler(io.Discard, nil)))
+	t.Cleanup(sock.close)
+	return sock
+}
+
+// Without the lock the keeper asks for it about every 250 ms. That is often
+// enough to serve again a moment after a process standing in lets go, and far
+// from a loop that keeps a processor busy for as long as that process serves.
+// A loaded machine makes a wait longer and never shorter, so the shortest wait
+// is the one judged.
+func TestClaudeSocketAsksForItsLockAboutEvery250Milliseconds(t *testing.T) {
+	socketPath := filepath.Join(claudeSocketTestDir(t), "claude.sock")
+	lease, err := acquireLocalDataSocketLease(socketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = lease.Close() })
+	asked := make(chan time.Time, 64)
+	startServedClaudeSocket(t, socketPath, func(path string) (leasedListener, error) {
+		select {
+		case asked <- time.Now():
+		default:
+		}
+		return openLeasedClaudeSocket(path)
+	})
+
+	const waits = 6
+	next := func() time.Time {
+		t.Helper()
+		select {
+		case at := <-asked:
+			return at
+		case <-time.After(keeperTestPatience):
+			t.Fatalf("the keeper did not ask for the lock again in %s", keeperTestPatience)
+			return time.Time{}
+		}
+	}
+	shortest := time.Duration(math.MaxInt64)
+	last := next()
+	for range waits {
+		at := next()
+		shortest = min(shortest, at.Sub(last))
+		last = at
+	}
+	if shortest < 125*time.Millisecond || shortest > 500*time.Millisecond {
+		t.Fatalf("the shortest of %d waits between two tries for the lock was %s, want about 250 ms", waits, shortest)
+	}
+}
+
+// boundAgainAt is the real socket, and notes each time the keeper has bound
+// its path again.
+type boundAgainAt struct {
+	leasedListener
+	times chan<- time.Time
+}
+
+func (l boundAgainAt) rebind(socket string) (leasedListener, error) {
+	next, err := l.leasedListener.rebind(socket)
+	if err != nil {
+		return nil, err
+	}
+	l.times <- time.Now()
+	return boundAgainAt{leasedListener: next, times: l.times}, nil
+}
+
+// With the lock the keeper checks its path about every 2 s, so a deleted path
+// is back within that time, and a path nobody touches costs two stats in 2 s.
+// The longest a path stays gone is one whole wait, for a path deleted just
+// after a check, and that is what each round times: it deletes the path the
+// moment the keeper has bound it again. A loaded machine makes a round longer
+// and never shorter, so the shortest round is the one judged.
+func TestClaudeSocketPathIsBackAboutTwoSecondsAfterItIsDeleted(t *testing.T) {
+	socketPath := filepath.Join(claudeSocketTestDir(t), "claude.sock")
+	boundAgain := make(chan time.Time, 8)
+	sock := startServedClaudeSocket(t, socketPath, func(path string) (leasedListener, error) {
+		real, err := openLeasedClaudeSocket(path)
+		if err != nil {
+			return nil, err
+		}
+		return boundAgainAt{leasedListener: real, times: boundAgain}, nil
+	})
+	if got := sock.Status(); got != claudeSocketServing {
+		t.Fatalf("status = %q, want %q", got, claudeSocketServing)
+	}
+
+	deleteAndWait := func() time.Time {
+		t.Helper()
+		if err := os.Remove(socketPath); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case at := <-boundAgain:
+			return at
+		case <-time.After(keeperTestPatience):
+			t.Fatalf("the deleted path was not bound again in %s", keeperTestPatience)
+			return time.Time{}
+		}
+	}
+	const rounds = 2
+	shortest := time.Duration(math.MaxInt64)
+	last := deleteAndWait()
+	for range rounds {
+		at := deleteAndWait()
+		shortest = min(shortest, at.Sub(last))
+		last = at
+	}
+	if shortest < time.Second || shortest > 4*time.Second {
+		t.Fatalf("the shortest of %d times a path deleted just after a check stayed gone was %s, want about 2 s", rounds, shortest)
 	}
 }
 
