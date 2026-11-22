@@ -2960,7 +2960,7 @@ ends run it as a process of its own.
   and neither the stand-in token, the peer link token nor any `srk_` text in either.
 - `TestStandbyLeavesNoDeadTimeAtThePath`: a client dials the path every 10 ms while the supervisor ends, a
   new one starts, and that one yields and takes the path back. The longest run of failed dials must be at
-  most 500 ms. Three runs measured 150 to 162 ms. A run in which the dialling loop itself was held up for
+  most 500 ms. Nine runs measured 150 to 188 ms. A run in which the dialling loop itself was held up for
   200 ms is measured again, up to three times, because it measured the machine.
 - `TestStandbyEndsItselfWhenItCannotFreeTheLock`, `TestStandbyEndsItselfWhenItStopsAnswering`,
   `TestStandbyKeepsRunningWhileItAnswers` and `TestStandbyExitsOnSIGTERMWithAStreamOpen`: exit code 1 and a
