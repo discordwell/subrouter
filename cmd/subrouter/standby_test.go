@@ -371,9 +371,10 @@ func (f *standbyFixture) config() standbyConfig {
 	}
 }
 
-// startStandby runs a stand-in in this process until the test ends. It must
+// startStandby runs a stand-in in this process until the test ends, or until
+// the test calls stop, which returns once the stand-in has stopped. It must
 // never end itself: the tests of that run it as a process of its own.
-func (f *standbyFixture) startStandby(t *testing.T, adjust func(*standbyConfig)) {
+func (f *standbyFixture) startStandby(t *testing.T, adjust func(*standbyConfig)) (stop func()) {
 	t.Helper()
 	config := f.config()
 	config.exit = func(code int) { t.Errorf("the stand-in ended itself with exit code %d", code) }
@@ -383,17 +384,22 @@ func (f *standbyFixture) startStandby(t *testing.T, adjust func(*standbyConfig))
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- runStandby(ctx, config) }()
-	t.Cleanup(func() {
-		cancel()
-		select {
-		case err := <-done:
-			if err != nil {
-				t.Errorf("the stand-in ended with %v", err)
+	var once sync.Once
+	stop = func() {
+		once.Do(func() {
+			cancel()
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Errorf("the stand-in ended with %v", err)
+				}
+			case <-time.After(standbyTestPatience):
+				t.Errorf("the stand-in did not stop in %s\n%s", standbyTestPatience, f.logs.String())
 			}
-		case <-time.After(standbyTestPatience):
-			t.Errorf("the stand-in did not stop in %s\n%s", standbyTestPatience, f.logs.String())
-		}
-	})
+		})
+	}
+	t.Cleanup(stop)
+	return stop
 }
 
 func (f *standbyFixture) startSupervisor(t *testing.T) *testSupervisor {
@@ -488,7 +494,8 @@ type pathAnswer struct {
 	box       string
 	workerPID string
 	// close is whether the answer said Connection: close.
-	close bool
+	close  bool
+	header http.Header
 }
 
 func (a pathAnswer) String() string {
@@ -1082,6 +1089,30 @@ func TestStandbyGivesThePathBackWhenTheSupervisorAsksForIt(t *testing.T) {
 	}
 }
 
+// When the stand-in stops, it closes its connections to the boxes then, not
+// when a box's idle limit of 90 s runs out.
+func TestStandbyClosesItsBoxConnectionsWhenItStops(t *testing.T) {
+	box := startStandbyBox(t, "box-one")
+	f := newStandbyFixture(t, box)
+	startFakeSupervisor(t, f, supervisorSays("yielded"))
+	stop := f.startStandby(t, nil)
+	f.waitForState(t, standbyHolding, "")
+	f.clock.advance(standbyHold)
+	waitForAnswerFrom(t, f, "box")
+	if got := box.connections.Load(); got < 1 {
+		t.Fatalf("the box has %d connections open after it answered, want at least 1", got)
+	}
+
+	stop()
+	deadline := time.Now().Add(10 * time.Second)
+	for box.connections.Load() != 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("the box still has %d connections 10 s after the stand-in stopped; want them closed at the stop", box.connections.Load())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 // The path goes back only when the supervisor asks for it and
 // the daemon has answered ready on three checks in a row. A daemon that is
 // ready twice and then not has to start again.
@@ -1444,10 +1475,11 @@ func TestStandbyDefaultsAreTheDaemons(t *testing.T) {
 	}
 	want := standbyConfig{
 		StateDir: stateDir, Socket: filepath.Join(stateDir, "claude.sock"), ControlSocket: filepath.Join(stateDir, "supervisor.sock"),
-		DaemonAddr: daemon.Addr, Hold: 30 * time.Second,
+		DaemonAddr: daemon.Addr, Hold: 30 * time.Second, PolicyEvery: 30 * time.Minute,
 	}
 	if config.StateDir != want.StateDir || config.Socket != want.Socket || config.ControlSocket != want.ControlSocket ||
-		config.DaemonAddr != want.DaemonAddr || config.Hold != want.Hold || config.PeersFile != "" || config.Tailnet != "" {
+		config.DaemonAddr != want.DaemonAddr || config.Hold != want.Hold || config.PolicyEvery != want.PolicyEvery ||
+		config.PeersFile != "" || config.Tailnet != "" {
 		t.Fatalf("defaults = %+v\nwant %+v", config, want)
 	}
 
@@ -1470,14 +1502,16 @@ func TestStandbyDefaultsAreTheDaemons(t *testing.T) {
 		t.Fatalf("with a worker config: peers file %q, tailnet %q; want the worker config's", config.PeersFile, config.Tailnet)
 	}
 	config = parse("--peers-file", "/flag/peers.json", "--tailnet", "box=100.64.0.3", "--socket", "/flag/claude.sock",
-		"--control-socket", "/flag/supervisor.sock", "--daemon-addr", "127.0.0.1:1", "--hold", "45s")
+		"--control-socket", "/flag/supervisor.sock", "--daemon-addr", "127.0.0.1:1", "--hold", "45s", "--policy-every", "10m")
 	if config.PeersFile != "/flag/peers.json" || config.Tailnet != "box=100.64.0.3" || config.Socket != "/flag/claude.sock" ||
-		config.ControlSocket != "/flag/supervisor.sock" || config.DaemonAddr != "127.0.0.1:1" || config.Hold != 45*time.Second {
+		config.ControlSocket != "/flag/supervisor.sock" || config.DaemonAddr != "127.0.0.1:1" || config.Hold != 45*time.Second ||
+		config.PolicyEvery != 10*time.Minute {
 		t.Fatalf("flags did not win: %+v", config)
 	}
 
 	for _, refused := range [][]string{
 		{"--hold", "91s"}, {"--hold", "-1s"}, {"--state-dir", "relative"}, {"--socket", "relative.sock"}, {"--control-socket", "relative.sock"}, {"extra"},
+		{"--policy-every", "59s"}, {"--policy-every", "24h"},
 	} {
 		if _, err := parseStandbyConfig(refused, getenv); err == nil {
 			t.Errorf("standby %v was accepted, want an error", refused)
@@ -1487,7 +1521,8 @@ func TestStandbyDefaultsAreTheDaemons(t *testing.T) {
 	// Every interval a config leaves unset is its named constant.
 	filled := standbyConfig{}.withDefaults()
 	if filled.LockPoll != standbyLockPoll || filled.StatusEvery != standbyStatusEvery || filled.StatusEveryBusy != standbyStatusEveryBusy ||
-		filled.HandBackLimit != standbyHandBackLimit || filled.SelfCheckEvery != standbySelfCheckEvery || filled.StopGrace != standbyStopGrace {
+		filled.HandBackLimit != standbyHandBackLimit || filled.SelfCheckEvery != standbySelfCheckEvery || filled.StopGrace != standbyStopGrace ||
+		filled.PolicyEvery != standbyPolicyEvery {
 		t.Fatalf("unset intervals are not the constants: %+v", filled)
 	}
 	// The supervisor gives a process standing by 5 seconds to take the lock,
