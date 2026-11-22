@@ -365,6 +365,22 @@ func (b *Box) testToken(ctx context.Context) (int, error) {
 	return resp.StatusCode, nil
 }
 
+// CloseIdleConnections closes the connections to every box that carry no
+// request. The stand-in calls it once the daemon has its socket back and the
+// last stream it sent to a box has ended, so it keeps no connection to a box
+// it is not using. A token test opens one again.
+func (s *Set) CloseIdleConnections() {
+	s.mu.Lock()
+	boxes := make([]*Box, 0, len(s.addresses))
+	for box := range s.addresses {
+		boxes = append(boxes, box)
+	}
+	s.mu.Unlock()
+	for _, box := range boxes {
+		box.transport.CloseIdleConnections()
+	}
+}
+
 // BoxStatus is one box in the stand-in's status.
 type BoxStatus struct {
 	Name  string    `json:"name"`
