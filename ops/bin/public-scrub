@@ -16,22 +16,35 @@ label that --check matches only in the case the map gives).
 The rewrite replaces each value exactly as the map writes it. --check also finds what the
 rewrite leaves: another case, a label at a camelCase boundary (fooBar), an email's local part
 on its own, and an IP address written with hyphens or URL-encoded separators. Fix those by hand.
+
+The git hooks in ops/hooks import map_path, read_map, compile_needles and hit_lines from this
+file, so they match exactly as --check does. Keep this file free of imports from its own directory:
+a pre-push hook may run it as python3 -I -c "$(git show <rev>:ops/bin/public-scrub)".
 """
 import os, re, shutil, subprocess, sys
 
 KINDS = {"ip", "ip6", "email", "dns", "label", "label-cs"}
 
+def map_path():
+    default = os.path.expanduser("~/.config/subrouter-public-scrub/map.tsv")
+    return os.environ.get("SUBROUTER_PUBLIC_SCRUB_MAP") or default
+
+def read_map(path):
+    """(well-formed rows, longest real value first; the count of malformed lines). Raises OSError."""
+    lines = open(path, encoding="utf-8").read().splitlines()
+    rows = [l.split("\t") for l in lines if l and not l.startswith("#")]
+    good = [r for r in rows if len(r) == 3 and r[0] in KINDS]
+    return sorted(good, key=lambda r: len(r[1]), reverse=True), len(rows) - len(good)
+
 def load_map():
-    path = os.environ.get("SUBROUTER_PUBLIC_SCRUB_MAP") or os.path.expanduser("~/.config/subrouter-public-scrub/map.tsv")
+    path = map_path()
     try:
-        lines = open(path, encoding="utf-8").read().splitlines()
+        rows, bad = read_map(path)
     except FileNotFoundError:
         sys.exit(f"public-scrub: no map at {path}")
-    rows = [l.split("\t") for l in lines if l and not l.startswith("#")]
-    bad = [r for r in rows if len(r) != 3 or r[0] not in KINDS]
     if bad:
-        sys.exit(f"public-scrub: {len(bad)} malformed map line(s) in {path}")
-    return sorted(rows, key=lambda r: len(r[1]), reverse=True)
+        sys.exit(f"public-scrub: {bad} malformed map line(s) in {path}")
+    return rows
 
 def pattern(kind, real):
     v = re.escape(real)
@@ -45,8 +58,23 @@ def pattern(kind, real):
         return re.compile(r"(?<![A-Za-z0-9-])" + v + r"(?![A-Za-z0-9-])")
     return re.compile(r"(?<![A-Za-z0-9@.])" + v + r"(?![A-Za-z0-9@])")
 
-# --check finds each value with a plain substring search of the lower-cased bytes, then tests
-# the bytes on either side: each kind's edges(t, i, j) says whether t[i:j] stands on its own.
+# --check finds each value with a plain substring search of the folded bytes, then tests the
+# bytes on either side: each kind's edges(t, i, j) says whether t[i:j] stands on its own.
+NON_ASCII = re.compile(rb"[\x80-\xff]+")
+
+def fold_run(m):
+    try:
+        run = m[0].decode("utf-8")
+    except UnicodeDecodeError:
+        return m[0]
+    return "".join(c.lower() if len(c.lower().encode()) == len(c.encode()) else c for c in run).encode()
+
+def fold(data):
+    """data lower-cased, letters outside ASCII too, with each offset in it the same offset in data.
+    A letter whose lower case has another length in UTF-8, such as the Turkish dotted I, keeps
+    its case."""
+    return data.lower() if data.isascii() else NON_ASCII.sub(fold_run, data.lower())
+
 def at(t, i):
     return t[i:i + 1] if i >= 0 else b""
 
@@ -84,27 +112,36 @@ def needles(kind, real, case_sensitive):
         return [(sep.join(parts).encode(), False, ip6_edges) for sep in (":", "-", "%3a")]
     if kind == "email":
         local = real.split("@")[0]
-        return [(real.lower().encode(), False, email_edges),
-                (local.encode() if local.lower() in case_sensitive else local.lower().encode(),
+        return [(fold(real.encode()), False, email_edges),
+                (local.encode() if local.lower() in case_sensitive else fold(local.encode()),
                  local.lower() in case_sensitive, label_edges)]
     if kind == "dns":
-        return [(real.lower().encode(), False, dns_edges)]
+        return [(fold(real.encode()), False, dns_edges)]
     if kind == "label-cs":
         return [(real.encode(), True, label_edges)]
-    return [(real.lower().encode(), False, label_edges)]
+    return [(fold(real.encode()), False, label_edges)]
 
-def hits(data, all_needles):
-    """The offsets in data where a value starts."""
-    lower = data.lower()
+def hits(data, all_needles, folded=None):
+    """The offsets in data where a value starts. folded is fold(data), when the caller has it."""
+    folded = fold(data) if folded is None else folded
     out = []
     for needle, exact, edges in all_needles:
-        hay = data if exact else lower
+        hay = data if exact else folded
         i = hay.find(needle)
         while i >= 0:
             if edges(data, i, i + len(needle)):
                 out.append(i)
             i = hay.find(needle, i + 1)
     return out
+
+def compile_needles(rows):
+    """Every needle for rows of (kind, real, ...)."""
+    case_sensitive = {r[1].lower() for r in rows if r[0] == "label-cs"}
+    return [n for r in rows for n in needles(r[0], r[1], case_sensitive)]
+
+def hit_lines(data, all_needles):
+    """The 1-based numbers of the lines of data that hold a value."""
+    return sorted({data.count(b"\n", 0, i) + 1 for i in hits(data, all_needles)})
 
 def text_of(data):
     if b"\0" in data[:8192]:
@@ -140,8 +177,7 @@ def commit_files(rev):
         pos = eol + 2 + size
 
 def check(rows, files):
-    case_sensitive = {real.lower() for kind, real, _ in rows if kind == "label-cs"}
-    all_needles = [n for kind, real, _ in rows for n in needles(kind, real, case_sensitive)]
+    all_needles = compile_needles(rows)
     found = 0
     for rel, data in files:
         if hits(rel.encode(), all_needles):
@@ -149,7 +185,7 @@ def check(rows, files):
             print(f"{rel}: in the path")
         if text_of(data) is None:
             continue
-        for line in sorted({data.count(b"\n", 0, i) + 1 for i in hits(data, all_needles)}):
+        for line in hit_lines(data, all_needles):
             found += 1
             print(f"{rel}:{line}")
     return 1 if found else 0
