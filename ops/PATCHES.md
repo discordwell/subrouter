@@ -2342,6 +2342,146 @@ the cap's line taken out of serve's Server literal, the default and 90 s cases f
   `cmd/subrouter/hold_config.go` (`resolveClientRetryAfterMax`, `logClientRetryAfterMax`).
 - Related: §58 (the hold), §67.5 (the give-up).
 
+## 79. The stand-in: while the laptop's daemon is gone, Claude Code's socket is answered from a box
+
+On 2026-11-21 the laptop daemon's launchd job was unloaded for 2 h 22 min. Every socket session on the Mac
+failed once its retries ran out, and 242 workflow agents died, while both boxes were healthy. A Claude Code
+session reaches one endpoint for its whole life, the socket path it was launched with (§30), so only a
+process on the Mac that answers that path can carry a session to a box. The stand-in is that process. It
+is built in parts: §79.1 sends one request to a box, and §79.2 chooses the box. Until a later part adds
+`subrouter standby`, nothing runs this code, and no behaviour of the daemon changes.
+
+§79.1 The box handler (`internal/standby`) is a plain `http.Handler` for a request as it arrives on the
+Claude socket. It removes the client's `Authorization` (Claude Code's `ssh-placeholder`), `X-Api-Key`,
+`X-Pool-Hop` and every `X-Subrouter-*` header (`session.StripSubrouterHeaders`, then any other header with
+that prefix). It sets `Authorization: Bearer <the box's stand-in token>`, `X-Subrouter-Agent: claude`
+(without it a box assumes Codex) and `X-Subrouter-Session` to `session.ExtractRoutingID` of the client's
+request. `X-Claude-Code-Session-Id`, the `anthropic-*` headers and the rest pass as the client sent them.
+These are the peer forward's rules (`forwardToPeer`) without a hop count or a target account, so a box
+treats the request as one from a session of its own, and a session the box already holds keeps its account
+and its prompt cache.
+
+Bodies stream both ways through `httputil.ReverseProxy`. Events reach the client as the box writes them, and
+a request body goes to the box as the client sends it, so a 20 MB body costs one copy buffer and nothing is
+kept for a resend. A request moves to the next box only while no request head has been written to any box
+(`httptrace` `WroteHeaders`): a refused dial, a timeout or a certificate that fails its pin moves on. A
+failure after that point, in the body or after the first byte of the answer, is the client's to retry, and
+the client sees an answer cut mid-stream as cut, never as a clean end. The transport speaks HTTP/2 (both
+boxes offer `h2`), so when many sessions move at once they share one connection per box. A connection that
+has received nothing for 15 s is pinged, and closed when the ping goes unanswered for 5 s. So a connection
+that falls silent (the Mac slept, or a gateway dropped its state) costs the sessions on it about 20 s, not
+the header bound, and each gets `standby_box_failed` to retry. Dial and TLS take at most 2 s each, and an
+answer's headers at most 150 s. The peer link's 30 s header bound is short because
+the peer link can fall back to local accounts. The stand-in cannot, and 150 s stays inside Claude Code's
+180 s first-byte limit. A stream's length is never bounded.
+
+The handler runs inside the daemon's own guard (`proxy.NewClaudeSocketGuard`,
+`internal/proxy/claude_socket_guard.go`). A box's 401, or its 403 that says the token was revoked, reaches
+the client as a 503, because either would make Claude Code drop its socket credential for the login stored
+on the Mac. Every Retry-After the client sees is at most 60 s. A longer one, or one that is not a whole
+number of seconds, becomes 30, and a 503 without one, the guard's included, gets 30. Without the client's
+retry watchdog, Claude Code fails a request at once on a 503 that asks for more than 60 s. With it, a
+session sleeps the whole value, so a box's `Retry-After: 3600` would park a session for an hour.
+
+One function, `routeFor`, decides what never goes to a box. `/_subrouter/health` gets the stand-in's own
+body, `{"ok":true,"claude_socket":"standby"}`. `claude-route` reads only `"ok": true`, so a new launch still
+takes the pool route, and `claude_socket` tells a deploy check that the daemon does not own the socket. The
+daemon's other `/_subrouter/` routes get a 503. `/api/*`, the client's account calls, gets a 503 with
+Retry-After 30: a box answers them with its own identity account, and the client keeps whichever identity
+answered (`internal/proxy/control_plane.go`). The one exception is `GET /api/claude_code/policy_limits`,
+which goes to a box. A live session served by a box on 2026-11-21 showed why. With a 503 there, a session
+that starts during the outage withholds WebFetch, DesignSync and RemoteTrigger, ignores the Retry-After, and
+does not ask again for an hour, so the tools stay gone after the daemon returns. With the box's 200 it keeps
+them, and nothing of the box's identity reached a file under its config folder. The box's body was the same
+as the daemon's, because both identities had the default policy. A box whose identity belonged to another
+organization would apply that organization's policy. The path is cleaned before it is read, so
+`/v1/../api/...` counts as `/api`. A request that names an account (`X-Subrouter-Account-ID` or
+`X-Subrouter-Account`, set by `claude <account>`) gets a 503 and is never sent, `policy_limits` included,
+because a pinned launch is promised that account and no other. With no box usable, the client gets a 503
+with Retry-After 30 at once, and nothing is parked. Every 503 the handler makes has Anthropic's `api_error`
+shape, which Claude Code retries like any server error, and names its cause in `X-Subrouter-Reason`:
+`standby_no_box`, `standby_box_unreachable`, `standby_box_failed`, `standby_pinned_account`,
+`standby_control_plane` or `standby_daemon_surface`.
+
+A `Box` exists only through `NewBox`. It takes an `https://host:port` URL, the stand-in token and the 64-hex
+pin of the box's certificate, and builds its transport on `proxy.PinnedTLSConfig`. A certificate that is not
+the pin ends the handshake before a byte of the request is written, so the token never reaches it. An
+`http://` URL, a missing pin and a malformed one are refused. The token is never logged.
+
+Not done: replaying the daemon's own `policy_limits` answer, saved while it is healthy, ahead of the box's.
+The same session accepted such a replay, even with its signature header removed. It needs the process
+that can reach the daemon, so it belongs to a later part. Turning it off: nothing runs the handler yet.
+Once `subrouter standby` runs it, stopping that job turns it off.
+
+§79.2 The box set (`Set`, `internal/standby/boxset.go`) decides which boxes a request may go to, and in
+which order. It reads only files the daemon already keeps, and it writes nothing to the state folder.
+
+Each box's name, URL and certificate pin come from the daemon's peers file (`SUBROUTER_REMOTE_POOLS_FILE`),
+read by the daemon's own loader (`proxy.LoadRemotePeersFile`), so a file the daemon refuses is refused here
+too. The tokens in that file are the daemon's peer link credentials. The set drops them as the file is read,
+and no request carries one. A box's tailnet address comes from the daemon's `SUBROUTER_PEER_TAILNET`
+(`name=IP,...`), read by the daemon's rules (§68). The peers file has no field for it: a new field would
+make builds already deployed refuse the whole file. The tailnet address is tried first and the URL second,
+both against the box's pin. A value the daemon would ignore (an IP outside Tailscale's ranges, a name that is
+not in the peers file, a box named twice) is ignored here too, and every box dials its URL.
+
+Each box needs a token minted for the stand-in: one `membership` token (§43) in
+`<state folder>/standby-tokens/<box name>`, a regular file that only its owner can read. A file that group
+or others can read is refused, and so is a missing, unreadable or malformed one. The box then shows a fixed
+word in the status (`file_mode`, `file_missing`, `file_unreadable` or `file_malformed`) and is sent nothing.
+The log names the box and the word, never a token. A peers-file entry that cannot make a pinned `https` box
+shows `box_invalid`. The files are read again every 2 s, so a token file written, changed or removed is used
+from then on, with no restart, and a rewritten peers file is picked up the same way. A box whose entry and
+token did not change keeps its connections and its result. A peers file that stops loading keeps the boxes
+of the last file that loaded. The status then shows a fixed word for the peers file, the token file's words
+(`file_missing`, `file_mode`, `file_unreadable` or `file_malformed`), and the log has the loader's message.
+
+A session the Mac holds on a box goes to that box, which has its account and its prompt cache. The holds
+are the daemon's `peer-holds.json` for the first peer and `peer-holds-<name>.json` for each other, keyed
+`claude:<session id>`, read as the daemon reads them: an entry that names another peer is dropped, and the
+first file wins. A hold's deadline is not read. While the daemon is down nothing renews a hold, and a
+session the stand-in has kept on its holder must not move when the outage outlasts the hold. Every other
+session goes to the box that a rendezvous hash of its session id ranks first (SHA-256 of the box name and
+the id). So a session lands on the same box every time, after a restart of the stand-in too, and a box that
+goes down moves only its own sessions. A box that refused its token gets no request. A box that could not
+be reached is tried only after every other box, because it may be back.
+
+The set tests a box's token with `HEAD /`, the cheapest request a box authenticates. The box's proxy answers
+204 to a token it takes and 401 to one it refuses, and sends nothing upstream. The result per box (`ok`,
+`refused` or `unreachable`) and its time are in `Set.Status()`, for a status body. A box not tested yet
+shows `untested` and is used. The box handler reports each box's answer to the set (`Boxes.Answered`,
+`Boxes.Unreachable`), and an answer other than a 401 counts as a test. So a box gets a token test only when
+nothing has reached it for 10 minutes: every 10 minutes while the stand-in is idle, and not while it
+serves. A token that lapses is found within 10 minutes, not on the day the stand-in needs it.
+
+A box's 401 to a request decides nothing by itself, because a box also relays an upstream 401. A box's
+identity whose token Anthropic revoked answers `policy_limits` with Anthropic's own 401 (the 2026-11-19 case
+in `internal/proxy/claude_socket_guard.go`), while the box takes the stand-in token and serves every model
+turn. This part first marked a box refused on that 401, and two session starts took both boxes out: every
+model turn got `standby_no_box` for 10 minutes while both boxes served. So a request's 401 asks for a token
+test on the next tick, within 2 s, and only the test's 401 marks the box refused: the box answers `HEAD /`
+itself, so that 401 is its own. The client's retry, 30 s later, goes to another box when the token was
+refused, and to the same box when it was not. An address that fails before a request is sent goes after its
+box's other addresses for a minute, as the peer link's tailnet cooldown does, and a box is unreachable only
+once all its addresses have failed. So a box whose tailnet address fails while its URL works is never shown
+unreachable.
+
+Not done: the stand-in command must take `SUBROUTER_PEER_TAILNET` from the daemon's worker config, and must
+apply the daemon's `remote.key` gate before it builds the set. Both belong to the part that adds
+`subrouter standby`. Turning it off: nothing runs the set yet. Once `subrouter standby` runs it, removing a
+box's token file takes that box out within 2 s.
+
+Tests: `internal/standby/handler_test.go` (§79.1) and `internal/standby/boxset_test.go` (§79.2) hold one
+test per behaviour above, against `httptest` TLS boxes that each have their own self-signed certificate and
+pin, with no network, and temporary state folders. Run them with `./deploy/docker/test.sh ./internal/standby`.
+Each test was run once with its behaviour's code taken out of the working tree, and failed.
+
+- Code: `internal/standby/box.go` (`Box`, `NewBox`, `Boxes`), `internal/standby/handler.go` (`NewHandler`,
+  `routeFor`, `rewriteForBox`, `send`, `retryAfterWriter`), `internal/standby/boxset.go` (`Set`, `NewSet`,
+  `Config`, `Run`, `Candidates`, `Status`)
+- Related: §30 (the Claude socket), §43 (named tokens; a stand-in token is a `membership` token), §68
+  (tailnet first), §31 (the peers file and the peer-holds files)
+
 ## 81. A watchdog job loads the daemon's job again when something unloads it, unless a stop was announced
 
 On 2026-11-21 a stray test run booted the daemon's job out of launchd (§76). launchd forgets a job that is booted out, so `KeepAlive` had nothing to restart, and the job stayed out for 2 h 22 min until a person loaded it by hand. Every Claude Code session and workflow on the Mac lost its proxy, and 242 workflow agents died while both boxes were healthy. A second job under its own label, one long-lived process that checks every 5 s, loaded a booted-out scratch job again in 2.4 to 3.4 s in a test on this Mac's launchd.
