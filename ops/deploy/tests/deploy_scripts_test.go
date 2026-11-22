@@ -1,6 +1,7 @@
 //go:build !windows
 
 // Package deploytests runs deploy-scripts-test.sh (the shell harness for
+// lightsail/deploy-box.sh, lightsail/bootstrap.sh, lightsail/push-box.sh,
 // macos/deploy-laptop.sh, macos/rollback-laptop-peer.sh and bin/sr-triage) as
 // one Go subtest per case, so the harness runs through the same sandboxed
 // `go test` wrapper as the rest of subrouter (ops/bin/sr-local-ci deploy). On
@@ -15,7 +16,8 @@
 // here conflicts with an upstream merge. The harness stubs every command that
 // could touch a real machine (sudo, systemctl, launchctl, curl, codesign, ...)
 // and aborts a case before the script runs if any of them resolves outside its
-// stub directory. It also checks that PATCHES.md heads each numbered section
+// stub directory, and moves every fixed path the box scripts touch under the
+// case's directory. It also checks that PATCHES.md heads each numbered section
 // once.
 package deploytests
 
@@ -39,6 +41,151 @@ import (
 // Every case that pins a guard. Removing one from the harness fails this test,
 // so a guard cannot lose its test silently.
 var requiredCases = []string{
+	// deploy-box.sh: the admin token from the env file, the private listener
+	// from SUBROUTER_BOX_ADDR or the env file and never guessed, and step 7's
+	// floor from the pool before the swap.
+	"box-default-ok",
+	"box-admin-token-from-env-file",
+	"box-admin-token-dash-without-one-refused",
+	"box-missing-address-refused",
+	"box-malformed-address-refused",
+	"box-address-host-with-a-path-refused",
+	"box-unbracketed-ipv6-address-refused",
+	"box-bracketed-ipv6-address-ok",
+	"box-address-from-the-environment",
+	"box-small-pool-ok",
+	"box-empty-pool-ok",
+	"box-pool-shrank-rolls-back",
+	// deploy-box.sh runs detached, so a lost ssh connection stops only the
+	// streaming of its log.
+	"box-lost-connection-deploy-finishes",
+	"box-lost-connection-still-rolls-back",
+	"box-closed-output-deploy-finishes",
+	"box-lost-connection-attest-first-starts-the-daemon",
+	"box-second-deploy-refused-while-one-runs",
+	"box-refused-while-a-bootstrap-runs",
+	"box-binary-path-argument",
+	// deploy-box.sh step 8: the public listener refuses the admin token and
+	// 404s every private route; its port is the env file's, and one the env
+	// file names that is down rolls back; with public admin on (PATCHES
+	// §43.1), what the new daemon logged decides, and the flag form is
+	// refused; no pipe into grep -q (§43.3).
+	"box-public-admin-off-still-demands-404",
+	"box-public-port-variable-ignored",
+	"box-configured-public-listener-down-rolls-back",
+	"box-private-only-skips-the-public-checks",
+	"box-public-admin-env-ok",
+	"box-scripts-never-pipe-into-grep-q",
+	"box-public-admin-long-journal",
+	"box-public-listener-among-many",
+	"box-public-admin-dropin-ok",
+	"box-public-admin-reset-unmounted-warns",
+	"box-public-admin-asked-not-confirmed-warns",
+	"box-public-admin-on-but-unmounted-warns",
+	"box-public-admin-flag-refused",
+	"box-public-admin-flag-false-refused",
+	"box-public-admin-static-token-rolls-back",
+	"box-public-admin-import-token-rolls-back",
+	"box-public-admin-transcripts-mounted-rolls-back",
+	"box-public-admin-unmarked-route-rolls-back",
+	// deploy-box.sh step 8: public /ready 503 startup_ready:false is accepted;
+	// draining and not-served still roll back; step 9 only warns.
+	"box-ready-startup-503-accepted",
+	"box-ready-startup-then-flips",
+	"box-ready-draining-rolls-back",
+	"box-ready-missing-rolls-back",
+	"box-ready-draining-with-startup-key-rolls-back",
+	// deploy-box.sh step 10: the isolation gate, as the service user.
+	"box-isolation-incomplete",
+	"box-isolation-check-cannot-run",
+	"box-unit-env-honored",
+	// deploy-box.sh rollback() and the step-1 downgrade guard: refused only
+	// once a Codex record has been migrated.
+	"box-rollback-refused-pre-isolation",
+	"box-rollback-allowed-by-override",
+	"box-rollback-refused-service-down",
+	"box-rollback-no-migrated-records",
+	"box-rollback-interactive-only-records",
+	"box-rollback-refused-store-unreadable",
+	"box-rollback-refused-unit-state-dir",
+	"box-rollback-post-to-post-unaffected",
+	"box-downgrade-refused",
+	"box-downgrade-allowed-by-override",
+	"box-downgrade-no-migrated-records",
+	// deploy-box.sh's restarts, step 4's and rollback()'s, drain over the drain
+	// socket first and force a build still draining after a wall-clock grace
+	// (PATCHES §38.1).
+	"box-restart-bounded",
+	"box-rollback-restart-bounded",
+	"box-drain-grace-is-wall-clock",
+	"box-drain-grace-forces-at-the-deadline",
+	"box-drain-grace-default-is-the-ceiling",
+	"box-drain-grace-ceiling-is-the-unit-timeout",
+	"box-drain-grace-ceiling-is-the-daemon-timeout",
+	"box-drain-grace-clamped-to-the-ceiling",
+	"box-drain-grace-overflow-clamped",
+	"box-drain-grace-not-a-number-refused",
+	"box-drains-over-the-socket-first",
+	"box-drain-socket-reports-the-drain",
+	"box-no-drain-socket-falls-back",
+	"box-drain-socket-off",
+	"box-drain-socket-off-any-spelling",
+	"box-drain-socket-relative-path-ignored",
+	"box-failed-restart-resumes-the-drain",
+	"box-operator-drain-is-not-lifted",
+	"box-drain-report-seconds-leading-zero",
+	"box-drain-report-seconds-not-a-number-refused",
+	"box-ready-wait-not-a-number-refused",
+	"box-drain-report-hung-socket-does-not-delay-the-force",
+	"box-drain-grace-fractional-unit-timeout",
+	"box-drain-grace-fractional-daemon-timeout",
+	"box-drain-grace-sub-second-timeout-is-one-second",
+	"box-drain-grace-hard-cap",
+	"box-rollback-grace-defaults-short",
+	"box-rollback-grace-forces-the-abandoned-build",
+	"box-rollback-grace-not-a-number-refused",
+	"box-rollback-drains-the-new-build-over-its-socket",
+	// deploy-box.sh ATTEST_FIRST=1.
+	"box-attest-first",
+	"box-attest-first-says-the-grace-does-not-apply",
+	"box-attest-first-rollback-refused",
+	"box-attest-first-preflight-ok-rolls-back",
+	"box-attest-first-nothing-to-attest",
+	"box-attest-first-preflight-cannot-run",
+	"box-attest-first-stop-stuck",
+	"box-attest-first-pre-isolation-candidate",
+	// bootstrap.sh: the isolation-crossing guard, the box's name, the laptop
+	// configuration it prints, the tokens a re-run keeps, and the checks a
+	// build passes before it replaces the installed one.
+	"boot-refuses-isolation-crossing",
+	"boot-crossing-allowed-by-override",
+	"boot-same-era-unaffected",
+	"boot-names-the-tailnet-host",
+	"boot-default-name-is-box",
+	"boot-bad-box-name-refused",
+	"boot-prints-the-laptop-configuration",
+	"boot-public-ip-lookup-failure-still-finishes",
+	"boot-rerun-keeps-the-tokens",
+	"boot-refused-while-a-deploy-runs",
+	"boot-unrunnable-build-refused",
+	"boot-unguarded-build-refused",
+	// push-box.sh: nothing is sent without a box, a build and values the box's
+	// shell cannot misread; the box is told the sha and "-", and its exit code
+	// comes back.
+	"push-deploy-ok",
+	"push-each-push-gets-its-own-directory",
+	"push-deploy-returns-the-box-exit-code",
+	"push-missing-host-refused",
+	"push-host-from-the-environment",
+	"push-host-flag-beats-the-environment",
+	"push-host-that-is-an-option-refused",
+	"push-missing-build-refused",
+	"push-unknown-verb-refused",
+	"push-deploy-passes-only-its-knobs",
+	"push-knob-the-box-shell-would-read-refused",
+	"push-bootstrap-ok",
+	"push-failed-upload-runs-nothing",
+	"push-lost-connection-names-the-box-log",
 	// deploy-laptop.sh.
 	"laptop-ok",
 	"laptop-isolation-incomplete",
