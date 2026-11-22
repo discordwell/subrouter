@@ -131,13 +131,19 @@ func resetRemoteGateCache() {
 }
 
 func resolveRemoteGate(warn io.Writer) remoteGateVerdict {
+	return resolveRemoteGateAt(remoteKeyPath(), warn)
+}
+
+// resolveRemoteGateAt is the gate for the key at path. The stand-in
+// (standby.go) asks it for the state folder it was started with, which a flag
+// can name; every other caller goes through remoteGate.
+func resolveRemoteGateAt(path string, warn io.Writer) remoteGateVerdict {
 	// Deliberately no migration: an earlier draft minted a key when servers.json
 	// held a server, so a machine that had been set up before the gate kept
 	// working untouched. That makes servers.json a second key -- a machine with
 	// one would have remote ON without holding the key, which is the opposite of
 	// what this gate is for. The key is the only key. Machines that should keep
 	// their access are given one before the binary lands.
-	path := remoteKeyPath()
 	info, err := os.Stat(path)
 	if err != nil {
 		// No key: total silence. Naming the file here would defeat the point.
