@@ -5,10 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"math/rand/v2"
 	"net"
 	"net/http"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -262,12 +264,26 @@ func (r *Router) Forget(id string) error {
 	return nil
 }
 
+// Serve accepts on listener until Accept fails with an error that is not
+// temporary. A temporary one (temporaryAcceptError) is retried on the same
+// listener after a pause that doubles from 5 ms to 1 s, as net/http's Serve
+// does.
 func (r *Router) Serve(listener net.Listener) error {
+	var pause time.Duration
 	for {
 		client, err := listener.Accept()
 		if err != nil {
-			return err
+			if !temporaryAcceptError(err) {
+				return err
+			}
+			if pause == 0 {
+				slog.Warn("subrouter accept failed; retrying", "listener", listener.Addr().String(), "error", err)
+			}
+			pause = min(max(2*pause, 5*time.Millisecond), time.Second)
+			time.Sleep(pause)
+			continue
 		}
+		pause = 0
 		// Registration is synchronous with Accept, so once the accept loop
 		// is joined no connection can appear afterward. During a canary the
 		// connection is held as pending until its first request head names
@@ -278,6 +294,13 @@ func (r *Router) Serve(listener net.Listener) error {
 		}
 		go r.serveCanaryConnection(client)
 	}
+}
+
+// temporaryAcceptError reports an accept(2) failure that says nothing about
+// the listener: the process or the system is out of file descriptors, or the
+// client gave up while it was queued. The next Accept can succeed.
+func temporaryAcceptError(err error) bool {
+	return errors.Is(err, syscall.EMFILE) || errors.Is(err, syscall.ENFILE) || errors.Is(err, syscall.ECONNABORTED)
 }
 
 func (r *Router) serveConnection(client net.Conn, state *backendState, prefix []byte) {
