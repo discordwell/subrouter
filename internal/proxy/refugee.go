@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"net/http"
 	"slices"
+	"strconv"
 	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
@@ -185,7 +186,7 @@ func (s Server) resumeWaitingRefugee(w http.ResponseWriter, r *http.Request, pro
 			"agent", agentType, "session", sessionID, "origin", mark.Origin,
 			"why", placed.why(), "laptop_free_slots", placed.laptopFree)
 	}
-	w.Header().Set("Retry-After", strandedRetryAfter)
+	w.Header().Set("Retry-After", strconv.FormatInt(s.clientRetryAfter(r, strandedRetryAfterSeconds), 10))
 	w.Header().Set(subrouterReasonHeader, strandedGaveUpReason)
 	http.Error(w, "subrouter: the account this chat's prompt cache was on still cannot be reached, and no account can take it yet; restart it later",
 		http.StatusServiceUnavailable)

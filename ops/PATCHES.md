@@ -1743,8 +1743,10 @@ as down at the second strike.
   its first held turn. "Answered" is a model turn whose 2xx, or whose websocket
   `response.completed`, the client got from an account's upstream. The give-up answer is
   `503`, `Retry-After: 3600`, `X-Subrouter-Reason: stranded_gave_up`, which Claude Code
-  shows at once. The hold reads the give-up again after each backoff, so a turn of the
-  same chat answered meanwhile is not undone. The chain is kept with the session's
+  shows at once. Since §78 an end client is told `Retry-After: 60` instead, and a session
+  with `CLAUDE_CODE_RETRY_WATCHDOG` sends the turn again a minute later. The hold reads
+  the give-up again after each backoff, so a turn of the same chat answered meanwhile is
+  not undone. The chain is kept with the session's
   assignment, so the next process carries it on; one the store cannot save is kept by
   the running process.
   - A chat whose cache was on a box then keeps its assignment marked waiting
@@ -1787,9 +1789,10 @@ as down at the second strike.
   them. They stay where they were placed.
 - *Another box unreachable too, but not found down.* The chats wait on their home holds
   and the laptop takes none until that box answers or is found down.
-- *An hour without an answer.* The chat gets one 503 its client shows. Restarted, it goes
-  home if its box answers, or wherever there is room, or gets the 503 again at once. Its
-  own box up but not answering yet keeps it off the laptop.
+- *An hour without an answer.* The chat gets one 503, which its client shows, or, with the
+  watchdog (§78), sends again a minute later. Restarted, it goes home if its box answers,
+  or wherever there is room, or gets the 503 again at once. Its own box up but not
+  answering yet keeps it off the laptop.
 
 **Residual risks.** A chat on a dead box pays up to 15 minutes before it moves. A slot
 stays taken up to an hour after a blip. A box that is never struck (no forward ever
@@ -2276,3 +2279,62 @@ On 2026-11-21 a stopped test run unloaded the developer's live service, and noth
 - Code: `ops/deploy/macos/laptop-deploy-lib.sh` (`own_job_or_exit`, `kickstart_job`, `bootout_and_wait`, `bootstrap_job`, `take_mutation_lock`), `ops/deploy/macos/deploy-laptop.sh` (`restart`), `ops/bin/sr-triage`, `ops/bin/sr-local-ci`
 - Tests: `ops/deploy/tests/deploy-scripts-test.sh` (`run_sandboxed`, `finish`, `cleanup`, and the six cases listed under §76 in `requiredCases`), `ops/deploy/tests/deploy_scripts_test.go`
 - Docs: `AGENTS.md`, `ops/README.md`
+
+## 78. An end client is told to wait at most a minute in the daemon's own 503s
+
+Two 503s that the daemon writes itself carry a long `Retry-After`. The spent pool's answer
+(`no non-exhausted claude accounts available; next account frees up in <human> (retry
+after <N>s)`) sends N, the seconds until an account frees, which can be hours. The stranded
+give-up (§67.5) sends 3600. Both were set for a Claude Code that fails a turn on a
+`Retry-After` over 60 s, so that the user saw the answer at once. Since 2026-11-21 the
+laptop's sessions run with `CLAUDE_CODE_RETRY_WATCHDOG=1`, toward the owner's goal that
+sessions and workflows survive the laptop daemon going away. Such a session sleeps the
+whole `Retry-After` of a 503 before it tries again (measured with 120 s). These two answers
+became an hour or more of silence in a session that could have carried on a minute after
+the pool or its upstream came back.
+
+§78.1 An end client is now told `Retry-After: min(N, 60)` in both answers. A wait under a
+minute is sent as it is. The body keeps the real N, because cmux parses "(retry after
+<N>s)" (`pool_exhausted.go`). A session with the watchdog tries again each minute, and the
+turn goes where there is room. A session without it retries a `Retry-After` of 60 s or
+less on its counted retries, where it used to show the answer at once. The give-up still
+ends the chat's chain of holds and unlinks it or leaves it waiting (§67.5), so the turn a
+minute later is placed afresh.
+
+§78.2 Who is an end client. Any caller whose request has no `X-Pool-Hop`: a Claude Code
+session on the socket or on TCP, and a caller with a membership token. A peer daemon's
+forward carries `X-Pool-Hop` of 1 or more (both forward paths set it) and gets the whole N,
+as before. The daemon that forwarded the turn reads only the status of the peer's 503
+(`classifyAccountSwitch`: a 429 or a 503 is `peer_declined`), then answers its own client
+with its own 503, capped there. The hold never runs on a peer's forward, so the give-up
+never reaches a peer.
+
+§78.3 Turning it off. `SUBROUTER_CLIENT_RETRY_AFTER_MAX` is a Go duration, default `60s`.
+`0` turns the cap off, and every client gets the whole wait, as before this entry. It has
+no flag, for the reason in §58. An unparseable value is logged and the default kept. At
+start serve logs `Retry-After cap is on` with `retry_after_max`, or `Retry-After cap is
+off`. A value over 60 s makes a client without the watchdog show the answer at once again.
+The change is in the worker only, so a laptop deploy swaps it in without dropping a
+connection. To turn it off on the laptop, set the variable in the plist and redeploy with
+`RELOAD=1`, as in §58.
+
+§78.4 What it costs. Under the watchdog each retry of a 503 counts against Claude Code's
+300. A pool spent for longer than about 5 hours (300 times 60 s) now fails the turn after
+that, where a long `Retry-After` slept up to 6 hours per retry. Not covered: a hosted
+broker's `Retry-After` in team mode, which is relayed as before, and the Codex capacity
+503, which already sends 1 to 60 s.
+
+§78.5 Tests (`internal/proxy/client_retry_after_test.go`). The handler's spent pool 503: a
+wait over the cap, a wait under it, a cap of 90 s, the cap off, and a peer's forward. The
+credit balance's 503, which the transport makes. Two daemons: the laptop forwards a turn
+to a box whose pool is spent, the box answers the laptop with the whole N, and the
+laptop's client gets 60. The hold's give-up and a waiting chat's give-up at once: 60 with
+the cap and 3600 with it off. With `clientRetryAfter` reverted to send the whole wait,
+every capped case fails (`Retry-After = "2820", want "60"`) and the cap-off, short-wait and
+peer cases pass. With the peer check removed, the peer cases fail. In `cmd/subrouter`,
+`TestResolveClientRetryAfterMax` covers the variable.
+
+- Code: `internal/proxy/client_retry_after.go` (`clientRetryAfter`),
+  `internal/proxy/pool_exhausted.go`, `internal/proxy/hold.go`, `internal/proxy/refugee.go`,
+  `cmd/subrouter/hold_config.go` (`resolveClientRetryAfterMax`).
+- Related: §58 (the hold), §67.5 (the give-up).

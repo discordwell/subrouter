@@ -1477,6 +1477,7 @@ func serve(args []string) error {
 		Hold:                      holdSettings.policy(slog.Default()),
 		OutageSpill:               outage.apply(slog.Default()),
 		PeerDownGrace:             outage.peerDownGrace,
+		ClientRetryAfterMax:       resolveClientRetryAfterMax(os.Getenv, slog.Default()),
 		AdminToken:                *adminToken,
 		AllowUnauthenticatedAdmin: *allowUnauthenticatedAdmin,
 		ShadowHealthKey:           shadowHealthKey,
