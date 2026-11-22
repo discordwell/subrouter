@@ -798,6 +798,122 @@ func TestAPeersFileThatDoesNotLoadShowsAFixedWord(t *testing.T) {
 	}
 }
 
+// One 401 to a request asks for one token test. Once that test has run, the
+// sweeps that follow test nothing more until TestEvery.
+func TestOneRequest401AsksForOneTokenTest(t *testing.T) {
+	var relayUpstream401 atomic.Bool
+	box := startBox(t, func(w http.ResponseWriter, r *http.Request) {
+		if relayUpstream401.Load() && r.Method != http.MethodHead {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = io.WriteString(w, `{"type":"error","error":{"type":"authentication_error","message":"OAuth access token has been revoked"}}`)
+			return
+		}
+		okBox(w, r)
+	})
+	f := newBoxSetFixture(t, peerOf("a", box))
+	f.writeToken(t, "a", box.token, 0o600)
+	logs := &lockedBuffer{}
+	set := startSet(t, f, "", time.Hour, logs)
+	eventually(t, "the first token test", func() bool {
+		return tokenTests(box) == 1 && boxState(set, "a").Token == standby.StateOK
+	})
+	front := standInOver(t, set, logs)
+
+	relayUpstream401.Store(true)
+	if resp := messageFor(t, front, testSessionID); resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want the guard's 503 for the relayed 401", resp.StatusCode)
+	}
+	eventually(t, "the token test the 401 asked for", func() bool { return tokenTests(box) == 2 })
+	// A sweep starts at every reload tick, 20 ms apart.
+	time.Sleep(time.Second)
+	if got := tokenTests(box); got != 2 {
+		t.Fatalf("%d token tests a second after one 401, want 2: the first, and the one the 401 asked for", got)
+	}
+	if got := boxState(set, "a").Token; got != standby.StateOK {
+		t.Fatalf("a = %q after its token test passed, want ok", got)
+	}
+}
+
+// Each way a box's token file or its peers-file entry cannot be used shows its
+// own word, and the box is sent nothing, not even a token test.
+func TestEachUnusableTokenFileOrPeersEntryShowsItsWord(t *testing.T) {
+	for _, c := range []struct {
+		name  string
+		entry func(peerEntry) peerEntry
+		token func(t *testing.T, f *boxSetFixture, box *testBox)
+		want  standby.State
+	}{
+		{name: "a folder where the token file goes", token: func(t *testing.T, f *boxSetFixture, _ *testBox) {
+			if err := os.Mkdir(f.tokenPath("a"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+		}, want: standby.StateFileUnreadable},
+		{name: "a token file with two words", token: func(t *testing.T, f *boxSetFixture, box *testBox) {
+			f.writeToken(t, "a", box.token+" "+box.token, 0o600)
+		}, want: standby.StateFileMalformed},
+		{name: "an empty token file", token: func(t *testing.T, f *boxSetFixture, _ *testBox) {
+			f.writeToken(t, "a", "", 0o600)
+		}, want: standby.StateFileMalformed},
+		{name: "a token file over 4 KiB", token: func(t *testing.T, f *boxSetFixture, _ *testBox) {
+			f.writeToken(t, "a", strings.Repeat("k", 4<<10+1), 0o600)
+		}, want: standby.StateFileMalformed},
+		{name: "a peers-file entry with an http URL", entry: func(p peerEntry) peerEntry {
+			p.URL = "http://" + strings.TrimPrefix(p.URL, "https://")
+			return p
+		}, want: standby.StateBoxInvalid},
+		{name: "a peers-file entry with no pin", entry: func(p peerEntry) peerEntry {
+			p.Fingerprint = ""
+			return p
+		}, want: standby.StateBoxInvalid},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			box := startBox(t, okBox)
+			peer := peerOf("a", box)
+			if c.entry != nil {
+				peer = c.entry(peer)
+			}
+			f := newBoxSetFixture(t, peer)
+			if c.token != nil {
+				c.token(t, f, box)
+			} else {
+				f.writeToken(t, "a", box.token, 0o600)
+			}
+			logs := &lockedBuffer{}
+			set := startSet(t, f, "", time.Hour, logs)
+			if got := boxState(set, "a").Token; got != c.want {
+				t.Fatalf("a = %q, want %q", got, c.want)
+			}
+			if got := set.Candidates(testSessionID); len(got) != 0 {
+				t.Fatalf("Candidates = %v, want none", names(got))
+			}
+			time.Sleep(200 * time.Millisecond)
+			if seen := box.requests(); len(seen) != 0 {
+				t.Fatalf("the box saw %d requests, want none", len(seen))
+			}
+			if got := boxState(set, "a").Token; got != c.want {
+				t.Fatalf("a = %q after 10 reloads, want %q", got, c.want)
+			}
+			if strings.Contains(logs.String(), box.token) || strings.Contains(logs.String(), peer.Token) {
+				t.Fatalf("the log holds a token:\n%s", logs.String())
+			}
+		})
+	}
+	t.Run("a folder where the peers file goes", func(t *testing.T) {
+		f := newBoxSetFixture(t, peerOf("a", startBox(t, okBox)))
+		if err := os.Remove(f.peersFile); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(f.peersFile, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		set := startSet(t, f, "", time.Hour, &lockedBuffer{})
+		if got := set.Status().PeersFile; got != standby.StateFileUnreadable {
+			t.Fatalf("peers_file = %q, want %q", got, standby.StateFileUnreadable)
+		}
+	})
+}
+
 type fileState struct {
 	mode    fs.FileMode
 	size    int64
