@@ -1333,6 +1333,8 @@ case " $* " in *" --yes "*) : > "$FAKE_DAEMON_FILE"; echo "daemon healthy"; exit
 echo "noninteractive terminal: re-run with --yes to apply"; exit 0'
   run_qs FAKE_QS_CALL=install FAKE_QS_BIN="$C/build/subrouter" FAKE_DAEMON_FILE="$C/daemon-up"
   expect_rc 0; expect_out "daemon:  healthy on http://127.0.0.1:1, no client config written"
+  # The plan it shows is the change set it applies: no client config either.
+  expect_log "^subrouter setup --plan --storage local --no-config$"
   expect_log "^subrouter setup --storage local --no-config --yes$"
   finish
 fi

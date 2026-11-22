@@ -794,7 +794,7 @@ def install(check: bool, peer: dict | None) -> str | None:
         if stale:
             say(stale)
     else:
-        say(run([BIN, "setup", "--plan", "--storage", "local"]).stdout.strip()[-800:] or "  (nothing to plan)")
+        say(run([BIN, "setup", "--plan", "--storage", "local", "--no-config"]).stdout.strip()[-800:] or "  (nothing to plan)")
         # setup applies its change set only once a person approves it at a
         # terminal, and run() hands it a pipe. --yes is that approval; without
         # it setup prints the plan, installs nothing and exits 0.
