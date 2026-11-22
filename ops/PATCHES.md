@@ -318,7 +318,7 @@ crash-loop under KeepAlive. Socket failures are soft (logged; TCP keeps serving)
 `--local-data-socket` opener would have made a socket problem a respawn loop with every TCP client down. Health
 reports `claude_socket` as `serving`, `unavailable`, `stopped` or `ignored_under_supervise` (fixed words, since
 health is also served on `--public-addr` and an error string carries the path). §77.1 adds `waiting` and
-`displaced`, and the socket is no longer opened only once. A socket peer reports `127.0.0.1`, so loopback gates treat it as
+`displaced`, and the socket is no longer opened only once. §77.3 adds `yielded`, in supervisor-status only. A socket peer reports `127.0.0.1`, so loopback gates treat it as
 loopback TCP and it gains nothing more. Without this, a token-enforcing daemon would 401 the placeholder and
 machine policy would count the socket as a second machine. The socket is 0600. The
 proxy replaces the placeholder `Authorization` with the pooled credential. The socket is bound as
@@ -2305,7 +2305,7 @@ Tested in Docker. `TestDeployHarnessRefusesAMacOutsideASandbox` stands in for ma
 - Tests: `ops/deploy/tests/deploy-scripts-test.sh` (`sandbox_profile`, `refuse_unfenced`, `run_sandboxed`, `finish`, `run_group`, `cleanup`, and the cases listed under §76 and §76.6 in `requiredCases`), `ops/deploy/tests/deploy_scripts_test.go`, `ops/localci/localci_test.go`
 - Docs: `AGENTS.md`, `ops/README.md`, `ops/deploy/lightsail/README.md`
 
-## 77. The supervisor keeps its Claude socket, and replaces a worker that stops answering
+## 77. The supervisor keeps its Claude socket, replaces a worker that stops answering, and lets go of the socket on purpose
 
 On 2026-11-21 the laptop's daemon was gone for more than two hours, and every Claude Code session on
 the Mac failed with it while the boxes were healthy. A session in socket mode has one endpoint, the
@@ -2467,6 +2467,125 @@ With the probe off, `worker_probe` is `{"enabled": false, "misses": 0}`.
   not. Not tested on macOS.
 - Related: builds on §69 (the supervisor and its upgrade path). The probe asks the route that
   gates every new generation, and it ignores whether the answer says ready.
+
+§77.3 A process that stands in on the socket path serves only while the supervisor does not hold the
+socket's lock, and the supervisor held the lock for as long as it ran. Two cases need the supervisor
+to let go while it keeps running. The first is the drill. Without one, the stand-in can be tried on
+the live job only by breaking the live job. The second is a worker that reports ready and exits
+again and again. The supervisor replaces such a worker each time (`monitorWorker`), so the
+supervisor never exits and its lock is never free, and every stream on the worker is cut at each
+exit.
+
+The keeper can now yield. It closes its listener, unlinks its socket and releases the lock, and it
+does not ask for them until the yield's time is up. `claude_socket` then reads `yielded`, and
+`claude_socket_yield` gives the `reason` and `until`. Connections that the supervisor already
+accepted keep working, and TCP is unaffected. When the time is up, the word becomes `waiting` and
+the supervisor takes the path as §77.1 describes: at once when the lock is free, and otherwise when
+the holder lets go. Each bind after a yield adds one to `claude_socket_rebinds`. A yield is kept in
+memory only, so a supervisor that restarts serves its socket. Both ways of yielding write one WARN
+line with the `reason` and `until`.
+
+An operator yields with two calls on the supervisor's control socket.
+
+- `POST /_subrouter/claude-socket/yield?for=<time>` yields for a stated time such as `2m`, with
+  the reason `operator`. The time is a Go duration above 0 and at most `60m`. Anything else gets
+  400 and changes nothing. A call during a yield states the time again.
+- `POST /_subrouter/claude-socket/reclaim` ends a yield early, whatever its reason. With nothing
+  yielded it changes nothing.
+
+Both calls answer 200 with the socket's fields of supervisor-status as they stand after the call:
+`claude_socket`, `claude_socket_yield` while yielded, `claude_socket_waits_for_lock`,
+`claude_socket_rebinds` and `claude_socket_exit_guard`. The yield call answers after the lock is
+free, so a process that waits on the lock has it by then. The reclaim call answers `serving` when
+the supervisor took the path at once, and `waiting` when another process holds the lock. A
+supervisor that keeps no Claude socket answers 409 to both.
+
+```sh
+curl -s --unix-socket ~/.subrouter/supervisor.sock -X POST 'http://supervisor/_subrouter/claude-socket/yield?for=2m'
+# {"claude_socket":"yielded", ..., "claude_socket_yield":{"reason":"operator","until":"2026-11-21T12:02:00Z"}}
+curl -s --unix-socket ~/.subrouter/supervisor.sock -X POST http://supervisor/_subrouter/claude-socket/reclaim
+```
+
+The supervisor yields by itself on the third failure of an active worker within 10 minutes, with
+the reason `worker_exits`. A failure is an exit of the active worker, or an active worker that the
+probe found silent and set out to replace (§77.2). The supervisor lets go before it starts the
+replacement, because a process standing by serves the path sooner than a new worker reports ready.
+It asks for the path only after 90 seconds in which the active worker stayed up and answered every
+probe. A missed probe or another failure starts the 90 seconds again, and `until` moves with them.
+A return is a yield for worker exits that ended because its time was up or an operator reclaimed
+the socket. A yield that begins within 10 minutes of the last return doubles the time, up to 15
+minutes. The times are 90 seconds, then 3, 6, 12 and 15 minutes. A yield that begins later starts
+at 90 seconds again. With the probe off, only an exit starts the time again.
+
+On a Mac with no stand-in, a yield leaves socket sessions with nothing to connect to. So 5 seconds
+into a yield for worker exits, the supervisor tries the path once. If another process holds the
+lock, the try changes nothing and the yield goes on. If the lock is free, nobody stands by. The
+try has then taken the path back, and the supervisor keeps the socket through later worker
+failures. It yields for worker exits again only after it has seen another process hold the lock,
+and it sees that whenever its own try at the lock fails for that reason. An operator's yield never
+asks and keeps its full time. So after a stand-in is installed beside a running supervisor that
+found nobody, one operator's yield shows the supervisor the stand-in.
+
+The operator has the last word. An operator's yield replaces a yield for worker exits, and worker
+failures do not change an operator's yield. The times are wall-clock times, so the time a Mac
+sleeps counts toward each of them.
+
+A process that stands in must do three things for this to work. It takes the lock within 5 seconds
+of the lock becoming free. It holds the lock for as long as it listens at the path. It lets go
+after `claude_socket` reads `waiting`.
+
+Supervisor-status gains `claude_socket_yield` while yielded, and `claude_socket_exit_guard`.
+
+- `claude_socket_yield.reason` is `operator` or `worker_exits`. `until` is the time at which the
+  supervisor asks for the path again, in UTC with whole seconds. In a yield for worker exits it is
+  the earliest such time.
+- `claude_socket_exit_guard.enabled`, `exits_to_yield` and `window_seconds` give the settings.
+- `recent_exits` is the number of worker failures in the last 10 minutes.
+- `standing_by` is `unknown` at start, `seen` once another process held the lock, and `nobody`
+  after a yield for worker exits in which nobody took the lock.
+- `return_after_seconds` is the time the worker had to stay steady in the last yield for worker
+  exits, and 90 before the first.
+
+With the guard off, `claude_socket_exit_guard` has only `enabled`, `recent_exits` and
+`standing_by`. A supervisor with no Claude socket reports neither field. The word `yielded`, the two
+reasons and the field name `claude_socket_yield` are fixed.
+
+- Knobs: `--claude-socket-yield-exits` (3, and `0` turns the yield for worker exits off). The
+  operator's two calls work either way. It is a supervisor flag whose default is in the code, so
+  the plist does not change, and the behaviour starts at the supervisor's next restart.
+- Code: `cmd/subrouter/claude_socket_yield.go` (`socketYield`, `exitGuard`, `lookWhileYielded`,
+  `yieldFor`, `reclaim`, `workerFailed`, `workerFaltered`, the two routes),
+  `cmd/subrouter/claude_socket_keeper.go` (`keep`, `look`, `take`), `cmd/subrouter/claude_socket.go`
+  (the status), `cmd/subrouter/supervisor.go` (the flag, `monitorWorker`),
+  `cmd/subrouter/supervisor_worker_probe.go` (`probeActiveWorker`, `replaceSilentWorker`),
+  `cmd/subrouter/local_data_listener_unix.go` (`socketLockHeldElsewhere`)
+- Tests, in Docker (`./deploy/docker/test.sh ./cmd/subrouter -run 'TestSupervisor.*(Yield|ClaudeSocketBack|StandsBy|StayedSteady|ReturnThatFailed|LastTenMinutes|GuardOff|LetGoOfTheClaudeSocket|OperatorCalls|FoundSilent)|ClaudeSocketYieldExits'`),
+  each seen failing with its part of the change taken out. They run a real supervisor over real
+  worker processes, kill the active worker, and stand by for the lock with a goroutine that
+  blocks in `flock` and keeps the lock once it has it. The supervisor reads an injected clock, so
+  the tests move 5 seconds, 90 seconds and 10 minutes at will.
+  `TestSupervisorYieldsTheClaudeSocketToAnOperator` takes the lock as soon as the yield call has
+  answered, sees a stream opened before the call finish, and sees the path come back after the
+  stated time. `TestSupervisorTakesTheClaudeSocketBackWhenAnOperatorEndsTheYield`,
+  `TestSupervisorRefusesAYieldWithoutAStatedTimeOfAtMostAnHour` and
+  `TestSupervisorWithoutAClaudeSocketHasNothingToYield` cover the two calls.
+  `TestSupervisorYieldsTheClaudeSocketOnTheThirdWorkerExit` sees the process standing by get the
+  lock at the third exit, and `waiting` and then `serving` after 90 seconds of answered probes.
+  `TestSupervisorAsksForTheClaudeSocketOnlyAfterTheWorkerStayedSteady` (a missed probe, an exit),
+  `TestSupervisorDoublesTheWaitAfterAReturnThatFailed` (90 seconds up to 15 minutes, and back),
+  `TestSupervisorTakesTheClaudeSocketBackWhenNobodyStandsBy` (the 5 seconds, no second yield, and
+  a yield again once the lock was seen held),
+  `TestSupervisorCountsOnlyWorkerExitsOfTheLastTenMinutes`,
+  `TestSupervisorCountsAWorkerItFoundSilentWithTheExits`,
+  `TestSupervisorKeepsTheClaudeSocketThroughWorkerExitsWithTheGuardOff`,
+  `TestSupervisorOperatorCallsOverrideAYieldForWorkerExits`,
+  `TestSupervisorLogsWhyItLetGoOfTheClaudeSocket`, `TestSupervisorForgetsAYieldWhenItRestarts` and
+  `TestParseSupervisorConfigClaudeSocketYieldExits`. No stand-in process exists yet, so no test
+  runs one. A real sleep is not tested. Not tested on macOS.
+- Related: builds on §77.1 (the keeper and the `waiting` state) and §77.2 (the probe). The deploy
+  scripts do not know `yielded` yet. The activation requires `serving`, so it fails during a
+  yield. A deploy during a yield reports the socket down and prints the word, unless something
+  answers at the path.
 
 ## 78. An end client is told to wait at most a minute in the daemon's own 503s
 
