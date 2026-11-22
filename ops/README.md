@@ -41,7 +41,7 @@ Put `ops/bin` from a detached checkout of `origin/main` on `PATH`. After a deplo
 
 ## Test
 
-The deploy cases drive scripts that call `launchctl`, kept from the real one by stubs on `PATH`. A stopped plain `go test ./...` in `ops/` on a Mac once left a detached `deploy-laptop.sh` running after its stubs were deleted, and it unloaded the developer's live service (PATCHES §76). The cases now use a label of their own, and a stopped test kills its detached runs. Still, run them in Docker, or on a Mac only in a sandbox. Plain `go test` refuses them on macOS.
+The deploy cases drive scripts that call `launchctl`, kept from the real one by stubs on `PATH`. A stopped plain `go test ./...` in `ops/` on a Mac once left a detached `deploy-laptop.sh` running after its stubs were deleted, and it unloaded the developer's live service (PATCHES §76). The cases now use a label of their own, and a stopped test kills its detached runs. Still, run them in Docker, or on a Mac only in a sandbox. On macOS plain `go test` refuses them, and so does the harness run by itself; with a sandbox named, the harness first checks that the sandbox refuses exec of `launchctl` (PATCHES §76.6).
 
 ```bash
 ops/bin/sr-local-ci --docker deploy                # every deploy case, on Linux in Docker

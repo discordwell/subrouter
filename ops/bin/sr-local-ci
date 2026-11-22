@@ -103,6 +103,10 @@ options:
                            home. macOS: without sandbox-exec (the fake
                            security and env isolation still apply, and the
                            known tests that put /usr/bin on PATH are skipped).
+                           On macOS the deploy cases refuse to run without
+                           the sandbox (PATCHES §76), so TestDeployScripts
+                           fails at once and counts as a real failure; run
+                           them with --docker.
                            A Linux host has no sandbox, so a host run there
                            needs this flag; --docker is the fenced Linux run.
   -C DIR                   the checkout to test (default: this script's own)
