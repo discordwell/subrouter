@@ -59,6 +59,52 @@ func TestFuseSeparatesPristineFromRunning(t *testing.T) {
 	}
 }
 
+// The board and the router read one fact, not two rules (PATCHES §86). The
+// fuse draws the weekly window that rolls first; the router reads the one it
+// binds on, the most spent, and only while its reading is live. Where the
+// drawn window alone says the opposite of the router, PRISTINE follows the
+// router: the board must never promise the next new session to an account the
+// router will not give it, or hide one it will.
+func TestTheFuseFollowsTheRouterWhereItsOwnWindowSaysOtherwise(t *testing.T) {
+	const fortnight = 14 * 24 * 60 * 60
+	for _, tc := range []struct {
+		name      string
+		windows   []accounts.UsageWindow
+		unstarted bool
+	}{
+		{
+			name: "the week it binds on has started",
+			windows: []accounts.UsageWindow{weeklyWindow(0, 604800),
+				{Name: "secondary", UsedPercent: 40, LimitWindowSeconds: fortnight, ResetAfterSeconds: 1000000}},
+		},
+		{
+			name: "a reading from before its own reset",
+			windows: []accounts.UsageWindow{{Name: "primary", LimitWindowSeconds: 604800, ResetAfterSeconds: 604800,
+				ResetAt: time.Now().Add(-time.Minute)}},
+		},
+		{
+			name: "the week it binds on has not started",
+			windows: []accounts.UsageWindow{weeklyWindow(0, 300000),
+				{Name: "secondary", UsedPercent: 10, LimitWindowSeconds: fortnight, ResetAfterSeconds: fortnight}},
+			unstarted: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			state, row := classifyFor(t, accounts.ProviderCodex, tc.windows)
+			if row.Fuse == nil {
+				t.Fatal("no fuse read")
+			}
+			if byItsWindow := row.Fuse.ResetSeconds >= row.Fuse.WindowSeconds; byItsWindow == tc.unstarted {
+				t.Fatalf("calibration: the drawn window alone reads unstarted=%v, the same as the router", byItsWindow)
+			}
+			if row.WeeklyUnstarted != tc.unstarted || (row.Fuse.State == poolFusePristine) != tc.unstarted || (state == poolStatePristine) != tc.unstarted {
+				t.Fatalf("weekly_unstarted %v, fuse %q, state %q (%s); want the router's unstarted=%v throughout",
+					row.WeeklyUnstarted, row.Fuse.State, state, row.StateNote, tc.unstarted)
+			}
+		})
+	}
+}
+
 // The forfeit band is the number no ordinary meter shows: the span between what
 // has been SPENT and what the clock has ELAPSED is budget already out of reach
 // at an even pace.

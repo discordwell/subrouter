@@ -15,6 +15,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gorilla/websocket"
+
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	"github.com/manaflow-ai/subrouter/selectacct"
 )
@@ -431,8 +433,12 @@ func newCodexLaptop(t *testing.T, local []selectacct.Score, peer *RemotePool) *c
 	t.Helper()
 	l := &codexLaptop{logs: &syncBuffer{}}
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = io.Copy(io.Discard, r.Body)
 		account := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer tok-")
+		if websocket.IsWebSocketUpgrade(r) {
+			serveOneWebSocketTurn(w, r, account)
+			return
+		}
+		_, _ = io.Copy(io.Discard, r.Body)
 		l.mu.Lock()
 		l.served = append(l.served, account)
 		l.mu.Unlock()
@@ -482,6 +488,50 @@ func (l *codexLaptop) newSession(t *testing.T, sessionID string) string {
 		return ""
 	}
 	return l.served[before]
+}
+
+// serveOneWebSocketTurn takes a Codex upgrade on account and answers its first
+// turn naming the account, then holds the socket until the client closes it.
+func serveOneWebSocketTurn(w http.ResponseWriter, r *http.Request, account string) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+	if _, _, err := conn.ReadMessage(); err != nil {
+		return
+	}
+	_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed","served_by":"`+account+`"}`))
+	_, _, _ = conn.ReadMessage()
+}
+
+// newWebSocketSession opens a new session's socket, as Codex opens its model
+// turns, sends its first turn and returns the account that answered it, local
+// or the box's. The socket stays open until the test ends, as a conversation's
+// does.
+func (l *codexLaptop) newWebSocketSession(t *testing.T, sessionID string) string {
+	t.Helper()
+	conn, response, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(l.proxy.URL, "http")+"/backend-api/codex/responses",
+		http.Header{"Session-Id": []string{sessionID}})
+	if err != nil {
+		status := 0
+		if response != nil {
+			status = response.StatusCode
+		}
+		t.Fatalf("session %s: dial: %v (status %d); logs:\n%s", sessionID, err, status, l.logs.String())
+	}
+	response.Body.Close()
+	t.Cleanup(func() { _ = conn.Close() })
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create"}`)); err != nil {
+		t.Fatalf("session %s: write: %v", sessionID, err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	_, body, err := conn.ReadMessage()
+	if err != nil {
+		t.Fatalf("session %s: read: %v", sessionID, err)
+	}
+	return servedByOf(body)
 }
 
 func codexBox(t *testing.T, scores ...selectacct.Score) *contractBox {
@@ -563,6 +613,37 @@ func TestANewSessionIsTargetedAtAPeersUnstartedWeekOnce(t *testing.T) {
 			t.Fatal("a substituted answer left a start mark")
 		}
 	})
+}
+
+// The same over a websocket, the way Codex opens its model turns and holds a
+// conversation. The first new session's upgrade is forwarded targeted at the
+// box's unstarted account, and the laptop marks it once the box takes the
+// upgrade, not when the socket closes: a second new session opened while the
+// first is still open goes where it would without §86.
+func TestANewWebSocketSessionIsTargetedAtAPeersUnstartedWeekOnce(t *testing.T) {
+	setStartUnstartedWeekForTest(t, true)
+	box := newVerdictPeer(t, accounts.ProviderCodex,
+		verdictPeerAccount{Score: codexWeekScore("box-fresh", 0, 604800)},
+		verdictPeerAccount{Score: codexWeekScore("box-other", 50, 400000)})
+	pool := box.pool()
+	laptop := newCodexLaptop(t, []selectacct.Score{codexWeekScore("lap-midweek", 20, 300000)}, pool)
+
+	if got := laptop.newWebSocketSession(t, "ws-one"); got != "box-fresh" {
+		t.Fatalf("the first new websocket session was answered by %q (box turns %+v), want the box's unstarted week", got, box.seen())
+	}
+	if turns := box.seen(); len(turns) != 1 || !turns[0].WebSocket || turns[0].Target != "box-fresh" {
+		t.Fatalf("box turns %+v, want one upgrade targeted at box-fresh", turns)
+	}
+	if got := laptop.newWebSocketSession(t, "ws-two"); got != "lap-midweek" {
+		t.Fatalf("the second new websocket session, opened while the first is open, was answered by %q (box turns %+v), want lap-midweek on pace",
+			got, box.seen())
+	}
+	if !peerMarked(laptop.server, pool, "box-fresh") {
+		t.Fatal("box-fresh carries no start mark on the laptop")
+	}
+	if marks := jsonLogLines(laptop.logs, startMarkSetMessage); len(marks) != 1 || marks[0]["peer"] != pool.name() || marks[0]["account"] != "box-fresh" {
+		t.Fatalf("start mark log lines %v, want one for the box's box-fresh", marks)
+	}
 }
 
 // With no local account that can serve, the box's accounts are ranked alone,

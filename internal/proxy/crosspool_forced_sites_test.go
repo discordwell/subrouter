@@ -84,6 +84,9 @@ func verdictPeerNormalized(provider accounts.Provider, id string, score selectac
 		out["weekly_headroom"] = score.WeeklyHeadroom
 		out["seconds_to_weekly_reset"] = score.WeeklyResetAt.Sub(now).Seconds()
 	}
+	if score.WeeklyUnstarted {
+		out["weekly_unstarted"] = true
+	}
 	return out
 }
 
