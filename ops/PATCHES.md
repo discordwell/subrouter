@@ -2668,9 +2668,10 @@ On 2026-11-21 the laptop daemon's launchd job was unloaded for 2 h 22 min. Every
 failed once its retries ran out, and 242 workflow agents died, while both boxes were healthy. A Claude Code
 session reaches one endpoint for its whole life, the socket path it was launched with (§30), so only a
 process on the Mac that answers that path can carry a session to a box. The stand-in is that process. It
-is built in parts: §79.1 sends one request to a box, §79.2 chooses the box, and §79.3 is the process,
-`subrouter standby`, that takes the socket path and gives it back. Until a later part installs that process
-as a launchd job, nothing starts it, and no behaviour of the daemon changes.
+is built in parts: §79.1 sends one request to a box, §79.2 chooses the box, §79.3 is the process,
+`subrouter standby`, that takes the socket path and gives it back, and §79.4 keeps the daemon's own
+`policy_limits` answer for the sessions that start while the stand-in serves. Until a later part installs that
+process as a launchd job, nothing starts it, and no behaviour of the daemon changes.
 
 §79.1 The box handler (`internal/standby`) is a plain `http.Handler` for a request as it arrives on the
 Claude socket. It removes the client's `Authorization` (Claude Code's `ssh-placeholder`), `X-Api-Key`,
@@ -2710,7 +2711,8 @@ takes the pool route, and `claude_socket` tells a deploy check that the daemon d
 daemon's other `/_subrouter/` routes get a 503. `/api/*`, the client's account calls, gets a 503 with
 Retry-After 30: a box answers them with its own identity account, and the client keeps whichever identity
 answered (`internal/proxy/control_plane.go`). The one exception is `GET /api/claude_code/policy_limits`,
-which goes to a box. A live session served by a box on 2026-11-21 showed why. With a 503 there, a session
+which goes to a box when the stand-in holds no copy of the daemon's own answer under a day old (§79.4). A
+live session served by a box on 2026-11-21 showed why. With a 503 there, a session
 that starts during the outage withholds WebFetch, DesignSync and RemoteTrigger, ignores the Retry-After, and
 does not ask again for an hour, so the tools stay gone after the daemon returns. With the box's 200 it keeps
 them, and nothing of the box's identity reached a file under its config folder. The box's body was the same
@@ -2718,7 +2720,7 @@ as the daemon's, because both identities had the default policy. A box whose ide
 organization would apply that organization's policy. The path is cleaned before it is read, so
 `/v1/../api/...` counts as `/api`. A request that names an account (`X-Subrouter-Account-ID` or
 `X-Subrouter-Account`, set by `claude <account>`) gets a 503 and is never sent, `policy_limits` included,
-because a pinned launch is promised that account and no other. With no box usable, the client gets a 503
+because a pinned launch is promised that account and no other. §79.4's copy does not answer it either. With no box usable, the client gets a 503
 with Retry-After 30 at once, and nothing is parked. Every 503 the handler makes has Anthropic's `api_error`
 shape, which Claude Code retries like any server error, and names its cause in `X-Subrouter-Reason`:
 `standby_no_box`, `standby_box_unreachable`, `standby_box_failed`, `standby_pinned_account`,
@@ -2729,10 +2731,9 @@ pin of the box's certificate, and builds its transport on `proxy.PinnedTLSConfig
 the pin ends the handshake before a byte of the request is written, so the token never reaches it. An
 `http://` URL, a missing pin and a malformed one are refused. The token is never logged.
 
-Not done: replaying the daemon's own `policy_limits` answer, saved while it is healthy, ahead of the box's.
-The same session accepted such a replay, even with its signature header removed. It needs the process
-that can reach the daemon, so it belongs to a later part. Turning it off: only `subrouter standby` (§79.3)
-runs the handler, and stopping that process turns it off.
+The same session accepted a replay of the daemon's own `policy_limits` answer, even with its signature
+header removed. §79.4 keeps that answer and replays it ahead of a box's. Turning it off: only
+`subrouter standby` (§79.3) runs the handler, and stopping that process turns it off.
 
 §79.2 The box set (`Set`, `internal/standby/boxset.go`) decides which boxes a request may go to, and in
 which order. It reads only files the daemon already keeps, and it writes nothing to the state folder.
@@ -2851,7 +2852,7 @@ set the daemon's peers file, its `SUBROUTER_PEER_TAILNET` and the state folder. 
 where a worker reads them: in the `env` of the worker config (`<state folder>/worker-config.json`) first, and
 in its own environment second. `--peers-file` and `--tailnet` name them outright. It asks the `remote.key`
 gate once, for the state folder it was given, before it builds the box set. It reads no account of the
-daemon, writes only its own two files, and dials only boxes. Its `/_subrouter/health` is its own answer,
+daemon, writes only its own files (two here, and §79.4's copy), and dials only boxes. Its `/_subrouter/health` is its own answer,
 below, and never §79.1's short one.
 
 Giving the path back. While it holds the path, the stand-in reads `supervisor-status` every second. When the
@@ -2902,7 +2903,7 @@ exits with 0.
 Flags. `--state-dir` (default `~/.subrouter`, or `SUBROUTER_STATE_DIR`), `--socket` (default
 `SUBROUTER_CLAUDE_SOCKET`, else `<state folder>/claude.sock`), `--control-socket` (default
 `<state folder>/supervisor.sock`), `--daemon-addr` (default `127.0.0.1:31415`), `--worker-config`,
-`--peers-file`, `--tailnet` and `--hold`. The defaults are the laptop daemon's own, so a job that runs the
+`--peers-file`, `--tailnet`, `--hold` and `--policy-every` (§79.4). The defaults are the laptop daemon's own, so a job that runs the
 stand-in needs the peers file's variable and little else. Every other interval above is a named constant in
 `standby.go`.
 
@@ -2973,11 +2974,93 @@ Each behaviour's code was taken out of the working tree in turn, 43 changes in a
 test. One behaviour has no such change: that a live listener at the path is left alone is the opener's own
 rule (§30), and the stand-in's part in it is to use that opener.
 
+§79.4 The daemon's own `policy_limits` answer. A session that starts while the stand-in serves asks
+`GET /api/claude_code/policy_limits` once, with no session id. Without a 200 it withholds WebFetch,
+DesignSync and RemoteTrigger, ignores the Retry-After, and asks again only an hour later, so a 503 costs it
+those tools for an hour after the daemon is back (§79.1). A box's 200 keeps them, but it is the box identity's
+answer, and a box whose identity belongs to another organization would apply that organization's policy.
+The live session of §79.1 also accepted a replay of the daemon's own 200, with or without its signature
+header. So the stand-in keeps the daemon's answer and replays it.
+
+Asking. While the stand-in is armed and the supervisor's latest answer says `serving`, the stand-in asks the
+daemon for `policy_limits` through the Claude socket, as a starting session does: Claude Code's User-Agent,
+`Cache-Control: no-cache`, no credential and no session id. So the daemon counts no session, and answers
+from its identity account (`internal/proxy/control_plane.go`). The stand-in asks when it is first armed, and
+then every 30 minutes (`--policy-every`, at least 1 minute and under 24 hours). It writes a 200 to
+`<state folder>/standby-policy.json` (mode 0600, replaced by rename): the status, the body, the time, and
+every header but the connection's own, `Date`, `Set-Cookie` and the daemon's `X-Subrouter-*`. Any other
+answer, a failed dial included, keeps the copy it has. An answer that comes back after the stand-in took the
+path is dropped, because it may be the stand-in's own copy or a box's. A disarmed stand-in asks nothing. Nor
+does one beside a supervisor that says `waiting` or `displaced`, because nobody, or another process, answers
+at the path then.
+
+Answering. While the stand-in holds the path, a `GET policy_limits` that names no account is answered with
+the copy when the copy is under 24 hours old. It is answered at once, the hold included, and a client's
+`If-None-Match` still gets the 200. A copy 24 hours old or more is not used. The answer's signature expires a
+day after it was issued; Claude Code 2.1.330 does not check it, and a later client may. With no copy, or an
+older one, the request goes to a box after the hold, as in §79.1, and the stand-in never answers it with a
+503 of its own choosing. A launch pinned to an account still gets §79.1's 503. The daemon answers a pinned
+launch's `policy_limits` from the pinned account (`internal/proxy/proxy.go`: a forced account is chosen
+before the control-plane identity), so the identity's copy is not that launch's answer. The file is read at
+start, so a stand-in that launchd restarts during an outage still has its copy.
+
+The health body and the state file have `policy_copy`: `held`, and when held, `saved_at` and
+`age_seconds`. As with `parked`, the state file's `age_seconds` is as of its last write. Neither holds the
+body or a header of the copy.
+
+The loose ends of §79.2 and §79.3. The connections to the boxes are closed once the stand-in has given the
+path back and the last stream has ended, and when the stand-in stops, not 90 s later when a box's idle limit
+runs out. A request's 401 asks for one token test, and its flag is cleared once that test has run, so one
+401 costs one test, not one per sweep. `file_unreadable`, `file_malformed` and `box_invalid` each appear for
+the case they name. These needed tests and no change in code.
+
+Turning it off: stop the stand-in. The copy has no switch of its own. Removing `standby-policy.json` drops the
+copy until the next ask.
+
+Not done. Nothing ran on macOS, against a real Claude Code client, or against the real daemon. The tests ask
+a daemon of their own. That the real daemon answers the ask from its identity account is read in
+`control_plane.go`, not measured. A replay older than the signature's expiry was never tried with a client.
+
+Tests (§79.4): `cmd/subrouter/standby_policy_test.go`, with a daemon of the test's own at the socket path that
+holds the socket's lock and answers `policy_limits` with the header names of a real answer.
+
+- `TestStandbyAnswersPolicyLimitsWithTheDaemonsSavedAnswer`: one ask at start, with no session id, no
+  `X-Subrouter-Session` and no credential, and a file of mode 0600. Once the daemon is gone and the stand-in
+  holds the path, `policy_limits` gets the daemon's status, body and headers inside the hold and after it,
+  without `Set-Cookie` and `X-Subrouter-*`, and the box sees nothing. A pinned launch gets the 503. Health
+  shows the copy 90 s old after the clock moves 90 s, and neither health nor the state file holds the body
+  or a header.
+- `TestStandbyAnswersPolicyLimitsFromACopyUnderADayOld`: a stand-in started after the first one stopped
+  answers with the saved file inside its hold. A second under 24 hours the copy still answers, and at
+  24 hours the box answers.
+- `TestStandbyKeepsItsPolicyCopyWhenTheDaemonAnswers500`: after a 500 the state file still shows the first
+  copy, and the path answers with it.
+- `TestStandbyAsksForPolicyLimitsEveryHalfHour`: one ask 29 minutes after the first, two at 30 minutes, and
+  the second 200 replaces the copy.
+- `TestStandbyKeepsOnlyTheDaemonsPolicyAnswer`: a disarmed stand-in asks nothing; beside a supervisor that
+  says `displaced`, the process at the path is not asked; an answer held back until the stand-in has taken
+  the path is dropped.
+- `TestStandbyClosesItsBoxConnectionsWhenItStops` (`cmd/subrouter/standby_test.go`): the box has no
+  connection left 10 s after the stop. `TestStandbyGivesThePathBackWhenTheSupervisorAsksForIt` checks the same
+  after a hand-back.
+- `TestOneRequest401AsksForOneTokenTest` and `TestEachUnusableTokenFileOrPeersEntryShowsItsWord`
+  (`internal/standby/boxset_test.go`): two token tests a second after one 401. A folder at a token file's
+  path or at the peers file's path shows `file_unreadable`. A token file with two words, an empty one and one
+  over 4 KiB show `file_malformed`. An `http://` URL or a missing pin shows `box_invalid`. The box is sent
+  nothing in each case.
+- `TestStandbyDefaultsAreTheDaemons`: `--policy-every` is 30 minutes by default, and 59 s and 24 h are
+  refused.
+
+Each behaviour's code was taken out of the working tree in turn, 29 changes in all, and each one
+failed its test.
+
 - Code: `internal/standby/box.go` (`Box`, `NewBox`, `Boxes`), `internal/standby/handler.go` (`NewHandler`,
-  `routeFor`, `IsHealth`, `rewriteForBox`, `send`, `retryAfterWriter`), `internal/standby/boxset.go` (`Set`,
+  `routeFor`, `IsHealth`, `PolicyCopyAnswers`, `rewriteForBox`, `send`, `retryAfterWriter`), `internal/standby/boxset.go` (`Set`,
   `NewSet`, `Config`, `Run`, `Candidates`, `Status`, `CloseIdleConnections`), `cmd/subrouter/standby.go`
   (`standbyCommand`, `parseStandbyConfig`, `runStandby`, `standIn`, `standbyTenure`, `holdGate`,
-  `armingVerdict`, `flapSteady`), `cmd/subrouter/remote_gate.go` (`resolveRemoteGateAt`)
+  `armingVerdict`, `flapSteady`), `cmd/subrouter/standby_policy.go` (`savedPolicy`, `standbyPolicy`,
+  `considerPolicy`, `askPolicy`, `gotPolicy`, `answerPolicy`), `cmd/subrouter/remote_gate.go`
+  (`resolveRemoteGateAt`)
 - Related: §30 (the Claude socket), §43 (named tokens; a stand-in token is a `membership` token), §68
   (tailnet first), §31 (the peers file and the peer-holds files), §17 (the `remote.key` gate), §77 (the
   supervisor keeps its socket, and lets go of it on purpose), §81 (the watchdog), §84 (the deploy checks

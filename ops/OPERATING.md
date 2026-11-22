@@ -415,6 +415,8 @@ curl -s --unix-socket ~/.subrouter/supervisor.sock -X POST http://supervisor/_su
 
 A stand-in ends itself, which frees the lock, when it cannot free the lock within 5 seconds of setting out to give the path back, and when it stops answering its own health through the path. A launch pinned to one account gets a 503 for as long as a stand-in serves.
 
+While the daemon serves its socket, the stand-in asks it for `policy_limits` as a starting session does, once when it is armed and then every 30 minutes (`--policy-every`), and keeps the last 200 in `~/.subrouter/standby-policy.json` (§79.4). A session that starts while the stand-in holds the path gets that answer at once, so it keeps WebFetch, DesignSync and RemoteTrigger. A copy 24 hours old or more is not used, and the request goes to a box instead. `policy_copy` in the state file and in health says whether a copy is held, when it was saved, and its age in seconds.
+
 ## Saved resets
 
 A saved reset clears an account's meters once. Anthropic has granted Claude accounts a one-time saved reset, and Codex accounts hold rate-limit reset credits. Each claim spends one for good, and it discards what is left of the account's current week. Never claim one unless the account owner asked for that claim.
@@ -475,6 +477,7 @@ An account that holds an unclaimed Claude reset ranks at twice a non-holder unti
 | `~/.subrouter/worker-config.json` | The supervised worker's `serve` arguments and extra environment. |
 | `~/.subrouter/standby-tokens/<box name>` | The stand-in's `membership` token for one box (§79.2). |
 | `~/.subrouter/standby-state.json`, `~/.subrouter/standby-supervisor.json` | The stand-in's state, and the supervisor's last answer to it (§79.3). |
+| `~/.subrouter/standby-policy.json` | The daemon's last 200 to `policy_limits`, which the stand-in answers sessions with while it holds the socket (§79.4). |
 | `~/.subrouter/transitions/` | Logs of deploy, activation, and rollback runs. |
 | `~/.claude-route/` | The shims, the mode files, and `claude-route`'s launch log. |
 | `~/.config/subrouter/cloud.json` | Written by `sr setup`. It holds the proxy token. |
