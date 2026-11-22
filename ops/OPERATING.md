@@ -363,6 +363,8 @@ Each hold logs `proxy hold started` and `proxy hold ended`. `outcome=answered` m
 
 The settings are `SUBROUTER_HOLD_DEADLINE` (default `8m`, and `0` turns holding off), `SUBROUTER_HOLD_MAX_REQUESTS` (256), and `SUBROUTER_HOLD_MAX_BYTES` (512 MiB). Keep the deadline under 9 minutes, because Claude Code gives up on a request with no response headers after 600 seconds.
 
+The daemon writes two 503s itself, one for a spent pool and one for a held chat that gives up (see [A box that goes quiet](#a-box-that-goes-quiet)). Each tells an end client to wait at most `SUBROUTER_CLIENT_RETRY_AFTER_MAX` in `Retry-After`. The default is `60s`, and `0` turns the cap off (§78). A session that sleeps out a `Retry-After` then tries again each minute instead of sleeping for an hour. The spent pool's body keeps the real wait, and a request a peer daemon forwarded gets the whole wait. At start, the daemon logs `Retry-After cap is on` or `Retry-After cap is off`.
+
 ### A failed lookup, and the outage spill
 
 Two mechanisms act before a hold when this Mac's own path to the provider breaks (§59):
@@ -476,6 +478,7 @@ The daemon reads these from its environment when it starts.
 | `SUBROUTER_HOLD_DEADLINE` | `8m` | How long a turn is held. `0` is off (§58). |
 | `SUBROUTER_HOLD_MAX_REQUESTS` | 256 | Held requests at once. |
 | `SUBROUTER_HOLD_MAX_BYTES` | 512 MiB | Held request bodies at once. |
+| `SUBROUTER_CLIENT_RETRY_AFTER_MAX` | `60s` | The longest `Retry-After` an end client gets in a spent pool's 503 or a held chat's give-up. The body keeps the real wait, and a peer daemon gets the whole wait. `0` is off (§78). |
 | `SUBROUTER_STICKY_DNS_MAX_AGE` | `168h` | How long a last good address is used. `0` is off (§59). |
 | `SUBROUTER_OUTAGE_SPILL_RATE` | 5 | Outage spills a second. `0` is off. |
 | `SUBROUTER_OUTAGE_SPILL_BURST` | 10 | The spill's burst. |
