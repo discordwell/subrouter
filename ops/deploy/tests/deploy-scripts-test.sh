@@ -3436,6 +3436,37 @@ if begin sup-claude-socket-down-names-the-supervisor-state; then
   finish
 fi
 
+# The words from before PATCHES §84 keep their meaning. A supervisor that says
+# `stopped` is read as before: an answer at the path is the daemon serving it,
+# and silence there is a socket not served. A supervisor from before
+# supervisor-status carried `claude_socket` names no word, and an answer at
+# the path is serving.
+if begin sup-claude-socket-stopped-and-answering-is-serving; then
+  sup_setup post post SUBROUTER_CLAUDE_SOCKET="$C/home/.subrouter/claude.sock"
+  run_laptop FAKE_SV_SOCKET=stopped
+  expect_rc 0; expect_out "claude socket              -> serving"; expect_out "DEPLOY OK"
+  expect_no_out "not owned by the daemon"; expect_build "$CUR" new
+  finish
+fi
+
+if begin sup-claude-socket-stopped-and-silent-is-not-served; then
+  sup_setup post post SUBROUTER_CLAUDE_SOCKET="$C/home/.subrouter/other.sock"
+  run_laptop FAKE_SV_SOCKET=stopped
+  expect_rc 3; expect_out "claude socket              -> down:no health answer on $H/.subrouter/other.sock (supervisor says: stopped)"
+  expect_out "DEPLOY INCOMPLETE (claude socket not served)"; expect_no_out "not owned by the daemon"
+  finish
+fi
+
+if begin sup-claude-socket-from-a-supervisor-without-the-word; then
+  sup_setup post post SUBROUTER_CLAUDE_SOCKET="$C/home/.subrouter/claude.sock"
+  : > "$C/launchd/supervisor-lacks-socket"
+  run_laptop
+  [ -e "$C/launchd/supervisor-lacks-socket" ] && ok || bad "the supervisor started again and now names the word"
+  expect_rc 0; expect_out "claude socket              -> serving"; expect_out "DEPLOY OK"
+  expect_build "$CUR" new
+  finish
+fi
+
 # Answering at the path is not owning it (PATCHES §84). A stand-in answers
 # health there with "ok": true while the daemon is away, and a supervisor can
 # serve TCP while it waits for the socket's lock, finds a listener it does not
