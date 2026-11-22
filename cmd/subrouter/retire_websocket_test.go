@@ -64,10 +64,40 @@ func TestRetireSignalClosesAnIdleCodexWebSocket1012(t *testing.T) {
 	_ = response.Body.Close()
 	defer conn.Close()
 
+	// The dial returns at the 101, before the handler watches for the retire
+	// signal, and a socket first watched after the signal owes its first turn
+	// and gets no 1012. The relay answers a ping only once the watch is set,
+	// as the proxy package's readSocketOnceRelayed relies on.
+	pong := make(chan struct{}, 1)
+	conn.SetPongHandler(func(string) error {
+		select {
+		case pong <- struct{}{}:
+		default:
+		}
+		return nil
+	})
+	closed := make(chan error, 1)
+	go func() {
+		_, _, err := conn.ReadMessage()
+		closed <- err
+	}()
+	if err := conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(10*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-pong:
+	case <-time.After(10 * time.Second):
+		t.Fatal("no pong within 10s: the daemon is not relaying the socket")
+	}
+
 	sigCh <- retireSignal
-	_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
-	if _, body, err := conn.ReadMessage(); !websocket.IsCloseError(err, websocket.CloseServiceRestart) || !strings.Contains(err.Error(), "reconnect") {
-		t.Fatalf("after the retire signal the idle socket got body=%q err=%v; want a 1012 close", body, err)
+	select {
+	case err := <-closed:
+		if !websocket.IsCloseError(err, websocket.CloseServiceRestart) || !strings.Contains(err.Error(), "reconnect") {
+			t.Fatalf("after the retire signal the idle socket got err=%v; want a 1012 close", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("after the retire signal the idle socket got nothing within 10s; want a 1012 close")
 	}
 
 	sigCh <- syscall.SIGTERM
