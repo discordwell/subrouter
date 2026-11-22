@@ -62,11 +62,12 @@ func StartUnstartedWeek() bool { return !startUnstartedWeekOff.Load() }
 // with scheduler: if that ranking read acct's week as unstarted, the account
 // carries a start mark for StartSentMarkDuration (a later session extends
 // it). Call it for every new session the router places, local or on a peer's
-// account; it decides whether a mark is due. A peer's account is marked under
-// the ID the merged ranking gave it, so the mark is per peer.
-func (r *SchedulerRef) NoteNewSession(scheduler Scheduler, acct account.Account) {
+// account; it decides whether a mark is due, and reports whether it set one.
+// A peer's account is marked under the ID the merged ranking gave it, so the
+// mark is per peer.
+func (r *SchedulerRef) NoteNewSession(scheduler Scheduler, acct account.Account) bool {
 	if r == nil || acct.ID == "" || !StartUnstartedWeek() || !scheduler.score(acct.Provider, acct.ID).WeeklyUnstarted {
-		return
+		return false
 	}
 	now := time.Now()
 	key := ScoreKey(acct.Provider, acct.ID)
@@ -81,6 +82,34 @@ func (r *SchedulerRef) NoteNewSession(scheduler Scheduler, acct account.Account)
 		}
 	}
 	r.startSentUntil[key] = now.Add(StartSentMarkDuration)
+	return true
+}
+
+// StartSentUntil reports when acct's start mark expires, while it stands: a
+// status surface says the priority is off until then.
+func (r *SchedulerRef) StartSentUntil(provider account.Provider, accountID string) (time.Time, bool) {
+	if r == nil {
+		return time.Time{}, false
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	until, ok := r.startSentUntil[ScoreKey(provider, accountID)]
+	return until, ok && until.After(time.Now())
+}
+
+// WithStartMarks attaches the live start marks to a scheduler that was not
+// read through Get, such as the bare one a ranking of peers' accounts alone
+// starts from, so a peer's marked account loses its priority there too.
+func (r *SchedulerRef) WithStartMarks(scheduler Scheduler) Scheduler {
+	if r == nil {
+		return scheduler
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if marks := r.startSentLocked(time.Now()); marks != nil {
+		return scheduler.withStartSent(marks)
+	}
+	return scheduler
 }
 
 // startSentLocked copies the start marks still live at now, for Get. The

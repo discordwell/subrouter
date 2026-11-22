@@ -288,6 +288,10 @@ func (s Server) selectTargetedAccount(provider accounts.Provider, agentType, ses
 			return accounts.Account{}, sessionID, userEmail, routingCapacity{}, err
 		}
 		userEmail = assignment.UserEmail
+		// The decider marks it for its own rankings once this turn is
+		// served; this daemon's own next pick must not follow it either
+		// (PATCHES §86.2).
+		s.noteNewSession(scheduler, target, agentType, sessionID)
 	}
 	if s.Logger != nil {
 		s.Logger.Info("targeted placement",

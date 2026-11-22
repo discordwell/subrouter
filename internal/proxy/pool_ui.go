@@ -88,10 +88,11 @@ const (
 	// early burndown under a quarter of its week, budget the claim would wipe
 	// (PATCHES §56). The note says which.
 	poolStateDrain = "drain"
-	// poolStatePristine is a weekly-only account whose tumbling fuse has never
-	// been lit -- reset == the full window length, so nothing is at risk yet.
-	// This is the single most important thing this board can say about a Codex
-	// account and no other tool shows it.
+	// poolStatePristine is an account whose weekly window has not started
+	// (Score.WeeklyUnstarted): its tumbling fuse has never been lit, so
+	// nothing is at risk yet, and the router gives it the next new session to
+	// start its clock (PATCHES §86). This is the single most important thing
+	// this board can say about a Codex account and no other tool shows it.
 	poolStatePristine = "pristine"
 	poolStateOK       = "ok"
 )
@@ -263,6 +264,10 @@ type poolRow struct {
 	// (Score.HoldsReset, PATCHES §56). Pace is the raw weekly pace, so without
 	// this a holder ranked above a faster account reads as a mistake.
 	ResetHold bool `json:"reset_hold,omitempty"`
+	// WeeklyUnstarted is Score.WeeklyUnstarted, the fact ranking reads: the
+	// weekly window has not started, so the next new session goes here first
+	// (PATCHES §86). The fuse, the state and the state note read it too.
+	WeeklyUnstarted bool `json:"weekly_unstarted,omitempty"`
 
 	// FableSpentFactor is the factor an Opus or Sonnet turn ranks this
 	// account's weekly pace by because its Fable meter is spent
@@ -740,6 +745,7 @@ func (s Server) poolBoard(ctx context.Context, boardModel, machineID string) poo
 		// measured; the peer's fills in for accounts local does not hold.
 		if pool == poolNameLocal || !row.Measured {
 			applyPoolReadings(row, status, scheduler, measurable, now)
+			s.noteUnstartedRow(row, status, pool, now)
 		}
 		if pool == poolNameLocal {
 			row.LiveKnown = true
@@ -826,15 +832,19 @@ func applyPoolReadings(row *poolRow, status AccountUsageStatus, scheduler select
 	row.Measured = known && measurable
 	row.Fresh = known && score.Fresh
 	row.WeeklyOnly = score.WeeklyOnly
+	row.WeeklyUnstarted = known && score.WeeklyUnstarted
 
-	// The fuse is read off the raw windows, not off the score: a tumbling
-	// window's state is (length, remaining), and the score keeps only the
-	// remaining half.
-	if fuse := readFuse(status.Windows, ""); fuse != nil {
+	// The fuse's gauge is read off the raw windows: the score keeps only the
+	// remaining half of a tumbling window's (length, remaining). Whether it is
+	// lit is the score's fact, the one ranking reads, so the board and the
+	// router cannot disagree on it (PATCHES §86). The Spark pool's week is its
+	// own pool score's.
+	if fuse := readFuse(status.Windows, "", row.WeeklyUnstarted); fuse != nil {
 		row.Fuse = fuse
 	}
-	if spark := readFuse(status.Windows, sparkFeature); spark != nil {
-		row.Spark = spark
+	spark := score.ModelScores[selectacct.ModelKey(sparkFeature)]
+	if fuse := readFuse(status.Windows, sparkFeature, known && spark.WeeklyUnstarted); fuse != nil {
+		row.Spark = fuse
 	}
 
 	if !row.Measured {
@@ -881,23 +891,47 @@ func applyPoolReadings(row *poolRow, status AccountUsageStatus, scheduler select
 	if factor := score.FableSpentFactor(); factor > 1 {
 		row.FableSpentFactor = factor
 	}
-	row.State, row.StateNote = classifyPoolState(status.Provider, status.ID, score, scheduler, row.Fuse, now)
+	row.State, row.StateNote = classifyPoolState(status.Provider, status.ID, score, scheduler, now)
+}
+
+// noteUnstartedRow says, on a row whose week has not started, what this
+// daemon's ranking does with it (PATCHES §86): this daemon may have sent it a
+// new session already, which takes the priority off until its start mark
+// expires, and a peer from before §86 does not publish the fact, so ranking
+// here never reads it. classifyPoolState's note assumes neither.
+func (s Server) noteUnstartedRow(row *poolRow, status AccountUsageStatus, pool string, now time.Time) {
+	if row.State != poolStatePristine || !selectacct.StartUnstartedWeek() {
+		return
+	}
+	provider, id := schedulerAccountProvider(status.Provider), status.ID
+	if pool != poolNameLocal {
+		if status.Normalized == nil || !status.Normalized.WeeklyUnstarted {
+			row.StateNote = "weekly window not started; its daemon does not publish weekly_unstarted (before PATCHES §86), so this daemon ranks it on its pace"
+			return
+		}
+		if box := s.firstPeer(); box != nil {
+			id = crossPoolCandidateID(box.name(), status.ID)
+		}
+	}
+	if until, marked := s.SchedulerRef.StartSentUntil(provider, id); marked && until.After(now) {
+		row.StateNote = "weekly window not started; a new session was sent here, so it ranks on its pace until " +
+			until.UTC().Format("15:04 MST") + ", while a usage reading catches up"
+	}
 }
 
 // classifyPoolState is the one place a row's colour is decided.
 //
 // Every verdict below is asked of the scheduler rather than recomputed:
 // Exhausted, UsableForNewSession, BurndownCause and HoldsReset are the same
-// predicates selection gates and ranks on. The only thing computed here is the
-// PRISTINE reading, which the scheduler has no opinion about -- a pristine
-// account and a freshly-rolled one are identical to the router and completely
-// different to an operator, because one has a lit fuse and the other does not.
+// predicates selection gates and ranks on, and PRISTINE is the score's
+// WeeklyUnstarted, the fact the router ranks on (PATCHES §86). A pristine
+// account and a freshly-rolled one both read 100% left, and only the first
+// takes the next new session.
 func classifyPoolState(
 	provider accounts.Provider,
 	accountID string,
 	score selectacct.Score,
 	scheduler selectacct.Scheduler,
-	fuse *poolFuse,
 	now time.Time,
 ) (string, string) {
 	if scheduler.Exhausted(provider, accountID) {
@@ -924,8 +958,11 @@ func classifyPoolState(
 	if !scheduler.UsableForNewSession(provider, accountID) {
 		return poolStateBurn, burnNote(score)
 	}
-	if fuse != nil && fuse.State == poolFusePristine {
-		return poolStatePristine, "weekly fuse never lit: the clock has not started and nothing is at risk yet"
+	if score.WeeklyUnstarted {
+		if !selectacct.StartUnstartedWeek() {
+			return poolStatePristine, "weekly window not started; SUBROUTER_START_UNSTARTED_WEEK=0 here, so it ranks on its pace"
+		}
+		return poolStatePristine, "weekly window not started: the next new session goes here first, to start its clock"
 	}
 	switch score.BurndownCause(now) {
 	case selectacct.BurndownCauseRoll:
@@ -996,10 +1033,12 @@ const poolWeeklyFuseMinSeconds = 6 * 24 * 60 * 60
 
 // readFuse models the tumbling weekly window for one feature ("" = account-wide).
 //
-// PRISTINE is ResetAfterSeconds >= LimitWindowSeconds: the clock has not
-// started. `>=` rather than `==` so a second of upstream clock skew does not
-// flip a genuinely untouched account into RUNNING.
-func readFuse(windows []accounts.UsageWindow, feature string) *poolFuse {
+// PRISTINE is unstarted: the score's WeeklyUnstarted for that pool, which
+// selectacct reads off the window it binds on (ResetAfterSeconds >=
+// LimitWindowSeconds, `>=` so a second of upstream clock skew does not flip a
+// genuinely untouched account into RUNNING). The board takes the fact from
+// the score rather than applying the rule a second time.
+func readFuse(windows []accounts.UsageWindow, feature string, unstarted bool) *poolFuse {
 	var best *accounts.UsageWindow
 	for i := range windows {
 		window := windows[i]
@@ -1035,10 +1074,10 @@ func readFuse(windows []accounts.UsageWindow, feature string) *poolFuse {
 		WindowSeconds: best.LimitWindowSeconds,
 		Spent:         clampFraction(best.UsedPercent / 100),
 	}
-	if elapsedSeconds <= 0 {
+	switch {
+	case unstarted:
 		fuse.State = poolFusePristine
-		fuse.Elapsed = 0
-	} else {
+	case elapsedSeconds > 0:
 		fuse.Elapsed = clampFraction(float64(elapsedSeconds) / float64(best.LimitWindowSeconds))
 	}
 	if forfeit := fuse.Elapsed - fuse.Spent; forfeit > 0 {

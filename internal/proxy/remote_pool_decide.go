@@ -216,9 +216,14 @@ type crossPoolCandidate struct {
 	// usage body carries no verdicts), which competes with its best score and
 	// is forwarded untargeted, exactly as before §31.
 	Account string
-	Score   selectacct.Score
-	Legacy  bool
-	Carried bool
+	// Provider is the scheduler provider the account competes under, so it
+	// keeps one ScoreKey -- and one start mark (PATCHES §86) -- in every
+	// ranking, with or without local candidates. Empty in a hand-built
+	// candidate, which then takes the local candidates' provider.
+	Provider accounts.Provider
+	Score    selectacct.Score
+	Legacy   bool
+	Carried  bool
 	// Reason is the verdict's reason ("eligible", "burndown"), or "legacy".
 	Reason string
 	// BodyAt is when the usage body this candidate came from was measured; a
@@ -336,15 +341,26 @@ func explainAcrossPools(scheduler selectacct.Scheduler, local []accounts.Account
 	candidates := SchedulerAccounts(local)
 	byID = make(map[string]int, len(peers))
 	for i, peer := range peers {
-		id := crossPoolCandidateID(peer.Peer.name(), peer.Account)
+		placeholder := peer.placeholder(provider)
 		score := peer.Score
-		score.AccountID, score.Provider, score.Remote = id, provider, true
+		score.AccountID, score.Provider, score.Remote = placeholder.ID, placeholder.Provider, true
 		merged = merged.WithScore(score)
-		candidates = append(candidates, accounts.Account{ID: id, Provider: provider, AuthMode: accounts.AuthModeOAuth})
-		byID[id] = i
+		candidates = append(candidates, placeholder)
+		byID[placeholder.ID] = i
 	}
 	ranked, err = merged.Explain(candidates)
 	return ranked, byID, err
+}
+
+// placeholder is the account a peer candidate competes as in the merged
+// ranking: its crossPoolCandidateID under its own provider, or fallback (the
+// local candidates') when it carries none.
+func (c crossPoolCandidate) placeholder(fallback accounts.Provider) accounts.Account {
+	provider := fallback
+	if c.Provider != "" {
+		provider = c.Provider
+	}
+	return accounts.Account{ID: crossPoolCandidateID(c.Peer.name(), c.Account), Provider: provider, AuthMode: accounts.AuthModeOAuth}
 }
 
 // matchPickedAccount maps the scheduler's winner back to the full local
@@ -419,6 +435,10 @@ type crossPoolRanking struct {
 	// says the last ranking did so, for the decision line.
 	targetedOnly  bool
 	legacyDropped bool
+
+	// localStart is selection's pick while a peer's account is tried first:
+	// it is marked if the turn comes back to it (PATCHES §86.2).
+	localStart *deferredLocalStart
 }
 
 type crossPoolPeerSnapshot struct {
@@ -553,9 +573,17 @@ func (c *crossPoolRanking) rank(scheduler selectacct.Scheduler, local []accounts
 func (c *crossPoolRanking) recompute() (crossPoolPlacement, error) {
 	scheduler, local := c.scheduler, c.local
 	if !c.ranked {
-		scheduler = selectacct.NewScheduler(nil)
+		scheduler = c.peersOnlyScheduler()
 	}
 	return c.rank(scheduler, local, "")
+}
+
+// peersOnlyScheduler is the scheduler a ranking of peers' accounts alone
+// starts from: no local score, but this daemon's start marks (PATCHES §86),
+// so a peer's account it just sent a new session to loses its priority here
+// too.
+func (c *crossPoolRanking) peersOnlyScheduler() selectacct.Scheduler {
+	return c.server.SchedulerRef.WithStartMarks(selectacct.NewScheduler(nil))
 }
 
 // forcedRerank is the ranking of a FORCED switch that local can serve (P8):
@@ -575,7 +603,7 @@ func (c *crossPoolRanking) forcedRerank(scheduler selectacct.Scheduler, next acc
 
 // rankPeersOnly ranks the peers with no local candidate: local cannot serve.
 func (c *crossPoolRanking) rankPeersOnly() (crossPoolPlacement, error) {
-	return c.rank(selectacct.NewScheduler(nil), nil, "")
+	return c.rank(c.peersOnlyScheduler(), nil, "")
 }
 
 // rankedPeers is every peer candidate left in this turn, best first.
@@ -584,7 +612,7 @@ func (c *crossPoolRanking) rankedPeers() []crossPoolCandidate {
 	if len(peers) == 0 {
 		return nil
 	}
-	ranked, byID, err := explainAcrossPools(selectacct.NewScheduler(nil), nil, peers)
+	ranked, byID, err := explainAcrossPools(c.peersOnlyScheduler(), nil, peers)
 	if err != nil {
 		return nil
 	}
@@ -659,7 +687,7 @@ func (p *RemotePool) decisionCandidates(snapshot AdminSnapshot, provider, poolMo
 			return nil, 0, false
 		}
 		return []crossPoolCandidate{{
-			Peer: p, Score: score, Legacy: true, Carried: carried, Reason: "legacy", BodyAt: snapshot.At,
+			Peer: p, Provider: accountProviderFor(accounts.Provider(provider)), Score: score, Legacy: true, Carried: carried, Reason: "legacy", BodyAt: snapshot.At,
 		}}, 0, true
 	}
 	// A verdict is a statement about NOW on the peer: eligible, burndown, at
@@ -719,7 +747,7 @@ func (p *RemotePool) decisionCandidates(snapshot AdminSnapshot, provider, poolMo
 		// local account's routed requests are (ApplyLiveDebit).
 		score = selectacct.ApplyLiveDebit(score, p.routed.since(provider, row.ID, snapshot.At))
 		out = append(out, crossPoolCandidate{
-			Peer: p, Account: row.ID, Score: score, Reason: verdict.Reason, BodyAt: snapshot.At,
+			Peer: p, Account: row.ID, Provider: accountProviderFor(accounts.Provider(provider)), Score: score, Reason: verdict.Reason, BodyAt: snapshot.At,
 		})
 	}
 	return out, excluded, true
@@ -773,7 +801,15 @@ type crossPoolLocal struct {
 // local wins -> false (serve locally); a peer wins -> targeted forward, and on
 // a failed attempt the SAME ranking recomputes without it, until something
 // serves, local wins, or the bound is reached (then local).
-func (s Server) serveCrossPoolDecision(w http.ResponseWriter, r *http.Request, agentType, sessionID string, mode remotePoolHoldMode, local crossPoolLocal, ranking *crossPoolRanking) bool {
+func (s Server) serveCrossPoolDecision(w http.ResponseWriter, r *http.Request, agentType, sessionID string, mode remotePoolHoldMode, local crossPoolLocal, ranking *crossPoolRanking) (served bool) {
+	clientGone := false
+	defer func() {
+		// Every peer attempt failed and selection's pick serves the turn: it
+		// is a new session there after all.
+		if !served && !clientGone {
+			s.noteDeferredLocalSession(ranking, agentType, sessionID)
+		}
+	}()
 	if !ranking.ranked {
 		reason := ranking.kept
 		if reason == "" {
@@ -813,6 +849,7 @@ func (s Server) serveCrossPoolDecision(w http.ResponseWriter, r *http.Request, a
 			return true
 		}
 		if out.clientGone() {
+			clientGone = true
 			return false
 		}
 		next, err := ranking.recompute()
@@ -827,7 +864,7 @@ func (s Server) serveCrossPoolDecision(w http.ResponseWriter, r *http.Request, a
 // failure against the turn and, for a refusal, against the peer's view.
 func (s Server) attemptCandidate(w http.ResponseWriter, r *http.Request, agentType, sessionID string, body []byte, mode remotePoolHoldMode, candidate crossPoolCandidate, ranking *crossPoolRanking) peerForwardOutcome {
 	target := candidate.Account
-	out := s.serveOnePeerAttempt(w, r, candidate.Peer, agentType, sessionID, body, mode, target)
+	out := s.serveOnePeerAttempt(w, withPeerStart(r, s, candidate, agentType, sessionID), candidate.Peer, agentType, sessionID, body, mode, target)
 	if out.Served || out.clientGone() {
 		return out
 	}
@@ -1162,8 +1199,8 @@ func (s Server) transportStageAcrossPools(r *http.Request, ranking *crossPoolRan
 		return nil, false
 	}
 	turn := ranking.turn
-	send := func(p *RemotePool, target string) peerForwardOutcome {
-		return s.forwardToPeer(p, r, agentType, sessionID, clientPath, rawQuery, body, remotePoolHoldSet, target)
+	send := func(p *RemotePool, req *http.Request, target string) peerForwardOutcome {
+		return s.forwardToPeer(p, req, agentType, sessionID, clientPath, rawQuery, body, remotePoolHoldSet, target)
 	}
 	served := func(p *RemotePool, out peerForwardOutcome) (*http.Response, bool) {
 		if s.Logger != nil {
@@ -1201,7 +1238,7 @@ func (s Server) transportStageAcrossPools(r *http.Request, ranking *crossPoolRan
 				s.Logger.Warn("remote pool last resort; forwarding untargeted",
 					"remote", p.name(), "agent", agentType, "session", sessionID, "stage", "transport")
 			}
-			out := send(p, "")
+			out := send(p, r, "")
 			if !out.Served {
 				turn.recordFailure(p.name(), "", out)
 				return nil, false
@@ -1214,7 +1251,7 @@ func (s Server) transportStageAcrossPools(r *http.Request, ranking *crossPoolRan
 		}
 		s.logCrossPoolDecision(r, agentType, sessionID, local, ranking, placement, why, recompute)
 		candidate := *placement.Peer
-		out := send(candidate.Peer, candidate.Account)
+		out := send(candidate.Peer, withPeerStart(r, s, candidate, agentType, sessionID), candidate.Account)
 		if out.Served {
 			return served(candidate.Peer, out)
 		}
