@@ -12,6 +12,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -432,11 +434,87 @@ func TestThePeerTokenOfThePeersFileIsNeverSent(t *testing.T) {
 	}
 }
 
+// A box that refuses a request's token is skipped by the next request at
+// once, without waiting for a token test. The set does not run, so no token
+// test is ever sent.
+func TestABoxThatRefusesARequestIsSkippedByTheNextOne(t *testing.T) {
+	var refuse atomic.Bool
+	a := startBox(t, func(w http.ResponseWriter, r *http.Request) {
+		if refuse.Load() {
+			refusingBox(w, r)
+			return
+		}
+		okBox(w, r)
+	})
+	b := startBox(t, okBox)
+	f := newBoxSetFixture(t, peerOf("a", a), peerOf("b", b))
+	f.writeToken(t, "a", a.token, 0o600)
+	f.writeToken(t, "b", b.token, 0o600)
+	logs := &lockedBuffer{}
+	set := newSet(t, f, "", time.Hour, logs)
+	onA := sessionsFirstOn(t, set, "a", 1)[0]
+	front := standInOver(t, set, logs)
+
+	if resp := messageFor(t, front, onA); resp.StatusCode != http.StatusOK || len(a.requests()) != 1 {
+		t.Fatalf("status = %d with a at %d requests, want a's 200", resp.StatusCode, len(a.requests()))
+	}
+	// The token is revoked on a between two tests.
+	refuse.Store(true)
+	if resp := messageFor(t, front, onA); resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want the guard's 503 for a's 401", resp.StatusCode)
+	}
+	if got := boxState(set, "a").Token; got != standby.StateRefused {
+		t.Fatalf("after a's 401, a = %q, want %q", got, standby.StateRefused)
+	}
+	if resp := messageFor(t, front, onA); resp.StatusCode != http.StatusOK || len(b.requests()) != 1 {
+		t.Fatalf("the next request: status = %d with b at %d requests, want b's 200", resp.StatusCode, len(b.requests()))
+	}
+	if got := len(a.requests()); got != 2 {
+		t.Fatalf("a saw %d requests, want 2: the one after its 401 must go to b", got)
+	}
+}
+
+// A box whose every address failed before a request was sent is tried last
+// by the next request, without waiting for a token test.
+func TestABoxThatCouldNotBeReachedIsTriedLastByTheNextRequest(t *testing.T) {
+	a := startBox(t, okBox)
+	b := startBox(t, okBox)
+	f := newBoxSetFixture(t, peerOf("a", a), peerOf("b", b))
+	f.writeToken(t, "a", a.token, 0o600)
+	f.writeToken(t, "b", b.token, 0o600)
+	logs := &lockedBuffer{}
+	set := newSet(t, f, "", time.Hour, logs)
+	onA := sessionsFirstOn(t, set, "a", 1)[0]
+	a.server.Close()
+
+	front := standInOver(t, set, logs)
+	if resp := messageFor(t, front, onA); resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want b's 200", resp.StatusCode)
+	}
+	if got := boxState(set, "a").Token; got != standby.StateUnreachable {
+		t.Fatalf("after a's refused dial, a = %q, want %q", got, standby.StateUnreachable)
+	}
+	if got := names(set.Candidates(onA)); len(got) != 2 || got[0] != "b" || got[1] != "a" {
+		t.Fatalf("Candidates = %v, want [b a]", got)
+	}
+}
+
 // The tailnet address is tried first and the peers file's URL second, both
 // against the pin. The test container has no route to a tailnet address, so
-// the request is answered over the URL.
+// the request is answered over the URL. A box whose URL still works is never
+// shown unreachable for its tailnet address, and its URL goes first for a
+// while.
 func TestTheTailnetAddressIsTriedFirstThenTheURL(t *testing.T) {
-	box := startBox(t, okBox)
+	arrived := make(chan struct{}, 1)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	box := startBox(t, func(w http.ResponseWriter, r *http.Request) {
+		arrived <- struct{}{}
+		<-release
+		okBox(w, r)
+	})
+	// Registered after the box, so it runs before the box closes.
+	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
 	other := startBox(t, okBox)
 	f := newBoxSetFixture(t, peerOf("a", box), peerOf("b", other))
 	f.writeToken(t, "a", box.token, 0o600)
@@ -449,8 +527,38 @@ func TestTheTailnetAddressIsTriedFirstThenTheURL(t *testing.T) {
 		t.Fatalf("Candidates = %v, want each box's tailnet address before its URL", got)
 	}
 	front := standInOver(t, set, logs)
-	if resp := messageFor(t, front, onA); resp.StatusCode != http.StatusOK || len(box.requests()) != 1 {
-		t.Fatalf("status = %d with a at %d requests, want a's 200 over its URL", resp.StatusCode, len(box.requests()))
+	answered := make(chan int, 1)
+	go func() {
+		header := claudeHeaders()
+		header.Set("X-Claude-Code-Session-Id", onA)
+		req, _ := http.NewRequest(http.MethodPost, front.URL+"/v1/messages", strings.NewReader(`{"model":"m"}`))
+		req.Header = header
+		resp, err := front.Client().Do(req)
+		if err != nil {
+			answered <- 0
+			return
+		}
+		resp.Body.Close()
+		answered <- resp.StatusCode
+	}()
+	select {
+	case <-arrived:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the request never reached a over its URL")
+	}
+	// The tailnet address has failed and the URL holds the request.
+	if got := boxState(set, "a").Token; got != standby.StateUntested {
+		t.Errorf("while a's URL holds the request, a = %q, want %q: its URL was reached", got, standby.StateUntested)
+	}
+	if got := names(set.Candidates(onA)); strings.Join(got, " ") != "a a/tailnet b/tailnet b" {
+		t.Errorf("after a's tailnet address failed, Candidates = %v, want a's URL first", got)
+	}
+	releaseOnce.Do(func() { close(release) })
+	if status := <-answered; status != http.StatusOK {
+		t.Fatalf("status = %d, want a's 200 over its URL", status)
+	}
+	if got := boxState(set, "a").Token; got != standby.StateOK {
+		t.Fatalf("a = %q, want ok: its URL answered", got)
 	}
 
 	// A value the daemon would ignore is ignored here too: every box dials
@@ -522,6 +630,41 @@ func TestASessionLandsOnTheSameBoxEveryTime(t *testing.T) {
 	}
 	if count["a"] < 10 || count["b"] < 10 {
 		t.Fatalf("64 sessions landed %v, want both boxes used", count)
+	}
+}
+
+// A box's token is tested every TestEvery while nothing reaches it, and not
+// while requests do: their answers tell the set the same thing.
+func TestTheTokenTestRepeatsOnlyWhileTheBoxIsIdle(t *testing.T) {
+	box := startBox(t, okBox)
+	f := newBoxSetFixture(t, peerOf("a", box))
+	f.writeToken(t, "a", box.token, 0o600)
+	tests := func() int {
+		n := 0
+		for _, seen := range box.requests() {
+			if seen.Method == http.MethodHead && seen.Path == "/" {
+				n++
+			}
+		}
+		return n
+	}
+
+	logs := &lockedBuffer{}
+	set := startSet(t, f, "", 3*time.Second, logs)
+	eventually(t, "three token tests while idle", func() bool { return tests() >= 3 })
+
+	front := standInOver(t, set, logs)
+	if resp := messageFor(t, front, testSessionID); resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	before := tests()
+	for end := time.Now().Add(5 * time.Second); time.Now().Before(end); time.Sleep(100 * time.Millisecond) {
+		if resp := messageFor(t, front, testSessionID); resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, want 200", resp.StatusCode)
+		}
+	}
+	if got := tests() - before; got != 0 {
+		t.Fatalf("%d token tests while requests reached the box every 100 ms, want none", got)
 	}
 }
 

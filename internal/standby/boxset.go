@@ -165,8 +165,10 @@ func NewSet(cfg Config) (*Set, error) {
 	return s, nil
 }
 
-// Run reloads the files every ReloadEvery, and tests each box's token every
-// TestEvery. It returns when ctx ends. Run it once.
+// Run reloads the files every ReloadEvery, and tests a box's token when no
+// test or request has told the set about that box for TestEvery: every 10
+// minutes while the stand-in is idle, and not while requests reach the box.
+// It returns when ctx ends. Run it once.
 func (s *Set) Run(ctx context.Context) {
 	var sweeps sync.WaitGroup
 	defer sweeps.Wait()
@@ -255,8 +257,8 @@ func rendezvous(name, sessionID string) uint64 {
 	return binary.BigEndian.Uint64(sum[:8])
 }
 
-// Answered records a box's answer to a token test: a 401 means it refuses
-// the token, any other answer that it takes it.
+// Answered records a box's answer to a request or a token test: a 401 means
+// it refuses the token, any other answer that it takes it.
 func (s *Set) Answered(box *Box, status int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -272,8 +274,8 @@ func (s *Set) Answered(box *Box, status int) {
 	s.decide(a.member, state)
 }
 
-// Unreachable records an address a token test could not reach. Its box is
-// unreachable once every one of its addresses has failed.
+// Unreachable records an address that failed before a request was sent to
+// it. Its box is unreachable once every one of its addresses has.
 func (s *Set) Unreachable(box *Box) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -302,7 +304,8 @@ func (s *Set) decide(m *member, state State) {
 	m.result, m.at = state, time.Now()
 }
 
-// sweep tests the token of every box not tested for TestEvery.
+// sweep tests the token of every box no test or request has told the set
+// about for TestEvery.
 func (s *Set) sweep(ctx context.Context) {
 	s.mu.Lock()
 	var stale []*member

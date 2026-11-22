@@ -145,6 +145,8 @@ func (b *testBox) boxWithPin(t *testing.T, name, pin string) *standby.Box {
 type boxList []*standby.Box
 
 func (l boxList) Candidates(string) []*standby.Box { return l }
+func (boxList) Answered(*standby.Box, int)         {}
+func (boxList) Unreachable(*standby.Box)           {}
 
 // startStandIn serves the handler behind a plain HTTP server, the way the
 // stand-in will serve it on the Claude socket.
