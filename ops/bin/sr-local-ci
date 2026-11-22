@@ -87,7 +87,11 @@ with the word `deploy`.
 
 options:
   -run REGEX, --run REGEX  only tests matching REGEX (go test -run)
-  --docker                 run on Linux in golang:<go.mod version> instead
+  --docker                 run on Linux in golang:<go.mod version> instead.
+                           Its build cache is the volume sr-local-ci-gocache:
+                           over SUBROUTER_TEST_CACHE_LIMIT_GB (default 6, 0
+                           turns this off), a run first deletes its entries
+                           unused for a day (PATCHES §85)
   --image IMAGE            the image --docker uses (default golang:<go.mod>)
   --selftest               prove the isolation (and that the proof can fail)
   --timeout DUR            go test -timeout for the suite (default 40m)
@@ -254,6 +258,11 @@ if [ "$mode" = docker ]; then
   [ -n "$image" ] || image="golang:${version}"
   gomod_volume=sr-local-ci-gomod
   gocache_volume=sr-local-ci-gocache
+  cache_limit_kib=$(awk -v gb="${SUBROUTER_TEST_CACHE_LIMIT_GB:-6}" \
+    'BEGIN { if (gb !~ /^[0-9]+(\.[0-9]+)?$/) exit 1; printf "%.0f\n", gb * 1048576 }') ||
+    die "SUBROUTER_TEST_CACHE_LIMIT_GB must be a number of GB, such as 6 or 0.5 (0 turns the trim off)"
+  # From this script's own checkout, not -C's, which can predate the trim.
+  trim_script="$script_dir/../../deploy/docker/trim-go-cache.sh"
   label="$(git -C "$repo_root" rev-parse --short HEAD 2>/dev/null || echo unknown)"
   if [ -n "$(git -C "$repo_root" status --porcelain --untracked-files=no 2>/dev/null | head -1)" ]; then
     label="${label}+uncommitted"
@@ -268,6 +277,17 @@ if [ "$mode" = docker ]; then
     -w /work \
     -e GOTOOLCHAIN=local -e GOFLAGS=-mod=readonly \
     "$image" go mod download || die "go mod download failed in ${image}"
+
+  # The build cache grows with every tree tested, and Go deletes only entries
+  # unused for five days. The trim's container mounts no module volume, and a
+  # failed trim leaves the cache as it was.
+  if [ "$cache_limit_kib" != 0 ] && [ -f "$trim_script" ]; then
+    docker run --rm --network none \
+      -v "${trim_script}:/opt/sr-local-ci/trim-go-cache.sh:ro" \
+      -v "${gocache_volume}:/cache" \
+      "$image" sh /opt/sr-local-ci/trim-go-cache.sh /cache/go-build "$cache_limit_kib" 1440 ||
+      say "${prog}: trimming the build cache failed; the suite runs anyway"
+  fi
 
   build_fwd
 

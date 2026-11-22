@@ -11,6 +11,10 @@
 # SUBROUTER_TEST_NETWORK=1 opts out of --network none for a future test that
 # genuinely needs DNS; the default network namespace has loopback only, which
 # is all httptest needs.
+#
+# SUBROUTER_TEST_CACHE_LIMIT_GB (default 6, 0 turns it off) bounds the build
+# cache volume: above it, each run first deletes the entries unused for a day
+# (trim-go-cache.sh, ops/PATCHES.md §85).
 set -eu
 
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
@@ -41,6 +45,10 @@ if [ "${SUBROUTER_TEST_NETWORK:-0}" = "1" ]; then
   network_args=""
 fi
 
+cache_limit_kib=$(awk -v gb="${SUBROUTER_TEST_CACHE_LIMIT_GB:-6}" \
+  'BEGIN { if (gb !~ /^[0-9]+(\.[0-9]+)?$/) exit 1; printf "%.0f\n", gb * 1048576 }') ||
+  die "SUBROUTER_TEST_CACHE_LIMIT_GB must be a number of GB, such as 6 or 0.5 (0 turns the trim off)"
+
 # The three cleared vars are HOME-derived fallbacks (see storepath.StateDir
 # and broker.DefaultConfigPath), so with HOME pinned to /home/agent they
 # resolve to the very same container paths either way -- the canary test
@@ -64,6 +72,18 @@ run_in_harness() {
 
 command -v docker >/dev/null 2>&1 || die "docker is required"
 docker build --target test -t "${image}" "${repo_root}" || die "docker build --target test failed"
+
+# Go itself deletes only entries unused for five days. The trim's container
+# mounts the build cache and no module volume, and a failed trim leaves the
+# cache as it was, so the run goes on.
+if [ "${cache_limit_kib}" != 0 ]; then
+  docker run --rm --network none \
+    -v "${repo_root}:/src:ro" \
+    -v "${gobuild_volume}:/root/.cache/go-build" \
+    "${image}" \
+    sh /src/deploy/docker/trim-go-cache.sh /root/.cache/go-build "${cache_limit_kib}" 1440 ||
+    echo "test: trimming the build cache failed; the run goes on" >&2
+fi
 
 if [ "${self_check}" -eq 0 ]; then
   exit_code=0
