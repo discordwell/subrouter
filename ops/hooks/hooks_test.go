@@ -387,6 +387,18 @@ func TestNewFilePath(t *testing.T) {
 	refused(t, out, err, "<private>-notes.md: in the path")
 }
 
+// git quotes a path that holds a quote, a backslash or a control character,
+// and the hooks name it as it is on disk.
+func TestQuotedPath(t *testing.T) {
+	s := newSandbox(t, fixture{privateValues: "Quillfeather\n"})
+	shown := "say \\ \"<private>\"\tnow.md"
+	out, err := s.commit("say \\ \"Quillfeather\"\tnow.md", "plain\nQuillfeather\n", "notes")
+	refusedExactly(t, out, err, shown+": in the path", shown+":2")
+	s.mustGit("commit", "-q", "--no-verify", "-m", "notes")
+	out, err = s.git("push", "-q", "origin", "main")
+	refusedExactly(t, out, err, s.head()+" "+shown+": in the path", s.head()+" "+shown+":2")
+}
+
 // A hunk that deletes lines ends, so the hunks and files after it are read
 // with their own paths and line numbers.
 func TestStagedDiffAfterADeletion(t *testing.T) {

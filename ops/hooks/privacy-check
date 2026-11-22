@@ -27,6 +27,9 @@ DNS_NAME = re.compile(r"(?:[a-z0-9-]+\.)+[a-z][a-z0-9-]*", re.I)
 WORD = re.compile(rb"[A-Za-z0-9]+")
 # A hunk header, with a range for each parent: one in a commit's diff, one per parent in a merge's.
 HUNK = re.compile(rb"(@@+)(?: -\d+(?:,\d+)?)+ \+(\d+)")
+# The escapes in a path that git writes in C-style quotes.
+C_ESCAPE = re.compile(rb'\\([0-7]{3}|[abtnvfr"\\])')
+C_CHARS = dict(zip(b'abtnvfr"\\', b'\a\b\t\n\v\f\r"\\'))
 
 # Where internal/tailnet and cmd/subrouter look for the tailscale CLI after SUBROUTER_TAILSCALE_BIN. A git client
 # that an app starts often has only /usr/bin:/bin:/usr/sbin:/sbin on PATH.
@@ -257,12 +260,26 @@ def usable_needles(rows, tree):
 
 
 def diff_path(header):
-    """The path in a "diff --git a/P b/P" line or a merge's "diff --cc P". --no-renames makes both sides the same."""
+    """The path in a "diff --git a/P b/P" line or a merge's "diff --cc P". --no-renames makes both sides the same.
+    A path that git quotes keeps its prefix inside the quotes: "a/P" "b/P"."""
     if header.startswith(b"diff --cc "):
-        return header[len(b"diff --cc "):].decode("utf-8", "replace")
-    rest = header[len(b"diff --git a/"):]
-    n = (len(rest) - 3) // 2
-    return (rest[:n] if rest[n:n + 3] == b" b/" else rest).decode("utf-8", "replace")
+        path = header[len(b"diff --cc "):]
+    elif header.startswith(b'diff --git "'):
+        rest = header[len(b"diff --git "):]
+        path = b'"' + rest[len(b'"a/'):(len(rest) - 1) // 2]
+    else:
+        rest = header[len(b"diff --git a/"):]
+        n = (len(rest) - 3) // 2
+        path = rest[:n] if rest[n:n + 3] == b" b/" else rest
+    return unquoted(path).decode("utf-8", "replace")
+
+
+def unquoted(path):
+    """path as it is on disk. git writes a path that holds ", \\ or a control character in C-style quotes,
+    even with core.quotePath=false."""
+    if not path.startswith(b'"'):
+        return path
+    return C_ESCAPE.sub(lambda m: bytes([int(m[1], 8) if len(m[1]) == 3 else C_CHARS[m[1][0]]]), path[1:-1])
 
 
 def patch_targets(patch, prefix):
