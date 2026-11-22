@@ -15,8 +15,9 @@
 # the case directories, all IP traffic (the live daemon on 127.0.0.1:31415
 # included), exec of the real launchctl, security, sudo and open, and reads of
 # the real ~/.subrouter, ~/.claude, ~/.codex and keychains. SETUP_TOOLS_SANDBOX=0
-# turns it off. Without sandbox-exec, as on Linux, only the stubs and the fake
-# HOME fence a case.
+# turns it off, and then setup_tools_test.go refuses to run the cases on macOS,
+# as it does without sandbox-exec (PATCHES §76). On Linux only the stubs and the
+# fake HOME fence a case.
 set -uo pipefail
 # The macOS default. A stricter umask would hide a mode a tool forgets to set.
 umask 022
