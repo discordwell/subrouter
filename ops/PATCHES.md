@@ -2410,15 +2410,59 @@ The same session accepted such a replay, even with its signature header removed.
 that can reach the daemon, so it belongs to a later part. Turning it off: nothing runs the handler yet.
 Once `subrouter standby` runs it, stopping that job turns it off.
 
-Tests: `internal/standby/handler_test.go` holds one test per behaviour above, against `httptest` TLS boxes
-that each have their own self-signed certificate and pin, with no network. Run them with
-`./deploy/docker/test.sh ./internal/standby`. Each test was run once with its behaviour's code taken out of
-the working tree, and failed.
+§79.2 The box set (`Set`, `internal/standby/boxset.go`) decides which boxes a request may go to, and in
+which order. It reads only files the daemon already keeps, and it writes nothing to the state folder.
+
+Each box's name, URL and certificate pin come from the daemon's peers file (`SUBROUTER_REMOTE_POOLS_FILE`),
+read by the daemon's own loader (`proxy.LoadRemotePeersFile`), so a file the daemon refuses is refused here
+too. The tokens in that file are the daemon's peer link credentials. The set drops them as the file is read,
+and no request carries one. A box's tailnet address comes from the daemon's `SUBROUTER_PEER_TAILNET`
+(`name=IP,...`), read by the daemon's rules (§68). The peers file has no field for it: a new field would
+make builds already deployed refuse the whole file. The tailnet address is tried first and the URL second,
+both against the box's pin. A value the daemon would ignore (an IP outside Tailscale's ranges, a name that is
+not in the peers file, a box named twice) is ignored here too, and every box dials its URL.
+
+Each box needs a token minted for the stand-in: one `membership` token (§43) in
+`<state folder>/standby-tokens/<box name>`, a regular file that only its owner can read. A file that group
+or others can read is refused, and so is a missing, unreadable or malformed one. The box then shows a fixed
+word in the status (`file_mode`, `file_missing`, `file_unreadable` or `file_malformed`) and is sent nothing.
+The log names the box and the word, never a token. A peers-file entry that cannot make a pinned `https` box
+shows `box_invalid`. The files are read again every 2 s, so a token file written, changed or removed is used
+from then on, with no restart, and a rewritten peers file is picked up the same way. A box whose entry and
+token did not change keeps its connections and its result. A peers file that stops loading keeps the boxes
+of the last file that loaded, and the status names the error.
+
+A session the Mac holds on a box goes to that box, which has its account and its prompt cache. The holds
+are the daemon's `peer-holds.json` for the first peer and `peer-holds-<name>.json` for each other, keyed
+`claude:<session id>`, read as the daemon reads them: an entry that names another peer is dropped, and the
+first file wins. A hold's deadline is not read. While the daemon is down nothing renews a hold, and a
+session the stand-in has kept on its holder must not move when the outage outlasts the hold. Every other
+session goes to the box that a rendezvous hash of its session id ranks first (SHA-256 of the box name and
+the id). So a session lands on the same box every time, after a restart of the stand-in too, and a box that
+goes down moves only its own sessions. A box that refused its token gets no request. A box that could not
+be reached is tried only after every other box, because it may be back.
+
+Every 10 minutes the set tests each box's token with `HEAD /`, the cheapest request a box authenticates.
+The box's proxy answers 204 to a token it takes and 401 to one it refuses, and sends nothing upstream. The
+result per box (`ok`, `refused` or `unreachable`) and its time are in `Set.Status()`, for a status body. A
+box not tested yet shows `untested` and is used. So a token that lapses is found within 10 minutes, not on
+the day the stand-in needs it.
+
+Not done: the stand-in command must take `SUBROUTER_PEER_TAILNET` from the daemon's worker config, and must
+apply the daemon's `remote.key` gate before it builds the set. Both belong to the part that adds
+`subrouter standby`. Turning it off: nothing runs the set yet. Once `subrouter standby` runs it, removing a
+box's token file takes that box out within 2 s.
+
+Tests: `internal/standby/handler_test.go` (§79.1) and `internal/standby/boxset_test.go` (§79.2) hold one
+test per behaviour above, against `httptest` TLS boxes that each have their own self-signed certificate and
+pin, with no network, and temporary state folders. Run them with `./deploy/docker/test.sh ./internal/standby`.
+Each test was run once with its behaviour's code taken out of the working tree, and failed.
 
 - Code: `internal/standby/box.go` (`Box`, `NewBox`, `Boxes`), `internal/standby/handler.go` (`NewHandler`,
-  `routeFor`, `rewriteForBox`, `send`, `retryAfterWriter`)
+  `routeFor`, `rewriteForBox`, `send`, `retryAfterWriter`), `internal/standby/boxset.go` (`Set`, `NewSet`,
+  `Config`, `Run`, `Candidates`, `Status`)
 - Related: §30 (the Claude socket), §43 (named tokens; a stand-in token is a `membership` token), §68
-  (tailnet first, which §79.2 applies)
+  (tailnet first), §31 (the peers file and the peer-holds files)
 
 ## 82. Main holds what one person needs to run their own subrouter
 
