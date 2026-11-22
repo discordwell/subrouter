@@ -304,6 +304,10 @@ if begin remote-key-check-applies-the-gate-rules; then
   printf '0123456789abcdef0123\n' > "$K"; chmod 644 "$K"
   run_remote_key -- --check
   expect_out "$K: present but mode 0644; the gate ignores it (chmod 600 it)"
+  # Any group or other bit closes the gate, not only a read bit.
+  chmod 620 "$K"
+  run_remote_key -- --check
+  expect_out "$K: present but mode 0620; the gate ignores it (chmod 600 it)"
   printf 'short\n' > "$K"; chmod 600 "$K"
   run_remote_key -- --check
   expect_out "$K: present but too short to be a key; the gate ignores it"
@@ -438,6 +442,11 @@ if begin remote-key-hint-names-the-daemon-store; then
   run_remote_key SUBROUTER_STATE_DIR="$H/alt-state"
   expect_rc 0; expect_line "  launchctl kickstart -k gui/\$(id -u)/$TEST_LABEL"
   expect_no_out "not this file"
+  # The daemon's store already holds a good key, so a new one in this shell's
+  # store needs only the restart too.
+  run_remote_key -- --force
+  expect_rc 0; expect_line "  launchctl kickstart -k gui/\$(id -u)/$TEST_LABEL"
+  expect_no_out "not this file"; expect_no_out Traceback
   finish
 fi
 
