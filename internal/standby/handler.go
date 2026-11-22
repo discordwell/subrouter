@@ -48,10 +48,10 @@ const (
 // So it gets a 503, with one exception. A session that starts without a 200
 // on policy_limits withholds WebFetch, DesignSync and RemoteTrigger, and does
 // not ask again for an hour; a box's answer kept them and wrote no identity
-// to a file (PATCHES §79.1). The process that owns the socket answers an
-// unpinned policy_limits with the daemon's own saved answer when it has one
-// under a day old (§79.4, PolicyCopyAnswers), so this handler sees it only
-// when it has none.
+// to a file (PATCHES §79.1). The process that owns the socket answers a GET
+// of policy_limits, pinned or not, with the daemon's own saved answer when it
+// has one under a day old (§79.4, PolicyCopyAnswers), so this handler sees it
+// only when it has none.
 //
 // A request that names an account (claude <account>) was promised that
 // account and no other, so it waits for the daemon.
@@ -88,16 +88,12 @@ func isPolicyLimits(r *http.Request) bool {
 }
 
 // PolicyCopyAnswers reports whether r may be answered with the daemon's
-// saved policy_limits answer (PATCHES §79.4): a GET of policy_limits that
-// names no account. The daemon answers a pinned launch's policy_limits from
-// the pinned account, so the copy, which its identity account answered, is
-// not that launch's answer.
+// saved policy_limits answer (PATCHES §79.4): a GET of policy_limits, whether
+// or not it names an account. A pinned launch gets the copy too: it is this
+// Mac's daemon's own last answer, and without a 200 the session loses three
+// tools for an hour that the daemon's return does not give back.
 func PolicyCopyAnswers(r *http.Request) bool {
-	if r.Method != http.MethodGet || !isPolicyLimits(r) {
-		return false
-	}
-	_, pinned, _ := session.ExtractAccountIDWithPresence(r)
-	return !pinned
+	return r.Method == http.MethodGet && isPolicyLimits(r)
 }
 
 // Handler answers a Claude Code request, as it arrives on the Mac's Claude
