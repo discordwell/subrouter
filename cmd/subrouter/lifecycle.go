@@ -94,7 +94,7 @@ func (c launchdController) stop() error {
 }
 
 func (c launchdController) restart() error {
-	return restartLaunchAgent(c.plist(), c.label, c.runner)
+	return restartLaunchAgent(c.home, c.plist(), c.label, c.runner)
 }
 
 // remove refuses outside the GUI login before it boots anything out or

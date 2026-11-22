@@ -423,6 +423,61 @@ func TestLaunchdStartReportsBootstrapFailureWhenNotLoaded(t *testing.T) {
 	}
 }
 
+// markerAtEachCall records, at every launchctl call, the watchdog stop marker
+// (ops/PATCHES.md §81) as the watchdog job would find it then.
+type markerAtEachCall struct {
+	marker string
+	seen   []string
+	fail   map[string]error
+}
+
+func (r *markerAtEachCall) Run(name string, args ...string) error {
+	body, err := os.ReadFile(r.marker)
+	state := "none"
+	if err == nil {
+		state = string(body)
+	}
+	r.seen = append(r.seen, args[0]+": "+state)
+	return r.fail[args[0]]
+}
+
+// `sr daemon restart` boots the job out and bootstraps it at once. The watchdog
+// must not load it in that gap, or the restart's own bootstrap fails, so the
+// stop is announced before the bootout. It is withdrawn after the bootstrap,
+// and after a failed one too, so a restart that could not load the job leaves
+// it to the watchdog rather than holding the watchdog off.
+func TestRestartLaunchAgentAnnouncesItsBootoutToTheWatchdog(t *testing.T) {
+	for _, bootstrapFails := range []bool{false, true} {
+		home := t.TempDir()
+		runner := &markerAtEachCall{marker: filepath.Join(home, ".subrouter", "watchdog-stop.test.subrouter.restart")}
+		if bootstrapFails {
+			runner.fail = map[string]error{"bootstrap": errors.New("Bootstrap failed: 5: Input/output error")}
+		}
+		before := time.Now().Unix()
+		err := restartLaunchAgent(home, filepath.Join(home, "job.plist"), "test.subrouter.restart", runner)
+		if (err != nil) != bootstrapFails {
+			t.Fatalf("bootstrap fails %v: restart error = %v", bootstrapFails, err)
+		}
+		if len(runner.seen) < 2 {
+			t.Fatalf("bootstrap fails %v: launchctl calls %q, want a bootout and a bootstrap", bootstrapFails, runner.seen)
+		}
+		for _, call := range runner.seen[:2] {
+			verb, body, _ := strings.Cut(call, ": ")
+			fields := strings.Split(strings.TrimSuffix(body, "\n"), "\n")
+			if len(fields) != 3 || fields[0] != "label=test.subrouter.restart" || !strings.HasPrefix(fields[2], "by=") {
+				t.Fatalf("bootstrap fails %v: at the %s the marker was %q, want label=, until= and by= lines", bootstrapFails, verb, body)
+			}
+			until, err := strconv.ParseInt(strings.TrimPrefix(fields[1], "until="), 10, 64)
+			if !strings.HasPrefix(fields[1], "until=") || err != nil || until < before+60 || until > time.Now().Unix()+86400 {
+				t.Fatalf("bootstrap fails %v: at the %s the marker held %q, want an end a minute to a day ahead", bootstrapFails, verb, fields[1])
+			}
+		}
+		if _, err := os.Stat(runner.marker); !os.IsNotExist(err) {
+			t.Fatalf("bootstrap fails %v: the marker is still there after the restart (%v)", bootstrapFails, err)
+		}
+	}
+}
+
 // fakeLaunchd installs a `launchctl` on PATH that keeps a tiny launchd model in
 // a scratch directory: whether the agent is loaded, and which daemon INSTANCE is
 // running (a counter bumped every time a process is started). The controller

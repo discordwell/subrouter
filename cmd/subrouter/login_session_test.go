@@ -297,7 +297,7 @@ func TestLaunchdIsNeverAskedOutsideTheGUILogin(t *testing.T) {
 		{"stop", launchdController.stop},
 		{"restart", launchdController.restart},
 		{"remove", launchdController.remove},
-		{"restartLaunchAgent", func(c launchdController) error { return restartLaunchAgent(c.plist(), c.label, c.runner) }},
+		{"restartLaunchAgent", func(c launchdController) error { return restartLaunchAgent(c.home, c.plist(), c.label, c.runner) }},
 	}
 	for _, answer := range answers {
 		for _, action := range actions {

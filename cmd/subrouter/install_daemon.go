@@ -231,7 +231,7 @@ func installDaemonWithConfig(config daemonConfig, home string, runner commandRun
 		return err
 	}
 	if config.Start {
-		if err := restartLaunchAgent(plistPath, config.Label, runner); err != nil {
+		if err := restartLaunchAgent(home, plistPath, config.Label, runner); err != nil {
 			return err
 		}
 	}
@@ -846,18 +846,47 @@ func sameFile(left, right string) bool {
 // nothing unless this shell is in the GUI login (requireAquaLaunchd, PATCHES
 // §47): the bootout below lands from a background session that the bootstrap
 // is then refused in, and its error used to be thrown away.
-func restartLaunchAgent(plistPath, label string, runner taskRunner) error {
+func restartLaunchAgent(home, plistPath, label string, runner taskRunner) error {
 	if err := requireAquaLaunchd(); err != nil {
 		return err
 	}
 	uid := strconv.Itoa(os.Getuid())
 	domain := "gui/" + uid
 	service := domain + "/" + label
+	// The watchdog job (ops/PATCHES.md §81) loads an unloaded job within about
+	// 5 s; between this bootout and bootstrap it would win the race and fail
+	// the bootstrap. The stop is announced for that gap only: withdrawn however
+	// the bootstrap ends, so a failed restart is still the watchdog's to repair.
+	announceWatchdogStop(home, label, 5*time.Minute)
+	defer withdrawWatchdogStop(home, label)
 	_ = runner.Run("launchctl", "bootout", domain, plistPath)
 	if err := runner.Run("launchctl", "bootstrap", domain, plistPath); err != nil {
 		return err
 	}
 	return runner.Run("launchctl", "kickstart", "-k", service)
+}
+
+// watchdogStopMarker is the stop marker the watchdog job reads for label: the
+// file subrouter-watchdog.sh `hold` writes, always under ~/.subrouter.
+func watchdogStopMarker(home, label string) string {
+	return filepath.Join(home, ".subrouter", "watchdog-stop."+label)
+}
+
+// announceWatchdogStop tells the watchdog job to leave label unloaded for
+// hold. It is best effort: without it the watchdog may load the job early,
+// which is what happened before there was a marker.
+func announceWatchdogStop(home, label string, hold time.Duration) {
+	path := watchdogStopMarker(home, label)
+	if os.MkdirAll(filepath.Dir(path), 0o700) != nil {
+		return
+	}
+	body := fmt.Sprintf("label=%s\nuntil=%d\nby=%s (pid %d)\n",
+		label, time.Now().Add(hold).Unix(), programBase(), os.Getpid())
+	_ = writeFileAtomic(path, []byte(body), 0o644)
+}
+
+func withdrawWatchdogStop(home, label string) {
+	_ = os.Remove(watchdogStopMarker(home, label))
 }
 
 type commandRunner struct{}
