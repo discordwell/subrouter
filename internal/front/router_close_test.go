@@ -224,6 +224,53 @@ func TestRouterReleasesAClientStillSendingToAWorkerThatStoppedReading(t *testing
 		"with the worker's side ended, the worker no longer reading, and the client still sending")
 }
 
+// A stopped worker's kernel still takes the connection and nothing ever reads
+// it or closes it. The client gives up and leaves. Before the limit, that
+// connection stayed routed for good, so the supervisor never saw the stopped
+// worker idle and never ended it.
+func TestRouterReleasesAClientThatLeftAWorkerThatNeverCloses(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	accepted := make(chan struct{})
+	hold := make(chan struct{})
+	t.Cleanup(func() { close(hold) })
+	go func() {
+		connection, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		defer connection.Close()
+		close(accepted)
+		<-hold
+	}()
+	restore := workerCloseGrace
+	workerCloseGrace = 500 * time.Millisecond
+	t.Cleanup(func() { workerCloseGrace = restore })
+
+	router, address := startRouterFor(t, listener.Addr().String())
+	client, err := net.Dial("tcp", address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(client, "GET / HTTP/1.1\r\nHost: worker\r\n\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-accepted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the worker never got the routed connection")
+	}
+	if got := backendConnections(router, "worker"); got != 1 {
+		t.Fatalf("routed connections = %d, want the client's 1", got)
+	}
+	_ = client.Close()
+
+	waitRouterIdle(t, router, workerCloseGrace+3*time.Second, "with the client gone and the worker silent")
+}
+
 func TestRouterBehindProxyProtocolPassesTheWorkersEndToTheClientAtOnce(t *testing.T) {
 	worker, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

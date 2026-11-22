@@ -353,11 +353,20 @@ func (r *Router) release(state *backendState, client net.Conn) {
 // websocket closes it outright).
 const clientCloseGrace = time.Second
 
+// A worker that is stopped or stuck never ends its side. A connection whose
+// client has gone would then stay routed to it for good, its generation would
+// never go idle, and the supervisor would never stop it. A worker that runs
+// ends its side as soon as it reads the client's end, because net/http drops
+// the request and closes. The limit is this long so that a client that has
+// only half-closed can still read a stream.
+var workerCloseGrace = 15 * time.Minute
+
 func proxyBidirectional(client, upstream net.Conn) {
 	toUpstream := make(chan struct{})
 	go func() {
 		_, _ = io.Copy(upstream, client)
 		closeWrite(upstream)
+		_ = upstream.SetReadDeadline(time.Now().Add(workerCloseGrace))
 		close(toUpstream)
 	}()
 	_, _ = io.Copy(client, upstream)
