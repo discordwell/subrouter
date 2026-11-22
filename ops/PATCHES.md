@@ -2367,8 +2367,11 @@ kept for a resend. A request moves to the next box only while no request head ha
 (`httptrace` `WroteHeaders`): a refused dial, a timeout or a certificate that fails its pin moves on. A
 failure after that point, in the body or after the first byte of the answer, is the client's to retry, and
 the client sees an answer cut mid-stream as cut, never as a clean end. The transport speaks HTTP/2 (both
-boxes offer `h2`), so when many sessions move at once they share one connection per box. Dial and TLS take
-at most 2 s each, and an answer's headers at most 150 s. The peer link's 30 s header bound is short because
+boxes offer `h2`), so when many sessions move at once they share one connection per box. A connection that
+has received nothing for 15 s is pinged, and closed when the ping goes unanswered for 5 s. So a connection
+that falls silent (the Mac slept, or a gateway dropped its state) costs the sessions on it about 20 s, not
+the header bound, and each gets `standby_box_failed` to retry. Dial and TLS take at most 2 s each, and an
+answer's headers at most 150 s. The peer link's 30 s header bound is short because
 the peer link can fall back to local accounts. The stand-in cannot, and 150 s stays inside Claude Code's
 180 s first-byte limit. A stream's length is never bounded.
 

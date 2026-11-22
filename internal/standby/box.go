@@ -28,6 +28,10 @@ const (
 	// A box the set stops naming (a new token, a reload) drops its
 	// connections on its own after this.
 	boxIdleConnTimeout = 90 * time.Second
+	// A connection that has received nothing for boxPingAfter is pinged, and
+	// closed when the ping goes unanswered for boxPingTimeout.
+	boxPingAfter   = 15 * time.Second
+	boxPingTimeout = 5 * time.Second
 )
 
 // Box is one box's TLS listener as the stand-in reaches it: its address, the
@@ -72,8 +76,12 @@ func NewBox(name, rawURL, token, fingerprint string) (*Box, error) {
 			ResponseHeaderTimeout: boxResponseHeaderTimeout,
 			IdleConnTimeout:       boxIdleConnTimeout,
 			// Both boxes offer h2: every session the stand-in moves shares one
-			// connection per box instead of opening its own.
+			// connection per box instead of opening its own. So a connection
+			// that falls silent (the Mac slept, a gateway dropped its state)
+			// would hold every one of them until the header bound; the ping
+			// closes it within 20 s instead.
 			ForceAttemptHTTP2: true,
+			HTTP2:             &http.HTTP2Config{SendPingTimeout: boxPingAfter, PingTimeout: boxPingTimeout},
 		},
 	}, nil
 }
