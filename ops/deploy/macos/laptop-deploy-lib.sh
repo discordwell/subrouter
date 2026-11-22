@@ -63,8 +63,33 @@ except Exception:
 PY
 }
 
+# --- the job this script owns (PATCHES §76) --------------------------------------
+# A script changes launchd only for a job it can load again: one launchd loaded
+# from $PLIST, or none. A stopped test run once left a detached deploy-laptop.sh
+# running after its stubs and fake home were deleted; the real launchctl then
+# restarted and unloaded the live job, and the bootstrap of the deleted plist
+# left it unloaded. Every kickstart, bootout and bootstrap below calls this
+# first, and so does take_mutation_lock, so a mismatch found at the start stops
+# a script before it changes a file. A print launchd refuses proves nothing
+# either way; launchd_blocker and bootout_and_wait already refuse on it.
+own_job_or_exit() { # kickstart | "boot out" | bootstrap | change
+    local printed from
+    if printed=$(launchctl print "$LABEL" 2>/dev/null); then
+        from=$(printf '%s\n' "$printed" | sed -n 's/^	path = //p' | head -1)
+        if [ "$from" != "$PLIST" ] && ! [ "$from" -ef "$PLIST" ]; then
+            echo "refusing to $1 $LABEL: launchd loaded it from ${from:-a plist it does not name}, and this script's plist is $PLIST. launchd was not changed." >&2
+            exit 1
+        fi
+        if [ "$1" = "boot out" ] && [ ! -f "$PLIST" ]; then
+            echo "refusing to boot out $LABEL: $PLIST does not exist, so launchd could not load the job again. launchd was not changed." >&2
+            exit 1
+        fi
+    fi
+}
+
 take_mutation_lock() {
     local lock="$PLIST.supervisor-mutation.lock" rc=0
+    own_job_or_exit change
     # shellcheck source=../../../deploy/macos/mutation-lease-lib.sh
     . "$LAPTOP_LIB_DIR/../../../deploy/macos/mutation-lease-lib.sh" \
         || { echo "refusing: cannot load deploy/macos/mutation-lease-lib.sh from this checkout. Nothing was changed." >&2; return 1; }
@@ -267,6 +292,7 @@ bootout_and_wait() { # [exit timeout seconds]
     local exit_timeout="${1:-}" limit=600 waited=0 out rc
     case "$exit_timeout" in ''|*[!0-9]*) ;; *) [ $((exit_timeout + 60)) -gt $limit ] && limit=$((exit_timeout + 60)) ;; esac
     LAUNCHD_ERR=""
+    own_job_or_exit "boot out"
     echo "   booting out $LABEL"
     out=$(launchctl bootout "$LABEL" 2>&1)
     while :; do
@@ -288,9 +314,22 @@ bootout_and_wait() { # [exit timeout seconds]
     echo "   job gone"
 }
 
+kickstart_job() { # the output in KICKSTART_OUT
+    own_job_or_exit kickstart
+    KICKSTART_OUT=$(launchctl kickstart -k "$LABEL" 2>&1)
+}
+
 bootstrap_job() {
     local out rc
     LAUNCHD_ERR=""
+    own_job_or_exit bootstrap
+    # launchd holds no job for $LABEL here, so the caller's recovery and its
+    # DOWN message still run.
+    if [ ! -f "$PLIST" ]; then
+        LAUNCHD_ERR="$PLIST does not exist, so it was not bootstrapped"
+        echo "   $LAUNCHD_ERR"
+        return 1
+    fi
     out=$(launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>&1); rc=$?
     [ "$rc" = 0 ] && return 0
     LAUNCHD_ERR="launchctl bootstrap gui/$(id -u) $PLIST failed: rc $rc${out:+: $out}"

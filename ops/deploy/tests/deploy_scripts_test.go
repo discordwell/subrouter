@@ -3,11 +3,12 @@
 // Package deploytests runs deploy-scripts-test.sh (the shell harness for
 // macos/deploy-laptop.sh, macos/rollback-laptop-peer.sh and bin/sr-triage) as
 // one Go subtest per case, so the harness runs through the same sandboxed
-// `go test` wrapper as the rest of subrouter (ops/bin/sr-local-ci deploy), or
-// on its own:
+// `go test` wrapper as the rest of subrouter (ops/bin/sr-local-ci deploy). On
+// Linux (CI, Docker) it also runs on its own; on macOS only sandboxed (see
+// requireFence):
 //
-//	cd ops && go test -count=1 ./deploy/tests
-//	cd ops && go test -count=1 -run 'TestDeployScripts/laptop-ok$' ./deploy/tests
+//	ops/bin/sr-local-ci --docker deploy
+//	cd ops && DEPLOY_TESTS_SANDBOX=1 go test -count=1 -run 'TestDeployScripts/laptop-ok$' ./deploy/tests
 //
 // ops/ is its own Go module (ops/go.mod), outside the subrouter module on
 // purpose: `go test ./...` at the repo root never picks it up, and nothing
@@ -19,13 +20,20 @@
 package deploytests
 
 import (
+	"bytes"
+	"fmt"
 	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
+	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"testing"
+	"time"
 )
 
 // Every case that pins a guard. Removing one from the harness fails this test,
@@ -74,6 +82,14 @@ var requiredCases = []string{
 	"laptop-restart-survives-a-killed-foreground",
 	"laptop-failed-install-leaves-no-stage-file",
 	"laptop-failed-bootstrap-rolls-back-at-once",
+	// The laptop scripts change launchd only for a job they can load again
+	// (PATCHES §76).
+	"laptop-refuses-a-job-loaded-from-another-plist",
+	"laptop-stops-before-kickstarting-a-job-from-another-plist",
+	"laptop-reload-refused-without-its-plist",
+	"laptop-plist-gone-after-the-bootout-is-not-bootstrapped",
+	"peer-rollback-refuses-a-job-loaded-from-another-plist",
+	"act-refuses-a-job-loaded-from-another-plist",
 	// deploy-laptop.sh step 7: old backups go only after the routes verify,
 	// this run's never; pre-isolation leftovers are named once a record is
 	// migrated; the checkout srq runs from is compared with the
@@ -247,7 +263,104 @@ var requiredCases = []string{
 
 var caseLine = regexp.MustCompile(`(?m)^if begin ([A-Za-z0-9_-]+); then$`)
 
+// On a Mac the real launchctl is one PATH entry behind the harness's stubs. A
+// stopped plain `go test ./...` here once left a detached deploy-laptop.sh
+// running after its stubs were deleted, and it unloaded the developer's live
+// service (PATCHES §76). The test label now keeps such a run off the live job,
+// and on macOS the cases still run only under a sandbox that refuses exec of
+// launchctl: the harness's own (DEPLOY_TESTS_SANDBOX=1), or sr-local-ci's,
+// which says so with SR_LOCAL_CI_SANDBOX=1 (a sandbox-exec inside it would be
+// refused). Linux has no launchctl, so CI and Docker runs are unchanged.
+func requireFence(t *testing.T) {
+	t.Helper()
+	if why := fenceRefusal(runtime.GOOS, os.Getenv); why != "" {
+		t.Fatal(why)
+	}
+}
+
+// The ways to run the cases that the refusal names, and the docs too.
+var safeDeployTestCommands = []struct{ command, where string }{
+	{"ops/bin/sr-local-ci --docker deploy", "Linux, in Docker"},
+	{"ops/bin/sr-local-ci deploy", "this Mac, sandboxed"},
+	{"cd ops && DEPLOY_TESTS_SANDBOX=1 go test -count=1 ./deploy/tests", "this Mac, each script sandboxed"},
+}
+
+func fenceRefusal(goos string, getenv func(string) string) string {
+	if goos != "darwin" || getenv("DEPLOY_TESTS_SANDBOX") == "1" || getenv("SR_LOCAL_CI_SANDBOX") == "1" {
+		return ""
+	}
+	why := `refusing to run the deploy script cases on macOS outside a sandbox: they drive scripts that call launchctl, and a stopped plain "go test" once unloaded the live subrouter service (ops/PATCHES.md §76). Run them with one of:`
+	for _, c := range safeDeployTestCommands {
+		why += fmt.Sprintf("\n\t%-66s (%s)", c.command, c.where)
+	}
+	return why
+}
+
+func TestDeployCasesRefuseAMacOutsideASandbox(t *testing.T) {
+	only := func(name string) func(string) string {
+		return func(key string) string {
+			if key == name {
+				return "1"
+			}
+			return ""
+		}
+	}
+	why := fenceRefusal("darwin", only(""))
+	if why == "" {
+		t.Fatal("a plain go test on macOS would run the deploy cases")
+	}
+	for _, c := range safeDeployTestCommands {
+		if !strings.Contains(why, c.command) {
+			t.Errorf("the refusal does not name %q:\n%s", c.command, why)
+		}
+	}
+	for _, name := range []string{"DEPLOY_TESTS_SANDBOX", "SR_LOCAL_CI_SANDBOX"} {
+		if why := fenceRefusal("darwin", only(name)); why != "" {
+			t.Errorf("%s=1 is a sandboxed run, and it was refused: %s", name, why)
+		}
+	}
+	if why := fenceRefusal("linux", only("")); why != "" {
+		t.Errorf("a Linux run was refused: %s", why)
+	}
+}
+
+// AGENTS.md told agents to run go test before handing off, and the Test
+// section of ops/README.md listed plain go test for these cases (PATCHES §76).
+var plainOpsGoTest = regexp.MustCompile(`cd ops && go test|go test[^\n]*\./deploy/tests`)
+
+func TestDocsNameTheSafeDeployTestCommands(t *testing.T) {
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := filepath.Join(wd, "..", "..", "..")
+	read := func(rel string) string {
+		src, err := os.ReadFile(filepath.Join(root, rel))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(src)
+	}
+	readme, agents := read("ops/README.md"), read("AGENTS.md")
+	for _, c := range safeDeployTestCommands {
+		if !strings.Contains(readme, c.command) {
+			t.Errorf("ops/README.md does not name %q", c.command)
+		}
+	}
+	if docker := safeDeployTestCommands[0].command; !strings.Contains(agents, docker) {
+		t.Errorf("AGENTS.md does not name %q", docker)
+	}
+	for name, doc := range map[string]string{"ops/README.md": readme, "AGENTS.md": agents} {
+		for i, line := range strings.Split(doc, "\n") {
+			if plainOpsGoTest.MatchString(line) && !strings.Contains(line, "DEPLOY_TESTS_SANDBOX=1") {
+				t.Errorf("%s:%d runs the deploy cases with go test outside a sandbox: %s", name, i+1, line)
+			}
+		}
+	}
+}
+
 func TestDeployScripts(t *testing.T) {
+	requireFence(t)
 	for _, tool := range []string{"bash", "python3", "shasum"} {
 		if _, err := exec.LookPath(tool); err != nil {
 			t.Fatalf("%s is required to run the deploy script harness: %v", tool, err)
@@ -310,6 +423,147 @@ func TestDeployScripts(t *testing.T) {
 	}
 }
 
+// A detached run ignores HUP, INT and TERM and outlives the harness that
+// started it. One outlived its test dir, lost its stubs and drove the real
+// launchctl (PATCHES §76). So the harness, stopped as a background task is
+// stopped (a signal to its process group), kills its detached runs before it
+// removes the dir. DEPLOY_TESTS_HOLD=1 parks laptop-ok's detached run in its
+// kickstart, which writes its process group to <test dir>/hold.held.
+func TestStoppedHarnessKillsItsDetachedRuns(t *testing.T) {
+	requireFence(t)
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	harness := filepath.Join(wd, "deploy-scripts-test.sh")
+	for _, sig := range []syscall.Signal{syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP} {
+		t.Run(sig.String(), func(t *testing.T) {
+			t.Parallel()
+			dir := t.TempDir()
+			var out syncBuffer
+			cmd := exec.Command("bash", harness, "=laptop-ok")
+			cmd.Dir = wd
+			cmd.Env = append(os.Environ(), "DEPLOY_TESTS_JOBS=1", "KEEP=", "TMPDIR="+dir, "DEPLOY_TESTS_HOLD=1")
+			cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+			cmd.Stdout, cmd.Stderr = &out, &out
+			cmd.WaitDelay = 10 * time.Second
+			if err := cmd.Start(); err != nil {
+				t.Fatal(err)
+			}
+			done := make(chan error, 1)
+			go func() { done <- cmd.Wait() }()
+
+			pgid := 0
+			for deadline := time.Now().Add(5 * time.Minute); pgid == 0; time.Sleep(50 * time.Millisecond) {
+				held, _ := filepath.Glob(filepath.Join(dir, "deploy-tests.*", "hold.held"))
+				if len(held) == 1 {
+					if b, err := os.ReadFile(held[0]); err == nil {
+						pgid, _ = strconv.Atoi(strings.TrimSpace(string(b)))
+					}
+				}
+				select {
+				case err := <-done:
+					t.Fatalf("the harness ended (%v) before its detached run reached the kickstart:\n%s", err, out.String())
+				default:
+				}
+				if pgid == 0 && time.Now().After(deadline) {
+					_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+					t.Fatalf("the detached run never reached the kickstart:\n%s", out.String())
+				}
+			}
+			if pgid <= 1 {
+				t.Fatalf("hold.held names process group %d", pgid)
+			}
+			t.Cleanup(func() { _ = syscall.Kill(-pgid, syscall.SIGKILL) })
+
+			if err := syscall.Kill(-cmd.Process.Pid, sig); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case <-done:
+			case <-time.After(2 * time.Minute):
+				_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+				<-done
+				t.Fatalf("the harness had not ended 2 minutes after %v:\n%s", sig, out.String())
+			}
+			// A killed process is gone once init reaps it.
+			for deadline := time.Now().Add(10 * time.Second); syscall.Kill(-pgid, 0) == nil; time.Sleep(50 * time.Millisecond) {
+				if time.Now().After(deadline) {
+					t.Fatalf("the detached run (process group %d) outlived the harness stopped with %v:\n%s", pgid, sig, out.String())
+				}
+			}
+			if left, _ := filepath.Glob(filepath.Join(dir, "deploy-tests.*")); len(left) > 0 {
+				t.Fatalf("the harness stopped with %v left %v", sig, left)
+			}
+		})
+	}
+}
+
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// Every launchctl call that changes a job is in laptop-deploy-lib.sh's
+// kickstart_job, bootout_and_wait or bootstrap_job, which first check that the
+// job is the script's own (PATCHES §76). A call anywhere else skips that check.
+var (
+	launchdChange = regexp.MustCompile(`(^|[;&|({]|\$\(|\bthen|\bdo|\belse)\s*launchctl\s+(kickstart|bootout|bootstrap)\b`)
+	shellFunc     = regexp.MustCompile(`^([A-Za-z_][A-Za-z0-9_]*)\(\) *\{`)
+	guardedCalls  = map[string]bool{"kickstart_job": true, "bootout_and_wait": true, "bootstrap_job": true}
+)
+
+func TestLaptopScriptsChangeLaunchdOnlyThroughTheGuard(t *testing.T) {
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	scripts, err := filepath.Glob(filepath.Join(wd, "..", "macos", "*.sh"))
+	if err != nil || len(scripts) == 0 {
+		t.Fatalf("found no laptop scripts beside the harness: %v", err)
+	}
+	guarded := 0
+	for _, path := range scripts {
+		src, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fn := ""
+		for i, line := range strings.Split(string(src), "\n") {
+			if m := shellFunc.FindStringSubmatch(line); m != nil {
+				fn = m[1]
+			} else if strings.HasPrefix(line, "}") {
+				fn = ""
+			}
+			if strings.HasPrefix(strings.TrimSpace(line), "#") || !launchdChange.MatchString(line) {
+				continue
+			}
+			if filepath.Base(path) == "laptop-deploy-lib.sh" && guardedCalls[fn] {
+				guarded++
+				continue
+			}
+			t.Errorf("%s:%d changes a launchd job outside kickstart_job, bootout_and_wait and bootstrap_job, so it skips their check that the job is this script's own: %s",
+				filepath.Base(path), i+1, strings.TrimSpace(line))
+		}
+	}
+	// A pattern that matches nothing would pass every script.
+	if guarded != len(guardedCalls) {
+		t.Fatalf("found %d launchctl calls in the guarded functions, want %d; the pattern no longer matches laptop-deploy-lib.sh", guarded, len(guardedCalls))
+	}
+}
+
 // PATCHES.md is the ledger that commits, code comments and the other docs cite
 // by section number, so a number must lead to one section. A docs commit once
 // appended §47 twice, the first copy running into a second copy of the end of
@@ -351,6 +605,56 @@ func TestPatchesLedgerHeadsEachSectionOnce(t *testing.T) {
 	// ### headings are optional.
 	if !levels["##"] {
 		t.Fatalf("found no numbered ## heading in %s; the pattern no longer matches the ledger", ledger)
+	}
+}
+
+// A section the ops tools cite in a message or comment must be in the ledger.
+var (
+	citedSection  = regexp.MustCompile(`PATCHES(?:\.md)? §([0-9]+)`)
+	ledgerSection = regexp.MustCompile(`(?m)^## ([0-9]+)\. `)
+)
+
+func TestOpsToolsCiteOnlySectionsThatExist(t *testing.T) {
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ops := filepath.Join(wd, "..", "..")
+	ledger, err := os.ReadFile(filepath.Join(ops, "PATCHES.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	heads := map[string]bool{}
+	for _, m := range ledgerSection.FindAllStringSubmatch(string(ledger), -1) {
+		heads[m[1]] = true
+	}
+	cited := 0
+	for _, dir := range []string{"bin", "deploy"} {
+		err := filepath.WalkDir(filepath.Join(ops, dir), func(path string, d fs.DirEntry, err error) error {
+			if err != nil || d.IsDir() {
+				return err
+			}
+			src, err := os.ReadFile(path)
+			if err != nil {
+				return err
+			}
+			for i, line := range strings.Split(string(src), "\n") {
+				for _, m := range citedSection.FindAllStringSubmatch(line, -1) {
+					cited++
+					if !heads[m[1]] {
+						rel, _ := filepath.Rel(ops, path)
+						t.Errorf("%s:%d cites PATCHES §%s, which ops/PATCHES.md has no section for", rel, i+1, m[1])
+					}
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if cited == 0 {
+		t.Fatal("found no cited section in ops/bin or ops/deploy; the pattern no longer matches")
 	}
 }
 

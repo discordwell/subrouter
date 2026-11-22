@@ -4,7 +4,7 @@ Go service for routing AI coding-agent traffic across subscription accounts and 
 
 ## Development
 
-- Use `go test ./...` before handing off changes.
+- Before handing off changes, run the tests in Docker: `make docker-test` for the Go suite, and `ops/bin/sr-local-ci --docker deploy` for the deploy-script tests in `ops/`. Never run `go test` in `ops/` on a Mac outside a sandbox: those tests drive the laptop's launchd scripts, and a stopped plain run once unloaded the developer's live service (`ops/PATCHES.md` §76). On a Mac, `ops/bin/sr-local-ci` runs them sandboxed, and their Go test refuses to run there without a sandbox.
 - Keep credential handling read-only unless a command explicitly delegates to the upstream account manager, such as `cx`.
 - Do not log access tokens, refresh tokens, API keys, request bodies, or complete Authorization headers.
 - Claude web `sessionKey` cookies (read from local browsers to show the prepaid extra-usage balance in `sr status`) follow the same rule: read-only, never logged, persisted only at `claude-web-sessions.json` under `storepath.CodexDir()` with mode 0600, and used only by the local CLI — never sent to the server or worker. Reading Chromium cookies may trigger a one-time macOS Keychain prompt for the browser's "Safe Storage" entry.
