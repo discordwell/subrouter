@@ -61,6 +61,8 @@ type Router struct {
 	sessionKey  func(*http.Request) string
 	peekTimeout time.Duration
 	intn        func(int) int
+	// workerGrace is workerCloseGrace. A test shortens it on its own router.
+	workerGrace time.Duration
 }
 
 func NewRouter(initial Backend) (*Router, error) {
@@ -78,6 +80,7 @@ func NewRouter(initial Backend) (*Router, error) {
 		dial: func(network, address string) (net.Conn, error) {
 			return net.DialTimeout(network, address, 10*time.Second)
 		},
+		workerGrace: workerCloseGrace,
 	}
 	router.changed = sync.NewCond(&router.mu)
 	return router, nil
@@ -320,7 +323,7 @@ func (r *Router) serveConnection(client net.Conn, state *backendState, prefix []
 			return
 		}
 	}
-	proxyBidirectional(client, upstream)
+	proxyBidirectional(client, upstream, r.workerGrace)
 }
 
 // acquireActive pins client to the active backend. While a canary runs it
@@ -359,14 +362,14 @@ const clientCloseGrace = time.Second
 // ends its side as soon as it reads the client's end, because net/http drops
 // the request and closes. The limit is this long so that a client that has
 // only half-closed can still read a stream.
-var workerCloseGrace = 15 * time.Minute
+const workerCloseGrace = 15 * time.Minute
 
-func proxyBidirectional(client, upstream net.Conn) {
+func proxyBidirectional(client, upstream net.Conn, workerGrace time.Duration) {
 	toUpstream := make(chan struct{})
 	go func() {
 		_, _ = io.Copy(upstream, client)
 		closeWrite(upstream)
-		_ = upstream.SetReadDeadline(time.Now().Add(workerCloseGrace))
+		_ = upstream.SetReadDeadline(time.Now().Add(workerGrace))
 		close(toUpstream)
 	}()
 	_, _ = io.Copy(client, upstream)
