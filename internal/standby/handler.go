@@ -55,7 +55,7 @@ const (
 func routeFor(r *http.Request) route {
 	clean := path.Clean("/" + r.URL.Path)
 	switch {
-	case clean == "/_subrouter/health":
+	case IsHealth(r):
 		return routeHealth
 	case clean == "/_subrouter" || strings.HasPrefix(clean, "/_subrouter/"):
 		return routeDaemonSurface
@@ -68,6 +68,14 @@ func routeFor(r *http.Request) route {
 		return routePinned
 	}
 	return routeBox
+}
+
+// IsHealth reports whether r asks for /_subrouter/health, the one route the
+// stand-in answers itself. The path is cleaned as routeFor cleans it. The
+// process that owns the socket (PATCHES §79.3) answers it with its state, at
+// once, while every other request waits out its hold.
+func IsHealth(r *http.Request) bool {
+	return path.Clean("/"+r.URL.Path) == "/_subrouter/health"
 }
 
 // Handler answers a Claude Code request, as it arrives on the Mac's Claude
