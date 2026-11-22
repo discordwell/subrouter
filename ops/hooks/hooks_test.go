@@ -398,9 +398,10 @@ func TestStagedDiffAfterADeletion(t *testing.T) {
 	refused(t, out, err, "notes.md:4", "<private>-new.md: in the path", "<private>-new.md:2")
 }
 
-// A user's git settings that put context lines in a patch, or that mark a text
-// file as binary, change nothing: each hook finds the same lines, with their
-// numbers, in a hunk with context lines and in the file after it.
+// A user's git diff settings change nothing: each hook finds the same lines,
+// with their numbers, and the same new path. The change has a hunk with
+// context lines, a file after it, a move into a path that holds a value, and a
+// submodule's new commit, whose lines are the submodule's and not this repo's.
 func TestUserDiffSettings(t *testing.T) {
 	cases := []struct {
 		name       string
@@ -412,6 +413,16 @@ func TestUserDiffSettings(t *testing.T) {
 		{name: "diff.suppressBlankEmpty", config: []string{"diff.interHunkContext", "3", "diff.suppressBlankEmpty", "true"}},
 		{name: "GIT_DIFF_OPTS", env: "GIT_DIFF_OPTS=--unified=3"},
 		{name: "binary attribute", attributes: "b.md binary\n"},
+		// On by default: a move shows as a rename, which has no "new file mode" line.
+		{name: "diff.renames", config: []string{"diff.renames", "true"}},
+		{name: "color.diff", config: []string{"color.diff", "always"}},
+		// An external diff or a textconv driver that prints nothing hides each line.
+		{name: "diff.external", config: []string{"diff.external", "/usr/bin/true"}},
+		{name: "GIT_EXTERNAL_DIFF", env: "GIT_EXTERNAL_DIFF=/usr/bin/true"},
+		{name: "textconv", config: []string{"diff.hide.textconv", "/usr/bin/true"}, attributes: "*.md diff=hide\n"},
+		{name: "diff.noprefix", config: []string{"diff.noprefix", "true"}},
+		{name: "diff.mnemonicPrefix", config: []string{"diff.mnemonicPrefix", "true"}},
+		{name: "diff.submodule", config: []string{"diff.submodule", "diff"}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -419,6 +430,13 @@ func TestUserDiffSettings(t *testing.T) {
 			s := newSandbox(t, fixture{privateValues: "Fernwood Analytics\n"})
 			s.commit("a.md", "1\n\n3\n\n5\n\n7\n", "a")
 			s.commit("b.md", "x\n", "b")
+			s.commit("c.md", "c\n", "c")
+			s.mustGit("init", "-q", "sub")
+			write(t, filepath.Join(s.repo, "sub", "s.md"), "plain\n")
+			s.mustGit("-C", "sub", "add", "s.md")
+			s.mustGit("-C", "sub", "commit", "-q", "-m", "s")
+			s.mustGit("add", "sub")
+			s.mustGit("commit", "-q", "-m", "sub")
 			s.mustGit("push", "-q", "origin", "main")
 			for i := 0; i < len(c.config); i += 2 {
 				s.mustGit("config", c.config[i], c.config[i+1])
@@ -432,12 +450,15 @@ func TestUserDiffSettings(t *testing.T) {
 			// Two changes with three lines between them, two of them blank, make one hunk.
 			write(t, filepath.Join(s.repo, "a.md"), "ONE\n\n3\n\nFernwood Analytics\n\n7\n")
 			write(t, filepath.Join(s.repo, "b.md"), "y\nFernwood Analytics\n")
-			s.mustGit("add", "a.md", "b.md")
+			s.mustGit("mv", "c.md", "Fernwood Analytics.md")
+			write(t, filepath.Join(s.repo, "sub", "s.md"), "plain\nFernwood Analytics\n")
+			s.mustGit("-C", "sub", "commit", "-q", "-a", "-m", "s")
+			s.mustGit("add", "a.md", "b.md", "sub")
 			out, err := s.git("commit", "-q", "-m", "notes")
-			refusedExactly(t, out, err, "a.md:5", "b.md:2")
+			refusedExactly(t, out, err, "<private>.md: in the path", "a.md:5", "b.md:2")
 			s.mustGit("commit", "-q", "--no-verify", "-m", "notes")
 			out, err = s.git("push", "-q", "origin", "main")
-			refusedExactly(t, out, err, s.head()+" a.md:5", s.head()+" b.md:2")
+			refusedExactly(t, out, err, s.head()+" <private>.md: in the path", s.head()+" a.md:5", s.head()+" b.md:2")
 		})
 	}
 }
@@ -899,9 +920,11 @@ func TestMerge(t *testing.T) {
 }
 
 // A merge's added lines keep their numbers where the merge drops lines on both
-// sides of a line that both parents hold.
+// sides of a line that both parents hold, even under a user's diff.context of
+// 0, which gives the -U0 diff that numbers them wrong.
 func TestMergeLineNumbers(t *testing.T) {
 	s := newSandbox(t, fixture{privateValues: "Fernwood Analytics\n", base: "x\nkeep\ny\n"})
+	s.mustGit("config", "diff.context", "0")
 	s.mustGit("checkout", "-q", "-b", "topic")
 	s.commit("notes.md", "t1\nkeep\nt2\n", "topic")
 	s.mustGit("checkout", "-q", "main")
