@@ -1530,6 +1530,7 @@ func serve(args []string) error {
 		// session store and the box identity. No file means none.
 		AccessTokens: serveAccessTokens(filepath.Dir(*sessionPath), slog.Default()),
 	}
+	logClientRetryAfterMax(server.ClientRetryAfterMax, slog.Default())
 	if err := server.ValidateCredentialUpstreams(); err != nil {
 		return err
 	}

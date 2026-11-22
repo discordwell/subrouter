@@ -2332,9 +2332,12 @@ laptop's client gets 60. The hold's give-up and a waiting chat's give-up at once
 the cap and 3600 with it off. With `clientRetryAfter` reverted to send the whole wait,
 every capped case fails (`Retry-After = "2820", want "60"`) and the cap-off, short-wait and
 peer cases pass. With the peer check removed, the peer cases fail. In `cmd/subrouter`,
-`TestResolveClientRetryAfterMax` covers the variable.
+`TestResolveClientRetryAfterMax` covers the variable. `TestServeRunsWithTheRetryAfterCap`
+runs serve itself, which logs its start line from the field of the Server it built. With
+the cap's line taken out of serve's Server literal, the default and 90 s cases fail
+(`lacks "Retry-After cap is on"`) because the daemon would run with the cap off.
 
 - Code: `internal/proxy/client_retry_after.go` (`clientRetryAfter`),
   `internal/proxy/pool_exhausted.go`, `internal/proxy/hold.go`, `internal/proxy/refugee.go`,
-  `cmd/subrouter/hold_config.go` (`resolveClientRetryAfterMax`).
+  `cmd/subrouter/hold_config.go` (`resolveClientRetryAfterMax`, `logClientRetryAfterMax`).
 - Related: §58 (the hold), §67.5 (the give-up).

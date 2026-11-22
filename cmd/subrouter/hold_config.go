@@ -130,8 +130,7 @@ func (h holdSettings) policy(logger *slog.Logger) *proxy.HoldPolicy {
 // resolveClientRetryAfterMax is serve's Server.ClientRetryAfterMax (PATCHES
 // §78): SUBROUTER_CLIENT_RETRY_AFTER_MAX as a Go duration, or
 // DefaultClientRetryAfterMax; 0 turns the cap off. An unreadable value is
-// reported and the default kept, as for the hold's variables. The start line
-// says what an end client is told.
+// reported and the default kept, as for the hold's variables.
 func resolveClientRetryAfterMax(getenv func(string) string, logger *slog.Logger) time.Duration {
 	limit := proxy.DefaultClientRetryAfterMax
 	if raw := strings.TrimSpace(getenv(clientRetryAfterMaxEnv)); raw != "" {
@@ -146,14 +145,18 @@ func resolveClientRetryAfterMax(getenv func(string) string, logger *slog.Logger)
 			limit = parsed
 		}
 	}
-	if logger != nil {
-		if limit <= 0 {
-			logger.Info("Retry-After cap is off: an end client is told the whole wait of a spent pool's 503 and of the stranded give-up",
-				"env", clientRetryAfterMaxEnv)
-		} else {
-			logger.Info("Retry-After cap is on: an end client is told to wait at most this long in a spent pool's 503 and in the stranded give-up; the body keeps the real wait, and a peer daemon gets the whole wait",
-				"retry_after_max", limit.String(), "env", clientRetryAfterMaxEnv)
-		}
-	}
 	return limit
+}
+
+// logClientRetryAfterMax is serve's start line for the cap. serve passes the
+// field of the Server it built, so the line reports the cap the daemon runs
+// with, not the one it read.
+func logClientRetryAfterMax(limit time.Duration, logger *slog.Logger) {
+	if limit <= 0 {
+		logger.Info("Retry-After cap is off: an end client is told the whole wait of a spent pool's 503 and of the stranded give-up",
+			"env", clientRetryAfterMaxEnv)
+		return
+	}
+	logger.Info("Retry-After cap is on: an end client is told to wait at most this long in a spent pool's 503 and in the stranded give-up; the body keeps the real wait, and a peer daemon gets the whole wait",
+		"retry_after_max", limit.String(), "env", clientRetryAfterMaxEnv)
 }
