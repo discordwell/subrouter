@@ -73,6 +73,10 @@ var requiredSetupToolCases = []string{
 	"quickstart-peer-restart-waits-for-launchd",
 	"quickstart-peer-rerun-leaves-a-peered-daemon-alone",
 	"quickstart-peer-restart-needs-the-gui-session",
+	// --peer restarts only a job launchd loaded from the script's plist
+	// (PATCHES §76.1).
+	"quickstart-peer-refuses-a-job-from-another-plist",
+	"quickstart-peer-refuses-a-job-with-no-plist",
 	"quickstart-peer-failed-bootstrap-says-the-daemon-is-down",
 	"quickstart-peer-step-takes-the-mutation-lock",
 	"quickstart-peer-restart-waits-for-a-slow-worker",

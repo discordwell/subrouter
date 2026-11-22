@@ -1035,8 +1035,10 @@ exit 0'
   run_qs FAKE_QS_CALL=configure_peer FAKE_HELD=640 FAKE_GONE_RC=113 FAKE_DAEMON_FILE="$C/daemon-up"
   expect_rc 0; expect_out "restarted and healthy"
   # Any other answer is not "gone": it stops, and names the bootstrap to run by hand.
+  # The session check, the job's plist and the loaded env print first, so the
+  # wait's first print still finds the job held.
   rm -f "$C/daemon-up"; : > "$C/log"
-  run_qs FAKE_QS_CALL=configure_peer FAKE_HELD=3 FAKE_GONE_RC=5 FAKE_DAEMON_FILE="$C/daemon-up"
+  run_qs FAKE_QS_CALL=configure_peer FAKE_HELD=4 FAKE_GONE_RC=5 FAKE_DAEMON_FILE="$C/daemon-up"
   expect_rc 1; expect_no_log "^launchctl bootstrap"
   expect_out "launchctl bootstrap gui/$(id -u) $H/Library/LaunchAgents/$TEST_LABEL.plist"
   finish
@@ -1152,6 +1154,45 @@ if begin quickstart-peer-restart-needs-the-gui-session; then
   # Only 0 and 113 from print are answers.
   run_qs FAKE_QS_CALL=configure_peer FAKE_MANAGER=Aqua FAKE_PRINT_RC=141
   expect_rc 1; expect_out "answered rc 141"; expect_no_log "bootout"
+  cmp -s "$P" "$C/plist-before" && ok || bad "the plist was written"
+  finish
+fi
+
+if begin quickstart-peer-refuses-a-job-from-another-plist; then
+  # The peer step boots the job out and bootstraps its plist. For a job launchd
+  # loaded from another plist, as for a run whose home or SUBROUTER_PLIST is
+  # not the job's, that restarts the job and loads a different one in its
+  # place (PATCHES §76.1). So --peer stops in phase 1, before the build, and
+  # the peer step again, and neither changes launchd or the plist.
+  qs_setup; seed_remote_key "$H/.subrouter"; stub_launchd
+  write_plist "{\"EnvironmentVariables\": {\"HOME\": \"$H\"}}"
+  P="$H/Library/LaunchAgents/$TEST_LABEL.plist"; cp "$P" "$C/plist-before"
+  mkdir -p "$C/other"; cp "$P" "$C/other/$TEST_LABEL.plist"; load_job "$C/other/$TEST_LABEL.plist"
+  refused="refusing to restart gui/$(id -u)/$TEST_LABEL: launchd loaded it from $C/other/$TEST_LABEL.plist, and this script's plist is $P. launchd was not changed."
+  run_qs FAKE_LAUNCHD="$C/launchd.json" FAKE_DAEMON_UP=1 FAKE_QS_STUB=build -- --peer "$PEER_URL" --peer-fingerprint ab12 --peer-token-file "$C/peer-token"
+  expect_rc 1; expect_out "$refused"; expect_no_out "(stubbed build)"
+  run_qs FAKE_QS_CALL=configure_peer FAKE_LAUNCHD="$C/launchd.json" FAKE_DAEMON_UP=1
+  expect_rc 1; expect_out "$refused"
+  expect_no_log "^launchctl boot"
+  cmp -s "$P" "$C/plist-before" && ok || bad "the plist was written"
+  # Calibration: launchd names this script's plist through a link, which is
+  # the same file, so the step goes on.
+  ln -s "$P" "$C/link.plist"; load_job "$C/link.plist"
+  run_qs FAKE_QS_CALL=configure_peer FAKE_LAUNCHD="$C/launchd.json" FAKE_DAEMON_UP=1
+  expect_rc 0; expect_out "restarted and healthy"; expect_log "^launchctl bootstrap gui/[0-9]+ $P$"
+  finish
+fi
+
+if begin quickstart-peer-refuses-a-job-with-no-plist; then
+  # A loaded job whose print names no plist is not shown to be this script's.
+  qs_setup; seed_remote_key "$H/.subrouter"; stub_launchd
+  write_plist "{\"EnvironmentVariables\": {\"HOME\": \"$H\"}}"
+  P="$H/Library/LaunchAgents/$TEST_LABEL.plist"; cp "$P" "$C/plist-before"
+  load_job ""
+  run_qs FAKE_QS_CALL=configure_peer FAKE_LAUNCHD="$C/launchd.json" FAKE_DAEMON_UP=1
+  expect_rc 1
+  expect_out "refusing to restart gui/$(id -u)/$TEST_LABEL: launchd loaded it from a plist it does not name, and this script's plist is $P. launchd was not changed."
+  expect_no_log "^launchctl boot"
   cmp -s "$P" "$C/plist-before" && ok || bad "the plist was written"
   finish
 fi
