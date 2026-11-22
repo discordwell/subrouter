@@ -2281,7 +2281,7 @@ On 2026-11-21 a stopped test run unloaded the developer's live service, and noth
 - Tests: `ops/deploy/tests/deploy-scripts-test.sh` (`run_sandboxed`, `finish`, `cleanup`, and the six cases listed under §76 in `requiredCases`), `ops/deploy/tests/deploy_scripts_test.go`
 - Docs: `AGENTS.md`, `ops/README.md`
 
-## 77. The supervisor keeps its Claude socket
+## 77. The supervisor keeps its Claude socket, and replaces a worker that stops answering
 
 On 2026-11-21 the laptop's daemon was gone for more than two hours, and every Claude Code session on
 the Mac failed with it while the boxes were healthy. A session in socket mode has one endpoint, the
@@ -2360,6 +2360,76 @@ A socket that opens at start and whose path nobody touches behaves as before. Th
 - Related: builds on §30 (the socket and its lock) and §69 (the supervisor owns the socket). The
   activation still requires `serving`. The deploy's probe asks through the socket and prints the
   word only when nothing answers there.
+
+§77.2 The supervisor replaced a worker that exited (`monitorWorker`) and did nothing about a worker
+that stayed alive and stopped answering. A Claude Code session on such a worker used to fail after
+about 13 minutes. With the client's longer wait it sends the turn again every 10 minutes with no end
+(measured on 2026-11-21 with Claude Code 2.1.330), so a silent worker has to be replaced.
+
+The supervisor now probes its active worker. Every 15 s it sends `GET /_subrouter/ready` to the
+worker's private socket and waits up to 10 s. Any HTTP answer counts, a 503 included, because an
+initial worker may report unready for as long as it runs and still serve every request. No answer
+means a timeout or a failed connection, so a worker whose private socket was deleted is replaced
+too. After 3 probes in a row with no answer, the supervisor starts a new generation from
+`--worker-bin` the way `POST /_subrouter/upgrade` does, and retires the silent worker the way a
+deploy does. New connections go to the new worker. What the silent worker still sends is left to
+finish, and the supervisor stops that worker once it holds no connection. By these numbers a worker
+is replaced 30 to 75 s after it stops answering, plus the time the new worker takes to report
+ready.
+
+A request that already waits on the silent worker is not moved. Its client gives up by its own
+timer and sends the request again on a new connection, which reaches the new worker. Claude Code
+2.1.330 does that 183 s after it sent a request that got no response headers.
+
+The misses belong to one worker. An answer sets the count to 0, and so does a switch to another
+worker. The supervisor skips a round in three cases:
+
+- An upgrade, a rollout step or a recovery holds the upgrade lock.
+- A canary runs.
+- The supervisor is shutting down.
+
+A probe tick that arrives more than 10 s late also sets the count to 0. A Mac that sleeps stops
+every process, so the tick after it wakes says nothing about the worker, and neither do the misses
+from before. The supervisor reads the lateness from the wall clock, because Go's monotonic clock
+stops while a Mac sleeps (the runtime reads `mach_absolute_time`).
+
+When the replacement cannot be made, the silent worker stays. That happens under an inhibit marker,
+and when the new worker never reports ready. The supervisor does not exit, because the silent
+worker may still be sending streams and an exit drops every connection. It tries again after the
+next missed probe and reports the reason.
+
+Supervisor-status gains `worker_probe`.
+
+- `enabled`, `interval_seconds`, `timeout_seconds` and `misses_to_replace` give the settings.
+- `misses` is the number of probes in a row that the active worker has not answered.
+- `replace_error` is present while a replacement cannot be made.
+- `last_replacement` has `at`, `reason`, `from` and `to`, where `from` and `to` are generation ids.
+
+With the probe off, `worker_probe` is `{"enabled": false, "misses": 0}`.
+
+- Knobs: `--worker-probe-interval` (15 s, and `0` turns the probe off), `--worker-probe-timeout`
+  (10 s) and `--worker-probe-misses` (3). They are supervisor flags whose defaults are in the code,
+  so the plist does not change, and the probe starts at the supervisor's next restart.
+- Code: `cmd/subrouter/supervisor_worker_probe.go` (`runWorkerProbe`, `probeActiveWorker`,
+  `probeTargetLocked`, `replaceSilentWorker`), `cmd/subrouter/supervisor.go` (the flags,
+  `readyStatus`, supervisor-status)
+- Tests, in Docker (`./deploy/docker/test.sh ./cmd/subrouter -run 'TestSupervisor.*(Probe|Unresponsive|Unready|Misses|SilentWorker|WhoseSocketIsGone)|WorkerProbeDefaults'`),
+  each seen failing with its part of the change taken out. They run a real supervisor over real
+  worker processes, and a worker is silenced while it stays alive and keeps accepting connections.
+  `TestSupervisorReplacesUnresponsiveWorker` runs on real time. It checks that another worker
+  answers on the port, that a stream the silent worker was sending finishes, and that the silent
+  worker's process is gone afterwards. The others move an injected clock one tick at a time:
+  `TestSupervisorKeepsAWorkerThatAnswersUnready`, `TestSupervisorDoesNotReadALateProbeTickAsAHang`,
+  `TestSupervisorReplacesAWorkerWhoseSocketIsGone`,
+  `TestSupervisorForgetsMissesOnceTheWorkerAnswers`, `TestSupervisorCountsMissesPerWorker`,
+  `TestSupervisorDoesNotReplaceAWorkerItDidNotProbe`, `TestSupervisorSkipsAProbeRound` (the lock,
+  a canary, a shutdown), `TestSupervisorKeepsRunningWhenTheSilentWorkerCannotBeReplaced`,
+  `TestSupervisorWorkerProbeIsOffAtIntervalZero` and
+  `TestParseSupervisorConfigWorkerProbeDefaultsAndLimits`. A real sleep is not tested. The
+  late-tick test moves the injected clock, and no test shows that the wall clock of a Mac jumps
+  over its sleep while Go's monotonic clock does not. Not tested on macOS.
+- Related: builds on §69 (the supervisor and its upgrade path). The probe asks the route that
+  gates every new generation, and it ignores whether the answer says ready.
 
 ## 78. An end client is told to wait at most a minute in the daemon's own 503s
 
