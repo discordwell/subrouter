@@ -14,12 +14,14 @@ import (
 // plist or /etc/default/subrouter, never in the unit's flags: a rolled-back
 // binary that predates the flags exits on them and launchd or systemd
 // respawns it forever, while it ignores a variable it does not know. The
-// stranded give-up has only its variable, for that reason.
+// stranded give-up and the Retry-After cap have only their variables, for
+// that reason.
 const (
-	holdDeadlineEnv    = "SUBROUTER_HOLD_DEADLINE"
-	holdMaxRequestsEnv = "SUBROUTER_HOLD_MAX_REQUESTS"
-	holdMaxBytesEnv    = "SUBROUTER_HOLD_MAX_BYTES"
-	strandedGiveUpEnv  = "SUBROUTER_STRANDED_GIVE_UP"
+	holdDeadlineEnv        = "SUBROUTER_HOLD_DEADLINE"
+	holdMaxRequestsEnv     = "SUBROUTER_HOLD_MAX_REQUESTS"
+	holdMaxBytesEnv        = "SUBROUTER_HOLD_MAX_BYTES"
+	strandedGiveUpEnv      = "SUBROUTER_STRANDED_GIVE_UP"
+	clientRetryAfterMaxEnv = "SUBROUTER_CLIENT_RETRY_AFTER_MAX"
 )
 
 // holdSettings is serve's hold configuration before it becomes a policy.
@@ -113,7 +115,7 @@ func (h holdSettings) policy(logger *slog.Logger) *proxy.HoldPolicy {
 				logger.Info("stranded give-up is off: a chat whose account cannot be reached waits for it across retries with no limit; 0 turns off only the limit",
 					"env", strandedGiveUpEnv)
 			} else {
-				logger.Info("stranded give-up is on: a chat whose account cannot be reached waits for it across retries until this long after its last answered turn, then gets 503 Retry-After 3600 (stranded_gave_up); a chat a box held then waits for room, and any other is unlinked",
+				logger.Info("stranded give-up is on: a chat whose account cannot be reached waits for it across retries until this long after its last answered turn, then gets a 503 (stranded_gave_up); a chat a box held then waits for room, and any other is unlinked",
 					"stranded_give_up", policy.GiveUp.String(), "env", strandedGiveUpEnv)
 				if policy.GiveUp > proxy.PeerHoldIdleTTL {
 					logger.Warn("stranded give-up is longer than the warm window: a stranded chat goes unlinked first and its turn is placed cold",
@@ -123,4 +125,35 @@ func (h holdSettings) policy(logger *slog.Logger) *proxy.HoldPolicy {
 		}
 	}
 	return policy
+}
+
+// resolveClientRetryAfterMax is serve's Server.ClientRetryAfterMax (PATCHES
+// §78): SUBROUTER_CLIENT_RETRY_AFTER_MAX as a Go duration, or
+// DefaultClientRetryAfterMax; 0 turns the cap off. An unreadable value is
+// reported and the default kept, as for the hold's variables. The start line
+// says what an end client is told.
+func resolveClientRetryAfterMax(getenv func(string) string, logger *slog.Logger) time.Duration {
+	limit := proxy.DefaultClientRetryAfterMax
+	if raw := strings.TrimSpace(getenv(clientRetryAfterMaxEnv)); raw != "" {
+		if raw == "0" {
+			limit = 0
+		} else if parsed, err := time.ParseDuration(raw); err != nil {
+			if logger != nil {
+				logger.Warn("ignoring an unreadable Retry-After cap; using the default",
+					"env", clientRetryAfterMaxEnv, "value", raw, "error", err)
+			}
+		} else {
+			limit = parsed
+		}
+	}
+	if logger != nil {
+		if limit <= 0 {
+			logger.Info("Retry-After cap is off: an end client is told the whole wait of a spent pool's 503 and of the stranded give-up",
+				"env", clientRetryAfterMaxEnv)
+		} else {
+			logger.Info("Retry-After cap is on: an end client is told to wait at most this long in a spent pool's 503 and in the stranded give-up; the body keeps the real wait, and a peer daemon gets the whole wait",
+				"retry_after_max", limit.String(), "env", clientRetryAfterMaxEnv)
+		}
+	}
+	return limit
 }

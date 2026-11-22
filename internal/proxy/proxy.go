@@ -204,6 +204,12 @@ type Server struct {
 	// opening that gateway attribution and §54 blame on it. serve sets it
 	// (DefaultPeerDownGrace).
 	PeerDownGrace time.Duration
+	// ClientRetryAfterMax caps the Retry-After of this daemon's own 503s to
+	// an end client: the spent pool's and the stranded give-up's
+	// (clientRetryAfter, PATCHES §78). The body keeps the real wait. Zero is
+	// off: the header is the whole wait, as before. serve sets it
+	// (DefaultClientRetryAfterMax).
+	ClientRetryAfterMax time.Duration
 	// refugeeSlotsOverride replaces refugeeSlotsFor's cap.
 	refugeeSlotsOverride func(peer, account, poolModel string) int
 	AdminToken           string
@@ -8604,7 +8610,7 @@ func (s Server) proxyHandler() http.Handler {
 				// comes back can serve it, so the hold (PATCHES §58) waits, as
 				// for a stranded chat (PATCHES §67), and gives up an hour
 				// after its first held turn. However it ends, the client gets
-				// a 502 Claude Code retries, not this 503, whose Retry-After is
+				// a 502 Claude Code retries, not this 503, whose body names
 				// the pool's reset. A peer that answered means the pool really
 				// is out, and the 503 goes out at once: like a client that
 				// left, it ends the chat's chain of held turns.
@@ -8615,7 +8621,7 @@ func (s Server) proxyHandler() http.Handler {
 					}
 					s.endHeldChain(holdMark{agent: sessionAgentType, session: sessionID, stranded: waitsForABox})
 				}
-				writeAccountSelectionUnavailable(w, err)
+				s.writeAccountSelectionUnavailable(w, r, err)
 				return
 			}
 		}
@@ -14647,7 +14653,7 @@ func (t usageLimitRetryTransport) claudeCreditPoolExhausted503(giveUp *http.Resp
 	if giveUp != nil && giveUp.Body != nil {
 		_ = giveUp.Body.Close()
 	}
-	return tagRoutedResponseAccount(poolExhaustedResponse(poolErr, req), accounts.Account{Provider: t.provider}), true
+	return tagRoutedResponseAccount(t.server.poolExhaustedResponse(poolErr, req), accounts.Account{Provider: t.provider}), true
 }
 
 func (t usageLimitRetryTransport) headerConfirmedClaudeQuota429(response *http.Response) bool {

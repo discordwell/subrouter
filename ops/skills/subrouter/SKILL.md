@@ -130,6 +130,7 @@ The `proxy hold started` line carries the `reason`, and the `proxy hold ended` l
 
 - Before a hold, a failed lookup dials the host's last good public address and logs `upstream lookup failed; dialing its last good address`. A turn that never left the machine can go to the peer for that turn only, logged as `outage spill` (§59).
 - A chat held on a box that cannot be reached waits for its account across the client's retries, with a `reason` that starts with `warm_wait:`. The box is found down only after 15 minutes of silence (§67).
+- A 503 the daemon writes itself, a spent pool's or a stranded chat's give-up, tells a session to wait at most 60 s in `Retry-After`, so a session that sleeps out a Retry-After tries again each minute. The spent pool's body keeps the real wait in `(retry after <N>s)`, and a peer daemon gets the whole wait in the header. `SUBROUTER_CLIENT_RETRY_AFTER_MAX` sets the cap, and `0` turns it off (§78).
 - Settings are `SUBROUTER_HOLD_DEADLINE` (`0` turns holding off), `SUBROUTER_HOLD_MAX_REQUESTS`, `SUBROUTER_HOLD_MAX_BYTES`, `SUBROUTER_STICKY_DNS_MAX_AGE`, `SUBROUTER_OUTAGE_SPILL_RATE`, and `SUBROUTER_OUTAGE_SPILL_BURST`. Set them in the daemon's environment. Never put the `--hold-*` flags in the plist or the unit, because a rolled-back binary exits on an unknown flag and the service manager starts it again forever (§58).
 
 ## Saved resets: never claim one

@@ -614,8 +614,13 @@ not an option. While another peer cannot be asked, or with no slot anywhere,
 the session keeps its hold and waits. A session's held turns give up an hour
 after its last answered turn, when an idle session goes unlinked
 (`SUBROUTER_STRANDED_GIVE_UP`; 0 is no limit), or, on a spent pool, an hour
-after its first held turn, with a 503, `Retry-After: 3600` and
-`X-Subrouter-Reason: stranded_gave_up`, which Claude Code shows at once. A
+after its first held turn, with a 503 and
+`X-Subrouter-Reason: stranded_gave_up`. This 503 and a spent pool's tell a
+session to wait at most a minute in `Retry-After`, so a session running with
+`CLAUDE_CODE_RETRY_WATCHDOG` sends the turn again a minute later. The spent
+pool's body still names the real wait. A peer daemon gets the whole wait
+(`SUBROUTER_CLIENT_RETRY_AFTER_MAX`, default `60s`; `0` sends every caller the
+whole wait; `ops/PATCHES.md` §78). A
 session a peer held then waits for room. Restarted, its next turn goes home if
 that peer answers, though it was found down. Otherwise it is placed as a
 refugee, and a home peer that is not found down keeps it off the local

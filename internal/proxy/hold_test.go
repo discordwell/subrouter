@@ -100,6 +100,8 @@ type holdRigOptions struct {
 	// refugeeSlots, when set, is each account's refugee cap
 	// (Server.refugeeSlotsOverride).
 	refugeeSlots func(peer, account, poolModel string) int
+	// retryAfterMax is Server.ClientRetryAfterMax; zero is off.
+	retryAfterMax time.Duration
 }
 
 // hookedHandler runs hook on each record before next handles it.
@@ -212,6 +214,7 @@ func newHoldRig(t *testing.T, opts holdRigOptions) *holdRig {
 		ActiveSessions:   opts.active,
 
 		refugeeSlotsOverride: opts.refugeeSlots,
+		ClientRetryAfterMax:  opts.retryAfterMax,
 	}
 	handler := server.Handler()
 	if opts.public {
