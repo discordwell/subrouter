@@ -639,15 +639,19 @@ func TestABoxWhoseCertificateIsNotItsPinNeverSeesTheToken(t *testing.T) {
 	})
 }
 
-// The client's account and policy calls, and the daemon's own
-// routes, are answered by the stand-in and never reach a box.
+// The client's account calls and the daemon's own routes are answered by the
+// stand-in and never reach a box. policy_limits does reach one, because a
+// session that starts without its 200 goes without some of its tools.
 func TestControlPlaneAndHealthAreAnsweredByTheStandIn(t *testing.T) {
-	box := startBox(t, okBox)
+	box := startBox(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"restrictions":{}}`)
+	})
 	front, _ := startStandIn(t, boxList{box.box(t, "a")})
 
 	for _, tc := range []struct{ method, path, reason string }{
 		{http.MethodGet, "/api/oauth/profile", "standby_control_plane"},
-		{http.MethodGet, "/api/claude_code/policy_limits", "standby_control_plane"},
+		{http.MethodGet, "/api/claude_cli/bootstrap", "standby_control_plane"},
 		{http.MethodHead, "/api/hello", "standby_control_plane"},
 		{http.MethodGet, "/v1/../api/oauth/profile", "standby_control_plane"},
 		{http.MethodGet, "/_subrouter/supervisor-status", "standby_daemon_surface"},
@@ -669,6 +673,30 @@ func TestControlPlaneAndHealthAreAnsweredByTheStandIn(t *testing.T) {
 	if n := len(box.requests()); n != 0 {
 		t.Fatalf("box saw %d requests, want none", n)
 	}
+
+	t.Run("policy_limits", func(t *testing.T) {
+		header := claudeHeaders()
+		header.Del("X-Claude-Code-Session-Id")
+		resp := send(t, front, http.MethodGet, "/api/claude_code/policy_limits", nil, header)
+		body, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode != http.StatusOK || string(body) != `{"restrictions":{}}` {
+			t.Fatalf("policy_limits = %d %s, want the box's 200", resp.StatusCode, body)
+		}
+		seen := box.requests()
+		if len(seen) != 1 || seen[0].Path != "/api/claude_code/policy_limits" ||
+			seen[0].Header.Get("Authorization") != "Bearer "+box.token || seen[0].Header.Get("X-Subrouter-Agent") != "claude" {
+			t.Fatalf("box saw %+v, want policy_limits with its token as a Claude request", seen)
+		}
+	})
+	t.Run("policy_limits pinned", func(t *testing.T) {
+		header := claudeHeaders()
+		header.Set("X-Subrouter-Account-Id", "local-account")
+		before := len(box.requests())
+		assertUnavailable(t, send(t, front, http.MethodGet, "/api/claude_code/policy_limits", nil, header), "standby_pinned_account")
+		if n := len(box.requests()) - before; n != 0 {
+			t.Fatalf("box saw %d pinned requests, want none", n)
+		}
+	})
 }
 
 // With no box usable, the client gets a 503 with Retry-After 30

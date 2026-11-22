@@ -2381,28 +2381,34 @@ retry watchdog, Claude Code fails a request at once on a 503 that asks for more 
 session sleeps the whole value, so a box's `Retry-After: 3600` would park a session for an hour.
 
 One function, `routeFor`, decides what never goes to a box. `/_subrouter/health` gets the stand-in's own
-body, `{"ok":true,"claude_socket":"standby"}`. `claude-route` reads only `"ok": true`, so a new launch
-still takes the pool route, and `claude_socket` tells a deploy check that the daemon does not own the
-socket. The daemon's other `/_subrouter/` routes get a 503. `/api/*`, the client's account and policy
-calls, gets a 503 with Retry-After 30: a box answers them with its own identity account, and the client
-keeps whichever identity answered (`internal/proxy/control_plane.go`). The path is cleaned before it is
-read, so `/v1/../api/...` counts as `/api`. A request that names an account (`X-Subrouter-Account-ID` or
-`X-Subrouter-Account`, set by `claude <account>`) gets a 503 and is never sent, because a pinned launch is
-promised that account and no other. With no box usable, the client gets a 503 with Retry-After 30 at once,
-and nothing is parked. Every 503 the handler makes has Anthropic's `api_error` shape, which Claude Code
-retries like any server error, and names its cause in `X-Subrouter-Reason`: `standby_no_box`,
-`standby_box_unreachable`, `standby_box_failed`, `standby_pinned_account`, `standby_control_plane` or
-`standby_daemon_surface`.
+body, `{"ok":true,"claude_socket":"standby"}`. `claude-route` reads only `"ok": true`, so a new launch still
+takes the pool route, and `claude_socket` tells a deploy check that the daemon does not own the socket. The
+daemon's other `/_subrouter/` routes get a 503. `/api/*`, the client's account calls, gets a 503 with
+Retry-After 30: a box answers them with its own identity account, and the client keeps whichever identity
+answered (`internal/proxy/control_plane.go`). The one exception is `GET /api/claude_code/policy_limits`,
+which goes to a box. A live session served by a box on 2026-11-21 showed why. With a 503 there, a session
+that starts during the outage withholds WebFetch, DesignSync and RemoteTrigger, ignores the Retry-After, and
+does not ask again for an hour, so the tools stay gone after the daemon returns. With the box's 200 it keeps
+them, and nothing of the box's identity reached a file under its config folder. The box's body was the same
+as the daemon's, because both identities had the default policy. A box whose identity belonged to another
+organization would apply that organization's policy. The path is cleaned before it is read, so
+`/v1/../api/...` counts as `/api`. A request that names an account (`X-Subrouter-Account-ID` or
+`X-Subrouter-Account`, set by `claude <account>`) gets a 503 and is never sent, `policy_limits` included,
+because a pinned launch is promised that account and no other. With no box usable, the client gets a 503
+with Retry-After 30 at once, and nothing is parked. Every 503 the handler makes has Anthropic's `api_error`
+shape, which Claude Code retries like any server error, and names its cause in `X-Subrouter-Reason`:
+`standby_no_box`, `standby_box_unreachable`, `standby_box_failed`, `standby_pinned_account`,
+`standby_control_plane` or `standby_daemon_surface`.
 
 A `Box` exists only through `NewBox`. It takes an `https://host:port` URL, the stand-in token and the 64-hex
 pin of the box's certificate, and builds its transport on `proxy.PinnedTLSConfig`. A certificate that is not
 the pin ends the handshake before a byte of the request is written, so the token never reaches it. An
 `http://` URL, a missing pin and a malformed one are refused. The token is never logged.
 
-Not settled: whether a session launched while the stand-in answers can do without
-`/api/claude_code/policy_limits`, which Claude Code needs for some tools. The rule is one case in
-`routeFor`. Turning it off: nothing runs the handler yet. Once `subrouter standby` runs it, stopping that
-job turns it off.
+Not done: replaying the daemon's own `policy_limits` answer, saved while it is healthy, ahead of the box's.
+The same session accepted such a replay, even with its signature header removed. It needs the process
+that can reach the daemon, so it belongs to a later part. Turning it off: nothing runs the handler yet.
+Once `subrouter standby` runs it, stopping that job turns it off.
 
 Tests: `internal/standby/handler_test.go` holds one test per behaviour above, against `httptest` TLS boxes
 that each have their own self-signed certificate and pin, with no network. Run them with
