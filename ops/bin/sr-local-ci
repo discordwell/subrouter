@@ -181,8 +181,11 @@ mod="$repo_root"
 # ops/ has a go.mod of its own, and a run there tests only the deploy harness.
 { [ -f "$mod/go.mod" ] && [ -d "$mod/cmd/subrouter" ]; } ||
   die "no subrouter module at ${mod}: -C names the checkout, the directory that holds cmd/subrouter/, not its ops/"
-deploy_test_rel=./ops/deploy/tests/deploy_scripts_test.go
-[ -f "$mod/$deploy_test_rel" ] || deploy_test_rel=""
+# Named file by file: from the root module, ./ops/deploy/tests is not a package.
+deploy_tests=()
+for f in "$mod"/ops/deploy/tests/*_test.go; do
+  [ -f "$f" ] && deploy_tests+=("./ops/deploy/tests/${f##*/}")
+done
 
 # go.mod's toolchain line wins over its go line, as it does for setup-go.
 gomod_version() {
@@ -206,7 +209,7 @@ else
   done
   pkgs=(${kept_pkgs[@]+"${kept_pkgs[@]}"})
 fi
-[ -n "$deploy_test_rel" ] || want_deploy=0
+[ ${#deploy_tests[@]} -gt 0 ] || want_deploy=0
 
 # ---------------------------------------------------------------- out dir
 
@@ -1464,8 +1467,8 @@ if [ "$build_ok" = 1 ]; then
     suite_go 1 "${pkgs[*]}" ${suite_env[@]+"${suite_env[@]}"} go "${test_args[@]}" "${pkgs[@]}"
   fi
   if [ "$want_deploy" = 1 ]; then
-    say "suite: the deploy scripts' harness (${deploy_test_rel})"
-    suite_go 2 "the deploy harness" ${deploy_env[@]+"${deploy_env[@]}"} go "${test_args[@]}" "$deploy_test_rel"
+    say "suite: the deploy scripts' harness (${deploy_tests[*]})"
+    suite_go 2 "the deploy harness" ${deploy_env[@]+"${deploy_env[@]}"} go "${test_args[@]}" "${deploy_tests[@]}"
   fi
 fi
 t1=$(date +%s)
@@ -1558,13 +1561,13 @@ $(excerpt "$out/suite.excerpts" "$p" "$t")"
     continue
   fi
   reruns=$((reruns + 1))
-  target=$p
+  targets=("$p")
   rerun_env=(${suite_env[@]+"${suite_env[@]}"})
-  if [ "$p" = command-line-arguments ]; then target=$deploy_test_rel; rerun_env=(${deploy_env[@]+"${deploy_env[@]}"}); fi
+  if [ "$p" = command-line-arguments ]; then targets=("${deploy_tests[@]}"); rerun_env=(${deploy_env[@]+"${deploy_env[@]}"}); fi
   f="$out/rerun/${reruns}"
   say "rerun ${reruns}: ${name} alone ..."
   (cd "$mod" && run_isolated ${rerun_env[@]+"${rerun_env[@]}"} go test -json -count=1 -timeout "$rerun_timeout" -run "^${t}\$" \
-    ${skip_args[@]+"${skip_args[@]}"} ${extra[@]+"${extra[@]}"} "$target") > "$f.json" 2> "$f.stderr" < /dev/null
+    ${skip_args[@]+"${skip_args[@]}"} ${extra[@]+"${extra[@]}"} "${targets[@]}") > "$f.json" 2> "$f.stderr" < /dev/null
   parse_json "$f.json" "$f"
   lone=$(awk -F'\t' -v t="$t" '$1 == "T" && $3 == t { s = $4 } END { print s }' "$f.results")
   if [ "$lone" = pass ]; then

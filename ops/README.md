@@ -19,9 +19,11 @@ Tools and notes for running this fork on a Mac, kept for the redesign.
 | `deploy/macos/deploy-laptop.sh` | Deploys a build to this Mac, checks its routes, and rolls back on failure. Under the supervisor it upgrades the worker without a restart. |
 | `deploy/macos/rollback-laptop-peer.sh` | Puts the previous laptop build back. |
 | `deploy/macos/laptop-deploy-lib.sh` | The route checks, launchd checks, lock and detached run that the laptop scripts share. |
-| `deploy/tests/` | Tests for the laptop scripts, `claude-route` and `sr-triage`, and a rehearsal against a scratch LaunchAgent. |
+| `deploy/macos/subrouter-watchdog.sh` | Loads the daemon's job again when something unloads it, unless a stop is announced; `hold` and `release` announce one. |
+| `deploy/macos/install-watchdog.sh` | Installs, removes and shows the watchdog's own LaunchAgent, `ai.manaflow.subrouter-watchdog`. |
+| `deploy/tests/` | Tests for the laptop scripts, the watchdog, `claude-route` and `sr-triage`, and rehearsals against scratch LaunchAgents. |
 | `LAPTOP.md` | How to move the laptop under the supervisor, deploy, roll back, and recover. |
-| `PATCHES.md` | Every change against upstream and why, §1 to §76, condensed. |
+| `PATCHES.md` | Every change against upstream and why, §1 to §81, condensed. |
 | `KNOWN-ISSUES.md` | Problems and misleading meters, with their status, condensed. |
 
 ## Run the tools
@@ -38,6 +40,7 @@ ops/bin/sr-local-ci deploy                         # the same on this Mac, sandb
 (cd ops && DEPLOY_TESTS_SANDBOX=1 go test -count=1 ./deploy/tests)    # through go test, each script sandboxed
 DEPLOY_TESTS_SANDBOX=1 bash ops/deploy/tests/deploy-scripts-test.sh   # the cases alone, each script sandboxed
 bash ops/deploy/tests/rehearse-laptop-supervisor.sh <build-a> <build-b> <scratch-dir>   # real launchd, scratch job
+bash ops/deploy/tests/rehearse-watchdog.sh <scratch-dir>        # the watchdog on real launchd, scratch jobs
 python3 ops/bin/srq selftest
 python3 ops/bin/sr-plot --selftest
 python3 ops/skills/revive-workflow-agents/test_wf_revive.py
