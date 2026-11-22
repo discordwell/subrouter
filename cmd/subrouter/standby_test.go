@@ -128,7 +128,13 @@ func startStandbyBox(t *testing.T, name string) *standbyBox {
 		}
 	}
 	box.server.StartTLS()
-	t.Cleanup(box.server.Close)
+	// Close waits for every request in flight, and one that a failing test
+	// left waiting on its gate would hold it for minutes. Closing the
+	// connections first ends those requests.
+	t.Cleanup(func() {
+		box.server.CloseClientConnections()
+		box.server.Close()
+	})
 	box.url = box.server.URL
 	return box
 }
