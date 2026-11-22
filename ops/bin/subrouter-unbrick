@@ -1,0 +1,227 @@
+#!/usr/bin/env python3
+"""subrouter-unbrick -- get a dead agent back on its own login, from a terminal.
+
+  subrouter-unbrick            undo it: point Claude Code and Codex back at their own auth
+  subrouter-unbrick --check    show what would change; touch nothing
+  subrouter-unbrick --restore  put back the most recent backup this tool or the quickstart made
+
+Why this exists as a script and not advice: a client pointed at the daemon has
+no login to fall back on. Claude Code's settings.json env overrides its own
+claude.ai login, and Codex's base URLs replace its own. So when the daemon stops
+answering you do not get a slow agent, you get a dead one, and the fix is
+trapped inside the session that just died. `sr setup` and subrouter-quickstart
+write those settings, and nothing in subrouter removes them: `sr cleanup --yes`
+removes the daemon and leaves every client pointed at it. Whoever is stuck
+cannot ask an agent for help, so the fix has to be one command in a terminal,
+with no working agent and no network.
+
+*** It takes effect on the NEXT launch. *** ANTHROPIC_BASE_URL is read at
+process start, so a running Claude Code will not move. Quit it fully.
+
+Three things get checked, because fixing only the obvious one leaves you just as
+dead and looking at a success message:
+
+  1. settings.json              the env block Claude Code reads, in
+                                $CLAUDE_CONFIG_DIR, else ~/.claude
+  2. config.toml                the four base-URL keys Codex reads, in
+                                $CODEX_HOME, else ~/.codex
+  3. ~/.zshrc and friends       once settings.json no longer sets it, an
+                                exported ANTHROPIC_BASE_URL takes over, so a
+                                repair that ignores the shell reports success
+                                and changes nothing that matters. Those are
+                                only reported: editing someone's rc file
+                                unasked is worse than telling them which line
+                                to delete.
+
+Only the two Anthropic keys are removed, never the whole env block: people keep
+AWS_PROFILE and friends in there. Codex keys are commented, not deleted, so the
+way back is uncommenting. Everything is backed up first, timestamped, and
+--restore reverses it. This is meant to be run by someone already having a bad
+day, so it must not be a one-way door.
+
+Python rather than sed: `sed -i ''` is BSD-only and means something else on
+Linux, and an alternation of key names collides with `|` as the sed delimiter.
+Both failed quietly in testing while still printing that they had worked.
+"""
+
+from __future__ import annotations
+
+import argparse
+import glob
+import json
+import os
+import re
+import shutil
+import sys
+import time
+
+
+def config_dir(variable: str, default: str) -> str:
+    """The directory a client reads, by the rule the Go writers use."""
+    return os.environ.get(variable, "").strip() or os.path.expanduser(default)
+
+
+CLAUDE = os.path.join(config_dir("CLAUDE_CONFIG_DIR", "~/.claude"), "settings.json")
+CODEX = os.path.join(config_dir("CODEX_HOME", "~/.codex"), "config.toml")
+ANTHROPIC_KEYS = ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN")
+# cmd/subrouter/codex_config.go codexRoutingConfigKeys.
+CODEX_KEYS = (
+    "openai_base_url",
+    "chatgpt_base_url",
+    "experimental_realtime_ws_base_url",
+    "experimental_realtime_webrtc_call_base_url",
+)
+RC_FILES = ("~/.zshrc", "~/.bashrc", "~/.zprofile", "~/.bash_profile", "~/.profile")
+BAK = ".subrouter-bak-"
+
+codex_pattern = re.compile(rf"^([ \t]*(?:{'|'.join(CODEX_KEYS)})[ \t]*=)", re.M)
+export_pattern = re.compile(r"\s*export\s+ANTHROPIC_(BASE_URL|AUTH_TOKEN)")
+
+
+def backup(path: str, stamp: str) -> str:
+    dest = f"{path}{BAK}{stamp}"
+    shutil.copy2(path, dest)
+    return dest
+
+
+def place_link(target: str, path: str) -> None:
+    """Make `path` a link to `target` in one rename, whatever is there now."""
+    temporary = os.path.join(os.path.dirname(path), f".{os.path.basename(path)}.link-{os.getpid()}")
+    os.symlink(target, temporary)
+    os.replace(temporary, path)
+
+
+def restore_backup(backup: str, path: str) -> None:
+    """Put `backup` in place of `path`.
+
+    A backup that is a link puts the link back, not a copy of what it points
+    at: subrouter-quickstart backs up a linked settings.json as the link, so a
+    dotfile manager's link outlives a rollback.
+    """
+    if os.path.islink(backup):
+        place_link(os.readlink(backup), path)
+    else:
+        shutil.copy2(backup, path)
+
+
+def fix_claude(stamp: str, check: bool) -> bool:
+    if not os.path.exists(CLAUDE):
+        print(f"  claude:  no {CLAUDE}, so nothing points anywhere")
+        return False
+    try:
+        data = json.load(open(CLAUDE))
+    except ValueError as err:
+        print(f"  claude:  {CLAUDE} is not valid JSON ({err}); fix it by hand")
+        return False
+    # Refused, not crashed on: config.toml and the shell are still to check.
+    if not isinstance(data, dict) or not isinstance(data.get("env") or {}, dict):
+        print(f'  claude:  {CLAUDE} is not a JSON object with an object "env"; fix it by hand')
+        return False
+    env = data.get("env") or {}
+    present = [k for k in ANTHROPIC_KEYS if k in env]
+    if not present:
+        print("  claude:  already on its own login")
+        return False
+    if check:
+        print(f"  claude:  would remove {present} from {CLAUDE}")
+        return True
+    backup(CLAUDE, stamp)
+    for key in present:
+        env.pop(key)
+    if env:
+        data["env"] = env
+    else:
+        data.pop("env", None)
+    json.dump(data, open(CLAUDE, "w"), indent=2)
+    # Verify rather than assume. A write that silently did nothing must not
+    # print the same line as a write that worked.
+    still = [k for k in ANTHROPIC_KEYS if k in (json.load(open(CLAUDE)).get("env") or {})]
+    print(f"  claude:  removed {present}" + (f"; {still} SURVIVED, check by hand" if still else ""))
+    return True
+
+
+def fix_codex(stamp: str, check: bool) -> bool:
+    if not os.path.exists(CODEX):
+        print(f"  codex:   no {CODEX}")
+        return False
+    text = open(CODEX).read()
+    hits = codex_pattern.findall(text)
+    if not hits:
+        print("  codex:   nothing pointing at subrouter")
+        return False
+    if check:
+        print(f"  codex:   would disable {len(hits)} line(s) in {CODEX}")
+        return True
+    backup(CODEX, stamp)
+    open(CODEX, "w").write(codex_pattern.sub(r"# disabled-by-unbrick \1", text))
+    left = len(codex_pattern.findall(open(CODEX).read()))
+    print(f"  codex:   disabled {len(hits)} line(s)" + (f"; {left} STILL ACTIVE, check by hand" if left else ""))
+    return True
+
+
+def report_shell() -> bool:
+    found = []
+    for name in RC_FILES:
+        path = os.path.expanduser(name)
+        if not os.path.exists(path):
+            continue
+        for number, line in enumerate(open(path, errors="replace"), 1):
+            if export_pattern.match(line):
+                found.append(f"{name}:{number}: {line.strip()}")
+    if not found:
+        print("  shell:   clean")
+        return False
+    # Never edited here: an rc file is the user's, and a bad rewrite breaks
+    # every future shell rather than one agent.
+    print("  shell:   !! these take over once settings.json no longer sets them; delete them by hand:")
+    for line in found:
+        print(f"             {line}")
+    return True
+
+
+def restore() -> int:
+    restored = 0
+    for path in (CLAUDE, CODEX):
+        backups = sorted(glob.glob(f"{path}{BAK}*"))
+        if not backups:
+            print(f"  {os.path.basename(path)}: no backup to restore")
+            continue
+        restore_backup(backups[-1], path)
+        print(f"  {os.path.basename(path)}: restored from {os.path.basename(backups[-1])}")
+        restored += 1
+    print("\nRestart the client for it to take effect." if restored else "\nNothing restored.")
+    return 0 if restored else 1
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(description="Point Claude Code and Codex back at their own auth.")
+    parser.add_argument("--check", action="store_true", help="show what would change; touch nothing")
+    parser.add_argument("--restore", action="store_true", help="put back the most recent backup")
+    args = parser.parse_args(argv)
+
+    if args.restore:
+        return restore()
+
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    changed = fix_claude(stamp, args.check) | fix_codex(stamp, args.check)
+    shell_blocked = report_shell()
+
+    if args.check:
+        print("\n--check: nothing was modified.")
+    elif changed:
+        print("\nFully quit and reopen Claude Code: the base URL is read at process start.")
+        if shell_blocked:
+            print("You are NOT done: delete the shell export lines above first, they route Claude Code now.")
+        print(f"Undo: {os.path.basename(sys.argv[0])} --restore")
+    elif shell_blocked:
+        # The config files were already clean, so the export above is not a
+        # footnote: it is the whole reason the agent is still dead.
+        print("\nThe config files were already clean, so those shell exports ARE the problem.")
+        print("Delete those lines, open a NEW terminal, and start Claude Code from it.")
+    else:
+        print("\nNothing was pointing at subrouter. If an agent is still failing, the cause is elsewhere.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
