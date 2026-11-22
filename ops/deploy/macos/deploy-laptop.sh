@@ -620,7 +620,7 @@ restart() {
     LAUNCHD_ERR=""
     before=$(listener_pid)
     if [ "${RELOAD:-0}" != 1 ]; then
-        out=$(launchctl kickstart -k "$LABEL" 2>&1); rc=$?
+        kickstart_job; rc=$?; out=$KICKSTART_OUT
         if [ "$rc" -ne 0 ]; then
             echo "   kickstart failed (rc $rc${out:+: $out}); reloading the job"
         else

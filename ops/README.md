@@ -21,7 +21,7 @@ Tools and notes for running this fork on a Mac, kept for the redesign.
 | `deploy/macos/laptop-deploy-lib.sh` | The route checks, launchd checks, lock and detached run that the laptop scripts share. |
 | `deploy/tests/` | Tests for the laptop scripts, `claude-route` and `sr-triage`, and a rehearsal against a scratch LaunchAgent. |
 | `LAPTOP.md` | How to move the laptop under the supervisor, deploy, roll back, and recover. |
-| `PATCHES.md` | Every change against upstream and why, §1 to §69, condensed. |
+| `PATCHES.md` | Every change against upstream and why, §1 to §76, condensed. |
 | `KNOWN-ISSUES.md` | Problems and misleading meters, with their status, condensed. |
 
 ## Run the tools
@@ -30,9 +30,13 @@ Put `ops/bin` from a detached checkout of `origin/main` on `PATH`. After a deplo
 
 ## Test
 
+The deploy cases drive scripts that call `launchctl`, kept from the real one by stubs on `PATH`. A stopped plain `go test ./...` in `ops/` on a Mac once left a detached `deploy-laptop.sh` running after its stubs were deleted, and it unloaded the developer's live service (PATCHES §76). The cases now use a label of their own, and a stopped test kills its detached runs. Still, run them in Docker, or on a Mac only in a sandbox. Plain `go test` refuses them on macOS.
+
 ```bash
-bash ops/deploy/tests/deploy-scripts-test.sh       # every deploy case
-(cd ops && go test -count=1 ./deploy/tests)        # the same cases through go test
+ops/bin/sr-local-ci --docker deploy                # every deploy case, on Linux in Docker
+ops/bin/sr-local-ci deploy                         # the same on this Mac, sandboxed
+(cd ops && DEPLOY_TESTS_SANDBOX=1 go test -count=1 ./deploy/tests)    # through go test, each script sandboxed
+DEPLOY_TESTS_SANDBOX=1 bash ops/deploy/tests/deploy-scripts-test.sh   # the cases alone, each script sandboxed
 bash ops/deploy/tests/rehearse-laptop-supervisor.sh <build-a> <build-b> <scratch-dir>   # real launchd, scratch job
 python3 ops/bin/srq selftest
 python3 ops/bin/sr-plot --selftest

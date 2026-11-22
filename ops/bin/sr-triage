@@ -44,7 +44,10 @@ if [ -z "$SR" ] && [ -x "$HOME/bin/sr" ]; then
   SR="$HOME/bin/sr"
   echo "           installed at $SR, but ~/bin is not on PATH: call it by that path, or add ~/bin to PATH"
 fi
-PLIST="$HOME/Library/LaunchAgents/ai.manaflow.subrouter.plist"
+# The same label and address overrides as the laptop scripts, so a test never names the live job.
+JOB="${SUBROUTER_LABEL:-ai.manaflow.subrouter}"
+ADDR="${SUBROUTER_ADDR:-127.0.0.1:31415}"
+PLIST="$HOME/Library/LaunchAgents/$JOB.plist"
 AGENT_BIN="$(python3 -c 'import plistlib, sys; print((plistlib.load(open(sys.argv[1], "rb")).get("ProgramArguments") or [""])[0])' "$PLIST" 2>/dev/null)"
 printf 'agent bin: %s\n' "${AGENT_BIN:-(no LaunchAgent program)}"
 BIN="$SR"
@@ -139,7 +142,7 @@ echo "=== 6. daemon ==="
 # label, one that does not exist included.
 printf 'launchd:  '
 if [ "$HAVE_LAUNCHCTL" = 1 ]; then
-  LD_OUT=$(launchctl print "gui/$(id -u)/ai.manaflow.subrouter" 2>&1); LD_RC=$?
+  LD_OUT=$(launchctl print "gui/$(id -u)/$JOB" 2>&1); LD_RC=$?
   case "$LD_RC" in
     0) printf '%s\n' "$LD_OUT" | grep -m1 "state = " || echo "loaded (no state line)" ;;
     113) echo "job NOT loaded (launchctl print rc 113)" ;;
@@ -148,4 +151,4 @@ if [ "$HAVE_LAUNCHCTL" = 1 ]; then
 else
   echo "no launchctl (not macOS)"
 fi
-printf 'health:   '; curl -s -m 5 http://127.0.0.1:31415/_subrouter/health >/dev/null 2>&1 && echo "OK" || echo "no daemon on 127.0.0.1:31415"
+printf 'health:   '; curl -s -m 5 "http://$ADDR/_subrouter/health" >/dev/null 2>&1 && echo "OK" || echo "no daemon on $ADDR"

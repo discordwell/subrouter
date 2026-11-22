@@ -16,7 +16,11 @@
 # runs, the harness checks that every one of those names resolves to its stub
 # and aborts the whole run otherwise. Each script runs under `env -i` with HOME in the
 # test dir, so this shell's CODEX_HOME / SUBROUTER_STATE_DIR cannot leak in
-# except where a case plants them on purpose.
+# except where a case plants them on purpose. Each script also gets a label and
+# an address that only this test uses, and a case fails if a stub records the
+# live job's label or port. When this test ends, by itself or on HUP, INT or
+# TERM, it kills every detached run its case started before it removes the
+# test dir (PATCHES §76).
 #
 # DEPLOY_TESTS_SANDBOX=1 (macOS) additionally runs each script inside
 # sandbox-exec: writes outside the test dir, network, exec of the real
@@ -76,9 +80,44 @@ fi
 
 T0=$(mktemp -d "${TMPDIR:-/tmp}/deploy-tests.XXXXXX") && [ -d "$T0" ] || { echo "mktemp failed" >&2; exit 2; }
 T=$(cd "$T0" && pwd -P) && [ -d "$T" ] && [ "$T" != / ] || { echo "cannot resolve $T0" >&2; exit 2; }
+# A detached run that outlived this test's stubs once reached the real
+# launchctl with the live job's label, and unloaded the developer's service
+# (PATCHES §76). So every script gets this label and address (run_sandboxed),
+# and finish fails a case whose stubs were handed the live ones.
+TEST_JOB="test.subrouter.deploytests.$$"
+TEST_ADDR="127.0.0.1:31497"
+LIVE_NAMES='ai\.manaflow\.subrouter|:31415([^0-9]|$)'
+export TEST_JOB TEST_ADDR
+# And no detached run outlives the dir: each one still running is killed
+# first. A detached run ignores HUP, INT and TERM, so it gets SIGKILL, and its
+# whole process group is stopped before that: a script waiting on its lease
+# helper would carry on if the helper died first. A run that started just
+# before a signal can write its pid a moment late.
+STOPPED=0
+stop_detached_runs() {
+  local f pgid
+  while IFS= read -r f; do
+    { [ -n "$f" ] && [ ! -e "${f%.pid}.rc" ]; } || continue
+    pgid=$("$PY3" -c 'import os, sys; print(os.getpgid(int(open(sys.argv[1]).read())))' "$f" 2>/dev/null) || continue
+    kill -STOP -- "-$pgid" 2>/dev/null
+    kill -KILL -- "-$pgid" 2>/dev/null
+  done <<EOF
+$(find "$T" -path '*/.subrouter/transitions/*.pid' 2>/dev/null)
+EOF
+}
 # chmod first: the unreadable-store cases leave mode-000 directories behind if
-# they stop early, and rm -rf cannot empty those.
-[ -n "${KEEP:-}" ] && echo "keeping $T" || trap 'chmod -R u+rwx "$T" 2>/dev/null; rm -rf "$T"' EXIT
+# they stop early, and neither find nor rm -rf can see into those.
+cleanup() {
+  [ -n "${KEEP:-}" ] || chmod -R u+rwx "$T" 2>/dev/null
+  stop_detached_runs
+  [ "$STOPPED" = 0 ] || { /bin/sleep 0.5; stop_detached_runs; }
+  [ -n "${KEEP:-}" ] || rm -rf "$T"
+}
+[ -n "${KEEP:-}" ] && echo "keeping $T"
+trap cleanup EXIT
+trap 'STOPPED=1; exit 129' HUP
+trap 'STOPPED=1; exit 130' INT
+trap 'STOPPED=1; exit 143' TERM
 PASS=0; FAILED=0; FAIL_LIST=""; CASE=""; C=""; RC=0
 
 SANDBOX=""
@@ -123,7 +162,12 @@ case " $* " in *" -s "*)
   if [ -n "${FAKE_SIGN_FAILS_AFTER:-}" ]; then
     n=$(( $(cat "$FAKE_LOG.signs" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$FAKE_LOG.signs"
     [ "$n" -gt "$FAKE_SIGN_FAILS_AFTER" ] && exit 1
-  fi ;;
+  fi
+  # Once a build is installed, FAKE_SIGN_MOVES_JOB=<plist>: launchd answers for a
+  # job loaded from <plist>, as the real one did once the stubs were gone;
+  # FAKE_SIGN_REMOVES_PLIST=1: the plist the job was loaded from is gone.
+  [ -z "${FAKE_SIGN_MOVES_JOB:-}" ] || echo "$FAKE_SIGN_MOVES_JOB" > "$FAKE_LAUNCHD/loaded-from"
+  [ -z "${FAKE_SIGN_REMOVES_PLIST:-}" ] || rm -f "$FAKE_PLIST" ;;
 esac
 case " $* " in *" -d"*) for f; do :; done; echo "CDHash=$(sed -n "s/^# fake subrouter build \([^ ]*\).*/\1/p" "$f")" >&2 ;; esac
 exit 0'
@@ -301,7 +345,7 @@ if [ -n "$sock" ]; then
   exit 0
 fi
 # A draining build (FAKE_RESTART_DRAINS) that is no longer the one installed has
-# had, or is about to get, its SIGTERM: its listener is closed and :31415
+# had, or is about to get, its SIGTERM: its listener is closed and its port
 # queues, which a client sees as nothing answering. Keyed on the install rather
 # than on the restart itself, which the script backgrounds, so the probes see
 # the drain whichever runs first.
@@ -554,6 +598,9 @@ begin() { # case name; returns 1 when filtered out
 }
 
 finish() {
+  if grep -Eq -- "$LIVE_NAMES" "$C/log" 2>/dev/null; then
+    bad "a stub was handed the live job's label or port: $(grep -Em1 -- "$LIVE_NAMES" "$C/log")"
+  fi
   if [ -n "$FAIL_LIST" ] && [ "${FAIL_LIST##* }" = "$CASE" ]; then
     echo "  --- $CASE output (tail) ---"; tail -25 "$C/out" | sed 's/^/  | /'
     echo "  --- $CASE log (tail) ---"; tail -15 "$C/log" | sed 's/^/  | /'
@@ -563,7 +610,11 @@ finish() {
 }
 
 run_sandboxed() { # env-assignments... -- command...
-  local envs=() e
+  local envs=(SUBROUTER_LABEL="$TEST_JOB" SUBROUTER_ADDR="$TEST_ADDR" CLAUDE_ROUTE_TCP="http://$TEST_ADDR") e
+  # DEPLOY_TESTS_HOLD=1: a kickstart writes its process group to $T/hold.held
+  # and waits, so deploy_scripts_test.go can stop this test while a detached
+  # run is in flight.
+  [ -z "${DEPLOY_TESTS_HOLD:-}" ] || envs+=(FAKE_HOLD="$T/hold")
   while [ $# -gt 0 ] && [ "$1" != -- ]; do envs+=("$1"); shift; done
   shift
   for e in "${envs[@]}"; do case "$e" in PATH=*) assert_shadowed "${e#PATH=}" ;; esac; done
@@ -578,9 +629,9 @@ run_sandboxed() { # env-assignments... -- command...
 # --- the laptop ---------------------------------------------------------------
 write_serve_plist() { # path home
   "$PY3" - "$1" "$2" <<'PY'
-import plistlib, sys
+import os, plistlib, sys
 with open(sys.argv[1], "wb") as f:
-    plistlib.dump({"Label": "ai.manaflow.subrouter",
+    plistlib.dump({"Label": os.environ["TEST_JOB"],
                    "ProgramArguments": [sys.argv[2] + "/bin/subrouter", "serve"],
                    "EnvironmentVariables": {"HOME": sys.argv[2]}}, f)
 PY
@@ -594,16 +645,16 @@ laptop_setup() { # old-era new-era
   NEWBIN="$C/subrouter-new"
   make_build "$CUR" "$1" old
   make_build "$NEWBIN" "$2" new
-  write_serve_plist "$H/Library/LaunchAgents/ai.manaflow.subrouter.plist" "$H"
+  write_serve_plist "$H/Library/LaunchAgents/$TEST_JOB.plist" "$H"
   echo '{"env":{"ANTHROPIC_AUTH_TOKEN":"admin-tok"}}' > "$H/.claude/settings.json"
-  load_plist "$H/Library/LaunchAgents/ai.manaflow.subrouter.plist"
+  load_plist "$H/Library/LaunchAgents/$TEST_JOB.plist"
   echo old > "$C/launchd/running"
   echo 100 > "$C/launchd/pid"
   echo 0 > "$H/.subrouter/fake-codex-needing-migration"
   # The listener on the daemon's port: the pid of the process launchd last
   # started, while a build is running.
   stub lsof '
-case " $* " in *" -iTCP:31415 "*) ;; *) echo "UNEXPECTED lsof $*" >> "$FAKE_LOG"; exit 97 ;; esac
+case " $* " in *" -iTCP:'"${TEST_ADDR##*:}"' "*) ;; *) echo "UNEXPECTED lsof $*" >> "$FAKE_LOG"; exit 97 ;; esac
 [ -s "$FAKE_RUNNING" ] || exit 1
 cat "$FAKE_LAUNCHD/pid"'
   # A launchd in the logged-in GUI session (managername Aqua). The loaded job
@@ -617,6 +668,7 @@ cat "$FAKE_LAUNCHD/pid"'
   #   FAKE_BOOTSTRAP_FAILS  every bootstrap exits 5 with launchd's message
   #   FAKE_BOOTOUT_LOCKS    a directory every bootout makes read-only, so the
   #                         files a run puts back after it cannot be written
+  #   FAKE_BOOTOUT_REMOVES_PLIST  every bootout deletes the plist on disk
   #   FAKE_SUPERVISE_AT_PRINT=<n>:<plist>  before answering the nth print, an
   #                         activation finishes: <plist> is written and loaded
   #   FAKE_STRAY            the daemon on the port was started by hand, not by
@@ -647,7 +699,11 @@ eio() { echo "Bootstrap failed: 5: Input/output error" >&2; exit 5; }
 case "$1" in
   managername) echo "${FAKE_MANAGER:-Aqua}" ;;
   kickstart)
-    [ -e "$S/loaded" ] || { echo "Could not find service \"ai.manaflow.subrouter\" in domain for user gui: $(id -u)" >&2; exit 113; }
+    if [ -n "${FAKE_HOLD:-}" ]; then
+      python3 -c "import os; print(os.getpgid(0))" > "$FAKE_HOLD.next" && mv "$FAKE_HOLD.next" "$FAKE_HOLD.held"
+      until [ -e "$FAKE_HOLD" ]; do /bin/sleep 0.1; done
+    fi
+    [ -e "$S/loaded" ] || { echo "Could not find service \"${3##*/}\" in domain for user gui: $(id -u)" >&2; exit 113; }
     [ -n "${FAKE_KICKSTART_NOOP:-}" ] || start ;;
   bootout)
     if grep -q "<string>supervise</string>" "$FAKE_PLIST"; then echo "bootout: the plist on disk runs supervise" >> "$FAKE_LOG"
@@ -655,6 +711,7 @@ case "$1" in
     echo "bootout: the worker on disk is $(build "$FAKE_DEST")" >> "$FAKE_LOG"
     echo "bootout: the plist on disk has checksum $(cksum < "$FAKE_PLIST" | cut -d" " -f1)" >> "$FAKE_LOG"
     [ -z "${FAKE_BOOTOUT_LOCKS:-}" ] || chmod 555 "$FAKE_BOOTOUT_LOCKS"
+    [ -z "${FAKE_BOOTOUT_REMOVES_PLIST:-}" ] || rm -f "$FAKE_PLIST"
     [ -e "$S/loaded" ] && echo "${FAKE_BOOTOUT_POLLS:-0}" > "$S/draining"
     rm -f "$S/loaded"; : > "$S/booted-out"
     [ -n "${FAKE_STRAY:-}" ] || { : > "$S/running"; : > "$S/supervisor"; }
@@ -668,7 +725,8 @@ case "$1" in
     [ -n "${FAKE_BOOTSTRAP_FAILS:-}" ] && eio
     if [ -n "${FAKE_BOOTSTRAP_FAILS_ONCE:-}" ] && [ ! -e "$S/bootstrap-failed" ]; then : > "$S/bootstrap-failed"; eio; fi
     [ -e "$S/loaded" ] && eio
-    cp "$FAKE_PLIST" "$S/loaded"; start ;;
+    [ -f "$3" ] || { echo "Bootstrap failed: 2: No such file or directory" >&2; exit 2; }
+    cp "$3" "$S/loaded"; echo "$3" > "$S/loaded-from"; start ;;
   print)
     if [ -n "${FAKE_SUPERVISE_AT_PRINT:-}" ]; then
       n=$(( $(cat "$S/prints" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$S/prints"
@@ -688,14 +746,15 @@ case "$1" in
 esac
 exit 0'
   cat > "$C/launchd/print.py" <<'PY'
-import plistlib, sys
+import os, plistlib, sys
 args = [str(a) for a in plistlib.load(open(sys.argv[1], "rb"))["ProgramArguments"]]
-print("%s = {\n\tstate = running\n\n\tprogram = %s\n\targuments = {" % (sys.argv[2], args[0]))
+loaded_from = open(os.path.join(os.path.dirname(sys.argv[1]), "loaded-from")).read().strip()
+print("%s = {\n\tactive count = 1\n\tpath = %s\n\tstate = running\n\n\tprogram = %s\n\targuments = {" % (sys.argv[2], loaded_from, args[0]))
 print("".join("\t\t%s\n" % a for a in args) + "\t}\n")
 print("\tlast exit reason = (none)\n\texit timeout = 5\n}")
 PY
 }
-load_plist() { cp "$1" "$C/launchd/loaded"; }
+load_plist() { cp "$1" "$C/launchd/loaded"; echo "$1" > "$C/launchd/loaded-from"; }
 unload_job() { rm -f "$C/launchd/loaded"; : > "$C/launchd/running"; : > "$C/launchd/supervisor"; }
 
 # A shell in a login session that has ended (PATCHES §47), as measured from a
@@ -738,7 +797,7 @@ run_laptop() { # extra env assignments... [-- script args]
     CODEX_HOME=/leaked/codex-home SUBROUTER_STATE_DIR=/leaked/state SUBROUTER_CODEX_SERVER=leaked \
     FAKE_LOG="$C/log" FAKE_LAUNCHD="$C/launchd" FAKE_RUNNING="$C/launchd/running" \
     FAKE_DAEMON="$C/launchd/running" FAKE_DEST="$CUR" FAKE_NEW_ID=new \
-    FAKE_PLIST="$H/Library/LaunchAgents/ai.manaflow.subrouter.plist" \
+    FAKE_PLIST="$H/Library/LaunchAgents/$TEST_JOB.plist" \
     FAKE_CONTROL_SOCKET="$H/.subrouter/supervisor.sock" FAKE_CLAUDE_SOCKET="$H/.subrouter/claude.sock" \
     FAKE_ADMIN=admin-tok ${envs[@]+"${envs[@]}"} \
     -- "$LAPTOP_BASH" "$LAPTOP_UNDER_TEST" "${args[@]}"
@@ -776,7 +835,7 @@ fi
 if begin laptop-plist-state-dir-honored; then
   laptop_setup pre post
   mkdir -p "$H/alt-state"; echo 2 > "$H/alt-state/fake-codex-needing-migration"
-  "$PY3" - "$H/Library/LaunchAgents/ai.manaflow.subrouter.plist" "$H" <<'PY'
+  "$PY3" - "$H/Library/LaunchAgents/$TEST_JOB.plist" "$H" <<'PY'
 import plistlib, sys
 with open(sys.argv[1], "rb") as f:
     p = plistlib.load(f)
@@ -889,7 +948,7 @@ if begin laptop-rollback-refused-plist-state-dir; then
   laptop_setup pre post
   seed_record "$H/.subrouter" z@x interactive-import
   mkdir -p "$H/alt-state"; seed_record "$H/alt-state" a@x isolated-server-login
-  "$PY3" - "$H/Library/LaunchAgents/ai.manaflow.subrouter.plist" "$H" <<'PY'
+  "$PY3" - "$H/Library/LaunchAgents/$TEST_JOB.plist" "$H" <<'PY'
 import plistlib, sys
 with open(sys.argv[1], "rb") as f:
     p = plistlib.load(f)
@@ -954,7 +1013,7 @@ if begin laptop-installs-where-the-job-runs-not-subrouter-bin; then
 fi
 
 # --- deploy-laptop.sh: a shell that cannot restart the daemon (PATCHES §47) ---
-LAPTOP_PLIST_REL="Library/LaunchAgents/ai.manaflow.subrouter.plist"
+LAPTOP_PLIST_REL="Library/LaunchAgents/$TEST_JOB.plist"
 expect_no_backup() { if any_exists "$H/bin/"*bak-*; then bad "a backup was taken before the refusal"; else ok; fi; }
 
 if begin laptop-dead-launchd-refused; then
@@ -1029,7 +1088,7 @@ if begin laptop-kickstart-error-falls-back; then
   # not come up". Now it shows launchd's answer and reloads at once.
   laptop_setup pre post; rm -f "$C/launchd/loaded"; : > "$C/launchd/running"; run_laptop
   expect_rc 0
-  expect_out "kickstart failed (rc 113: Could not find service \"ai.manaflow.subrouter\" in domain for user gui: $(id -u)); reloading the job"
+  expect_out "kickstart failed (rc 113: Could not find service \"$TEST_JOB\" in domain for user gui: $(id -u)); reloading the job"
   expect_no_out "kickstart did not come up"
   expect_none_between "launchctl kickstart" "launchctl bootout" "curl .*/_subrouter/health"
   expect_order "launchctl bootout" "launchctl bootstrap"
@@ -1108,6 +1167,47 @@ if begin laptop-failed-bootstrap-rolls-back-at-once; then
   expect_out "!! ROLLING BACK"; expect_out "rolled back, healthy"; expect_build "$CUR" old
   after_first_bootstrap > "$C/between"
   grep -q "_subrouter/health" "$C/between" && bad "health was polled after launchd refused the bootstrap" || ok
+  finish
+fi
+
+# A script changes launchd only for a job it can load again (PATCHES §76).
+if begin laptop-refuses-a-job-loaded-from-another-plist; then
+  # As for a run with a home that is not the job's: launchd loaded the job from
+  # another plist. Nothing changes, and both plists are named.
+  laptop_setup pre post; echo "$C/other/$TEST_JOB.plist" > "$C/launchd/loaded-from"
+  run_laptop
+  expect_rc 1
+  expect_out "refusing to change gui/$(id -u)/$TEST_JOB: launchd loaded it from $C/other/$TEST_JOB.plist, and this script's plist is $H/$LAPTOP_PLIST_REL"
+  expect_build "$CUR" old; expect_no_restart; expect_no_backup
+  finish
+fi
+
+if begin laptop-stops-before-kickstarting-a-job-from-another-plist; then
+  # The outage: the job was the test's when the run started, and by the restart
+  # launchd answered for one loaded from another plist.
+  laptop_setup pre post; run_laptop FAKE_SIGN_MOVES_JOB="$C/other/$TEST_JOB.plist"
+  expect_rc 1
+  expect_out "refusing to kickstart gui/$(id -u)/$TEST_JOB: launchd loaded it from $C/other/$TEST_JOB.plist, and this script's plist is $H/$LAPTOP_PLIST_REL"
+  expect_no_restart; expect_running old
+  finish
+fi
+
+if begin laptop-reload-refused-without-its-plist; then
+  # Nothing could load the job again after this bootout.
+  laptop_setup pre post; run_laptop RELOAD=1 FAKE_SIGN_REMOVES_PLIST=1
+  expect_rc 1
+  expect_out "refusing to boot out gui/$(id -u)/$TEST_JOB: $H/$LAPTOP_PLIST_REL does not exist, so launchd could not load the job again"
+  expect_no_restart; expect_running old
+  finish
+fi
+
+if begin laptop-plist-gone-after-the-bootout-is-not-bootstrapped; then
+  # The plist goes during the drain: no bootstrap of a missing file, and the run
+  # says the daemon is down.
+  laptop_setup pre post; run_laptop RELOAD=1 FAKE_BOOTOUT_REMOVES_PLIST=1
+  expect_rc 2
+  expect_out "$H/$LAPTOP_PLIST_REL does not exist, so it was not bootstrapped"
+  expect_out "STILL DOWN"; expect_no_log "launchctl bootstrap"
   finish
 fi
 
@@ -1424,14 +1524,14 @@ fi
 
 write_supervised_plist() { # path home [env assignments...]
   "$PY3" - "$@" <<'PY'
-import plistlib, sys
+import os, plistlib, sys
 path, home = sys.argv[1], sys.argv[2]
 env = {"HOME": home}
 env.update(kv.split("=", 1) for kv in sys.argv[3:])
 with open(path, "wb") as f:
-    plistlib.dump({"Label": "ai.manaflow.subrouter",
+    plistlib.dump({"Label": os.environ["TEST_JOB"],
                    "ProgramArguments": [home + "/bin/subrouter-supervisor", "supervise",
-                                        "--addr", "127.0.0.1:31415",
+                                        "--addr", os.environ["TEST_ADDR"],
                                         "--control-socket", home + "/.subrouter/supervisor.sock",
                                         "--worker-bin", home + "/bin/subrouter",
                                         "--worker-stop-grace", "2m", "--ready-timeout", "2m", "--drain-timeout", "90s",
@@ -1704,7 +1804,7 @@ if begin sup-loaded-supervisor-plist-says-serve-refused; then
   sup_setup post post
   write_serve_plist "$H/$LAPTOP_PLIST_REL" "$H"
   run_laptop
-  expect_rc 1; expect_out "launchd runs gui/$(id -u)/ai.manaflow.subrouter under supervise, but $H/$LAPTOP_PLIST_REL no longer does"
+  expect_rc 1; expect_out "launchd runs gui/$(id -u)/$TEST_JOB under supervise, but $H/$LAPTOP_PLIST_REL no longer does"
   expect_out "activate-laptop-supervisor.sh --rollback"; expect_out "Nothing was changed"
   expect_build "$CUR" old; expect_no_restart; expect_no_log "upgrade"
   finish
@@ -1727,7 +1827,7 @@ peer_setup() { # current-era backup-era
   PEER_BK="$H/.subrouter/laptop-cutover-backup-20260816"
   mkdir -p "$PEER_BK"
   make_build "$PEER_BK/subrouter.bak" "$2" cutover
-  cp "$H/Library/LaunchAgents/ai.manaflow.subrouter.plist" "$PEER_BK/plist.bak"
+  cp "$H/Library/LaunchAgents/$TEST_JOB.plist" "$PEER_BK/plist.bak"
 }
 run_peer() { # extra env assignments... [-- script args]
   local envs=()
@@ -1737,7 +1837,7 @@ run_peer() { # extra env assignments... [-- script args]
     LAPTOP_BACKUP_PTR="$C/no-such-pointer" \
     FAKE_LOG="$C/log" FAKE_LAUNCHD="$C/launchd" FAKE_RUNNING="$C/launchd/running" \
     FAKE_DAEMON="$C/launchd/running" FAKE_DEST="$CUR" FAKE_NEW_ID=new \
-    FAKE_PLIST="$H/Library/LaunchAgents/ai.manaflow.subrouter.plist" ${envs[@]+"${envs[@]}"} \
+    FAKE_PLIST="$H/Library/LaunchAgents/$TEST_JOB.plist" ${envs[@]+"${envs[@]}"} \
     -- "$LAPTOP_BASH" "$DEPLOY/macos/rollback-laptop-peer.sh" "$@"
 }
 
@@ -1808,7 +1908,7 @@ with open(sys.argv[1], "wb") as f:
     plistlib.dump(p, f)
 PY2
   run_peer
-  expect_rc 1; expect_out "refusing: $PEER_BK/plist.bak runs $H/other/subrouter, but gui/$(id -u)/ai.manaflow.subrouter runs $CUR"
+  expect_rc 1; expect_out "refusing: $PEER_BK/plist.bak runs $H/other/subrouter, but gui/$(id -u)/$TEST_JOB runs $CUR"
   expect_out "Nothing was restored"; expect_build "$CUR" old; expect_running old; expect_no_restart
   cmp -s "$C/live.plist" "$H/$LAPTOP_PLIST_REL" && ok || bad "the plist changed"
   finish
@@ -1854,7 +1954,7 @@ if begin peer-rollback-print-refused-is-not-unloaded; then
   # refused query, so nothing is restored and nothing is booted out.
   peer_setup post post; printf 'cutover plist\n' > "$PEER_BK/plist.bak"; run_peer FAKE_PRINT_REFUSED=always
   expect_rc 1
-  expect_out "refusing: launchctl print gui/$(id -u)/ai.manaflow.subrouter answered rc 141 (only 0, loaded, and 113, not loaded, are answers)"
+  expect_out "refusing: launchctl print gui/$(id -u)/$TEST_JOB answered rc 141 (only 0, loaded, and 113, not loaded, are answers)"
   expect_out "Nothing was restored"; expect_no_out "ROLLED BACK"
   expect_build "$CUR" old; expect_running old; expect_plist_kept
   expect_no_log "launchctl (bootout|bootstrap)"
@@ -1888,7 +1988,7 @@ if begin peer-rollback-unload-wait-needs-rc-113; then
   peer_setup post post; run_peer FAKE_PRINT_REFUSED=after-bootout
   expect_rc 1; expect_out "answered rc 141 after the bootout"; expect_out "not bootstrapping blind"
   expect_out "the bootout may already have unloaded the job, so the daemon may be down"
-  expect_line "  launchctl print gui/$(id -u)/ai.manaflow.subrouter"
+  expect_line "  launchctl print gui/$(id -u)/$TEST_JOB"
   expect_line "  launchctl bootstrap gui/$(id -u) $H/$LAPTOP_PLIST_REL"
   expect_no_out "the daemon was not restarted"
   expect_no_out "ROLLED BACK"; expect_no_log "launchctl bootstrap"
@@ -1952,6 +2052,15 @@ if begin peer-rollback-refused-while-the-mutation-lock-is-held; then
   finish
 fi
 
+if begin peer-rollback-refuses-a-job-loaded-from-another-plist; then
+  peer_setup post post; echo "$C/other/$TEST_JOB.plist" > "$C/launchd/loaded-from"
+  run_peer
+  expect_rc 1
+  expect_out "refusing to change gui/$(id -u)/$TEST_JOB: launchd loaded it from $C/other/$TEST_JOB.plist, and this script's plist is $H/$LAPTOP_PLIST_REL"
+  expect_build "$CUR" old; expect_no_restart
+  finish
+fi
+
 if begin peer-rollback-stops-the-job-before-restoring-files; then
   peer_setup post post; run_peer
   expect_rc 0; expect_log "bootout: the worker on disk is old"; expect_no_log "bootout: the worker on disk is cutover"
@@ -1988,13 +2097,13 @@ ACT_SH="$DEPLOY/macos/activate-laptop-supervisor.sh"
 act_setup() {
   local old="$1" new="$2"; shift 2
   laptop_setup "$old" "$new"
-  APLIST="$H/Library/LaunchAgents/ai.manaflow.subrouter.plist"
+  APLIST="$H/Library/LaunchAgents/$TEST_JOB.plist"
   "$PY3" - "$APLIST" "$H" "$@" <<'PY'
-import plistlib, sys
+import os, plistlib, sys
 path, home = sys.argv[1], sys.argv[2]
 with open(path, "wb") as f:
-    plistlib.dump({"Label": "ai.manaflow.subrouter",
-                   "ProgramArguments": [home + "/bin/subrouter", "serve", "--addr", "127.0.0.1:31415",
+    plistlib.dump({"Label": os.environ["TEST_JOB"],
+                   "ProgramArguments": [home + "/bin/subrouter", "serve", "--addr", os.environ["TEST_ADDR"],
                                         "--cloud-config", home + "/.config/subrouter/cloud.json",
                                         "--transcripts", home + "/.subrouter/transcripts"] + sys.argv[3:],
                    "EnvironmentVariables": {"HOME": home, "SUBROUTER_CLAUDE_SOCKET": home + "/.subrouter/claude.sock",
@@ -2044,11 +2153,11 @@ expect_untouched() {
 }
 check_supervised() {
   "$PY3" - "$APLIST" "$C/plist.orig" "$H/.subrouter/worker-config.json" "$H" "$1" <<'PY'
-import json, plistlib, sys
+import json, os, plistlib, sys
 new_p, orig_p, config_p, home, tailnet = sys.argv[1:6]
 new, orig = plistlib.load(open(new_p, "rb")), plistlib.load(open(orig_p, "rb"))
 serve = ["--cloud-config", home + "/.config/subrouter/cloud.json", "--transcripts", home + "/.subrouter/transcripts"]
-want_args = [home + "/bin/subrouter-supervisor", "supervise", "--addr", "127.0.0.1:31415",
+want_args = [home + "/bin/subrouter-supervisor", "supervise", "--addr", os.environ["TEST_ADDR"],
              "--control-socket", home + "/.subrouter/supervisor.sock", "--worker-bin", home + "/bin/subrouter",
              "--worker-stop-grace", "2m", "--ready-timeout", "2m", "--drain-timeout", "90s",
              "--worker-config", home + "/.subrouter/worker-config.json", "--"] + serve
@@ -2529,7 +2638,7 @@ fi
 if begin act-rollback-with-a-refused-bootstrap-names-the-command; then
   act_setup post post; run_act FAKE_BOOTSTRAP_FAILS=1
   expect_rc 2; expect_out "ROLLED BACK, NOT HEALTHY"
-  expect_out "launchd has not loaded gui/$(id -u)/ai.manaflow.subrouter"
+  expect_out "launchd has not loaded gui/$(id -u)/$TEST_JOB"
   expect_line "     launchctl bootstrap gui/$(id -u) $APLIST"; expect_plist_orig
   finish
 fi
@@ -2545,6 +2654,15 @@ fi
 if begin act-refused-while-the-mutation-lock-is-held; then
   act_setup post post; hold_lock "$APLIST"; run_act; release_lock
   expect_lock_refusal "$APLIST"; expect_untouched
+  finish
+fi
+
+if begin act-refuses-a-job-loaded-from-another-plist; then
+  act_setup post post; echo "$C/other/$TEST_JOB.plist" > "$C/launchd/loaded-from"
+  run_act
+  expect_rc 1
+  expect_out "refusing to change gui/$(id -u)/$TEST_JOB: launchd loaded it from $C/other/$TEST_JOB.plist, and this script's plist is $APLIST"
+  expect_untouched
   finish
 fi
 
@@ -2692,7 +2810,7 @@ fi
 if begin route-link-finds-the-scripts-in-the-checkout; then
   route_setup; ln -s "$ROUTE_SH" "$H/bin/claude-route"
   run_route_as "$H/bin/claude-route" -- socket-on
-  expect_rc 1; expect_out "socket-on refused: gui/$(id -u)/ai.manaflow.subrouter runs subrouter supervise"
+  expect_rc 1; expect_out "socket-on refused: gui/$(id -u)/$TEST_JOB runs subrouter supervise"
   expect_plist_unchanged
   finish
 fi
@@ -2716,7 +2834,7 @@ if begin route-shims-keep-max-retries; then
       -- "$SHIM" -p hi
     expect_rc 0; expect_out "CLAUDE_CODE_MAX_RETRIES=15"
   done
-  expect_out "ANTHROPIC_BASE_URL=http://127.0.0.1:31415"; expect_out "CLAUDE_CODE_PROMPT_CACHE_TTL=1h"
+  expect_out "ANTHROPIC_BASE_URL=http://$TEST_ADDR"; expect_out "CLAUDE_CODE_PROMPT_CACHE_TTL=1h"
   env -i PATH=/usr/bin:/bin HOME="$H" CLAUDE_CODE_MAX_RETRIES=15 CLAUDE_CODE_EFFORT_LEVEL=high \
     "$LAPTOP_BASH" -c 'source "$1"; build_launch_env; printf "%s\n" "${CLEAN[@]}"' _ "$C/route-lib.sh" > "$C/out"
   expect_out "CLAUDE_CODE_EFFORT_LEVEL"; expect_no_out "CLAUDE_CODE_MAX_RETRIES"
@@ -2936,8 +3054,8 @@ fi
 if begin triage-finds-the-launchagent-binary; then
   # No sr anywhere, but the LaunchAgent starts a binary that exists.
   triage_setup; rmdir "$H/bin"; fake_sr "$C/opt/subrouter"
-  H_PLIST="$H/Library/LaunchAgents/ai.manaflow.subrouter.plist"
-  "$PY3" -c 'import plistlib, sys; plistlib.dump({"Label": "ai.manaflow.subrouter", "ProgramArguments": [sys.argv[2], "serve"]}, open(sys.argv[1], "wb"))' \
+  H_PLIST="$H/Library/LaunchAgents/$TEST_JOB.plist"
+  "$PY3" -c 'import os, plistlib, sys; plistlib.dump({"Label": os.environ["TEST_JOB"], "ProgramArguments": [sys.argv[2], "serve"]}, open(sys.argv[1], "wb"))' \
     "$H_PLIST" "$C/opt/subrouter"
   run_triage
   expect_rc 0; expect_out "binary:    $C/opt/subrouter"; expect_no_out "binary:    MISSING"

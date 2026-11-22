@@ -1362,6 +1362,11 @@ else
     case $a in -race|-race=true|--race|--race=true) suite_env=(); cgo_note="cgo at the toolchain default (-race)" ;; esac
   done
 fi
+# On macOS the deploy harness's Go test refuses to run outside a sandbox
+# (PATCHES §76). This sandbox refuses exec of launchctl, and a sandbox-exec
+# inside it would be refused, so the harness is told with this variable.
+deploy_env=()
+[ "$sandbox_on" = 1 ] && deploy_env=(env SR_LOCAL_CI_SANDBOX=1)
 
 say "${prog}: ${goos}/${goarch} ${host_go} (go.mod: ${want_go}; CI: ${want_go} on linux/amd64)"
 say "  checkout ${repo_root} (${label}); logs in ${out}; load $(load)"
@@ -1460,7 +1465,7 @@ if [ "$build_ok" = 1 ]; then
   fi
   if [ "$want_deploy" = 1 ]; then
     say "suite: the deploy scripts' harness (${deploy_test_rel})"
-    suite_go 2 "the deploy harness" go "${test_args[@]}" "$deploy_test_rel"
+    suite_go 2 "the deploy harness" ${deploy_env[@]+"${deploy_env[@]}"} go "${test_args[@]}" "$deploy_test_rel"
   fi
 fi
 t1=$(date +%s)
@@ -1555,7 +1560,7 @@ $(excerpt "$out/suite.excerpts" "$p" "$t")"
   reruns=$((reruns + 1))
   target=$p
   rerun_env=(${suite_env[@]+"${suite_env[@]}"})
-  if [ "$p" = command-line-arguments ]; then target=$deploy_test_rel; rerun_env=(); fi
+  if [ "$p" = command-line-arguments ]; then target=$deploy_test_rel; rerun_env=(${deploy_env[@]+"${deploy_env[@]}"}); fi
   f="$out/rerun/${reruns}"
   say "rerun ${reruns}: ${name} alone ..."
   (cd "$mod" && run_isolated ${rerun_env[@]+"${rerun_env[@]}"} go test -json -count=1 -timeout "$rerun_timeout" -run "^${t}\$" \
