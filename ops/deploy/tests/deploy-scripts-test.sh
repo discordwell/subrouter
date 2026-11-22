@@ -1818,7 +1818,8 @@ boot_full_setup() { # [unguarded]
   make_boot_build "$C/subrouter-upload" new "${1:-guard}"
   stub tailscale 'echo "tailscale $*" >> "$FAKE_LOG"
 case "$1" in
-  status) [ -e "$FAKE_TS_UP" ] ;;
+  status) [ -e "$FAKE_TS_UP" ] || exit 1
+    [ "${2:-}" = --json ] && [ -z "${FAKE_TS_NO_NODE_ID:-}" ] && echo "{\"Self\": {\"ID\": \"nTESTNODE1CNTRL\"}}"; exit 0 ;;
   up) : > "$FAKE_TS_UP" ;;
   ip) [ -e "$FAKE_TS_UP" ] && echo 100.64.0.10 ;;
 esac'
@@ -1917,6 +1918,18 @@ if begin boot-prints-the-laptop-configuration; then
   expect_line "    --fingerprint '$BOOT_PIN'"
   expect_out "SUBROUTER_PEER_TAILNET=box-2=100.64.0.10 "
   expect_peers_entry box-2 https://100.64.0.10:31416
+  # The entry carries the box's node ID, or `sr claude move` sends nothing, and
+  # never --default, which rewrites the laptop's client configs.
+  expect_line "    --tailscale-node-id 'nTESTNODE1CNTRL' \\"
+  if grep -Eq -- "--default( |$)" "$C/out"; then bad "the printed sr server add carries --default"; else ok; fi
+  finish
+fi
+
+if begin boot-node-id-unknown-prints-where-to-find-it; then
+  boot_full_setup; run_boot SUBROUTER_BOX_NAME=box-2 FAKE_TS_NO_NODE_ID=1
+  expect_rc 0; expect_out "== done"
+  expect_line "    --tailscale-node-id '<node-id>' \\"
+  expect_out "<node-id> is this box's ID under Peer in 'tailscale status --json' on the laptop."
   finish
 fi
 

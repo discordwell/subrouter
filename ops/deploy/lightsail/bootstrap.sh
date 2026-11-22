@@ -105,6 +105,10 @@ fi
 TSIP="$(tailscale ip -4 | head -1)"
 [ -n "$TSIP" ] || die "no tailnet IPv4 address; is 'tailscale up' complete?"
 printf '    tailnet address: %s\n' "$TSIP"
+# The laptop's sr entry needs the box's stable node ID: without it, and with no
+# public admin path, `sr claude move` to a plain http URL sends nothing.
+NODE_ID="$(tailscale status --json 2>/dev/null |
+  python3 -c 'import json, sys; print(json.load(sys.stdin)["Self"]["ID"])' 2>/dev/null || true)"
 
 say "2/7 install binary as /usr/local/bin/subrouter (+ sr symlink)"
 # Staged and checked beside the installed binary, then renamed over it: a build
@@ -357,9 +361,16 @@ sr reaches this box only on a laptop that holds remote.key (PATCHES §17).
 Without the key, sr answers 'unknown account command "server"', as to a typo.
 
   sr server add $BOX_NAME --url http://$TSIP:$PORT \\
+    --tailscale-node-id '${NODE_ID:-<node-id>}' \\
     --admin-token '$ADMIN_TOKEN' \\
-    --account-import-token '$IMPORT_TOKEN' --default
+    --account-import-token '$IMPORT_TOKEN'
+
+Leave out --default: it rewrites the laptop's Codex config and cloud.json, and
+restarts the daemon outside deploy-laptop.sh.
 EOF
+if [ -z "$NODE_ID" ]; then
+  echo "<node-id> is this box's ID under Peer in 'tailscale status --json' on the laptop."
+fi
 
 if [ -n "$FINGERPRINT" ]; then
 cat <<EOF
