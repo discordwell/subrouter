@@ -54,7 +54,7 @@ func TestDaemonLogCapConfig(t *testing.T) {
 
 // Only the long-lived daemon commands touch the process log.
 func TestIsDaemonLogCommand(t *testing.T) {
-	for _, args := range [][]string{{"serve"}, {"supervise", "--worker-bin", "x"}, {"front"}} {
+	for _, args := range [][]string{{"serve"}, {"supervise", "--worker-bin", "x"}, {"front"}, {"standby"}} {
 		if !isDaemonLogCommand(args) {
 			t.Errorf("%v is a daemon command", args)
 		}

@@ -243,6 +243,8 @@ type standbyConfig struct {
 	PolicyEvery time.Duration
 	// RemoteUnlocked is the remote.key gate's verdict for StateDir.
 	RemoteUnlocked bool
+	// Check asks for one look and a printed verdict in place of a run.
+	Check bool
 
 	// The intervals. Zero is the constant of the same name.
 	LockPoll, OpenRetry              time.Duration
@@ -321,6 +323,7 @@ func parseStandbyConfig(args []string, getenv func(string) string) (standbyConfi
 	flags.StringVar(&config.Tailnet, "tailnet", "", "name=IP pairs to dial over Tailscale first (default: "+peerTailnetEnv+" in the worker config, else in the environment)")
 	flags.DurationVar(&config.Hold, "hold", standbyHold, "how long requests wait after the stand-in takes the path, in case the daemon comes straight back; at most "+standbyHoldMax.String())
 	flags.DurationVar(&config.PolicyEvery, "policy-every", standbyPolicyEvery, "how often the daemon is asked for its policy_limits answer while it serves the socket; at least 1m and under 24h")
+	flags.BoolVar(&config.Check, "check", false, "print whether a stand-in with these settings would arm now, and why not, then exit; it takes no lock, writes no file and dials no box")
 	if err := flags.Parse(args); err != nil {
 		return standbyConfig{}, err
 	}
@@ -392,6 +395,9 @@ func standbyCommand(args []string) error {
 	// The gate is asked once, for the state folder this stand-in serves.
 	keyPath := filepath.Join(storepath.CodexDirForStateRootReadOnlyInspection(config.StateDir), remoteKeyFileName)
 	config.RemoteUnlocked = resolveRemoteGateAt(keyPath, os.Stderr).unlocked
+	if config.Check {
+		return checkStandby(context.Background(), config, os.Stdout)
+	}
 	return runStandbyUntilSignalled(config)
 }
 

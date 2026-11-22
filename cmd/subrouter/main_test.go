@@ -164,6 +164,26 @@ func TestConfigureDefaultLoggerLeavesSupervisorLoggerAlone(t *testing.T) {
 	}
 }
 
+// The stand-in's launchd job keeps its own log through stderr (PATCHES
+// §79.5), so its records must not go to the CLI log in the state folder.
+func TestConfigureDefaultLoggerLeavesStandbyLoggerAlone(t *testing.T) {
+	previous := slog.Default()
+	defer slog.SetDefault(previous)
+
+	stateDir := filepath.Join(t.TempDir(), "state")
+	t.Setenv("SUBROUTER_STATE_DIR", stateDir)
+	sentinel := slog.New(slog.NewTextHandler(io.Discard, nil))
+	slog.SetDefault(sentinel)
+
+	configureDefaultLogger("subrouter", []string{"standby", "--check"})
+	if slog.Default() != sentinel {
+		t.Fatal("standby should keep the process logger, which writes to stderr")
+	}
+	if _, err := os.Stat(stateDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("standby's logger created state: %v", err)
+	}
+}
+
 func TestConfigureDefaultLoggerLeavesIsolationCheckReadOnly(t *testing.T) {
 	previous := slog.Default()
 	defer slog.SetDefault(previous)

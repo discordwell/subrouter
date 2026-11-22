@@ -28,7 +28,7 @@ const (
 // whose stderr is the daemon log. They are the commands that keep the process
 // logger (shouldKeepProcessLogger), less the one-shot listener-transfer.
 func isDaemonLogCommand(args []string) bool {
-	return len(args) > 0 && (args[0] == "serve" || args[0] == "supervise" || args[0] == "front")
+	return len(args) > 0 && (args[0] == "serve" || args[0] == "supervise" || args[0] == "standby" || args[0] == "front")
 }
 
 // configureDaemonLog applies SUBROUTER_LOG_LEVEL and starts the stderr cap for
