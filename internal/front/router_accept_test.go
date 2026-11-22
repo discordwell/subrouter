@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -83,6 +84,64 @@ func TestRouterKeepsAcceptingAfterTemporaryAcceptErrors(t *testing.T) {
 	case err := <-served:
 		t.Fatalf("Serve returned %v while its listener was open", err)
 	default:
+	}
+}
+
+// shortOfDescriptors fails every Accept with EMFILE until the shortage is over,
+// as accept(2) does for a process at its file descriptor limit: at once, with
+// nothing to wait on.
+type shortOfDescriptors struct {
+	net.Listener
+	until time.Time
+	tries atomic.Int64
+}
+
+func (l *shortOfDescriptors) Accept() (net.Conn, error) {
+	if time.Now().Before(l.until) {
+		l.tries.Add(1)
+		return nil, acceptError(syscall.EMFILE)
+	}
+	return l.Listener.Accept()
+}
+
+// PATCHES section 77.1. While the shortage lasts every Accept fails at once,
+// so a loop that retries without a pause keeps a processor busy until a
+// descriptor frees. With the pause that doubles from 5 ms, Serve tries 7 times
+// in 400 ms. Without one it tries more than a thousand times.
+func TestRouterPausesBetweenTriesWhileAcceptKeepsFailing(t *testing.T) {
+	const shortage = 400 * time.Millisecond
+	const mostTries = 20
+
+	worker := startHTTPWorker(t, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, "ok")
+	})
+	router, err := NewRouter(Backend{ID: "worker", Address: worker.Addr})
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	short := &shortOfDescriptors{Listener: listener, until: time.Now().Add(shortage)}
+	go func() { _ = router.Serve(short) }()
+
+	// The connection waits in the listener's queue until the shortage is over.
+	client := &http.Client{Timeout: 10 * time.Second}
+	defer client.CloseIdleConnections()
+	response, err := client.Get("http://" + listener.Addr().String() + "/")
+	if err != nil {
+		t.Fatalf("GET after a %s shortage of file descriptors: %v", shortage, err)
+	}
+	body, _ := io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	if string(body) != "ok" {
+		t.Fatalf("body = %q, want the worker's answer", body)
+	}
+	if tries := short.tries.Load(); tries > mostTries {
+		t.Fatalf("Serve tried Accept %d times in the %s it kept failing, want at most %d: it does not pause between tries",
+			tries, shortage, mostTries)
 	}
 }
 
