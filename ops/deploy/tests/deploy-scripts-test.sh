@@ -2667,6 +2667,118 @@ if begin laptop-back-to-back-runs-take-the-lock; then
   finish
 fi
 
+# The lease helper never leaves a run waiting on it for ever (PATCHES §83).
+# FAKE_LEASE_HELPER_DELAY=<s>: a lease helper started with TERM ignored, as a
+# detached run starts it, sleeps that long before it starts, keeping its pid.
+slow_lease_helper() {
+  cat > "$C/lease-delay.py" <<'PY'
+import os, signal, sys, time
+if signal.getsignal(signal.SIGTERM) == signal.SIG_IGN:
+    delay = os.environ["FAKE_LEASE_HELPER_DELAY"]
+    with open(os.environ["FAKE_LOG"], "a") as log:
+        log.write("lease helper delayed %ss\n" % delay)
+    time.sleep(float(delay))
+os.execv(sys.argv[1], sys.argv[1:])
+PY
+  rm -f "$C/bin/python3"
+  stub python3 '
+case "${2:-}" in *.supervisor-mutation.lock)
+  [ -z "${FAKE_LEASE_HELPER_DELAY:-}" ] || exec "'"$PY3"'" "'"$C/lease-delay.py"'" "'"$PY3"'" "$@" ;;
+esac
+exec "'"$PY3"'" "$@"'
+}
+# "pid ppid" of each live lease helper for <lock file>, which its arguments name.
+lease_helpers() { ps -A -o pid=,ppid=,args= 2>/dev/null | LOCK_ARG="$1" awk 'index($0, ENVIRON["LOCK_ARG"]) { print $1, $2 }'; }
+lease_free() { # lock file
+  "$PY3" -c 'import fcntl, os, sys
+fd = os.open(sys.argv[1], os.O_WRONLY | os.O_CREAT, 0o600)
+try:
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except BlockingIOError:
+    sys.exit(1)' "$1"
+}
+# Runs <runner> in its own process group and gives it <seconds> on the clock,
+# so a run that hangs fails its case instead of stalling the test.
+run_within() { # seconds runner args...
+  local limit="$1" runner="$2" pid start="$SECONDS"; shift 2
+  set -m
+  ( "$runner" "$@"; exit "$RC" ) &
+  pid=$!
+  set +m
+  while kill -0 "$pid" 2>/dev/null && [ $((SECONDS - start)) -lt "$limit" ]; do /bin/sleep 0.1; done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -KILL -- "-$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+    RC=hung; bad "the run had not ended after ${limit}s"
+    return 1
+  fi
+  wait "$pid"; RC=$?
+}
+
+if begin laptop-detached-run-waits-for-a-slow-lease-helper; then
+  # The limit is seconds on the clock. It was 1000 polls, which this stubbed
+  # `sleep` spends in a few seconds; at a load of 80 they once ran out before
+  # the helper's Python had started, and the run then waited for ever on it.
+  laptop_setup post post; slow_lease_helper
+  run_within 120 run_laptop FAKE_LEASE_HELPER_DELAY=6
+  expect_rc 0; expect_out "DEPLOY OK"; expect_build "$CUR" new
+  expect_log "lease helper delayed 6s"
+  finish
+fi
+
+if begin laptop-lease-helper-that-never-answers-is-stopped; then
+  # A detached run ignores TERM, and so does its helper: the run that gave up
+  # sent TERM and waited on the helper for ever, with the lease taken once the
+  # helper got to it. Now it kills the helper, ends, and changes nothing, and
+  # the next run takes the lease.
+  laptop_setup post post; slow_lease_helper; LOCK="$H/$LAPTOP_PLIST_REL.supervisor-mutation.lock"
+  run_within 120 run_laptop FAKE_LEASE_HELPER_DELAY=600 SUBROUTER_MUTATION_LEASE_WAIT_SECONDS=3
+  expect_rc 1; expect_log "lease helper delayed 600s"
+  expect_out "the mutation lease helper did not answer within 3s"
+  expect_out "refusing: cannot take $LOCK (exit 73). Nothing was changed."
+  left=$(lease_helpers "$LOCK")
+  [ -z "$left" ] && ok || bad "a lease helper outlived its run: $left"
+  lease_free "$LOCK" && ok || bad "the lease is held after the run ended"
+  expect_build "$CUR" old; expect_no_restart; expect_no_backup
+  run_within 120 run_laptop
+  expect_rc 0; expect_out "DEPLOY OK"; expect_build "$CUR" new
+  finish
+fi
+
+if begin laptop-killed-run-frees-the-lease; then
+  # The helper exits once the shell that started it is no longer its parent,
+  # unless it adopted a rollback child, so a killed run leaves the lease free.
+  # The detached run is parked in its kickstart, past the lock, and only its
+  # shell is killed.
+  laptop_setup post post; LOCK="$H/$LAPTOP_PLIST_REL.supervisor-mutation.lock"
+  run_laptop FAKE_HOLD="$C/hold" &
+  fg=$!
+  n=0; until [ -e "$C/hold.held" ] || [ "$n" -ge 600 ]; do /bin/sleep 0.1; n=$((n + 1)); done
+  holder=$(lease_helpers "$LOCK" | head -1); shell=${holder#* }
+  if [ -z "$holder" ] || [ "$shell" -le 1 ] || lease_free "$LOCK"; then
+    bad "the parked run holds no lease (helper: '${holder:-none}')"
+  else
+    ok; kill -KILL "$shell"
+    n=0; while { [ -n "$(lease_helpers "$LOCK")" ] || ! lease_free "$LOCK"; } && [ "$n" -lt 100 ]; do /bin/sleep 0.1; n=$((n + 1)); done
+    [ "$n" -lt 100 ] && ok || bad "the lease is held 10 s after the shell that took it was killed"
+  fi
+  : > "$C/hold"; wait "$fg"
+  run_within 120 run_laptop
+  expect_rc 0; expect_out "DEPLOY OK"
+  finish
+fi
+
+if begin lease-release-stops-a-helper-that-ignores-term; then
+  # A shell that ignores TERM, as a detached run does, waited for ever on the
+  # helper it had just told to let go.
+  laptop_setup post post
+  run_within 60 run_sandboxed PATH="$C/bin:/usr/bin:/bin" TMPDIR="$C/tmp" LIB="$LEASE_LIB" LOCK="$C/lease.lock" \
+    -- "$LAPTOP_BASH" -c 'trap "" TERM; . "$LIB"; acquire_subrouter_mutation_lease "$LOCK" || exit 9
+release_subrouter_mutation_lease; echo released'
+  expect_rc 0; expect_out released
+  lease_free "$C/lease.lock" && ok || bad "the lease is held after its release"
+  finish
+fi
+
 if begin laptop-restart-survives-a-killed-foreground; then
   laptop_setup post post; run_killable run_laptop RELOAD=1
   expect_killed_and_finished "DEPLOY OK"

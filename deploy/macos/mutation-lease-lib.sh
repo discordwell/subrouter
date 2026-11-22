@@ -30,12 +30,35 @@ else:
 PY
 }
 
+# Ends a lease helper and reaps it, and never waits on one that is still alive.
+# TERM comes first, then KILL: a helper started by a detached run inherits an
+# ignored TERM, and a wait on it then never returned (ops/PATCHES.md §83).
+# Returns 1 when the helper is still alive 10 s after the KILL.
+stop_subrouter_mutation_lease_helper() {
+  local helper_pid="$1" deadline
+  kill -TERM "$helper_pid" || true
+  deadline=$((SECONDS + 2))
+  while kill -0 "$helper_pid" && [ "$SECONDS" -lt "$deadline" ]; do sleep 0.01; done
+  if kill -0 "$helper_pid"; then
+    kill -KILL "$helper_pid" || true
+    deadline=$((SECONDS + 10))
+    while kill -0 "$helper_pid" && [ "$SECONDS" -lt "$deadline" ]; do sleep 0.01; done
+    if kill -0 "$helper_pid"; then return 1; fi
+  fi
+  wait "$helper_pid" || true
+} 2>/dev/null
+
 # Acquire a crash-released BSD file lock without passing the lock descriptor to
 # commands started by the caller. The helper owns the descriptor and exits as
 # soon as its shell parent and any explicitly adopted rollback child are gone,
 # so ordinary callback descendants cannot accidentally keep the lease alive.
+# A helper answers once Python has started, which on a loaded Mac can take
+# seconds, so it gets SUBROUTER_MUTATION_LEASE_WAIT_SECONDS (default 30) on the
+# clock, not a count of polls (ops/PATCHES.md §83).
 acquire_subrouter_mutation_lease() {
-  local lock_file="$1" control_dir ready_file helper_pid attempts result
+  local lock_file="$1" control_dir ready_file helper_pid deadline result
+  local limit="${SUBROUTER_MUTATION_LEASE_WAIT_SECONDS:-30}"
+  case "$limit" in ''|*[!0-9]*) limit=30 ;; esac
   control_dir="$(mktemp -d "${TMPDIR:-/tmp}/subrouter-mutation-lease.XXXXXX")" || return 73
   ready_file="$control_dir/ready"
   python3 - "$lock_file" "$control_dir" "$$" <<'PY' &
@@ -166,8 +189,9 @@ finally:
         pass
 PY
   helper_pid=$!
-  attempts=0
-  while [ "$attempts" -lt 1000 ]; do
+  # SECONDS counts whole seconds; the 1 makes the wait at least the limit.
+  deadline=$((SECONDS + limit + 1))
+  while [ "$SECONDS" -lt "$deadline" ]; do
     if [ -s "$ready_file" ]; then
       result="$(tr -d '[:space:]' <"$ready_file")"
       rm -f "$ready_file"
@@ -186,13 +210,14 @@ PY
       rmdir "$control_dir" 2>/dev/null || true
       return 73
     fi
-    attempts=$((attempts + 1))
     sleep 0.01
   done
-  kill "$helper_pid" 2>/dev/null || true
-  wait "$helper_pid" 2>/dev/null || true
-  rm -f "$ready_file"
-  rmdir "$control_dir" 2>/dev/null || true
+  if stop_subrouter_mutation_lease_helper "$helper_pid"; then
+    echo "the mutation lease helper did not answer within ${limit}s (SUBROUTER_MUTATION_LEASE_WAIT_SECONDS) and was stopped; the lease was not taken" >&2
+  else
+    echo "the mutation lease helper (pid $helper_pid) did not answer within ${limit}s and is still alive after SIGKILL; it may hold $lock_file" >&2
+  fi
+  rm -rf "$control_dir"
   return 73
 }
 
@@ -200,8 +225,7 @@ release_subrouter_mutation_lease() {
   local helper_pid="${SUBROUTER_MUTATION_LEASE_PID:-}"
   local control_dir="${SUBROUTER_MUTATION_LEASE_CONTROL_DIR:-}"
   case "$helper_pid" in ''|*[!0-9]*) return 0 ;; esac
-  kill "$helper_pid" 2>/dev/null || true
-  wait "$helper_pid" 2>/dev/null || true
+  stop_subrouter_mutation_lease_helper "$helper_pid" || true
   if [ -n "$control_dir" ] && [ -d "$control_dir" ]; then
     rm -f "$control_dir/ready" "$control_dir/adopt" "$control_dir/adopted"
     rmdir "$control_dir" 2>/dev/null || true

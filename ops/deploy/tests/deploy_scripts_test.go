@@ -227,6 +227,11 @@ var requiredCases = []string{
 	// and its failed installs and refused bootstraps (PATCHES §69).
 	"laptop-refused-while-the-mutation-lock-is-held",
 	"laptop-back-to-back-runs-take-the-lock",
+	// The lease helper never leaves a run waiting on it for ever (PATCHES §83).
+	"laptop-detached-run-waits-for-a-slow-lease-helper",
+	"laptop-lease-helper-that-never-answers-is-stopped",
+	"laptop-killed-run-frees-the-lease",
+	"lease-release-stops-a-helper-that-ignores-term",
 	"laptop-restart-survives-a-killed-foreground",
 	"laptop-failed-install-leaves-no-stage-file",
 	"laptop-failed-bootstrap-rolls-back-at-once",
