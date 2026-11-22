@@ -110,17 +110,12 @@ func (s *supervisor) generationReady(id string) error {
 	if worker == nil {
 		return fmt.Errorf("generation %q is not supervised", id)
 	}
-	transport := workerTransport(worker)
-	defer transport.CloseIdleConnections()
-	client := &http.Client{Timeout: 3 * time.Second, Transport: transport}
-	response, err := client.Get("http://subrouter-worker/_subrouter/ready")
+	status, err := readyStatus(worker, 3*time.Second)
 	if err != nil {
 		return err
 	}
-	defer response.Body.Close()
-	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4<<10))
-	if response.StatusCode != http.StatusOK {
-		return fmt.Errorf("ready returned status %d", response.StatusCode)
+	if status != http.StatusOK {
+		return fmt.Errorf("ready returned status %d", status)
 	}
 	return nil
 }

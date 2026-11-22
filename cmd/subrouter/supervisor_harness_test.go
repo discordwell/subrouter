@@ -23,6 +23,13 @@ type testSupervisor struct {
 
 func startTestSupervisor(t *testing.T, config supervisorConfig) *testSupervisor {
 	t.Helper()
+	return startTestSupervisorWith(t, config, nil)
+}
+
+// startTestSupervisorWith lets a test change the supervisor before it runs,
+// for what the config does not carry, such as its clock.
+func startTestSupervisorWith(t *testing.T, config supervisorConfig, prepare func(*supervisor)) *testSupervisor {
+	t.Helper()
 	t.Setenv("SUBROUTER_TEST_FAKE_WORKER", "1")
 	initial, err := startWorkerGeneration(config, generationInitial)
 	if err != nil {
@@ -32,6 +39,9 @@ func startTestSupervisor(t *testing.T, config supervisorConfig) *testSupervisor 
 	if err != nil {
 		terminateWorker(initial, time.Second)
 		t.Fatal(err)
+	}
+	if prepare != nil {
+		prepare(s)
 	}
 	go s.monitorWorker(initial)
 	ts := &testSupervisor{supervisor: s, signals: make(chan os.Signal, 1), exited: make(chan struct{})}

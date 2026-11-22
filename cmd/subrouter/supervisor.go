@@ -6,6 +6,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -41,6 +42,10 @@ type supervisorConfig struct {
 	ExpectProxyProtocol bool
 	TakeoverListenerPID int
 	TakeoverListenerFD  int
+	// A WorkerProbeInterval of 0 turns the probe of the active worker off.
+	WorkerProbeInterval time.Duration
+	WorkerProbeTimeout  time.Duration
+	WorkerProbeMisses   int
 	WorkerArgs          []string
 }
 
@@ -93,6 +98,8 @@ type supervisor struct {
 	canary      *canaryRollout
 	lastRollout *rolloutOutcome
 	clock       rolloutClock
+
+	probe workerProbe
 }
 
 func supervise(args []string) error {
@@ -151,6 +158,11 @@ func parseSupervisorConfig(args []string) (supervisorConfig, error) {
 	flags.BoolVar(&config.ExpectProxyProtocol, "expect-proxy-protocol", false, "require PROXY protocol from the stable private front")
 	flags.IntVar(&config.TakeoverListenerPID, "takeover-listener-pid", 0, "existing process whose live TCP listener is inherited without rebinding")
 	flags.IntVar(&config.TakeoverListenerFD, "takeover-listener-fd", -1, "listener file descriptor in --takeover-listener-pid")
+	// The defaults are here and not in a plist, so a supervisor started from
+	// a plist written before the probe existed still probes.
+	flags.DurationVar(&config.WorkerProbeInterval, "worker-probe-interval", 15*time.Second, "how often the active worker's readiness route is asked whether the worker still answers; 0 turns the probe off")
+	flags.DurationVar(&config.WorkerProbeTimeout, "worker-probe-timeout", 10*time.Second, "how long one probe of the active worker waits for an answer")
+	flags.IntVar(&config.WorkerProbeMisses, "worker-probe-misses", 3, "unanswered probes in a row after which the active worker is replaced")
 	if err := flags.Parse(args); err != nil {
 		return supervisorConfig{}, err
 	}
@@ -195,6 +207,12 @@ func validateSupervisorConfig(config supervisorConfig) error {
 	}
 	if config.WorkerConfig != "" && !filepath.IsAbs(config.WorkerConfig) {
 		return fmt.Errorf("worker-config must be an absolute path, got %q", config.WorkerConfig)
+	}
+	if config.WorkerProbeInterval < 0 {
+		return errors.New("worker-probe-interval must not be negative; 0 turns the probe off")
+	}
+	if config.WorkerProbeInterval > 0 && (config.WorkerProbeTimeout <= 0 || config.WorkerProbeMisses < 1) {
+		return errors.New("worker-probe-timeout must be positive and worker-probe-misses at least 1")
 	}
 	return validateWorkerArgs(config.WorkerArgs)
 }
@@ -522,6 +540,22 @@ func workerTransport(generation *workerGeneration) *http.Transport {
 	}
 }
 
+// readyStatus asks one generation's /_subrouter/ready on its private socket
+// and returns the status it answered with. An error means it did not answer
+// within timeout.
+func readyStatus(worker *workerGeneration, timeout time.Duration) (int, error) {
+	transport := workerTransport(worker)
+	defer transport.CloseIdleConnections()
+	client := &http.Client{Timeout: timeout, Transport: transport}
+	response, err := client.Get("http://subrouter-worker/_subrouter/ready")
+	if err != nil {
+		return 0, err
+	}
+	defer response.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4<<10))
+	return response.StatusCode, nil
+}
+
 func (s *supervisor) run(signals <-chan os.Signal) error {
 	listener, err := openPublicListener(s.config.Addr, s.config.TakeoverListenerPID, s.config.TakeoverListenerFD)
 	if err != nil {
@@ -570,6 +604,9 @@ func (s *supervisor) run(signals <-chan os.Signal) error {
 	s.claudeSocket.start(s.router.Serve, s.config.LocalDataSocket, slog.Default())
 	defer s.claudeSocket.close()
 	go func() { controlErrCh <- controlServer.Serve(controlListener) }()
+	probeCtx, stopProbe := context.WithCancel(context.Background())
+	defer stopProbe()
+	go s.runWorkerProbe(probeCtx)
 
 	slog.Info("subrouter supervisor listening", "addr", s.config.Addr, "control_socket", s.config.ControlSocket, "worker", s.router.Active().ID)
 
@@ -882,6 +919,7 @@ func (s *supervisor) controlHandler() http.Handler {
 			// A present inhibit marker is how a pin or an in-flight
 			// transaction blocks worker upgrades; surface it for doctor.
 			"upgrade_inhibited": s.upgradeInhibited(),
+			"worker_probe":      s.workerProbeStatus(),
 		}
 		if s.claudeSocket != nil {
 			status["claude_socket"] = s.claudeSocket.Status()
