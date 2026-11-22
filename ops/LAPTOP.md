@@ -131,6 +131,49 @@ bash ops/deploy/macos/subrouter-watchdog.sh release ai.manaflow.subrouter   # be
 
 Rehearse it on scratch jobs, from a Terminal.app window: `bash ops/deploy/tests/rehearse-watchdog.sh <scratch-dir>`. It ends with `REHEARSAL PASS` when a booted-out scratch job came back in under 10 s each time, an announced stop was kept until it was withdrawn or its marker ended, and a job loaded from another plist was left as it was.
 
+## Stand in for the daemon while it is gone
+
+A Claude Code session talks only to the daemon's Claude socket, so while the daemon is down every session on the Mac waits, even when the boxes are healthy. The stand-in, `subrouter standby`, is a second LaunchAgent, `ai.manaflow.subrouter-standby`, that waits on the socket's lock. When the supervisor lets go of the socket, the stand-in takes the path, holds new requests for 30 s in case the daemon comes straight back, and then sends turns to a box. When the supervisor asks for the socket again and the daemon has answered ready three times, it gives the path back (PATCHES §79). It needs a supervisor that waits for the socket's lock, which `supervisor-status` shows as `claude_socket_waits_for_lock: true` (§77.1). An older supervisor must be restarted on a newer build first.
+
+Give it one `membership` token for each box in the peers file, minted on that box (`subrouter token mint <name> --role membership --expires 90d`, see `OPERATING.md`). The token goes in through standard input only, and nothing of it is printed:
+
+```bash
+pbpaste | bash ops/deploy/macos/install-standby.sh token <box name> --expires <its last day, YYYY-MM-DD>
+```
+
+Then install it with a build of this checkout. `--dry-run` prints the plist and every command and changes nothing:
+
+```bash
+bash ops/deploy/macos/install-standby.sh install ~/bin/subrouter --dry-run
+bash ops/deploy/macos/install-standby.sh install ~/bin/subrouter
+```
+
+`install` copies the build to `~/.subrouter/standby/subrouter-standby`, a copy that no deploy replaces, so deploys of the daemon never touch the stand-in. It reads the daemon's settings from `~/Library/LaunchAgents/ai.manaflow.subrouter.plist` and never changes that file or the daemon's job. Before it changes anything it asks the build, as `subrouter standby --check`, whether the stand-in would arm, and refuses with one line when it would not. It prints the copy's sha256, and it adds the job to the watchdog's list (`--no-watchdog` leaves the watchdog alone). To upgrade, run `install` again with the new build. It refuses while the stand-in holds the socket, because the restart would cut every session it carries, unless you add `--force`.
+
+Read it with `status`. `state` is `armed` while it waits, `holding` and then `serving` while it has the socket, and `disarmed` with a reason when it will not take the socket. Each box shows its token word (`ok`, `refused`, `file_missing`, ...), and with a recorded last day `renew_soon` in the last 7 days and `lapsed` after it:
+
+```bash
+bash ops/deploy/macos/install-standby.sh status
+```
+
+Drill it on the live job without stopping the daemon: let the supervisor yield its socket for two minutes, watch `status` go to `holding` and then `serving`, and see the daemon take the socket back afterwards. `reclaim` ends a drill early.
+
+```bash
+curl -s --unix-socket ~/.subrouter/supervisor.sock -X POST 'http://supervisor/_subrouter/claude-socket/yield?for=2m'
+curl -s --unix-socket ~/.subrouter/claude.sock http://x/_subrouter/health        # "claude_socket": "standby" during the drill
+curl -s --unix-socket ~/.subrouter/supervisor.sock -X POST http://supervisor/_subrouter/claude-socket/reclaim
+```
+
+Rehearse it first on scratch jobs, from a Terminal.app window. It needs a build of this checkout, a folder holding one stand-in token file per box (named as the box), and the peers file, which it reads where it is. Keep the scratch folder short, because a socket path must stay under 104 bytes:
+
+```bash
+bash ops/deploy/tests/rehearse-standby.sh /tmp/sbr <subrouter binary> <token-dir> <peers-file>
+```
+
+It ends with `REHEARSAL PASS` when the socket went from the scratch daemon to the stand-in with no gap over 1 s, one real turn was answered by a box after the hold, the daemon had the socket back within 10 s of its job being loaded again, and a 60 s yield gave both hand-overs again. The turn costs one short haiku answer on a box.
+
+To turn it off, `bash ops/deploy/macos/install-standby.sh uninstall`. It takes the job off the watchdog's list and keeps the token files unless you add `--purge-tokens`.
+
 ## Rehearse on a scratch job
 
 `ops/deploy/tests/rehearse-laptop-supervisor.sh` runs the activation, a deploy with streams open over TCP and the Claude socket, the refusals, and the rollback against a scratch LaunchAgent with two builds. It also turns the Claude socket off and on with `claude-route` through `deploy-laptop.sh`. Then it activates, deploys and rolls back again, and SIGKILLs the calling shell each time: once the bootout has started, or once the upgrade has. It uses the label `test.subrouter.rehearsal.<pid>`, ports 31499 and 31498, sockets in `/private/tmp/srsv-<pid>`, and a scratch home for all five state paths. It never touches the real LaunchAgent:

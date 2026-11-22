@@ -2669,9 +2669,10 @@ failed once its retries ran out, and 242 workflow agents died, while both boxes 
 session reaches one endpoint for its whole life, the socket path it was launched with (§30), so only a
 process on the Mac that answers that path can carry a session to a box. The stand-in is that process. It
 is built in parts: §79.1 sends one request to a box, §79.2 chooses the box, §79.3 is the process,
-`subrouter standby`, that takes the socket path and gives it back, and §79.4 keeps the daemon's own
-`policy_limits` answer for the sessions that start while the stand-in serves. Until a later part installs that
-process as a launchd job, nothing starts it, and no behaviour of the daemon changes.
+`subrouter standby`, that takes the socket path and gives it back, §79.4 keeps the daemon's own
+`policy_limits` answer for the sessions that start while the stand-in serves, and §79.5 installs the process as
+a launchd job of its own. Until someone runs that install, nothing starts it, and no behaviour of the daemon
+changes.
 
 §79.1 The box handler (`internal/standby`) is a plain `http.Handler` for a request as it arrives on the
 Claude socket. It removes the client's `Authorization` (Claude Code's `ssh-placeholder`), `X-Api-Key`,
@@ -2802,8 +2803,8 @@ supervisor. It waits on the lock of the daemon's Claude socket (`<socket>.lock`,
 lets go of that lock, because it ended, its job was unloaded, or it let go on purpose (§77.3), the stand-in
 binds the same socket path and sends turns to a box through §79.1 and §79.2, until the supervisor asks for
 the path back. While the daemon serves its socket, the stand-in is not in the path of any request. It runs on
-Unix. On Windows the command says that it is not supported. This part adds the command only: nothing
-installs or starts it.
+Unix. On Windows the command says that it is not supported. This part adds the command only; §79.5
+installs it.
 
 Arming. A stand-in is armed or disarmed, and a disarmed one never touches the lock or the path, not even to
 create the lock file. It asks the supervisor's control socket for `supervisor-status` every 3 s. It is armed
@@ -3054,13 +3055,150 @@ holds the socket's lock and answers `policy_limits` with the header names of a r
 Each behaviour's code was taken out of the working tree in turn, 29 changes in all, and each one
 failed its test.
 
+§79.5 Packaging: the stand-in's own launchd job. `ops/deploy/macos/install-standby.sh` installs, upgrades,
+reads and removes the stand-in, and writes its tokens. Nothing is installed by hand, and nothing it runs can
+change the daemon's job.
+
+Installing. `install-standby.sh install <subrouter binary>` copies the binary to
+`~/.subrouter/standby/subrouter-standby`. A deploy replaces `~/bin/subrouter`, so a copy of its own keeps every
+deploy of the daemon from changing the file the stand-in runs. It writes
+`~/Library/LaunchAgents/ai.manaflow.subrouter-standby.plist` and loads it, and it prints the copy's sha256. The
+job has `RunAtLoad`, `KeepAlive`, because a stand-in that ends itself exits 1 and must start again (§79.3), and
+`ThrottleInterval` 10. Its log is `~/Library/Logs/subrouter-standby.log`, kept small by the daemon's own stderr
+cap (§39) at 4 MiB with two older copies (`SUBROUTER_LOG_MAX_MB=4`, `SUBROUTER_LOG_KEEP=2`). Before this part,
+`subrouter standby` wrote its log to the CLI's file, `<state folder>/logs/subrouter-cli.log`, because `main`
+gives that logger to every command but the daemon's own. It now keeps the process logger, as `serve` and
+`supervise` do, and takes `SUBROUTER_LOG_LEVEL` and the cap as they do.
+
+The job's settings are the daemon's, read from the daemon's plist and never written there. The daemon plist's
+`SUBROUTER_STATE_DIR`, `SUBROUTER_CLAUDE_SOCKET`, `SUBROUTER_REMOTE_POOLS_FILE` and `SUBROUTER_PEER_TAILNET` go
+into the job's environment under the same names, so the stand-in reads them as the daemon's worker does: the
+worker config first, then the environment. The daemon's `--control-socket`, `--addr` and `--worker-config` go
+in as the stand-in's `--control-socket`, `--daemon-addr` and `--worker-config`. Nothing else is copied; the
+daemon's peer link token stays in its own plist. `--state-dir`, `--socket`, `--control-socket`,
+`--daemon-addr` and `--peers-file` name a setting outright.
+
+The check. Before it changes anything, `install` runs the binary as the job would, with the job's flags and
+environment, as `subrouter standby --check`. That flag, new here, takes one live look and prints one fact per
+line: `socket`, `control_socket`, `state_dir`, `peers_file <word> <path>` and `box <name> <token word>` (only
+with the gate open, as in a run), `supervisor <claude_socket> waits_for_lock=<bool>` or `supervisor no_answer`,
+and last `verdict armed` or `verdict disarmed <reason>`. The verdict is the run's own rule (`armingVerdict`)
+applied to the supervisor's answer now. A saved reading is not read, no lock is taken, no path is bound, no
+file is written and no box is dialled. The script refuses every `disarmed` verdict with one line of its own:
+`remote_locked`, `peers_file_missing`, `no_supervisor_reading`, `supervisor_without_marker` (the supervisor
+must first be restarted on a build with §77.1), and `supervisor_keeps_no_socket`. A box without a token file,
+or with one the box set cannot use, is a warning that names the `token` verb. A binary that does not know
+`--check` is refused. The binary answers, not the script, so that the gate's key path, the order in which the
+peers file is looked for, and the arming rule each keep one spelling (the lesson of §12). The watchdog's
+installer asks the watchdog the same way (§81.3).
+
+Upgrading. Run again, `install` replaces the copy and the plist and loads the job again. It refuses while the
+stand-in holds the socket, that is while a state file written by the job's own pid says `holding`, `serving`
+or `yielding`: a restart then would cut every session the stand-in carries. `--force` goes on. Otherwise it
+announces the stop to the watchdog for 300 s (`subrouter-watchdog.sh hold`, §81.2), boots the job out, renames
+the new copy and plist into place, bootstraps the job and withdraws the stop. Until the rename, the running
+stand-in keeps the file it started from.
+
+Labels and launchd. The script refuses every label but `ai.manaflow.subrouter-standby`, and labels that start
+with `test.subrouter.` for a rehearsal. The refusals of the daemon's label and the watchdog's name them. A
+scratch label needs `--dir`, keeps its copy, plist and log there, reads no daemon plist unless one is named,
+and never touches the watchdog. The script calls launchctl only for its own label, from
+`SUBROUTER_STANDBY_LAUNCHCTL`, which defaults to `/bin/launchctl` and is never looked up on PATH. It refuses
+its label loaded from another plist. The watchdog's job is changed only by `install-watchdog.sh`, which runs
+`SUBROUTER_WATCHDOG_LAUNCHCTL`. Everything runs under macOS `/bin/bash` 3.2 with only what macOS ships. Days
+and times are counted in bash alone, because `date` parses differently on macOS and Linux.
+
+The watchdog. `install` ends with `install-watchdog.sh install --watch ai.manaflow.subrouter-standby=<plist>`.
+The daemon stays watched, as by default, and so does every other `--watch` pair the watchdog's plist already
+has. `--no-watchdog` leaves the watchdog as it is.
+
+Removing. `install-standby.sh uninstall` announces the stop, boots the job out, has the watchdog watch the
+daemon and its other jobs alone again, and removes the plist, the copy and the stand-in's three files in the
+state folder (§79.3, §79.4). It keeps the token files unless `--purge-tokens` is given, and it keeps the log.
+`--dry-run` prints the plist and every command of `install` or `uninstall` and changes nothing.
+
+Tokens. `install-standby.sh token <box name>` reads one token from standard input and refuses a terminal, so
+the token is never on screen, in an argument or in the shell's history. It refuses an argument that looks like
+a token: one that starts with `srk_`, holds 24 hex digits in a row, or is not a peers-file name
+(`[A-Za-z0-9._-]{1,64}`). It never prints an argument it refuses. It drops the spaces and line ends around the
+token, refuses more than one word or 4 KiB, and writes `<state folder>/standby-tokens/<box name>` at mode 0600
+in a folder it sets to 0700, by rename. A running stand-in reads it within 2 s (§79.2). `--expires
+YYYY-MM-DD` records the token's last day in `<state folder>/standby-token-expiry/<box name>`. A new token
+without it drops the old token's day.
+
+Status. `install-standby.sh status` prints whether the job is loaded and from which plist, what the plist runs,
+the copy's sha256, the state word with its reason, warning, time and pid from `standby-state.json` (a file
+whose pid is not the job's is called stale), the supervisor's last answer, the peers file's word, each box's
+token word with its time and, with a recorded last day, `ok`, `renew_soon` in the token's last 7 days, or
+`lapsed` after it, the age of the saved `policy_limits` copy, whether the watchdog's plist names the job, and
+the log's path. It prints no token and no account.
+
+The rehearsal. `bash ops/deploy/tests/rehearse-standby.sh <scratch-dir> <subrouter binary> <token-dir>
+<peers-file>` runs on the Mac's real launchd, from a Terminal.app window, with scratch labels only. It runs a
+scratch supervisor job (`test.subrouter.sbrehearsal.<pid>.sup`, its worker on `127.0.0.1:31496`) with a home,
+a state folder and a `remote.key` of its own and a Claude socket inside the scratch folder, and it installs a
+scratch stand-in beside it with `install-standby.sh`. The token files are copied in and removed at the end;
+the peers file is read where it is. A probe asks the socket path for its health every 50 ms. It boots the
+supervisor's job out and checks that the path's owner goes from the daemon to the stand-in with no gap over
+1 s, and that one real turn, sent at once, is answered by a box after the 30 s hold. It bootstraps the job
+again and checks that the daemon has the path back within 10 s. It has the supervisor yield for 60 s and checks
+both hand-overs again. It also checks that `status` reads the stand-in's own state file. Every launchctl call
+goes through a guard that refuses any label not starting with `test.subrouter.sbrehearsal.` and any plist
+outside the scratch folder. It prints `PASS` or `FAIL` per check and one `REHEARSAL` line. In a Linux
+container, with a stand-in launchd that runs the jobs and two TLS boxes of the test's own, all 10 checks
+passed in each of two runs. The stand-in answered at the path 0.1 s after the bootout or the yield, with
+0.05 to 0.11 s as the longest wait between two answers. The turn came back 29.9 s after it was sent. The
+daemon answered again 3.4 s after the bootstrap and 3.1 to 3.2 s after the yield ended, with 0.21 to 0.27 s as
+the longest wait. It has not run on the Mac.
+
+Turning it off: `bash ops/deploy/macos/install-standby.sh uninstall`.
+
+Not done. Nothing here ran on macOS or under the real launchd; the rehearsal is for that, and then the drill on
+the live job (one `yield?for=2m`). The scratch daemon has no accounts, so the rehearsal cannot show the saved
+`policy_limits` answer. The upgrade's refusal reads the state file, which the stand-in writes at each change of
+state, so a stand-in that took the path in the second before the check is not seen.
+
+Tests (§79.5): `ops/deploy/tests/standby-install-test.sh`, run by `TestStandbyInstall`
+(`ops/deploy/tests/standby_install_test.go`). Two stand-ins for launchd share one set of jobs. The installer's
+fails a case when it is handed the daemon's label or the watchdog's, and the watchdog installer's fails one
+when it is handed any label but the watchdog's. The binary is a stand-in that answers `standby --check` from
+the case's files and records the arguments and environment it was run with. Each case has a daemon plist and
+the live job's stop marker in its home, and fails when either changes. The cases: one install writes the
+plist, the copy and the watchdog's plist and bootstraps each once, with the daemon's settings and not its
+token; a second install announces a stop that is in place at the bootout and gone after it, and loads the new
+copy; every other label is refused for every verb, and nothing runs; each of the five verdicts is refused with
+one line, before anything is written, and a refused upgrade changes nothing; a missing token is a warning; a
+binary without `--check` is refused; an upgrade while the job's own state file says `serving` is refused, and
+`--force` goes on; the label loaded from another plist is refused; the dry runs of install, upgrade and
+uninstall change nothing; uninstall keeps the tokens and purges them when told, and puts the watchdog back to
+its default list; the watchdog keeps its other jobs; `token` writes the token alone at 0600 in a 0700 folder,
+prints and writes it nowhere else, and refuses each argument that looks like a token, a terminal, two words and
+nothing; `renew_soon` and `lapsed` at five times the case sets; `status` with a state file written as the
+stand-in writes it, and a stale one; a scratch label keeps to its folder and reads no daemon plist; launchctl is
+never looked up on PATH; neither script uses bash 4; and the stand-ins catch what they must. The cases pass
+under bash 5 and, in the `bash:3.2` image, under bash 3.2.
+
+`cmd/subrouter/standby_check_test.go`: `TestStandbyCheckSaysWhetherItWouldArm` (each verdict, the facts, no
+lock, no path, no file, no request to the box and no token printed; with no supervisor a saved reading is not
+used; with the gate locked no box is read), `TestStandbyCommandWithCheckPrintsAndReturns` (the command with
+the gate read from the state folder's key returns its lines and leaves the path free) and
+`TestStandbyCheckIsAFlag`. `TestConfigureDefaultLoggerLeavesStandbyLoggerAlone` and `TestIsDaemonLogCommand`
+cover the log.
+
+Each behaviour's code was taken out of the working tree in turn, 40 changes in all, and each one failed its
+test.
+
 - Code: `internal/standby/box.go` (`Box`, `NewBox`, `Boxes`), `internal/standby/handler.go` (`NewHandler`,
   `routeFor`, `IsHealth`, `PolicyCopyAnswers`, `rewriteForBox`, `send`, `retryAfterWriter`), `internal/standby/boxset.go` (`Set`,
   `NewSet`, `Config`, `Run`, `Candidates`, `Status`, `CloseIdleConnections`), `cmd/subrouter/standby.go`
   (`standbyCommand`, `parseStandbyConfig`, `runStandby`, `standIn`, `standbyTenure`, `holdGate`,
   `armingVerdict`, `flapSteady`), `cmd/subrouter/standby_policy.go` (`savedPolicy`, `standbyPolicy`,
   `considerPolicy`, `askPolicy`, `gotPolicy`, `answerPolicy`), `cmd/subrouter/remote_gate.go`
-  (`resolveRemoteGateAt`)
+  (`resolveRemoteGateAt`), `cmd/subrouter/standby_check.go` (`checkStandby`), `cmd/subrouter/main.go`
+  (`shouldKeepProcessLogger`), `cmd/subrouter/daemon_log.go` (`isDaemonLogCommand`),
+  `ops/deploy/macos/install-standby.sh`
+- Tests (§79.5): `ops/deploy/tests/standby-install-test.sh`, `ops/deploy/tests/standby_install_test.go`,
+  `ops/deploy/tests/rehearse-standby.sh`, `cmd/subrouter/standby_check_test.go`
 - Related: §30 (the Claude socket), §43 (named tokens; a stand-in token is a `membership` token), §68
   (tailnet first), §31 (the peers file and the peer-holds files), §17 (the `remote.key` gate), §77 (the
   supervisor keeps its socket, and lets go of it on purpose), §81 (the watchdog), §84 (the deploy checks
