@@ -122,14 +122,14 @@ bash ops/deploy/macos/install-watchdog.sh status
 bash ops/deploy/macos/install-watchdog.sh uninstall           # turns it off
 ```
 
-The deploy scripts announce their own stops. To stop the daemon by hand, with `sr down` or a `launchctl bootout`, announce it first, for up to a day, or the watchdog loads it again:
+The deploy scripts and `sr daemon restart` announce their own stops. `sr daemon down` does not, on purpose: a stray one must not keep the watchdog away for long. To stop the daemon by hand, with `sr daemon down` or a `launchctl bootout`, or before `deploy/macos/migrate-launchagent-to-supervisor.sh` or `rollback-launchagent-supervisor.sh`, announce it first, for up to a day, or the watchdog loads it again:
 
 ```bash
 bash ops/deploy/macos/subrouter-watchdog.sh hold ai.manaflow.subrouter 3600
 bash ops/deploy/macos/subrouter-watchdog.sh release ai.manaflow.subrouter   # before the hour ends
 ```
 
-Rehearse it on scratch jobs, from a Terminal.app window: `bash ops/deploy/tests/rehearse-watchdog.sh <scratch-dir>`. It ends with `REHEARSAL PASS` when a booted-out scratch job came back in under 10 s each time and the announced stops were kept.
+Rehearse it on scratch jobs, from a Terminal.app window: `bash ops/deploy/tests/rehearse-watchdog.sh <scratch-dir>`. It ends with `REHEARSAL PASS` when a booted-out scratch job came back in under 10 s each time, an announced stop was kept until it was withdrawn or its marker ended, and a job loaded from another plist was left as it was.
 
 ## Rehearse on a scratch job
 

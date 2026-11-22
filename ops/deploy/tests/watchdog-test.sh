@@ -170,8 +170,9 @@ envs() {
   echo SUBROUTER_WATCHDOG_LAUNCHCTL="$C/bin/fake-launchctl"
   echo SUBROUTER_WATCHDOG_OSASCRIPT="$C/bin/fake-osascript"
 }
-in_env() { # [VAR=value | -u VAR]... -- command...
-  local e=() line drop=""
+in_env() { # [--bg] [VAR=value | -u VAR]... -- command...  (--bg: BG is its pid)
+  local e=() line drop="" bg=0
+  [ "$1" != --bg ] || { bg=1; shift; }
   while [ $# -gt 0 ] && [ "$1" != -- ]; do
     case "$1" in -u) drop="$drop $2"; shift 2 ;; *) e+=("$1"); shift ;; esac
   done
@@ -182,7 +183,7 @@ in_env() { # [VAR=value | -u VAR]... -- command...
   done <<EOF
 $(envs)
 EOF
-  env -i "${e[@]}" "$@"
+  if [ "$bg" = 1 ]; then env -i "${e[@]}" "$@" & BG=$!; else env -i "${e[@]}" "$@"; fi
 }
 # Runs the watchdog for N checks against the one scratch job.
 watch() { # checks [env assignments...] [-- extra args]
@@ -204,6 +205,9 @@ notes() { count . "$C/ld/notes"; }
 events() { count "$1" "$C/wd.log"; }
 expect_rc() { [ "$RC" = "$1" ] && ok || bad "exit $RC, want $1"; }
 expect_out() { grep -Fq -- "$1" "$C/out" && ok || bad "output lacks: $1"; }
+expect_line() { grep -Fxq -- "$1" "$C/out" && ok || bad "output lacks the line: $1"; }
+# The program arguments of the plist a dry run prints, one line.
+planned_args() { sed -n '/<key>ProgramArguments<\/key>/,/<\/array>/s:^[[:space:]]*<string>\(.*\)</string>$:\1:p' "$C/out" | tr '\n' ' '; }
 expect_calls() { local n; n=$(calls "$1"); [ "$n" = "$2" ] && ok || bad "$n launchctl calls match /$1/, want $2"; }
 expect_notes() { local n; n=$(notes); [ "$n" = "$1" ] && ok || bad "$n notifications, want $1"; }
 expect_events() { local n; n=$(events "$1"); [ "$n" = "$2" ] && ok || bad "$n log lines match /$1/, want $2"; }
@@ -213,8 +217,11 @@ bootstrap_times() { sed -n 's/^launchctl bootstrap .* @\([0-9]*\)$/\1/p' "$C/ld/
 echo "== the watchdog (under $WD_BASH)"
 
 if begin unloaded-job-is-loaded-once; then
-  watch 6
+  m0=$(/bin/date '+%Y-%m-%dT%H:%M'); watch 6; m1=$(/bin/date '+%Y-%m-%dT%H:%M')
   expect_rc 0
+  # Every event line starts with the time it was logged.
+  n=$(grep -cvE "^($m0|$m1):[0-9]{2}[-+][0-9]{4} " "$C/wd.log")
+  [ "$n" = 0 ] && ok || bad "$n log lines do not start with the time they were logged, as: $(grep -vE "^($m0|$m1):" "$C/wd.log" | head -1)"
   expect_calls "^launchctl bootstrap gui/$UIDN $PLIST @" 1
   expect_calls " (bootout|kickstart) " 0
   check "the job is not loaded afterwards" loaded
@@ -268,23 +275,28 @@ if begin marker-expiring-mid-run-ends-the-hold; then
   finish
 fi
 
-if begin unusable-markers-are-ignored-and-logged-once; then
-  # A marker for another job, one with no expiry, one more than a day ahead
-  # and one that cannot be read are all ignored: none can switch the watchdog
-  # off. Each is logged once, however many checks see it.
-  for kind in other-label no-until too-far unreadable; do
-    rm -f "$C/ld/jobs/"* "$C/wd.log"; : > "$C/ld/calls"
-    m="$STOPS/watchdog-stop.$JOB"; rm -f "$m"
+if begin ignored-markers-are-logged-once; then
+  # An expired marker, one for another job, one with no expiry, one more than
+  # a day ahead and one that cannot be read are all ignored: none can switch
+  # the watchdog off. The bootstrap keeps failing, so the job stays down and
+  # every check reads the marker again; each is still logged once.
+  echo "Bootstrap failed: 5: Input/output error" > "$C/ld/boot-fails"
+  for kind in expired other-label no-until too-far unreadable; do
+    rm -f "$C/wd.log"; : > "$C/ld/calls"
+    m="$STOPS/watchdog-stop.$JOB"; rm -rf "$m"
+    t0=$(clock)
     case "$kind" in
-      other-label) printf 'label=%s.other\nuntil=%s\n' "$JOB" $((START + 600)) > "$m"; why="names the job '$JOB.other'" ;;
+      expired) printf 'label=%s\nuntil=%s\nby=a test\n' "$JOB" $((t0 - 1)) > "$m"; why="the stop announced by a test ended at" ;;
+      other-label) printf 'label=%s.other\nuntil=%s\n' "$JOB" $((t0 + 600)) > "$m"; why="names the job '$JOB.other'" ;;
       no-until) printf 'label=%s\nuntil=soon\n' "$JOB" > "$m"; why="holds no expiry time" ;;
-      too-far) printf 'label=%s\nuntil=%s\n' "$JOB" $((START + 10 * 86400)) > "$m"; why="names an expiry more than 86400 s ahead" ;;
+      too-far) printf 'label=%s\nuntil=%s\n' "$JOB" $((t0 + 10 * 86400)) > "$m"; why="names an expiry more than 86400 s ahead" ;;
       unreadable) mkdir "$m"; why="cannot be read" ;;
     esac
-    watch 5
-    n=$(calls "^launchctl bootstrap gui/$UIDN $PLIST @"); [ "$n" = 1 ] && ok || bad "$kind: $n bootstraps, want 1"
-    n=$(events "$why"); [ "$n" = 1 ] && ok || bad "$kind: $n log lines say '$why', want 1"
-    rm -rf "$m"
+    watch 8
+    n=$(calls "^launchctl print gui/$UIDN/$JOB @"); [ "$n" = 8 ] && ok || bad "$kind: $n checks, want 8"
+    t=$(bootstrap_times | head -1)
+    [ "$t" = "$t0" ] && ok || bad "$kind: first bootstrap at clock ${t:-never}, want the first check, $t0"
+    n=$(events "$why"); [ "$n" = 1 ] && ok || bad "$kind: $n log lines say '$why' over 8 checks, want 1"
   done
   finish
 fi
@@ -368,12 +380,12 @@ if begin default-watch-is-the-daemon-and-watch-adds; then
   # the case on the live label).
   wd config
   expect_rc 0
-  expect_out "watch ai.manaflow.subrouter $C/home/Library/LaunchAgents/ai.manaflow.subrouter.plist"
-  expect_out "log $C/home/Library/Logs/subrouter-watchdog.log"
-  expect_out "stops $C/home/.subrouter"
-  expect_out "interval 5"
+  expect_line "watch ai.manaflow.subrouter $C/home/Library/LaunchAgents/ai.manaflow.subrouter.plist"
+  expect_line "log $C/home/Library/Logs/subrouter-watchdog.log"
+  expect_line "stops $C/home/.subrouter"
+  expect_line "interval 5"
   wd config --watch "$JOB=$PLIST"
-  expect_out "watch ai.manaflow.subrouter "; expect_out "watch $JOB $PLIST"
+  expect_out "watch ai.manaflow.subrouter "; expect_line "watch $JOB $PLIST"
   wd config --watch "$JOB=$PLIST" --no-daemon
   n=$(grep -c '^watch ' "$C/out"); [ "$n" = 1 ] && ok || bad "--no-daemon left $n watched jobs, want 1"
   wd config --no-daemon --watch "$JOB=$PLIST" --watch "$JOB=$PLIST"
@@ -409,24 +421,21 @@ fi
 
 if begin a-signal-stops-it-at-once; then
   load_job
-  in_env PATH="/usr/bin:/bin" -- "$WD_BASH" "$WATCHDOG" run --no-daemon --watch "$JOB=$PLIST" \
-    --log "$C/wd.log" --stops "$STOPS" --interval 3600 > "$C/out" 2>&1 &
-  bg=$!
-  pid=""
-  for _ in $(seq 1 100); do
-    pid=$(sed -n 's/.* started (pid \([0-9]*\),.*/\1/p' "$C/wd.log" 2>/dev/null)
-    [ -n "$pid" ] && [ "$(calls "^launchctl print ")" -ge 1 ] && break
-    /bin/sleep 0.1
-  done
-  if [ -z "$pid" ]; then
-    bad "the watchdog never started"
+  # env execs the watchdog, so BG is the watchdog's own pid.
+  in_env --bg PATH="/usr/bin:/bin" -- "$WD_BASH" "$WATCHDOG" run --no-daemon --watch "$JOB=$PLIST" \
+    --log "$C/wd.log" --stops "$STOPS" --interval 3600 > "$C/out" 2>&1
+  pid=$BG
+  for _ in $(seq 1 100); do [ "$(calls "^launchctl print ")" -ge 1 ] && break; /bin/sleep 0.1; done
+  if [ "$(calls "^launchctl print ")" -lt 1 ]; then
+    bad "the watchdog made no check in 10 s"
   else
     /bin/sleep 0.5
     kill -TERM "$pid"
     for _ in $(seq 1 30); do kill -0 "$pid" 2>/dev/null || break; /bin/sleep 0.1; done
-    if kill -0 "$pid" 2>/dev/null; then bad "still running 3 s after SIGTERM, mid-sleep"; kill -KILL "$pid"; else ok; fi
+    if kill -0 "$pid" 2>/dev/null; then bad "still running 3 s after SIGTERM, mid-sleep"; else ok; fi
   fi
-  wait "$bg" 2>/dev/null
+  kill -KILL "$pid" 2>/dev/null
+  wait "$pid" 2>/dev/null
   expect_events "stopped by a signal" 1
   finish
 fi
@@ -475,10 +484,16 @@ if begin installer-refuses-the-daemon-label; then
 fi
 
 if begin installer-refuses-a-foreign-label; then
-  for label in com.example.watchdog ai.manaflow.subrouter-watchdog2 test.subrouterx.wd "test.subrouter.wd/x"; do
-    installer install --label "$label" --dir "$C/wdhome" --no-daemon --watch "$JOB=$PLIST"
+  # Each attempt would be a valid install under the real label, so the label
+  # is the only thing left to refuse.
+  for label in com.example.watchdog ai.manaflow.subrouter-watchdog2 test.subrouterx.wd; do
+    installer install --label "$label" --dir "$C/wdhome" --watch "$JOB=$PLIST"
     [ "$RC" = 2 ] && ok || bad "label $label: exit $RC, want 2"
+    expect_out "refusing the label $label:"
   done
+  # A scratch prefix does not make any text a label.
+  installer install --label "test.subrouter.wd/x" --dir "$C/wdhome" --no-daemon --watch "$JOB=$PLIST"
+  expect_rc 2; expect_out "refusing 'test.subrouter.wd/x': not a launchd label"
   expect_calls . 0
   check "nothing was written" test ! -e "$C/wdhome"
   check "nothing was written under LaunchAgents" test ! -e "$C/home/Library/LaunchAgents"
@@ -561,14 +576,20 @@ if begin installer-dry-run-changes-nothing; then
   expect_out "would run: $C/bin/fake-launchctl bootstrap gui/$UIDN $(WDPLIST)"
   check "nothing was written" test ! -e "$C/wdhome"
   expect_no_change
-  # The real label's plan: its own plist under LaunchAgents, and the daemon
-  # watched by the watchdog's default, not named in the plist.
+  # The real label's plan: its own plist under LaunchAgents, the daemon watched
+  # by the watchdog's default, not named in the plist, its log under
+  # ~/Library/Logs, and its stop markers in ~/.subrouter, where the deploy
+  # scripts write theirs.
   installer install --dry-run
   expect_rc 0
   expect_out "would write $C/home/Library/LaunchAgents/ai.manaflow.subrouter-watchdog.plist:"
   expect_out "<string>ai.manaflow.subrouter-watchdog</string>"
-  expect_out "<string>$C/home/.subrouter/watchdog/subrouter-watchdog.sh</string>"
-  grep -q -- "--watch" "$C/out" && bad "the real plan names a --watch" || ok
+  got=$(planned_args)
+  want="/bin/bash $C/home/.subrouter/watchdog/subrouter-watchdog.sh run --log $C/home/Library/Logs/subrouter-watchdog.log --stops $C/home/.subrouter "
+  [ "$got" = "$want" ] && ok || bad "the real plan runs
+  $got
+want
+  $want"
   check "nothing was written under LaunchAgents" test ! -e "$C/home/Library/LaunchAgents"
   expect_no_change
   installer uninstall --dry-run
@@ -579,6 +600,44 @@ if begin installer-dry-run-changes-nothing; then
   expect_rc 2
   installer install --launchctl "$C/bin/fake-launchctl" --dry-run
   expect_rc 2
+  finish
+fi
+
+if begin installed-watchdog-reads-the-markers-hold-writes; then
+  # The deploy scripts announce a stop with `hold` and no --stops. A watchdog
+  # run as the real install plans it must find that marker, or it loads the job
+  # in the middle of a deploy.
+  installer install --dry-run
+  stops=$(planned_args | sed -n 's/.* --stops \([^ ]*\) .*/\1/p')
+  [ -n "$stops" ] && ok || bad "the real plan names no --stops"
+  wd hold "$JOB" 600 --by "a deploy"
+  expect_rc 0
+  watch 4 -- --stops "${stops:-/nowhere}"
+  expect_no_change
+  expect_events "a deploy announced the stop until .*leaving it alone" 1
+  finish
+fi
+
+if begin installer-runs-launchctl-by-absolute-path; then
+  # Named without a path, it is refused before any call.
+  in_env SUBROUTER_WATCHDOG_LAUNCHCTL=launchctl -- "$WD_BASH" "$INSTALLER" status --label "$PFX.wd" --dir "$C/wdhome" > "$C/out" 2>&1; RC=$?
+  expect_rc 2; expect_out "never looked up on PATH"
+  # Unset, it is /bin/launchctl, even with a launchctl first on PATH (that one
+  # fails the case in finish). Here /bin/launchctl is missing or fenced off,
+  # and status shows what running it answered.
+  in_env -u SUBROUTER_WATCHDOG_LAUNCHCTL -- "$WD_BASH" "$INSTALLER" status --label "$PFX.wd" --dir "$C/wdhome" > "$C/out" 2>&1; RC=$?
+  expect_out "/bin/launchctl"
+  expect_calls . 0
+  finish
+fi
+
+if begin installer-refuses-what-the-watchdog-would-refuse; then
+  # A job that exits at start is started again by launchd every 10 s for ever,
+  # so the installer asks the watchdog first. A job watched twice is one such.
+  scratch_install --watch "$JOB=$PLIST"
+  expect_rc 2; expect_out "watched twice"
+  expect_calls . 0
+  check "nothing was written" test ! -e "$C/wdhome"
   finish
 fi
 

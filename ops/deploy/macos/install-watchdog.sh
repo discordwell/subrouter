@@ -97,6 +97,13 @@ ARGS=(/bin/bash "$SCRIPT" run)
 for pair in ${WATCH[@]+"${WATCH[@]}"}; do ARGS+=(--watch "$pair"); done
 [ -z "$INTERVAL" ] || ARGS+=(--interval "$INTERVAL")
 ARGS+=(--log "$LOG" --stops "$STOPS")
+if [ "$VERB" = install ]; then
+    [ -f "$SOURCE" ] || die "cannot find $SOURCE"
+    # launchd starts a KeepAlive job that exits at once again every 10 s for
+    # ever, so the watchdog is asked first whether it would run with these.
+    refusal=$(SUBROUTER_WATCHDOG_LAUNCHCTL="${JOB_LAUNCHCTL:-/bin/launchctl}" "$BASH" "$SOURCE" config "${ARGS[@]:3}" 2>&1 > /dev/null) ||
+        die "the watchdog would refuse to run: ${refusal#subrouter-watchdog: }"
+fi
 
 plist_xml() {
     local a
@@ -160,7 +167,6 @@ bootout_own() {
 
 case "$VERB" in
 install)
-    [ -f "$SOURCE" ] || die "cannot find $SOURCE"
     if [ "$DRY" = 1 ]; then
         echo "would copy $SOURCE to $SCRIPT"
         echo "would write $PLIST:"

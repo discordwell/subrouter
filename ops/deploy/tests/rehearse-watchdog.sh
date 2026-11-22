@@ -60,8 +60,9 @@ lc() { "$GUARD" "$@"; }
 loaded() { lc print "$DOM/$1" > /dev/null 2>&1; }
 loaded_from() { lc print "$DOM/$1" 2>/dev/null | sed -n 's/^	path = //p' | head -1; }
 now() { /usr/bin/perl -MTime::HiRes=time -e 'printf "%.1f\n", time'; }
-since() { /usr/bin/perl -e 'printf "%.1f", $ARGV[1] - $ARGV[0]' "$1" "$(now)"; }
-under() { /usr/bin/perl -e 'exit($ARGV[0] < $ARGV[1] ? 0 : 1)' "$1" "$2"; }
+# `--`: a negative number after -e would be read as a perl switch.
+since() { /usr/bin/perl -e 'printf "%.1f", $ARGV[1] - $ARGV[0]' -- "$1" "$(now)"; }
+under() { /usr/bin/perl -e 'exit($ARGV[0] < $ARGV[1] ? 0 : 1)' -- "$1" "$2"; }
 watchdog() { /bin/bash "$MACOS/subrouter-watchdog.sh" "$@"; }
 installer() { SUBROUTER_WATCHDOG_LAUNCHCTL="$GUARD" /bin/bash "$MACOS/install-watchdog.sh" "$@"; }
 await_loaded() { # label limit-seconds: true once loaded within the limit
@@ -147,13 +148,15 @@ else
 fi
 sleep 2
 
+# The marker ends at a whole second, up to 1 s before 12 s have passed, so the
+# return is timed from the end the marker names.
 watchdog hold "$SVC" 12 --stops "$S/wd" --by "the rehearsal" > /dev/null
-t0=$(now)
+ends=$(sed -n 's/^until=//p' "$S/wd/watchdog-stop.$SVC")
 boot_out "$SVC" || failed "12 s stop: the bootout did not unload the job"
 if await_loaded "$SVC" 60; then
-    took=$(since "$t0")
-    if under 11.5 "$took" && under "$took" 22; then pass "a 12 s stop is respected and then not: loaded again ${took} s after it was announced"
-    else failed "a 12 s stop ended with the job loaded again ${took} s after it was announced (want 12 to 22)"; fi
+    took=$(since "$ends")
+    if under -0.5 "$took" && under "$took" 10; then pass "a 12 s stop is respected and then not: loaded again ${took} s after the marker ended"
+    else failed "a 12 s stop ended with the job loaded again ${took} s after the marker ended (want 0 to 10)"; fi
 else
     failed "a 12 s stop: not loaded again within 60 s"
 fi
