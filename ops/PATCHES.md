@@ -2342,6 +2342,78 @@ the cap's line taken out of serve's Server literal, the default and 90 s cases f
   `cmd/subrouter/hold_config.go` (`resolveClientRetryAfterMax`, `logClientRetryAfterMax`).
 - Related: §58 (the hold), §67.5 (the give-up).
 
+## 79. The stand-in: while the laptop's daemon is gone, Claude Code's socket is answered from a box
+
+On 2026-11-21 the laptop daemon's launchd job was unloaded for 2 h 22 min. Every socket session on the Mac
+failed once its retries ran out, and 242 workflow agents died, while both boxes were healthy. A Claude Code
+session reaches one endpoint for its whole life, the socket path it was launched with (§30), so only a
+process on the Mac that answers that path can carry a session to a box. The stand-in is that process. It
+is built in parts: §79.1 sends one request to a box, and §79.2 chooses the box. Until a later part adds
+`subrouter standby`, nothing runs this code, and no behaviour of the daemon changes.
+
+§79.1 The box handler (`internal/standby`) is a plain `http.Handler` for a request as it arrives on the
+Claude socket. It removes the client's `Authorization` (Claude Code's `ssh-placeholder`), `X-Api-Key`,
+`X-Pool-Hop` and every `X-Subrouter-*` header (`session.StripSubrouterHeaders`, then any other header with
+that prefix). It sets `Authorization: Bearer <the box's stand-in token>`, `X-Subrouter-Agent: claude`
+(without it a box assumes Codex) and `X-Subrouter-Session` to `session.ExtractRoutingID` of the client's
+request. `X-Claude-Code-Session-Id`, the `anthropic-*` headers and the rest pass as the client sent them.
+These are the peer forward's rules (`forwardToPeer`) without a hop count or a target account, so a box
+treats the request as one from a session of its own, and a session the box already holds keeps its account
+and its prompt cache.
+
+Bodies stream both ways through `httputil.ReverseProxy`. Events reach the client as the box writes them, and
+a request body goes to the box as the client sends it, so a 20 MB body costs one copy buffer and nothing is
+kept for a resend. A request moves to the next box only while no request head has been written to any box
+(`httptrace` `WroteHeaders`): a refused dial, a timeout or a certificate that fails its pin moves on. A
+failure after that point, in the body or after the first byte of the answer, is the client's to retry, and
+the client sees an answer cut mid-stream as cut, never as a clean end. The transport speaks HTTP/2 (both
+boxes offer `h2`), so when many sessions move at once they share one connection per box. Dial and TLS take
+at most 2 s each, and an answer's headers at most 150 s. The peer link's 30 s header bound is short because
+the peer link can fall back to local accounts. The stand-in cannot, and 150 s stays inside Claude Code's
+180 s first-byte limit. A stream's length is never bounded.
+
+The handler runs inside the daemon's own guard (`proxy.NewClaudeSocketGuard`,
+`internal/proxy/claude_socket_guard.go`). A box's 401, or its 403 that says the token was revoked, reaches
+the client as a 503, because either would make Claude Code drop its socket credential for the login stored
+on the Mac. Every Retry-After the client sees is at most 60 s. A longer one, or one that is not a whole
+number of seconds, becomes 30, and a 503 without one, the guard's included, gets 30. Without the client's
+retry watchdog, Claude Code fails a request at once on a 503 that asks for more than 60 s. With it, a
+session sleeps the whole value, so a box's `Retry-After: 3600` would park a session for an hour.
+
+One function, `routeFor`, decides what never goes to a box. `/_subrouter/health` gets the stand-in's own
+body, `{"ok":true,"claude_socket":"standby"}`. `claude-route` reads only `"ok": true`, so a new launch
+still takes the pool route, and `claude_socket` tells a deploy check that the daemon does not own the
+socket. The daemon's other `/_subrouter/` routes get a 503. `/api/*`, the client's account and policy
+calls, gets a 503 with Retry-After 30: a box answers them with its own identity account, and the client
+keeps whichever identity answered (`internal/proxy/control_plane.go`). The path is cleaned before it is
+read, so `/v1/../api/...` counts as `/api`. A request that names an account (`X-Subrouter-Account-ID` or
+`X-Subrouter-Account`, set by `claude <account>`) gets a 503 and is never sent, because a pinned launch is
+promised that account and no other. With no box usable, the client gets a 503 with Retry-After 30 at once,
+and nothing is parked. Every 503 the handler makes has Anthropic's `api_error` shape, which Claude Code
+retries like any server error, and names its cause in `X-Subrouter-Reason`: `standby_no_box`,
+`standby_box_unreachable`, `standby_box_failed`, `standby_pinned_account`, `standby_control_plane` or
+`standby_daemon_surface`.
+
+A `Box` exists only through `NewBox`. It takes an `https://host:port` URL, the stand-in token and the 64-hex
+pin of the box's certificate, and builds its transport on `proxy.PinnedTLSConfig`. A certificate that is not
+the pin ends the handshake before a byte of the request is written, so the token never reaches it. An
+`http://` URL, a missing pin and a malformed one are refused. The token is never logged.
+
+Not settled: whether a session launched while the stand-in answers can do without
+`/api/claude_code/policy_limits`, which Claude Code needs for some tools. The rule is one case in
+`routeFor`. Turning it off: nothing runs the handler yet. Once `subrouter standby` runs it, stopping that
+job turns it off.
+
+Tests: `internal/standby/handler_test.go` holds one test per behaviour above, against `httptest` TLS boxes
+that each have their own self-signed certificate and pin, with no network. Run them with
+`./deploy/docker/test.sh ./internal/standby`. Each test was run once with its behaviour's code taken out of
+the working tree, and failed.
+
+- Code: `internal/standby/box.go` (`Box`, `NewBox`, `Boxes`), `internal/standby/handler.go` (`NewHandler`,
+  `routeFor`, `rewriteForBox`, `send`, `retryAfterWriter`)
+- Related: §30 (the Claude socket), §43 (named tokens; a stand-in token is a `membership` token), §68
+  (tailnet first, which §79.2 applies)
+
 ## 82. Main holds what one person needs to run their own subrouter
 
 `ops/` held the laptop's tools and this log. The box deploy, the setup tools, the docs a newcomer needs and the agent skill lived outside the repository, written for a team that shared one pool. Main is now canonical for one person running their own subrouter: a Mac laptop daemon and, optionally, a Linux box of their own on Tailscale.
