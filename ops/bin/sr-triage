@@ -152,3 +152,18 @@ else
   echo "no launchctl (not macOS)"
 fi
 printf 'health:   '; curl -s -m 5 "http://$ADDR/_subrouter/health" >/dev/null 2>&1 && echo "OK" || echo "no daemon on $ADDR"
+# The Claude socket the job names. A stand-in answers health there with
+# "ok": true while the daemon is away, so sessions still get answers, but the
+# daemon does not own its socket: neither OK nor down (PATCHES §84).
+SOCK="$(python3 -c 'import plistlib, sys; print((plistlib.load(open(sys.argv[1], "rb")).get("EnvironmentVariables") or {}).get("SUBROUTER_CLAUDE_SOCKET") or "")' "$PLIST" 2>/dev/null)"
+printf 'socket:   '
+if [ -z "$SOCK" ]; then
+  echo "none ($PLIST names no SUBROUTER_CLAUDE_SOCKET)"
+else
+  case "$(curl -s -m 5 --unix-socket "$SOCK" http://api.anthropic.com/_subrouter/health 2>/dev/null \
+    | python3 -c 'import json, sys; b = json.load(sys.stdin); print("" if b.get("ok") is not True else "standby" if b.get("claude_socket") == "standby" else "ok")' 2>/dev/null)" in
+    standby) echo "STAND-IN at $SOCK: the daemon does not own its socket, and a stand-in answers the sessions there" ;;
+    ok) echo "OK ($SOCK)" ;;
+    *) echo "NOT answering at $SOCK" ;;
+  esac
+fi

@@ -25,7 +25,10 @@
 # shell cannot restart the daemon -- read the message); 2 the daemon is DOWN;
 # 3 INCOMPLETE -- the new build is serving and is kept, but Codex accounts fail
 # its credential-isolation gate (see below), or the plist names a Claude socket
-# that neither build serves (see probe_claude_socket).
+# that neither build serves, or one the daemon does not own: a stand-in answers
+# there, or the supervisor waits for its lock, finds a listener it does not own
+# there, or let go of it on purpose (see probe_claude_socket, PATCHES §84).
+# --check ends the same way: CHECK OK, CHECK FAILED or CHECK INCOMPLETE.
 #
 # It exists because the laptop had only a ROLLBACK script
 # (rollback-laptop-peer.sh). Deploys were therefore ad-hoc, and on 2026-09-01 an
@@ -554,7 +557,7 @@ upgrade() { # <the build it replaces>
     return 2
 }
 
-SOCKET_INCOMPLETE=0
+SOCKET_INCOMPLETE=0; SOCKET_WHY=""
 if [ "$MODE" = "--check" ]; then
     echo "== verify =="
     [ "$SUPERVISED" = 1 ] && echo "   supervised: worker $CUR, control socket $CONTROL_SOCKET"
@@ -570,6 +573,7 @@ if [ "$MODE" = "--check" ]; then
     echo
     if [ $rc -ne 0 ]; then echo "CHECK FAILED"; exit $rc; fi
     if [ $iso -ne 0 ]; then echo "CHECK INCOMPLETE"; exit 3; fi
+    if [ "$SOCKET_INCOMPLETE" = 1 ]; then echo "CHECK INCOMPLETE (claude socket $SOCKET_WHY)"; exit 3; fi
     echo "CHECK OK"
     exit 0
 fi
@@ -807,7 +811,7 @@ if [ "$ISOLATION_INCOMPLETE" = 1 ]; then
 fi
 if [ "$SOCKET_INCOMPLETE" = 1 ]; then
     echo
-    echo "DEPLOY INCOMPLETE (claude socket not served)  sha=$(shasum -a256 "$CUR" | cut -c1-12)  backup=$BACKUP"
+    echo "DEPLOY INCOMPLETE (claude socket $SOCKET_WHY)  sha=$(shasum -a256 "$CUR" | cut -c1-12)  backup=$BACKUP"
     exit 3
 fi
 
