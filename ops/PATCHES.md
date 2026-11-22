@@ -2343,20 +2343,33 @@ A socket that opens at start and whose path nobody touches behaves as before. Th
   `cmd/subrouter/supervisor.go` (supervisor-status), `internal/front/router.go` (`Serve`)
 - Tests, in Docker (`./deploy/docker/test.sh ./cmd/subrouter ./internal/front`), each seen failing with
   its part of the change taken out: `TestSupervisorRecreatesDeletedClaudeSocket` (a stream opened
-  before the delete finishes, and a waiter blocked on the lock never gets it),
+  before the delete finishes, a waiter blocked on the lock never gets it, and the lock is held
+  through the same open file after the delete as before it),
   `TestSupervisorReplacesADeadSocketAtTheClaudeSocketPath`,
   `TestSupervisorTakesClaudeSocketWhenLeaseFrees`,
   `TestSupervisorWaitsWhileAnotherProcessListensAtTheClaudeSocket`,
-  `TestSupervisorDoesNotStealALiveForeignSocket`,
+  `TestSupervisorNeverTriesAClaudeSocketInAnUnsafeFolder` (a folder its group or anyone can write
+  to, and a folder that is a symlink: `unavailable`, and still unserved once the folder is put
+  right), `TestSupervisorDoesNotStealALiveForeignSocket`,
   `TestSupervisorLeavesAnUnsafeEntryAtTheClaudeSocketPathAlone`,
   `TestSupervisorTakesTheClaudeSocketAgainWhenItsFolderIsReplaced`,
   `TestSupervisorStatusSaysItWaitsForTheClaudeSocketLock`,
   `TestSupervisorShutsDownCleanlyWhileWaitingForTheClaudeSocket`,
   `TestSupervisorShutsDownCleanlyWhileDisplacedFromTheClaudeSocket`,
+  `TestClaudeSocketAsksForItsLockAboutEvery250Milliseconds`,
+  `TestClaudeSocketPathIsBackAboutTwoSecondsAfterItIsDeleted`,
   `TestClaudeSocketKeepsAcceptingAfterTemporaryError`,
-  `TestClaudeSocketGivesUpThePathWhenItStopsServing`, `TestClaudeSocketSecondOwnerIsSoft` and
-  `TestRouterKeepsAcceptingAfterTemporaryAcceptErrors`. Not tested on macOS. The tests run on Linux
-  only, and the laptop's supervisor picks the change up at its next restart.
+  `TestClaudeSocketGivesUpThePathWhenItStopsServing`, `TestClaudeSocketSecondOwnerIsSoft`,
+  `TestRouterKeepsAcceptingAfterTemporaryAcceptErrors` and
+  `TestRouterPausesBetweenTriesWhileAcceptKeepsFailing` (at most 20 tries in 400 ms of `EMFILE`).
+  The two tests of the 250 ms and the 2 s judge the shortest of several waits, and fail below
+  half the time or above twice the time. A loaded machine makes a wait longer and never shorter,
+  so load does not fail them. A waiter blocked in `flock` is woken when the holder lets go, and
+  is not handed the lock, so a holder that takes the lock again at once can beat the waiter to
+  it. The check of the open file cannot be beaten that way. With the path bound again by letting
+  go and opening again, the waiter caught 4 runs of 10 and the check of the open file caught the
+  other 6. Not tested on macOS. The tests run on Linux only, and the laptop's supervisor picks the
+  change up at its next restart.
 - Related: builds on §30 (the socket and its lock) and §69 (the supervisor owns the socket). The
   activation still requires `serving`. The deploy's probe asks through the socket and prints the
   word only when nothing answers there.
