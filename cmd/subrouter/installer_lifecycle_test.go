@@ -423,6 +423,42 @@ func TestLaunchdStartReportsBootstrapFailureWhenNotLoaded(t *testing.T) {
 	}
 }
 
+// No test may hand the stop-marker code the live job's label (ops/PATCHES.md
+// §81): its marker is the one the live watchdog reads. The check runs before
+// the marker's path is made, so nothing is written.
+func init() {
+	watchdogStopMarkerHook = func(label string) {
+		if label == defaultDaemonLabel {
+			panic("a test handed the watchdog's stop marker the live job's label " + label + "; give it a test.subrouter. label")
+		}
+	}
+}
+
+func TestStopMarkerCodeIsNeverHandedTheLiveLabelInTests(t *testing.T) {
+	home := t.TempDir()
+	for name, use := range map[string]func(){
+		"announce": func() { announceWatchdogStop(home, defaultDaemonLabel, time.Minute) },
+		"withdraw": func() { withdrawWatchdogStop(home, defaultDaemonLabel) },
+	} {
+		func() {
+			defer func() {
+				if recover() == nil {
+					t.Errorf("%s with the live label went ahead; the guard proves nothing", name)
+				}
+			}()
+			use()
+		}()
+	}
+	if _, err := os.Stat(filepath.Join(home, ".subrouter")); !os.IsNotExist(err) {
+		t.Fatalf("the refused announce wrote under the home (%v)", err)
+	}
+	// A scratch label is let through.
+	announceWatchdogStop(home, "test.subrouter.guard", time.Minute)
+	if _, err := os.Stat(watchdogStopMarker(home, "test.subrouter.guard")); err != nil {
+		t.Fatalf("a scratch label's marker was not written: %v", err)
+	}
+}
+
 // markerAtEachCall records, at every launchctl call, the watchdog stop marker
 // (ops/PATCHES.md §81) as the watchdog job would find it then.
 type markerAtEachCall struct {

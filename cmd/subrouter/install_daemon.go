@@ -866,9 +866,14 @@ func restartLaunchAgent(home, plistPath, label string, runner taskRunner) error 
 	return runner.Run("launchctl", "kickstart", "-k", service)
 }
 
+// watchdogStopMarkerHook sees the label of every stop marker announced or
+// withdrawn. The tests fail through it on the live job's label.
+var watchdogStopMarkerHook = func(label string) {}
+
 // watchdogStopMarker is the stop marker the watchdog job reads for label: the
 // file subrouter-watchdog.sh `hold` writes, always under ~/.subrouter.
 func watchdogStopMarker(home, label string) string {
+	watchdogStopMarkerHook(label)
 	return filepath.Join(home, ".subrouter", "watchdog-stop."+label)
 }
 
