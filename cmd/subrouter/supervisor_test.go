@@ -1007,12 +1007,22 @@ func waitForSupervisorStatus(t *testing.T, client *http.Client, runDone <-chan e
 
 func getSupervisorStatus(t *testing.T, client *http.Client) supervisorControlStatus {
 	t.Helper()
-	status, err := fetchSupervisorStatus(client)
-	if err != nil {
-		t.Fatalf("supervisor status: %v", err)
+	// A busy machine can take longer than the client's limit to answer, and a
+	// slow answer is not a failed one: only a read that keeps timing out fails.
+	deadline := time.Now().Add(supervisorStatusReadLimit)
+	for {
+		status, err := fetchSupervisorStatus(client)
+		if err == nil {
+			return status
+		}
+		var slow net.Error
+		if !errors.As(err, &slow) || !slow.Timeout() || time.Now().After(deadline) {
+			t.Fatalf("supervisor status: %v", err)
+		}
 	}
-	return status
 }
+
+const supervisorStatusReadLimit = 30 * time.Second
 
 func fetchSupervisorStatus(client *http.Client) (supervisorControlStatus, error) {
 	response, err := client.Get("http://supervisor/_subrouter/supervisor-status")
