@@ -2668,8 +2668,9 @@ On 2026-11-21 the laptop daemon's launchd job was unloaded for 2 h 22 min. Every
 failed once its retries ran out, and 242 workflow agents died, while both boxes were healthy. A Claude Code
 session reaches one endpoint for its whole life, the socket path it was launched with (§30), so only a
 process on the Mac that answers that path can carry a session to a box. The stand-in is that process. It
-is built in parts: §79.1 sends one request to a box, and §79.2 chooses the box. Until a later part adds
-`subrouter standby`, nothing runs this code, and no behaviour of the daemon changes.
+is built in parts: §79.1 sends one request to a box, §79.2 chooses the box, and §79.3 is the process,
+`subrouter standby`, that takes the socket path and gives it back. Until a later part installs that process
+as a launchd job, nothing starts it, and no behaviour of the daemon changes.
 
 §79.1 The box handler (`internal/standby`) is a plain `http.Handler` for a request as it arrives on the
 Claude socket. It removes the client's `Authorization` (Claude Code's `ssh-placeholder`), `X-Api-Key`,
@@ -2730,8 +2731,8 @@ the pin ends the handshake before a byte of the request is written, so the token
 
 Not done: replaying the daemon's own `policy_limits` answer, saved while it is healthy, ahead of the box's.
 The same session accepted such a replay, even with its signature header removed. It needs the process
-that can reach the daemon, so it belongs to a later part. Turning it off: nothing runs the handler yet.
-Once `subrouter standby` runs it, stopping that job turns it off.
+that can reach the daemon, so it belongs to a later part. Turning it off: only `subrouter standby` (§79.3)
+runs the handler, and stopping that process turns it off.
 
 §79.2 The box set (`Set`, `internal/standby/boxset.go`) decides which boxes a request may go to, and in
 which order. It reads only files the daemon already keeps, and it writes nothing to the state folder.
@@ -2786,21 +2787,201 @@ box's other addresses for a minute, as the peer link's tailnet cooldown does, an
 once all its addresses have failed. So a box whose tailnet address fails while its URL works is never shown
 unreachable.
 
-Not done: the stand-in command must take `SUBROUTER_PEER_TAILNET` from the daemon's worker config, and must
-apply the daemon's `remote.key` gate before it builds the set. Both belong to the part that adds
-`subrouter standby`. Turning it off: nothing runs the set yet. Once `subrouter standby` runs it, removing a
-box's token file takes that box out within 2 s.
+The set does not read `SUBROUTER_PEER_TAILNET` from the daemon's worker config, and does not ask the
+daemon's `remote.key` gate: the process that builds it does both (§79.3). Turning it off: only
+`subrouter standby` runs the set, and removing a box's token file takes that box out within 2 s.
 
 Tests: `internal/standby/handler_test.go` (§79.1) and `internal/standby/boxset_test.go` (§79.2) hold one
 test per behaviour above, against `httptest` TLS boxes that each have their own self-signed certificate and
 pin, with no network, and temporary state folders. Run them with `./deploy/docker/test.sh ./internal/standby`.
 Each test was run once with its behaviour's code taken out of the working tree, and failed.
 
+§79.3 The process. `subrouter standby` (`cmd/subrouter/standby.go`) is a second small process beside the
+supervisor. It waits on the lock of the daemon's Claude socket (`<socket>.lock`, §30). When the supervisor
+lets go of that lock, because it ended, its job was unloaded, or it let go on purpose (§77.3), the stand-in
+binds the same socket path and sends turns to a box through §79.1 and §79.2, until the supervisor asks for
+the path back. While the daemon serves its socket, the stand-in is not in the path of any request. It runs on
+Unix. On Windows the command says that it is not supported. This part adds the command only: nothing
+installs or starts it.
+
+Arming. A stand-in is armed or disarmed, and a disarmed one never touches the lock or the path, not even to
+create the lock file. It asks the supervisor's control socket for `supervisor-status` every 3 s. It is armed
+when the supervisor's last answer has `claude_socket_waits_for_lock: true` and a `claude_socket` of
+`serving`, `waiting`, `displaced` or `yielded`. A supervisor built before §77.1 tries its socket once at
+start and gives up for good. A stand-in that took the lock while such a supervisor restarted would leave the
+daemon without its socket until someone noticed, so beside one the stand-in stays disarmed. The supervisor's
+last answer, good or bad, is kept in `<state folder>/standby-supervisor.json` (mode 0600), written when it
+changes and every 5 minutes. A stand-in that starts while the supervisor is away, which is the day it is
+needed, is armed by a saved answer under 24 hours old. It waits for its first look at the control socket
+before it decides. A saved answer without the marker keeps it disarmed, so a supervisor that was rolled back
+to an older build is not armed against from an earlier answer. A disarmed stand-in gives one fixed word for
+the reason:
+
+- `remote_locked`: the `remote.key` gate (§17) is locked for the state folder. The box set is then never
+  built, so no token is read and no box is dialled.
+- `peers_file_missing`: no peers file is named, or the named one is not there. The stand-in arms within
+  seconds of the file arriving.
+- `no_supervisor_reading`: the supervisor has not answered, and there is no saved answer under 24 hours old.
+- `supervisor_without_marker`: the supervisor's last answer has no `claude_socket_waits_for_lock`.
+- `supervisor_keeps_no_socket`: the marker is there, and the word is `unavailable` or `stopped`.
+
+Taking the path. An armed stand-in tries the lock every 50 ms with the daemon's own opener
+(`openLeasedClaudeSocket`). So it holds the lock about 50 ms after the lock is free, well inside the 5 s the
+supervisor gives a process standing by (§77.3), and the socket it binds is one the supervisor accepts: bound
+under a temporary name, made private, and renamed into place. It polls for the keeper's reason (§77.1): a
+goroutine blocked in `flock(2)` cannot be told to stop. It holds the lock for as long as it listens. The
+opener refuses a path at which a live listener answers and frees the lock again, and the stand-in then tries
+every 2 s. While the supervisor's last answer is `waiting`, the stand-in does not try at all. That supervisor
+takes the lock within 250 ms of it being free, and the stand-in must not win back the lock it has just let
+go of.
+
+The hold. For the first 30 s after it takes the path (`--hold`, at most 90 s), the stand-in answers
+`/_subrouter/health` and parks every other request. A watchdog loads an unloaded job again within seconds
+(§81) and launchd restarts a supervisor that crashed in about 15 s. A session that moved to a box for that
+long would pay one write of its prompt cache for nothing. If the path goes back inside the hold, each parked
+connection is closed with no answer. The client's own retry then reaches the daemon, and nothing was sent to
+a box. When the hold ends, the parked requests go on in the order they came. Each goes once the one before it
+has had its head written to a box, or 2 s after it, and a request that arrives after the hold goes at once.
+The requests the stand-in answers itself with a 503 (the daemon's other routes, `/api/*`, a pinned launch)
+are parked too. A 503 would make such a client sleep 30 s through a restart of 5 s, and a closed connection
+is tried again at once.
+
+Serving. After the hold, a request goes through §79.1 to a box that §79.2 chose. The stand-in hands the box
+set the daemon's peers file, its `SUBROUTER_PEER_TAILNET` and the state folder. It reads the two settings
+where a worker reads them: in the `env` of the worker config (`<state folder>/worker-config.json`) first, and
+in its own environment second. `--peers-file` and `--tailnet` name them outright. It asks the `remote.key`
+gate once, for the state folder it was given, before it builds the box set. It reads no account of the
+daemon, writes only its own two files, and dials only boxes. Its `/_subrouter/health` is its own answer,
+below, and never §79.1's short one.
+
+Giving the path back. While it holds the path, the stand-in reads `supervisor-status` every second. When the
+word is `waiting`, it also asks the daemon `GET /_subrouter/ready` on TCP (`--daemon-addr`). Once the
+supervisor has asked and the daemon has answered 200 on 3 checks in a row, the stand-in shuts its server
+down (`http.Server.Shutdown`). That stops accepting, closes the listener, which removes the stand-in's socket
+file, and frees the lock, in that order. The supervisor binds the path within 250 ms (§77.1). From that
+moment every answer says `Connection: close` and idle kept-alive connections are closed, so no session stays
+on the stand-in. A stream that is already running to a box runs to its end. When the last one has ended, the
+connections to the boxes are closed. A supervisor that says `yielded` is not asking, and the stand-in keeps
+the path for the whole yield. Then it is armed again.
+
+No bouncing. The rule counts the times the stand-in took the path. From the third take within 10 minutes,
+3 checks are not enough: the daemon has to answer ready on every check for 60 s, and for 2, 4, 8 and then 10
+minutes at each further take within those 10 minutes. The hold is the same in every take. So a daemon that is
+away twice for less than the hold moves no session. A daemon that keeps coming and going moves sessions to a
+box once, when the third hold ends, and they stay there until the daemon has stayed up for a minute. The
+other design's guard was built for a relay that sat in front of the daemon all the time. That relay had to
+judge the daemon by probes, so it kept a window of probes, a returning state and a table of the sessions it
+had moved. The stand-in is told when the supervisor wants the path, and the supervisor already waits for a
+steady worker before it asks (§77.3). All that is left to decide is how long the daemon must prove itself,
+and one time that doubles decides it. The health body shows `takes` and `hand_back_after_seconds`. An
+operator's yield counts as a take, so a third drill within 10 minutes goes back a minute after its reclaim.
+
+Ending itself. A stand-in that holds the lock and does not serve makes a healthy daemon unreachable by
+socket, and nothing else would notice. Two rules end such a process, and the kernel frees a dead process's
+lock. If the lock is not free 5 s after the stand-in set out to give the path back, it exits with 1. While it
+holds the path, it asks its own `/_subrouter/health` through the path every 15 s. After 3 misses in a row,
+each no answer in 5 s or an answer that is not a stand-in's, it exits with 1. A supervisor that answers
+without the marker while the stand-in holds the path shows as `warning: supervisor_without_marker` and one
+ERROR line. The stand-in keeps serving and never gives that supervisor the path, whatever word it says: it
+has already given up on its socket, and a box is better than nothing.
+
+Health and state. `/_subrouter/health` at the path answers at once, the hold included, with
+`{"ok": true, "claude_socket": "standby", "standby": {...}}`. The object has `state` (`disarmed`, `armed`,
+`holding`, `serving` or `yielding`), `reason` when disarmed, `warning`, `since` (when the state began),
+`pid`, `supervisor` (the last answer's `claude_socket` and `claude_socket_waits_for_lock`, and `read_at`),
+`supervisor_answering`, `takes`, `hand_back_after_seconds`, `ready_checks`, `parked` (requests in the hold)
+and `boxes` (§79.2's status: each box's name and the word for its token). The same object is written to
+`<state folder>/standby-state.json` (mode 0600, replaced by rename) whenever anything in it changes but a
+count or a time of day. So the file's `parked`, `ready_checks` and `read_at` are those of the last change.
+After a clean stop the file says `stopped`, and `pid` shows a file that a killed process left. Neither holds
+a token or an account.
+
+SIGTERM and SIGINT. The stand-in gives the path back as above, lets streams run for 8 s, cuts the rest, and
+exits with 0.
+
+Flags. `--state-dir` (default `~/.subrouter`, or `SUBROUTER_STATE_DIR`), `--socket` (default
+`SUBROUTER_CLAUDE_SOCKET`, else `<state folder>/claude.sock`), `--control-socket` (default
+`<state folder>/supervisor.sock`), `--daemon-addr` (default `127.0.0.1:31415`), `--worker-config`,
+`--peers-file`, `--tailnet` and `--hold`. The defaults are the laptop daemon's own, so a job that runs the
+stand-in needs the peers file's variable and little else. Every other interval above is a named constant in
+`standby.go`.
+
+Turning it off: stop the process. It frees the path and the lock on SIGTERM, and a supervisor that waits has
+the path 250 ms later. `--hold 0` sends requests to a box as soon as the stand-in has the path.
+
+Not done. A socket file that is deleted while the stand-in holds the path is not bound again: the
+stand-in's own check ends the process about a minute later, and whatever restarts it takes the path again. A
+changed `SUBROUTER_PEER_TAILNET` is read at the stand-in's next start. The ready check wants a 200, so a
+worker that answers unready for good keeps sessions on a box, although the supervisor would serve with it.
+The number of parked requests has no limit. When a supervisor is restarted on purpose and the old one drains
+for longer than the hold, sessions move to a box until the new one asks for the path. Nothing ran on macOS.
+
+Tests (§79.3): `cmd/subrouter/standby_test.go`, run with
+`./deploy/docker/test.sh ./cmd/subrouter -run TestStandby`. They run a stand-in beside a real supervisor
+with a real worker on a temporary socket path, or beside a control socket that answers what the test tells
+it to, with TLS boxes that each have a certificate, a pin and a token of their own. The stand-in's rules
+read the test's clock, so 30 s, a minute and a day pass when the test says so. The three tests of how it
+ends run it as a process of its own.
+
+- `TestStandbyAnswersFromABoxAfterTheHoldWhenTheSupervisorEnds`: the supervisor ends, the stand-in holds the
+  lock, a request is parked and counted in health, no answer comes a second before the hold ends, and after
+  it the box answers and saw its stand-in token.
+- `TestStandbyClosesHeldRequestsWhenTheSupervisorIsBackInsideTheHold`: a new supervisor starts inside the
+  hold, the parked connection is closed with no answer, the retry is answered by the daemon's worker, and
+  the box saw nothing.
+- `TestStandbyReleasesHeldRequestsInTheOrderTheyCame`: 8 parked requests are written to a box in the order
+  they were parked, and all 8 before the box answers one. The box in this test reads the HTTP/2 frames
+  itself. A `net/http` server starts the handlers of requests that arrive together in whatever order its
+  scheduler picks, so it cannot say which came first.
+- `TestStandbyNeverTakesTheLockBesideASupervisorWithoutTheMarker`: no lock file is ever made beside a
+  supervisor without the marker, or beside one that says `stopped`, and the test takes the lock itself. The
+  same stand-in takes the path once the supervisor has the marker.
+- `TestStandbyLeavesTheLockToASupervisorThatAsksForIt`: nothing is touched while the word is `waiting`, and
+  the path is taken when that supervisor is gone.
+- `TestStandbyArmsFromASavedReadingUnderADayOld`: 23 hours arms and 25 does not; a saved answer without the
+  marker disarms; the file is private and a later answer without the marker replaces it.
+- `TestStandbyIsDisarmedWithoutTheRemoteKeyOrThePeersFile`: with the gate locked the box gets no request at
+  all; the gate reads the key in the state folder it is given; a peers file that arrives arms the stand-in.
+- `TestStandbyDoesNotStealALiveListenerAtThePath`: another process's listener keeps answering, and the lock
+  is free between tries.
+- `TestStandbyGivesThePathBackWhenTheSupervisorAsksForIt`: an operator's yield moves requests to the box
+  after the hold; the stand-in stays through `yielded`; after the reclaim the worker answers, the path is
+  the supervisor's private socket, the idle connection is closed, the request in flight is answered with
+  `Connection: close`, the open stream runs to its end, and the box's connections then close.
+- `TestStandbyGivesThePathBackOnlyAfterThreeReadyChecksInARow`: a daemon that is not ready, or ready twice
+  and then not, three times over, does not get the path.
+- `TestStandbyKeepsSessionsOnABoxWhileTheDaemonComesAndGoes` and
+  `TestStandbyDoublesTheSteadyTimeForEachFurtherTake`: two absences shorter than the hold send nothing to
+  the box; on the third take the stand-in still serves after many ready checks and a second under a minute,
+  and gives the path back at the minute.
+- `TestStandbyKeepsServingBesideASupervisorWithoutTheMarker`: the warning word, and no hand-back to a
+  supervisor that says `waiting` without the marker while the daemon answers ready.
+- `TestStandbyHealthAndStateFileHoldFixedWordsAndNoToken`: the words and fields of both, the file's mode,
+  and neither the stand-in token, the peer link token nor any `srk_` text in either.
+- `TestStandbyLeavesNoDeadTimeAtThePath`: a client dials the path every 10 ms while the supervisor ends, a
+  new one starts, and that one yields and takes the path back. The longest run of failed dials must be at
+  most 500 ms. Three runs measured 150 to 162 ms. A run in which the dialling loop itself was held up for
+  200 ms is measured again, up to three times, because it measured the machine.
+- `TestStandbyEndsItselfWhenItCannotFreeTheLock`, `TestStandbyEndsItselfWhenItStopsAnswering`,
+  `TestStandbyKeepsRunningWhileItAnswers` and `TestStandbyExitsOnSIGTERMWithAStreamOpen`: exit code 1 and a
+  free lock for the first two; a stand-in that answers is still there after 20 checks; SIGTERM with a stream
+  open ends the process with 0 well inside 10 s, with the path and the lock gone and `stopped` in the file.
+- `TestStandbyDefaultsAreTheDaemons`: the defaults above, the worker config before the environment, flags
+  before both, and the refused values.
+
+Each behaviour's code was taken out of the working tree in turn, 43 changes in all, and each one failed its
+test. One behaviour has no such change: that a live listener at the path is left alone is the opener's own
+rule (§30), and the stand-in's part in it is to use that opener.
+
 - Code: `internal/standby/box.go` (`Box`, `NewBox`, `Boxes`), `internal/standby/handler.go` (`NewHandler`,
-  `routeFor`, `rewriteForBox`, `send`, `retryAfterWriter`), `internal/standby/boxset.go` (`Set`, `NewSet`,
-  `Config`, `Run`, `Candidates`, `Status`)
+  `routeFor`, `IsHealth`, `rewriteForBox`, `send`, `retryAfterWriter`), `internal/standby/boxset.go` (`Set`,
+  `NewSet`, `Config`, `Run`, `Candidates`, `Status`, `CloseIdleConnections`), `cmd/subrouter/standby.go`
+  (`standbyCommand`, `parseStandbyConfig`, `runStandby`, `standIn`, `standbyTenure`, `holdGate`,
+  `armingVerdict`, `flapSteady`), `cmd/subrouter/remote_gate.go` (`resolveRemoteGateAt`)
 - Related: §30 (the Claude socket), §43 (named tokens; a stand-in token is a `membership` token), §68
-  (tailnet first), §31 (the peers file and the peer-holds files)
+  (tailnet first), §31 (the peers file and the peer-holds files), §17 (the `remote.key` gate), §77 (the
+  supervisor keeps its socket, and lets go of it on purpose), §81 (the watchdog), §84 (the deploy checks
+  tell a stand-in from the daemon)
 
 ## 81. A watchdog job loads the daemon's job again when something unloads it, unless a stop was announced
 
