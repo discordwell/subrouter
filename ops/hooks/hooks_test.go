@@ -55,7 +55,7 @@ var full = fixture{
 			"TailscaleIPs":["100.99.8.37","fd7a:115c:a1e0::9"]},
 		"Peer":{"nodekey:1":{"HostName":"fern-nas","DNSName":"fern-nas.tail0fixture.ts.net.","TailscaleIPs":["100.99.8.38"]},
 			"nodekey:2":{"HostName":"localhost","DNSName":"bramble-phone.tail0fixture.ts.net."}},
-		"User":{"1":{"LoginName":"tailquill@plantedmail.net"}}}`,
+		"User":{"1":{"LoginName":"tailquill@plantedmail.net","DisplayName":"Quilla Fernhart"}}}`,
 	email:         "gitquill@plantedmail.net",
 	login:         "quillsmith",
 	privateValues: "# a former employer\nFernwood Analytics\n",
@@ -71,7 +71,7 @@ var planted = []string{
 	"100.88.41.7", "100.64.213.9", "fd7a:115c:a1e0::10:3", "Émilie Zorbrecht", "Łukasz", "İlkay",
 	"100-99-8-37", "100%2e99%2e8%2e37", "fd7a%3a115c%3aa1e0%3a%3a9", "tailnet.quill@plantedmail.net",
 	"bramble-phone", "Wavecrest", "user@plantedmail.net", "Quill Harborside",
-	"author.quill@plantedmail.net", "committer.quill@plantedmail.net",
+	"author.quill@plantedmail.net", "committer.quill@plantedmail.net", "Quilla Fernhart",
 }
 
 type sandbox struct {
@@ -277,6 +277,7 @@ func TestEachSourceEachHook(t *testing.T) {
 		{"tailscale peer's DNS name, not its host name", "bramble-phone", "box"},
 		{"tailscale tailnet name", "tailnet.quill@plantedmail.net", "someone@example.com"},
 		{"tailscale user", "tailquill@plantedmail.net", "someone@example.com"},
+		{"tailscale user's display name", "by Quilla Fernhart", "by someone"},
 		{"git email", "gitquill@plantedmail.net", "someone@example.com"},
 		{"git email local part", "gitquill wrote this", "someone wrote this"},
 		{"login name", "/Users/quillsmith/bin", "~/bin"},
@@ -593,6 +594,15 @@ func TestGenericValuesPass(t *testing.T) {
 		out, err := s.commit("notes.md", "notes\nssh macbook-pro-2\n", "on macbook-pro-2")
 		passed(t, out, err)
 		out, err = s.commit("notes.md", "notes\nssh macbook-pro-2.tail0fixture.ts.net\n", "notes")
+		refused(t, out, err, "notes.md:2")
+	})
+	// Tailscale gives a tailnet's tagged devices a user of their own.
+	t.Run("tailscale's user for tagged devices", func(t *testing.T) {
+		s := newSandbox(t, fixture{tailscale: `{"User":{"1":{"LoginName":"tailquill@plantedmail.net","DisplayName":"Quilla Fernhart"},
+			"2":{"LoginName":"tagged-devices","DisplayName":"Tagged Devices"}}}`})
+		out, err := s.commit("notes.md", "notes\nTagged Devices are tagged-devices\n", "for tagged devices")
+		passed(t, out, err)
+		out, err = s.commit("notes.md", "notes\nby Quilla Fernhart\n", "notes")
 		refused(t, out, err, "notes.md:2")
 	})
 	t.Run("already in the base", func(t *testing.T) {

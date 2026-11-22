@@ -12,11 +12,13 @@ ZERO = "0" * 40
 CACHE_TTL = 600
 MIN_LEN = 4
 
-# Words that name no one: system and device defaults, and the repo's placeholder machine names.
+# Values that name no one: system and device defaults, the repo's placeholder machine names, and the
+# user that tailscale gives a tailnet's tagged devices.
 GENERIC = {
     "user", "users", "admin", "administrator", "root", "guest", "agent", "runner", "ubuntu",
     "debian", "ec2-user", "localhost", "iphone", "ipad", "android", "raspberrypi", "macbook",
     "macbook-pro", "macbook-air", "imac", "desktop", "laptop", "server", "router", "default", "home",
+    "tagged-devices", "tagged devices",
 }
 # The documentation ranges, which no machine uses. A tailnet address is real even where it equals one
 # of the repo's placeholders, such as 100.64.0.1, because a hook matches only the values a source reports.
@@ -136,7 +138,8 @@ def daemon():
 
 
 def tailscale():
-    """This node's and every peer's addresses and names, the tailnet's name and its MagicDNS suffix."""
+    """This node's and every peer's addresses and names, the tailnet's name, its MagicDNS suffix, and each user's
+    login and display name."""
     # A configured CLI is the only one, as for sr, so one that does not run leaves this source out.
     exe = (os.environ.get("SUBROUTER_TAILSCALE_BIN", "").strip()
            or next(filter(None, map(shutil.which, TAILSCALE_CLIS)), None))
@@ -151,7 +154,7 @@ def tailscale():
         for node in [status.get("Self") or {}, *(status.get("Peer") or {}).values()]:
             dns = (node.get("DNSName") or "").rstrip(".")
             found += [*(node.get("TailscaleIPs") or []), node.get("HostName"), dns, dns.split(".")[0]]
-        found += [user.get("LoginName") for user in (status.get("User") or {}).values()]
+        found += [user.get(f) for user in (status.get("User") or {}).values() for f in ("LoginName", "DisplayName")]
         return [v for v in found if isinstance(v, str)]
     return classify(cached("tailscale", exe, fetch))
 

@@ -59,7 +59,7 @@ Each source is optional. If a source is missing or fails, the hooks use the othe
 | Source | Values |
 |---|---|
 | The subrouter daemon at `$SUBROUTER_ADDR`, default `127.0.0.1:31415` | The `id`, `label` and `email` of each account in `GET /_subrouter/accounts`. The `account_identity` of each row in `GET /_subrouter/usage-status?snapshot=1`. The name, URL host and accounts of each peer in `GET /_subrouter/peers/usage-status`. |
-| `tailscale status --json` | The addresses, `HostName`, `DNSName` and first `DNSName` label of this node and of each peer. The MagicDNS suffix, the tailnet's name, and the `LoginName` of each user. |
+| `tailscale status --json` | The addresses, `HostName`, `DNSName` and first `DNSName` label of this node and of each peer. The MagicDNS suffix, the tailnet's name, and the `LoginName` and `DisplayName` of each user, but not the user that owns tagged devices. |
 | `git config user.email` | The email and its local part. |
 | Your login | `$LOGNAME`, `$USER`, `$HOME`, and the login name and home directory from the password database. |
 | `~/.config/subrouter/private-values` | One value on each line. A line that starts with `#` is a comment. Add the values that no other source knows, such as the name of a former employer or of a person. |
