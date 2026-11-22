@@ -76,7 +76,7 @@ func configureDefaultLogger(program string, args []string) {
 
 func shouldKeepProcessLogger(_ string, args []string) bool {
 	return isCodexIsolationCheckCommand(args) ||
-		(len(args) > 0 && (args[0] == "serve" || args[0] == "supervise" || args[0] == "front" || args[0] == "listener-transfer")) ||
+		(len(args) > 0 && (args[0] == "serve" || args[0] == "supervise" || args[0] == "standby" || args[0] == "front" || args[0] == "listener-transfer")) ||
 		// The drain verbs run as root on the box (`sudo subrouter drain`), where
 		// the CLI log would create /root/.subrouter for one HTTP request.
 		(len(args) > 0 && (args[0] == "drain" || args[0] == "resume" || args[0] == "drain-status"))
@@ -2809,8 +2809,9 @@ Usage:
 
   %[1]s serve [--addr 127.0.0.1:31415] [--unix-socket PATH] [--fetch-usage=true] [--multi-tenant] [--codex-upstream URL] [--claude-upstream URL] [--kimi-upstream URL] [--zai-upstream URL] [--openrouter-upstream URL] [--deepseek-upstream URL] [--together-upstream URL] [--fireworks-upstream URL] [--opencode-zen-upstream URL] [--grok-upstream URL] [--grok-subscription-upstream URL] [--qwen-upstream URL] [--qwen-token-upstream URL] [--qwen-anthropic-upstream URL] [--antigravity-upstream URL] [--openai-compatible name=URL] [--transcripts DIR] [--transcript-gcs-uri gs://bucket/prefix] [--transcript-gcs-sync-timeout 30m] [--transcript-local-retention 24h] [--transcript-max-local-bytes 2GiB]
   %[1]s supervise --worker-bin PATH [--addr 127.0.0.1:31415] [--control-socket /var/run/subrouter-supervisor.sock] [--local-data-socket PATH] [--upgrade-inhibit-file PATH] [--expect-proxy-protocol] [--drain-timeout 10m] [--worker-stop-grace 30s] [--worker-probe-interval 15s] [--worker-probe-timeout 10s] [--worker-probe-misses 3] [--claude-socket-yield-exits 3] -- [serve flags]
-  %[1]s standby [--state-dir ~/.subrouter] [--socket PATH] [--control-socket PATH] [--daemon-addr 127.0.0.1:31415] [--worker-config PATH] [--peers-file PATH] [--tailnet name=IP,...] [--hold 30s] [--policy-every 30m]
-                           stand in on the daemon's Claude socket while the supervisor does not hold it, and send turns to a box
+  %[1]s standby [--state-dir ~/.subrouter] [--socket PATH] [--control-socket PATH] [--daemon-addr 127.0.0.1:31415] [--worker-config PATH] [--peers-file PATH] [--tailnet name=IP,...] [--hold 30s] [--policy-every 30m] [--check]
+                           stand in on the daemon's Claude socket while the supervisor does not hold it, and send turns to a box;
+                           --check prints whether it would arm now, and changes nothing
   %[1]s front --backend-id ID --backend-address ADDRESS [--backend-network tcp|unix] [--addr 127.0.0.1:31415] [--control-socket /var/run/subrouter-front.sock] [--listener-transfer-socket /var/run/subrouter-front-listener.sock]
   %[1]s probe [--url http://127.0.0.1:31415]
   %[1]s accounts
