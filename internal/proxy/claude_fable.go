@@ -210,11 +210,8 @@ func (s Server) claudeFableAPIKeyResponse(r *http.Request, body []byte) (*http.R
 	session.StripSubrouterHeaders(outReq.Header)
 	stripOutboundForwardingHeaders(outReq.Header)
 	stripClientAcceptEncoding(outReq.Header)
-	for key := range outReq.Header {
-		if strings.HasPrefix(strings.ToLower(key), "x-subrouter-") {
-			outReq.Header.Del(key)
-		}
-	}
+	// 2026-11-23: no subrouter-internal header reaches a provider (PATCHES 101).
+	stripInternalHeaders(outReq.Header)
 	outReq.Header.Set("X-Api-Key", s.ClaudeFableAPIKey)
 	removeCommaHeaderValue(outReq.Header, "Anthropic-Beta", claudeOAuthBetaHeader)
 	if outReq.Header.Get("Anthropic-Version") == "" {

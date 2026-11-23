@@ -9738,6 +9738,10 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 	session.StripSubrouterHeaders(headers)
 	s.setDelegatedSessionHeaders(headers, agentType, sessionID)
 	stripOutboundForwardingHeaders(headers)
+	if !s.upstreamIsSubrouter() {
+		// 2026-11-23: no subrouter-internal header reaches a provider (PATCHES 101).
+		stripInternalHeaders(headers)
+	}
 	setAccountAuthHeaders(headers, account, compatibilityModel)
 	transcriptRequestID := nextTranscriptRequestID()
 	r = r.WithContext(withTranscriptRequestID(r.Context(), transcriptRequestID))
@@ -9980,7 +9984,7 @@ func webSocketOriginAllowed(r *http.Request) bool {
 // --upstream proxy chain. Provider endpoints never receive these internal
 // headers through their normal provider-specific upstream configuration.
 func (s Server) setDelegatedSessionHeaders(headers http.Header, agentType, sessionID string) {
-	if s.Upstream == nil || !s.ForwardSessionHeaders {
+	if !s.upstreamIsSubrouter() {
 		return
 	}
 	headers.Set("X-Subrouter-Agent", agentType)
@@ -17776,6 +17780,11 @@ func (s Server) transport() http.RoundTripper {
 	base := s.Transport
 	if base == nil {
 		base = http.DefaultTransport
+	}
+	// 2026-11-23: no subrouter-internal header reaches a provider (PATCHES 101).
+	// At the bottom, so every layer above still reads X-Pool-Hop.
+	if !s.upstreamIsSubrouter() {
+		base = providerTransport{base: base}
 	}
 	// With a peer, every local upstream round trip is also evidence about this
 	// machine's own network, which a peer breaker reads before it ends the

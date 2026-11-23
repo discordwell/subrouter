@@ -1442,6 +1442,8 @@ func copyBedrockRequestHeaders(dst, src http.Header) {
 		}
 	}
 	stripClientAcceptEncoding(dst)
+	// 2026-11-23: no subrouter-internal header reaches a provider (PATCHES 101).
+	stripInternalHeaders(dst)
 	if dst.Get("Content-Type") == "" {
 		dst.Set("Content-Type", "application/json")
 	}
