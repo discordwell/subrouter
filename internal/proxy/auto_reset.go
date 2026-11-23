@@ -497,9 +497,11 @@ type autoResets struct {
 	latches map[string]autoResetLatch
 	// choices is the accounts chosen to load at the last pass, by ScoreKey,
 	// replaced whole at each pass (PATCHES §95.1, reset_choice.go); codexHold
-	// is the Codex account loaded one at a time, and since when.
+	// is the Codex account loaded one at a time, and since when; resetGaps is
+	// each choice keeping its place through a gap in the pool's need (§96).
 	choices   map[string]resetChosen
 	codexHold resetCodexHold
+	resetGaps map[string]resetGap
 }
 
 type autoResetCreditList struct {

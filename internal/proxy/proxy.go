@@ -1067,6 +1067,9 @@ type AccountRef struct {
 	// autoResetMemory is §93's decision memory (sharedAutoResets): the wall,
 	// the reading pass and the views read one.
 	autoResetMemory atomic.Pointer[autoResets]
+	// resetNeedMemory is §96's memory of each meter's need
+	// (sharedResetNeeds): burn.json, §94's decision and §95's choice read one.
+	resetNeedMemory atomic.Pointer[resetNeeds]
 }
 
 // sharedAdmission returns the ref's admission gate, creating it on first use.

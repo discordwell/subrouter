@@ -6,16 +6,18 @@ import (
 	"math"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 )
 
 // When an automatic claim is worth making (PATCHES §94.1): each meter's pool
-// pressure, whether the pool needs its saved resets, what a claim now is
-// worth, a reset's last chance, and the window before a reset expires. Need
-// is published on burn.json and each window on this daemon's own usage-status
-// rows. Nothing ranks, routes or decides on any of it here.
+// pressure, whether the pool needs its saved resets (held near its bar by
+// §96), what a claim now is worth, a reset's last chance, and the window
+// before a reset expires. Need is published on burn.json and each window on
+// this daemon's own usage-status rows. Nothing ranks, routes or decides on
+// any of it here.
 
 // Ruling 2026-11-22: "only reset if we are over burn rate, or the second
 // derivative is taking it well over 1.0 to 1.1".
@@ -25,6 +27,17 @@ const (
 	resetNeedAt = 1.0
 	// resetNeedRisingAt is the bar for the 6-hour pressure plus its trend.
 	resetNeedRisingAt = 1.1
+)
+
+const (
+	// resetNeedHoldAt is where a yes ends (PATCHES §96): once the pool needs
+	// its saved resets, it needs them until the pressure that decides falls
+	// under this, so a pressure that sits at the bar does not turn the
+	// choices on and off with every reading.
+	resetNeedHoldAt = 0.9
+	// resetNeedUnknownHold is how long a yes holds through readings that have
+	// no figure at all.
+	resetNeedUnknownHold = 30 * time.Minute
 )
 
 const (
@@ -171,6 +184,9 @@ type MeterNeed struct {
 	// the accounts with a figure in both; null when it is not known.
 	Trend *float64 `json:"trend"`
 	Why   string   `json:"why"`
+	// Held is a yes this daemon keeps from an earlier reading (PATCHES §96):
+	// the figures alone would answer no or unknown.
+	Held bool `json:"held,omitempty"`
 }
 
 // needOf is whether the pool needs its saved resets on one meter, from its
@@ -254,6 +270,102 @@ func meterNeed(windows map[string]UsagePoolWindow, held []UsageAccountBurn) *Met
 	}
 	need := needOf(pressure, pressureTrend(held, "6h", "6h_prev"))
 	return &need
+}
+
+// holdNeed is a meter's need with what this daemon remembers of it (PATCHES
+// §96): yesAt is when need last answered yes on a figure, zero when it has not
+// since the daemon started. A yes stays yes until the pressure that decides it
+// falls under resetNeedHoldAt, and through readings with no figure for
+// resetNeedUnknownHold. It returns the answer, and yesAt for the next reading.
+func holdNeed(raw MeterNeed, yesAt, now time.Time) (MeterNeed, time.Time) {
+	switch {
+	case raw.Answer == ResetNeedYes:
+		return raw, now
+	case yesAt.IsZero():
+		return raw, time.Time{}
+	case raw.Answer == ResetNeedNo:
+		window, figure, ok := needHeldBy(raw.Pressure, raw.Trend)
+		if !ok {
+			return raw, time.Time{}
+		}
+		raw.Answer, raw.Window, raw.Held = ResetNeedYes, window, true
+		raw.Why = fmt.Sprintf("still yes: %s, and it turns no under %.1f", figure, resetNeedHoldAt)
+		return raw, now
+	case now.Sub(yesAt) > resetNeedUnknownHold:
+		return raw, time.Time{}
+	}
+	raw.Answer, raw.Held = ResetNeedYes, true
+	raw.Why = fmt.Sprintf("still yes: no window has a pressure now, and the last one said yes %s ago; without a figure a yes holds for %s",
+		shortDuration(now.Sub(yesAt)), shortDuration(resetNeedUnknownHold))
+	return raw, yesAt
+}
+
+// needHeldBy is the figure that keeps a yes at resetNeedHoldAt, with its
+// window and in words: the 24-hour pressure, or the 6-hour pressure plus its
+// trend; without a 24-hour figure, the window that decides need. False when
+// none reaches it.
+func needHeldBy(pressure map[string]Pressure, trend *float64) (string, string, bool) {
+	if day := pressure["24h"]; day.known() {
+		if day.atLeast(resetNeedHoldAt) {
+			return "24h", "the 24-hour pressure is " + day.String(), true
+		}
+		six := pressure["6h"]
+		if rising, ok := six.plus(trend); ok && trend != nil && rising.atLeast(resetNeedHoldAt) {
+			return "6h", fmt.Sprintf("the 24-hour pressure is %s, and the 6-hour pressure %s plus its trend %+.2f is %s",
+				day, six, *trend, rising), true
+		}
+		return "", "", false
+	}
+	for _, window := range resetNeedWindows[1:] {
+		if p := pressure[window]; p.known() {
+			return window, "the 24-hour window has too little history; the " + windowWords(window) + " pressure is " + p.String(),
+				p.atLeast(resetNeedHoldAt)
+		}
+	}
+	return "", "", false
+}
+
+// resetNeeds is what this daemon remembers of each meter's need (PATCHES §96):
+// when it last answered yes on a figure. burn.json, §94's decision and §95's
+// choice all read need through it, so the three read one answer. It lives in
+// memory alone: a daemon that has just started answers from the figures.
+type resetNeeds struct {
+	mu    sync.Mutex
+	yesAt map[string]time.Time
+}
+
+func (r *AccountRef) sharedResetNeeds() *resetNeeds {
+	if r == nil {
+		return &resetNeeds{}
+	}
+	if needs := r.resetNeedMemory.Load(); needs != nil {
+		return needs
+	}
+	r.resetNeedMemory.CompareAndSwap(nil, &resetNeeds{})
+	return r.resetNeedMemory.Load()
+}
+
+// hold puts each meter's held need in place of its need from the figures, at
+// now, and remembers it.
+func (n *resetNeeds) hold(meters []UsagePoolMeter, now time.Time) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	for i := range meters {
+		if meters[i].Need == nil {
+			continue
+		}
+		key := meters[i].Provider + "\x00" + meters[i].Meter
+		need, yesAt := holdNeed(*meters[i].Need, n.yesAt[key], now)
+		switch {
+		case yesAt.IsZero():
+			delete(n.yesAt, key)
+		case n.yesAt == nil:
+			n.yesAt = map[string]time.Time{key: yesAt}
+		default:
+			n.yesAt[key] = yesAt
+		}
+		meters[i].Need = &need
+	}
 }
 
 // pressureTrend is the change in pressure from the window before, over the
@@ -593,7 +705,9 @@ func (s Server) resetPoolOf(statuses []AccountUsageStatus, now time.Time) resetP
 		read := readPeerBurn(peer.name(), peer.cachedUsage())
 		rows, holders = append(rows, read.rows...), append(holders, read.holders...)
 	}
-	for _, meter := range usagePoolMeters(rows) {
+	meters := usagePoolMeters(rows)
+	s.AccountRef.sharedResetNeeds().hold(meters, now)
+	for _, meter := range meters {
 		pool.meters[meter.Provider+"\x00"+meter.Meter] = meter
 	}
 	pool.holdings = resetHoldings(holders, pool.now)

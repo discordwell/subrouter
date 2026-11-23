@@ -149,11 +149,50 @@ func (l autoResetLatch) blocks(now time.Time) string {
 	case now.Sub(l.StartedAt) < autoResetClaimFloor:
 		return fmt.Sprintf("never twice: an automatic claim on this account started at %s, and no other follows within %s",
 			l.StartedAt.UTC().Format(time.RFC3339), autoResetClaimFloor)
-	case (l.Sent || !l.Finished) && l.BackAt.IsZero():
+	case l.unsettled():
 		return fmt.Sprintf("never twice: the automatic claim sent at %s is not settled, and only a reading that shows %s back settles it",
 			l.StartedAt.UTC().Format(time.RFC3339), autoResetMetersWords(l.Meters))
 	}
 	return ""
+}
+
+// unsettled is a claim that may have reached the provider, or is still
+// running, that no reading since has shown back.
+func (l autoResetLatch) unsettled() bool {
+	return !l.StartedAt.IsZero() && (l.Sent || !l.Finished) && l.BackAt.IsZero()
+}
+
+// currentLatch is key's latch as a decision reads it: this worker's, or the
+// one another worker stored if that claim started later, settled by readings.
+// It keeps what it read and reports whether readings settled it. The caller
+// holds m.mu.
+func (m *autoResets) currentLatch(key string, stored autoResetLatch, readings map[autoResetMeter]autoResetReading) (autoResetLatch, bool) {
+	latch := newerAutoResetLatch(m.latches[key], stored)
+	settled := latch.settle(readings)
+	if !latch.StartedAt.IsZero() {
+		m.latches[key] = latch
+	}
+	return latch, settled
+}
+
+// autoResetUnsettledClaim says why key's last automatic claim is not settled,
+// read as a decision reads its latch, or "" when it is (PATCHES §96): §95's
+// choice passes over such an account, since no claim can follow on it until a
+// reading shows its meters back.
+func (s Server) autoResetUnsettledClaim(key string, readings map[autoResetMeter]autoResetReading) string {
+	stored, _ := s.loadAutoResetLatch(key)
+	memory := s.AccountRef.sharedAutoResets()
+	memory.mu.Lock()
+	latch, settled := memory.currentLatch(key, stored, readings)
+	memory.mu.Unlock()
+	if settled {
+		s.saveAutoResetLatch(key, latch)
+	}
+	if !latch.unsettled() {
+		return ""
+	}
+	return fmt.Sprintf("its automatic claim started at %s is not settled: no reading since shows %s back, and until one does no other claim follows",
+		latch.StartedAt.UTC().Format(time.RFC3339), autoResetMetersWords(latch.Meters))
 }
 
 // settle notes BackAt when readings, measured after the claim started, show
@@ -249,9 +288,7 @@ func (s Server) startAutoResetClaim(account accounts.Account, f autoResetFacts, 
 		memory.mu.Unlock()
 		return claim, ""
 	}
-	latch := newerAutoResetLatch(memory.latches[key], stored)
-	settled := latch.settle(f.readings)
-	memory.latches[key] = latch
+	latch, settled := memory.currentLatch(key, stored, f.readings)
 	if why := latch.blocks(f.now); why != "" {
 		memory.mu.Unlock()
 		if settled {
