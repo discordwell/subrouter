@@ -109,6 +109,11 @@ func (s Score) allowance(now time.Time) Allowance {
 		}
 	}
 	allowed := max(taper, out.Paced)
+	if s.loading {
+		// A chosen account is run to its limit (PATCHES §95.2): the ceiling,
+		// held down by backpressure and the 5h brake like any raise.
+		allowed = out.Ceiling
+	}
 	// Slots beyond the first need a 5h window that survives them. The drain
 	// admits an account past usableForNewSession's burn projection (only the
 	// short floor applies), which is right for its final task and wrong for a

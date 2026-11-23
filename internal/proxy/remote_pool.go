@@ -695,6 +695,13 @@ type remotePoolNormalized struct {
 	// 1x. The peer publishes it at the top level only; a pool entry takes its
 	// account's.
 	FableWeekSpent float64 `json:"fable_week_spent"`
+	// ResetChoice is the peer's choice to run this account to its limit for
+	// its next saved reset (PATCHES §95), published in real mode only, which
+	// this daemon ranks on as it ranks a choice of its own unless
+	// SUBROUTER_RESET_LOADING=0. Absent -- not chosen, or a peer before §95 --
+	// is none. The peer publishes it at the top level only; a pool entry
+	// takes its account's.
+	ResetChoice *selectacct.ResetChoice `json:"reset_choice"`
 	// WeeklyUnstarted is the peer's reading that the account's weekly window
 	// has not started (PATCHES §86): this daemon's clause then gives the
 	// account the next new session, unless this daemon marked it for one it
@@ -871,6 +878,9 @@ func (n remotePoolNormalized) score(id string, now time.Time) (selectacct.Score,
 	}
 	score.FableSpent = min(max(n.FableWeekSpent, 0), 1)
 	score.WeeklyUnstarted = n.WeeklyUnstarted
+	if n.ResetChoice != nil && n.ResetChoice.Known() && ResetLoading() {
+		score.ResetChoice = *n.ResetChoice
+	}
 	return score, true
 }
 

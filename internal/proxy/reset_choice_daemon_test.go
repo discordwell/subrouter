@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -80,10 +79,10 @@ func usageRows(t *testing.T, server Server) map[string]map[string]json.RawMessag
 
 // published is what a row says of its choice: the would_choose beside
 // normalized, and the reset_choice inside it.
-func published(t *testing.T, row map[string]json.RawMessage) (would, inside *ResetChoice) {
+func published(t *testing.T, row map[string]json.RawMessage) (would, inside *selectacct.ResetChoice) {
 	t.Helper()
 	if raw, ok := row["would_choose"]; ok {
-		would = &ResetChoice{}
+		would = &selectacct.ResetChoice{}
 		if err := json.Unmarshal(raw, would); err != nil {
 			t.Fatal(err)
 		}
@@ -95,7 +94,7 @@ func published(t *testing.T, row map[string]json.RawMessage) (would, inside *Res
 		}
 	}
 	if raw, ok := normalized["reset_choice"]; ok {
-		inside = &ResetChoice{}
+		inside = &selectacct.ResetChoice{}
 		if err := json.Unmarshal(raw, inside); err != nil {
 			t.Fatal(err)
 		}
@@ -139,7 +138,7 @@ func TestTheChoiceIsPublishedAsTheModeSays(t *testing.T) {
 			if mode == AutoResetReal {
 				got, other, message = inside, would, resetChooseMessage
 			}
-			if got == nil || other != nil || got.Meter != ResetChoiceWeek || got.Order != 1 ||
+			if got == nil || other != nil || got.Meter != selectacct.ResetChoiceWeek || got.Order != 1 ||
 				!strings.Contains(got.Why, "the pool needs its saved resets on the Claude week") {
 				t.Fatalf("%s: would_choose %+v and reset_choice %+v", what, would, inside)
 			}
@@ -344,7 +343,7 @@ func TestAnAccountWithADeadCredentialIsNeverChosen(t *testing.T) {
 	d := choiceCodex(t)
 	d.server.autoResetPass(context.Background())
 	would, _ := published(t, usageRows(t, d.server)[heldCodex])
-	if would == nil || would.Meter != ResetChoiceCodexWeek || would.Order != 1 {
+	if would == nil || would.Meter != selectacct.ResetChoiceCodexWeek || would.Order != 1 {
 		t.Fatalf("calibration: held's would_choose is %+v, want the Codex week", would)
 	}
 	d.server.AccountRef.noteCredResult(d.account(heldCodex), &accounts.CodexStoredRefreshFailureError{})
@@ -426,75 +425,5 @@ func TestTheBackgroundPassReadsAStalePeerAndNothingElseDoes(t *testing.T) {
 	d.pass()
 	if requests.Load() != 1 {
 		t.Fatalf("a pass on a body 4 minutes old made %d peer requests in all, want one", requests.Load())
-	}
-}
-
-// 10. No ranking changes: the daemon's own Explain, Pick and PickSteady are
-// the same before and after a pass chooses, in every mode, and a peer that
-// reads the rows published with the choice ranks the accounts exactly as it
-// does the same rows published without it.
-func TestAChoiceChangesNoRanking(t *testing.T) {
-	candidates := []accounts.Account{
-		{ID: "held", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth},
-		{ID: "spare", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth},
-	}
-	rank := func(s Server) []string {
-		scheduler := s.scheduler().WithReserves(s.AccountReserves)
-		var out []string
-		for _, explain := range []func([]accounts.Account) ([]selectacct.Explanation, error){scheduler.Explain, scheduler.ExplainSteady} {
-			explained, err := explain(candidates)
-			if err != nil {
-				t.Fatal(err)
-			}
-			for _, e := range explained {
-				out = append(out, e.Account.ID+": "+e.Reason)
-			}
-		}
-		picked, _ := scheduler.Pick(candidates)
-		steady, _ := scheduler.PickSteady(candidates)
-		return append(out, picked.ID, steady.ID)
-	}
-	for _, mode := range []AutoResetMode{AutoResetOff, AutoResetShadow, AutoResetReal} {
-		d := choiceClaude(t, mode, true, nil, nil)
-		before := rank(d.server)
-		d.pass()
-		if after := rank(d.server); !reflect.DeepEqual(after, before) {
-			t.Fatalf("%s: the pass changed the ranking:\n%v\nbefore\n%v", mode, after, before)
-		}
-		if mode != AutoResetReal {
-			continue
-		}
-		if _, inside := published(t, usageRows(t, d.server)["held"]); inside == nil {
-			t.Fatal("calibration: real mode publishes no choice")
-		}
-		// The same rows, published with the choice and without it.
-		SetResetLoading(false)
-		rec := httptest.NewRecorder()
-		d.server.handleUsageStatus(rec, loopbackRequest(http.MethodGet, remotePoolUsagePath, ""))
-		SetResetLoading(true)
-		var rows []AccountUsageStatus
-		if err := json.Unmarshal(rec.Body.Bytes(), &rows); err != nil {
-			t.Fatal(err)
-		}
-		without, _ := json.Marshal(rows)
-		withChoice, _ := json.Marshal(d.server.withResetChoices(rows))
-		if !strings.Contains(string(withChoice), `"reset_choice"`) || strings.Contains(string(without), `"reset_choice"`) {
-			t.Fatalf("calibration: the bodies with and without the choice are\n%s\n%s", withChoice, without)
-		}
-		peer := NewRemotePool("http://peer.invalid", "", "")
-		now := time.Now()
-		ranked := func(body []byte) []crossPoolCandidate {
-			candidates, _, ok := peer.decisionCandidates(AdminSnapshot{Body: body, At: now}, string(accounts.ProviderClaude), "", nil, now)
-			if !ok || len(candidates) != 2 {
-				t.Fatalf("calibration: %d peer candidates (ok %v)", len(candidates), ok)
-			}
-			for i := range candidates {
-				candidates[i].Peer = nil
-			}
-			return candidates
-		}
-		if got, want := ranked(withChoice), ranked(without); !reflect.DeepEqual(got, want) {
-			t.Fatalf("a peer ranks on the choice:\n%+v\nwithout it\n%+v", got, want)
-		}
 	}
 }

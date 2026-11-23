@@ -42,6 +42,10 @@ const (
 	// holds closed_queue waiters (PATCHES §72): no new session and no refugee
 	// until it drains. Its warm sessions stay and queue.
 	VerdictQueueClosed = "queue_closed"
+	// VerdictChosen is an account its holder chose to run to its limit for
+	// its next saved reset (PATCHES §95.2), below its allowance: it takes a
+	// new session below the short floor.
+	VerdictChosen = "chosen"
 )
 
 // NewSessionVerdict is one daemon's answer, for one of its own accounts, to
@@ -72,7 +76,8 @@ type NewSessionVerdict struct {
 	// floor and the reserve (endgameDrainEligible). Ranks first.
 	Burndown bool `json:"burndown"`
 	// AtCap: inside the window and carrying its full taper allowance
-	// (endgameAtCap).
+	// (endgameAtCap), or chosen for a saved reset and carrying its allowance
+	// (PATCHES §95.2).
 	AtCap bool `json:"at_cap"`
 	// Evicted: a session ALREADY on this account must leave it -- a spent
 	// window or the owner's holdout (Scheduler.Evicted). This is the
@@ -83,8 +88,9 @@ type NewSessionVerdict struct {
 	// LiveSessions is the account's current concurrency on the publishing
 	// daemon: the count its taper and its session spread run on.
 	LiveSessions int `json:"live_sessions"`
-	// AllowedSessions is the endgame taper allowance; 0 outside the burndown
-	// window.
+	// AllowedSessions is the endgame taper allowance, or a chosen account's
+	// (PATCHES §95.2); 0 outside the burndown window for an account not
+	// chosen.
 	AllowedSessions int `json:"allowed_sessions"`
 	// BurndownCause says why the account is in the burndown window, "roll" or
 	// "reset" (Score.BurndownCause), whenever it is -- for logs, srq and the
@@ -153,12 +159,12 @@ func (s Scheduler) NewSessionVerdict(provider account.Provider, accountID string
 	score := s.score(provider, accountID)
 	verdict := NewSessionVerdict{
 		Burndown:      score.endgameDrainEligible(now),
-		AtCap:         score.endgameAtCap(now),
+		AtCap:         score.endgameAtCap(now) || score.loadAtCap(now),
 		Evicted:       score.evicted(),
 		LiveSessions:  score.LiveSessions,
 		BurndownCause: score.BurndownCause(now),
 	}
-	if score.inBurndownWindow(now) {
+	if score.inBurndownWindow(now) || score.loading {
 		verdict.AllowedSessions = score.endgameAllowedSessions(now)
 	}
 	verdict.RefugeeCap = RefugeeCap{Slots: score.refugeeCap(now), Published: true}
@@ -176,6 +182,8 @@ func (s Scheduler) NewSessionVerdict(provider account.Provider, accountID string
 		verdict.Reason = VerdictAtCap
 	case verdict.Burndown:
 		verdict.Eligible, verdict.Reason = true, VerdictBurndown
+	case score.loadEligible(now):
+		verdict.Eligible, verdict.Reason = true, VerdictChosen
 	case score.usableForNewSession():
 		verdict.Eligible, verdict.Reason = true, VerdictEligible
 	case score.ShortHeadroom < MinShortHeadroomFloor:
