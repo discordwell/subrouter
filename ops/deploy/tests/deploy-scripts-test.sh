@@ -4961,6 +4961,7 @@ if begin route-failed-check-without-paradev-blocks-the-gate; then
   [ "$(cat "$H/.claude-route/codex-mode" 2>/dev/null)" = pool ] && bad "codex mode is pool" || ok
   echo off > "$H/.claude-route/mode"
   run_route_launch FAKE_NO_SESSIONS=1 -- test
+  expect_line "  FAIL    ...through the pool   (details: $H/.claude-route/test.err)"
   expect_line "  FAIL    ...and the pool served it   (details: $H/.claude-route/test.err)"
   expect_line "  SKIP  Paradev's wrapper execs the shim   (no Paradev wrapper)"
   expect_test_counts
