@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"math"
@@ -383,6 +384,73 @@ func (h *UsageHistory) recordClaimLocked(claim usageClaim) {
 	h.claims = append(h.claims, claim)
 	h.queueLocked(usageHistoryLine{Claim: &claim})
 	h.logger.Info("reset claim recorded", usageClaimLogArgs(claim)...)
+	if table, showed, contradicts := claimAgainstTable(claim); contradicts {
+		h.logger.Warn(claimContradictsTableMessage, "account", claim.Account, "provider", claim.Provider, "kind", claim.Kind,
+			"table", table, "claim", showed, "claimed_at", time.UnixMicro(claim.At).UTC().Format(time.RFC3339Nano))
+	}
+}
+
+const claimContradictsTableMessage = "reset claim contradicts the kinds table; the table is unchanged"
+
+// claimTableMeters are the history's meters for the names a kind's GivesBack
+// uses.
+var claimTableMeters = map[string]string{"seven_day": usageMeterWeek, "seven_day_overage_included": usageMeterFable, "weekly": usageMeterWeek}
+
+// claimAgainstTable compares a landed claim's record with its kind's entry in
+// the kinds table (§94.2): whether the roll of the kind's meter moved by more
+// than usageSegmentRollMove, against restarts_clock, and whether each meter
+// the kind gives back fell. It returns what the table says and what the
+// claim showed when they disagree. A failed claim, one with no reading after
+// it, a kind the table does not know, and a meter not read on both sides
+// settle nothing. The table is never changed here.
+func claimAgainstTable(claim usageClaim) (table, showed string, contradicts bool) {
+	spec, known := accounts.ResetKindNamed(accounts.Provider(claim.Provider), accounts.ResetKind(claim.Kind))
+	if claim.Failed || len(claim.After) == 0 || !known {
+		return "", "", false
+	}
+	reading := func(readings []usageMeterReading, meter string) (usageMeterReading, bool) {
+		for _, r := range readings {
+			if r.Meter == meter {
+				return r, true
+			}
+		}
+		return usageMeterReading{}, false
+	}
+	var says, saw []string
+	meter := string(spec.Meter)
+	before, hadBefore := reading(claim.Before, meter)
+	after, hadAfter := reading(claim.After, meter)
+	// A roll already past at the claim is the week's own roll, not the claim's.
+	if restarts, ok := spec.RestartsClock.Restarts(); ok && hadBefore && hadAfter && before.Roll != 0 && after.Roll != 0 &&
+		!before.Unstarted && time.Unix(before.Roll, 0).After(time.UnixMicro(claim.At)) {
+		moved := time.Duration(absInt64(after.Roll-before.Roll))*time.Second > usageSegmentRollMove
+		if moved != restarts {
+			says = append(says, fmt.Sprintf("restarts_clock %s", spec.RestartsClock))
+			roll := fmt.Sprintf("the %s roll stayed at %s", meter, time.Unix(before.Roll, 0).UTC().Format(time.RFC3339))
+			if moved {
+				roll = fmt.Sprintf("the %s roll moved from %s to %s", meter, time.Unix(before.Roll, 0).UTC().Format(time.RFC3339),
+					time.Unix(after.Roll, 0).UTC().Format(time.RFC3339))
+			}
+			saw = append(saw, roll)
+		}
+	}
+	for _, name := range spec.GivesBack {
+		given, ok := claimTableMeters[name]
+		if !ok {
+			continue
+		}
+		before, hadBefore := reading(claim.Before, given)
+		after, hadAfter := reading(claim.After, given)
+		if !hadBefore || !hadAfter || before.Used <= usageSegmentFall || after.Used < before.Used-usageSegmentFall {
+			continue
+		}
+		says = append(says, fmt.Sprintf("gives back %s (%s)", given, name))
+		saw = append(saw, fmt.Sprintf("the %s did not fall: %.3f used before, %.3f after", given, before.Used, after.Used))
+	}
+	if len(says) == 0 {
+		return "", "", false
+	}
+	return strings.Join(says, "; "), strings.Join(saw, "; "), true
 }
 
 func usageClaimLogArgs(claim usageClaim) []any {

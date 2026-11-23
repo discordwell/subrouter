@@ -301,21 +301,37 @@ func autoResetNearEmptyEnabled() (bool, error) {
 	return false, fmt.Errorf("SUBROUTER_AUTO_RESET_NEAR_EMPTY=%q: want 1 (the default) or 0", raw)
 }
 
-// autoResetSpendsAlone refuses SUBROUTER_AUTO_RESET=1 beside either older
-// path that redeems Codex credits by itself, the failover redeem
+// autoResetWorthEnabled reads SUBROUTER_AUTO_RESET_WORTH (PATCHES §94.2):
+// unset or 1, an automatic claim is made only when it is worth making; 0
+// goes back to §93.1's rule. Anything else is an error.
+func autoResetWorthEnabled() (bool, error) {
+	raw := os.Getenv("SUBROUTER_AUTO_RESET_WORTH")
+	switch strings.TrimSpace(raw) {
+	case "", "1":
+		return true, nil
+	case "0":
+		return false, nil
+	}
+	return false, fmt.Errorf("SUBROUTER_AUTO_RESET_WORTH=%q: want 1 (the default) or 0", raw)
+}
+
+// autoResetFoldWarnings names each older path that redeems Codex credits by
+// itself and that SUBROUTER_AUTO_RESET=1 turns off: the failover redeem
 // (SUBROUTER_CODEX_AUTO_RATE_LIMIT_RESET) and the background spender in its
-// spending mode: only one thing may spend credits (PATCHES §93.2).
-func autoResetSpendsAlone(mode proxy.AutoResetMode, failoverRedeem bool, spender proxy.ResetCreditAutospend) error {
+// spending mode, which then only advises. The proxy turns them off; serve
+// says so at startup, one Warn each (PATCHES §94.2).
+func autoResetFoldWarnings(mode proxy.AutoResetMode, failoverRedeem bool, spender proxy.ResetCreditAutospend) []string {
 	if mode != proxy.AutoResetReal {
 		return nil
 	}
+	var warnings []string
 	if failoverRedeem {
-		return errors.New("SUBROUTER_AUTO_RESET=1 and SUBROUTER_CODEX_AUTO_RATE_LIMIT_RESET=1 both spend Codex reset credits by themselves; set only one")
+		warnings = append(warnings, "SUBROUTER_CODEX_AUTO_RATE_LIMIT_RESET is set and SUBROUTER_AUTO_RESET=1: the failover redeem is off, automatic resets now decide every Codex claim")
 	}
 	if spender == proxy.ResetCreditAutospendSpend {
-		return errors.New("SUBROUTER_AUTO_RESET=1 and --reset-credit-autospend=spend both spend Codex reset credits by themselves; set only one")
+		warnings = append(warnings, "--reset-credit-autospend=spend and SUBROUTER_AUTO_RESET=1: the background spender redeems nothing and only advises, as with warn; automatic resets now decide every Codex claim")
 	}
-	return nil
+	return warnings
 }
 
 // pacedAllowanceEnabled reads SUBROUTER_PACED_ALLOWANCE (PATCHES §72). 0 keeps
@@ -1203,11 +1219,20 @@ func serve(args []string) error {
 	if err != nil {
 		return err
 	}
-	// §93.2: only one thing may spend Codex credits by itself.
-	if err := autoResetSpendsAlone(autoReset, envTrue("SUBROUTER_CODEX_AUTO_RATE_LIMIT_RESET"), resetCreditAutospend); err != nil {
+	autoResetWorth, err := autoResetWorthEnabled()
+	if err != nil {
 		return err
 	}
 	proxy.SetAutoReset(autoReset, autoResetNearEmpty)
+	proxy.SetAutoResetWorth(autoResetWorth)
+	// §94.2: in real mode only automatic resets spend Codex credits.
+	for _, warning := range autoResetFoldWarnings(autoReset, envTrue("SUBROUTER_CODEX_AUTO_RATE_LIMIT_RESET"), resetCreditAutospend) {
+		slog.Warn(warning)
+	}
+	if !autoResetWorth {
+		slog.Warn("SUBROUTER_AUTO_RESET_WORTH=0: an automatic claim follows §93's rule alone, at the limit with demand, whatever the pool's burn",
+			"reenable", "unset SUBROUTER_AUTO_RESET_WORTH and restart")
+	}
 	switch {
 	case autoReset == proxy.AutoResetOff:
 		slog.Info("automatic resets disabled by SUBROUTER_AUTO_RESET=0; nothing decides or logs a claim",

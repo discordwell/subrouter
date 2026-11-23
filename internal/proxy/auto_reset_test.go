@@ -103,6 +103,8 @@ type autoResetProfile struct {
 	week, fable float64 // percent used
 	block       string  // the cedar_ember block, "" for none
 	turn        http.HandlerFunc
+	// roll is how far ahead both meters roll; 0 is three days.
+	roll time.Duration
 }
 
 // autoResetClaude is a daemon holding Claude profiles measured by its own
@@ -152,7 +154,11 @@ func newAutoResetClaude(t *testing.T, profiles map[string]*autoResetProfile) *au
 			return respond(http.StatusNotFound, `{}`)
 		}
 		d.mu.Lock()
-		week := time.Now().Add(3 * 24 * time.Hour).UTC().Format(time.RFC3339)
+		roll := profile.roll
+		if roll == 0 {
+			roll = 3 * 24 * time.Hour
+		}
+		week := time.Now().Add(roll).UTC().Format(time.RFC3339)
 		body := fmt.Sprintf(`{"seven_day":{"utilization":%g,"resets_at":%q},"seven_day_oauth_apps":{"utilization":%g,"resets_at":%q}`,
 			profile.week, week, profile.fable, week)
 		if profile.block != "" {

@@ -250,6 +250,11 @@ func (s Server) spendResetCredits(ctx context.Context, now time.Time, mode Reset
 	if mode != ResetCreditAutospendWarn && mode != ResetCreditAutospendSpend {
 		return nil
 	}
+	if mode == ResetCreditAutospendSpend && autoResetFoldsOlderSpenders() {
+		// Automatic resets in real mode spend the credits (PATCHES §94.2):
+		// the spender only advises, as in warn mode.
+		mode = ResetCreditAutospendWarn
+	}
 	scan, err := s.scanRateLimitReset(ctx, min(resetCreditExpiringMinWait, resetCreditBlockedMinWait))
 	if err != nil {
 		return []RateLimitResetResult{{Error: err.Error()}}

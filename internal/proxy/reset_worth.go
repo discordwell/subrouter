@@ -439,8 +439,15 @@ func expiryWindow(expires, now time.Time, holders int, headroom float64, demand 
 			lead = time.Duration(margin * float64(time.Hour))
 		}
 	}
-	lead = min(lead, left).Round(time.Second)
-	return accounts.ResetExpiryWindow{OpensAt: expires.Add(-lead).UTC(), LeadSeconds: int64(lead / time.Second), Why: why}
+	lead = min(lead, left)
+	opens := expires.Add(-lead.Round(time.Second))
+	if lead == left {
+		// Capped at the time left: the window is open now. A rounded lead
+		// could put it a fraction of a second ahead of the decision that
+		// reads it; the second now falls in keeps it steady between reads.
+		opens = now.Truncate(time.Second)
+	}
+	return accounts.ResetExpiryWindow{OpensAt: opens.UTC(), LeadSeconds: int64(lead.Round(time.Second) / time.Second), Why: why}
 }
 
 func plural(n int, one, many string) string {
@@ -551,12 +558,22 @@ func holdingKeyOf(provider string, entry accounts.HeldReset, now time.Time) (res
 	return resetHoldingKey{provider: provider, kind: entry.Kind, expires: expires.UnixMicro()}, spec, true
 }
 
-// withResetWindows puts each reset's expiry window on this daemon's own rows.
-// The pool is this daemon's accounts and every peer counted on burn.json, each
-// peer from its last usage body: usage-status reads no peer, since a peer that
-// reads this daemon's usage-status would read it back.
-func (s Server) withResetWindows(statuses []AccountUsageStatus) []AccountUsageStatus {
-	now := s.AccountRef.sharedHeldResets().clock()
+// resetPool is the pool as the expiry windows and the decision read it: each
+// meter's figures and need, and what the holders of each kind and date have
+// left.
+type resetPool struct {
+	now      time.Time
+	meters   map[string]UsagePoolMeter
+	holdings map[resetHoldingKey]resetHolding
+}
+
+// resetPoolOf reads the pool at now from statuses, this daemon's own rows
+// carrying their burn and resets, and every peer counted on burn.json, each
+// from its last usage body. No peer is read here: a peer that reads this
+// daemon's usage-status would read it back, and a decision does not wait on
+// a peer.
+func (s Server) resetPoolOf(statuses []AccountUsageStatus, now time.Time) resetPool {
+	pool := resetPool{now: now, meters: map[string]UsagePoolMeter{}}
 	var rows []usageBurnAccount
 	var holders []resetHolder
 	for _, status := range statuses {
@@ -575,11 +592,36 @@ func (s Server) withResetWindows(statuses []AccountUsageStatus) []AccountUsageSt
 		read := readPeerBurn(peer.name(), peer.cachedUsage())
 		rows, holders = append(rows, read.rows...), append(holders, read.holders...)
 	}
-	meters := map[string]UsagePoolMeter{}
 	for _, meter := range usagePoolMeters(rows) {
-		meters[meter.Provider+"\x00"+meter.Meter] = meter
+		pool.meters[meter.Provider+"\x00"+meter.Meter] = meter
 	}
-	holdings := resetHoldings(holders, now)
+	pool.holdings = resetHoldings(holders, pool.now)
+	return pool
+}
+
+// meter is the pool's figures on provider's meter.
+func (p resetPool) meter(provider string, meter accounts.ResetMeter) UsagePoolMeter {
+	m, ok := p.meters[provider+"\x00"+string(meter)]
+	if !ok {
+		m.Label = usageMeterLabel(provider, string(meter))
+	}
+	return m
+}
+
+// window is entry's expiry window, for a known kind with a date still ahead.
+func (p resetPool) window(provider string, entry accounts.HeldReset) (accounts.ResetExpiryWindow, bool) {
+	key, spec, ok := holdingKeyOf(provider, entry, p.now)
+	if !ok {
+		return accounts.ResetExpiryWindow{}, false
+	}
+	holding := p.holdings[key]
+	expires, _ := entry.Expires()
+	return expiryWindow(expires, p.now, holding.holders, holding.headroom, meterDemand(p.meter(provider, spec.Meter))), true
+}
+
+// withResetWindows puts each reset's expiry window on this daemon's own rows.
+func (s Server) withResetWindows(statuses []AccountUsageStatus) []AccountUsageStatus {
+	pool := s.resetPoolOf(statuses, s.AccountRef.sharedHeldResets().clock())
 	out := append([]AccountUsageStatus(nil), statuses...)
 	for i := range out {
 		provider := usageHistoryProvider(accounts.Account{ID: out[i].ID, Provider: out[i].Provider})
@@ -589,18 +631,9 @@ func (s Server) withResetWindows(statuses []AccountUsageStatus) []AccountUsageSt
 		// The list may be the block's own, shared with the sweep's snapshot.
 		out[i].Resets = slices.Clone(out[i].Resets)
 		for j, entry := range out[i].Resets {
-			key, spec, ok := holdingKeyOf(provider, entry, now)
-			if !ok {
-				continue
+			if window, ok := pool.window(provider, entry); ok {
+				out[i].Resets[j].ExpiryWindow = &window
 			}
-			holding := holdings[key]
-			meter, ok := meters[provider+"\x00"+string(spec.Meter)]
-			if !ok {
-				meter.Label = usageMeterLabel(provider, string(spec.Meter))
-			}
-			expires, _ := entry.Expires()
-			window := expiryWindow(expires, now, holding.holders, holding.headroom, meterDemand(meter))
-			out[i].Resets[j].ExpiryWindow = &window
 		}
 	}
 	return out

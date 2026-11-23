@@ -54,6 +54,8 @@ type claudeClaimProfile struct {
 	stuck bool
 	// reorderAtLimit lists the grants last first while at a limit.
 	reorderAtLimit bool
+	// usableEarly lists the grants usable now before any limit is reached.
+	usableEarly bool
 }
 
 // claudeClaimFake is a fake Anthropic shared by every daemon that holds its
@@ -65,6 +67,8 @@ type claudeClaimFake struct {
 	mu       sync.Mutex
 	profiles map[string]*claudeClaimProfile
 	claims   int
+	// reads counts the usage reads, the reset block's among them.
+	reads    int
 	served   []string
 	hold     chan struct{}
 	answer   func() (int, string)
@@ -92,7 +96,7 @@ func (f *claudeClaimFake) counts() (int, []string) {
 
 func (f *claudeClaimFake) grantJSON(p *claudeClaimProfile, i int) map[string]any {
 	atLimit := p.week >= 100 || p.fable >= 100
-	grant := map[string]any{"id": fmt.Sprintf("week_reset_%d", i), "resets_total": 1, "resets_left": 1, "usable_now": atLimit,
+	grant := map[string]any{"id": fmt.Sprintf("week_reset_%d", i), "resets_total": 1, "resets_left": 1, "usable_now": atLimit || p.usableEarly,
 		"use_requires_limit": true, "ends_at": time.Now().Add(17 * 24 * time.Hour).UTC().Format(time.RFC3339),
 		"clears": []string{"seven_day", "seven_day_overage_included"}}
 	if p.grants[i] {
@@ -121,6 +125,7 @@ func (f *claudeClaimFake) anthropic(req *http.Request) (*http.Response, error) {
 	case req.URL.Path == "/api/oauth/usage":
 		f.mu.Lock()
 		defer f.mu.Unlock()
+		f.reads++
 		grants := []any{}
 		for i := range p.grants {
 			grants = append(grants, f.grantJSON(p, i))

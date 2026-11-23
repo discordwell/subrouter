@@ -10703,7 +10703,7 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 				revived, ok := s.redeemForFailover(ctx, provider, agentType, sessionID, userEmail,
 					map[string]struct{}{accountID: {}})
 				if !ok {
-					if s.Logger != nil && !s.AutoRedeemRateLimitReset {
+					if s.Logger != nil && !s.failoverRedeems() {
 						// The silent give-up is the failure mode this whole
 						// path exists to prevent: the client sees "usage limit
 						// reached" and the daemon's log shows nothing tried.
