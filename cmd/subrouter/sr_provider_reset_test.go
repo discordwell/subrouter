@@ -223,6 +223,9 @@ func TestClaudeResetCellNamesAFableResetAsOne(t *testing.T) {
 	}
 	weekDate := time.Date(2026, 12, 10, 22, 0, 0, 0, time.UTC).Local().Format("1/2")
 	fableDate := time.Date(2027, 3, 9, 7, 59, 0, 0, time.UTC).Local().Format("1/2")
+	// A Fable reset that ends before the week reset: the soonest grant is
+	// the Fable one, and the cell still dates the week reset.
+	soonFable := `{"id":"fable_soon","resets_total":1,"resets_left":1,"ends_at":"2026-12-01T12:00:00Z","clears":["seven_day_overage_included"]}`
 	older := row(t, week, fable(1))
 	older.complimentaryReset.RemainingByKind = nil
 	for _, tc := range []struct {
@@ -232,6 +235,7 @@ func TestClaudeResetCellNamesAFableResetAsOne(t *testing.T) {
 	}{
 		{"Fable resets alone", row(t, fable(2)), "2 Fable " + fableDate, "2 Fable"},
 		{"the week reset and a Fable reset queued behind it", row(t, week, fable(1)), "1 +1F " + weekDate, "1 +1F"},
+		{"the week reset and a Fable reset that ends first", row(t, week, soonFable), "1 +1F " + weekDate, "1 +1F"},
 		{"the week reset alone", row(t, week), "1 left " + weekDate, "1 left"},
 		{"a daemon from before §64", older, "2 left " + weekDate, "2 left"},
 	} {
