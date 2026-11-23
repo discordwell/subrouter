@@ -575,7 +575,22 @@ The modes follow `SUBROUTER_AUTO_RESET`:
 - `shadow`: the daemon chooses and logs, and publishes `would_choose` on the account's `usage-status` row, beside `normalized`. `normalized` is what it would be without the choice, and nothing ranks on it.
 - `1` (real): the daemon publishes the choice inside `normalized`, as `reset_choice`, where every daemon that ranks the account reads it. A daemon from before §95 ignores it.
 
-Both carry `{"meter": "week", "order": 1, "why": "..."}`. In this build nothing ranks on a choice yet, in any mode: the next part of §95 makes real mode send new sessions to the chosen accounts first.
+Both carry `{"meter": "week", "order": 1, "why": "..."}`.
+
+What a choice does to routing (§95.2). Only a choice published in real mode moves anything, and it moves only new sessions:
+
+- A chosen account that can take a new session ranks above every steady account. The drain stays above it: an account in its last 24 hours before its roll, and a reset holder in early burndown that is not chosen. An account whose week has not started still takes one session first (§86).
+- Among chosen accounts the holder's order decides, 1 first. The next one takes new sessions only when the ones before it carry their allowance. On the Fable pool a `fable` choice goes before a `week` choice. The local-over-peer preference, the live-session spread and the per-request debit do not reorder chosen accounts.
+- A `week` or `codex_week` choice loads every model pool of the account. A `fable` choice loads the Fable pool only.
+- The allowance of a chosen account is `SUBROUTER_PACED_SESSION_CEILING` (20 by default), not the taper. A 5h window that cannot sustain more sessions still holds it at 1, and a 429 that is not a quota rejection holds it at 4 for 15 minutes. At its allowance it ranks below every other account that can take a session, and its verdict says `at_cap`.
+- The 5% short floor does not stop a chosen account, so a Codex account takes new sessions down to its limit. Its verdict reason is `chosen`. Exhaustion, the owner's holdout, a dead credential and a closed admission queue still refuse it.
+- A chosen account is not in the reset holder's early burndown: it is loaded in its holder's order instead. In its last 24 hours it drains like any account.
+- An Opus or Sonnet turn does not rank an account chosen for its Fable meter up for its spent Fable (the Fable-spent preference): that work would eat the week under its Fable reset. Every other account keeps the preference.
+- A session that already has an account never moves for a choice. A warm session stays where it is when another account becomes chosen, and it stays on a chosen account when the choice ends. A session idle for 70 minutes re-ranks as a new one, as it always did.
+
+Every daemon honours a choice published in real mode, the holder's own and its peers', whatever its own mode: the holder decides for its accounts. In shadow mode this daemon's own choices rank nowhere. `pool.json` and the board show the ranking with each `reason`, such as `chosen to run to its limit for its next saved reset`.
+
+To go back: `SUBROUTER_AUTO_RESET=shadow` keeps this daemon's choices out of routing, and `SUBROUTER_RESET_LOADING=0` makes the daemon ignore every choice, its peers' too. Each needs a restart.
 
 `SUBROUTER_RESET_LOADING=0` stops this daemon from choosing in any mode, and it then ignores a peer's choice too. Unset or `1` is on, the default. Any other value stops the daemon from starting, and it logs a Warn at startup when it is `0`. A change needs a restart.
 
@@ -702,7 +717,7 @@ The daemon reads these from its environment when it starts.
 | `SUBROUTER_AUTO_RESET` | `shadow` | Automatic resets (§93, [Automatic resets](#automatic-resets)): `shadow` logs what the daemon would claim and claims nothing, `0` is off, `1` claims in place (§93.2), and turns off the failover redeem of `SUBROUTER_CODEX_AUTO_RATE_LIMIT_RESET` and the spending of `--reset-credit-autospend=spend` (§94.2). Only `shadow`, `0` or `1`; any other value stops the daemon. |
 | `SUBROUTER_AUTO_RESET_WORTH` | on | An automatic claim is made only when it is worth making: the pool needs the reset and a claim adds at least a quarter of a week before the roll, or the reset is in its expiry window or last chance (§94.2). `0` goes back to §93's rule: claim at the limit when there is demand. Only `1` or `0`; any other value stops the daemon. |
 | `SUBROUTER_AUTO_RESET_NEAR_EMPTY` | on | The owner's condition on automatic claims: under 1% left on the meter the reset gives back. It stays on until the owner turns it off with `0`. Only `1` or `0`; any other value stops the daemon. |
-| `SUBROUTER_RESET_LOADING` | on | The daemon chooses which of its accounts to run to their limit for their saved resets, in shadow or real mode of `SUBROUTER_AUTO_RESET` ([Accounts chosen for a reset](#accounts-chosen-for-a-reset), §95.1). `0` chooses none and ignores a peer's choice. Only `1` or `0`; any other value stops the daemon. |
+| `SUBROUTER_RESET_LOADING` | on | The daemon chooses which of its accounts to run to their limit for their saved resets, in shadow or real mode of `SUBROUTER_AUTO_RESET` ([Accounts chosen for a reset](#accounts-chosen-for-a-reset), §95.1), and routes new sessions to the accounts chosen in real mode, its own and its peers' (§95.2). `0` chooses none and ranks on no choice, a peer's included. Only `1` or `0`; any other value stops the daemon. |
 | `SUBROUTER_PUBLIC_ADMIN` | off | On a box, `1` serves admin routes on the public listener to named admin tokens. |
 | `SUBROUTER_USAGE_HISTORY` | on | `0` stops recording this daemon's own meter readings and reset claims in `usage-history.jsonl` (§92.1), and with them the burn figures (§92.2). A value it does not recognize stops the daemon. |
 
