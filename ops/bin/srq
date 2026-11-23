@@ -30,6 +30,7 @@ Usage:
   srq dir <label>          the profile dir for one account, from the DAEMON
   srq resets  [--json]     every saved reset in the pool, soonest expiry first
   srq selftest             run the regression fixtures (no daemon needed)
+  srq burn    [--json]     how fast the pool spends each weekly meter, with its trend
 """
 
 from __future__ import annotations
@@ -1030,12 +1031,20 @@ def cmd_pool(argv):
             err = str(e)
         remotes.append({"name": cfg["name"], "url": cfg["url"], "rows": rows, "error": err})
 
+    burn_line, burn = None, None
+    if want_local:
+        try:
+            burn = _get_burn()
+            burn_line = burn_pool_line(burn)
+        except SrqError as e:
+            burn_line = f"pool burn: not read ({e})"
+
     if "--json" in argv:
         first = remotes[0] if remotes else {"url": None, "rows": [], "error": None}
         print(json.dumps({"local": local_rows, "remote": first["rows"],
                           "remote_peer": first["url"] or None,
                           "remote_error": first["error"],
-                          "remotes": remotes}, indent=2))
+                          "remotes": remotes, "burn": burn}, indent=2))
         return 0
 
     if want_local:
@@ -1048,6 +1057,8 @@ def cmd_pool(argv):
                 print("\n".join(_remote_failure_lines(peer["url"], peer["error"])) + "\n")
             else:
                 _render_sections(peer["rows"], f"peer {peer['name']}", peer=True)
+    if burn_line:
+        print(burn_line)
     return 0
 
 
@@ -1334,6 +1345,158 @@ def cmd_resets(argv):
                          indent=2))
         return 0
     _render_resets(items, notes, datetime.datetime.now(datetime.timezone.utc))
+    return 0
+
+
+# --- burn: how fast the pool spends each weekly meter (PATCHES §92.2) --------
+# The daemon computes it from each daemon's own usage history and its peers'
+# usage-status, so srq only reads and words it. Nothing ranks on it.
+
+BURN_PATH = "/_subrouter/burn.json"
+BURN_WINDOWS = (("1h", "last hour"), ("6h", "last 6 hours"), ("24h", "last 24 hours"))
+# The trend compares a window with the one before it, so it needs half of the
+# one before covered too.
+BURN_TRENDS = {"6h": ("the 6 hours before", "9 hours"), "24h": ("the 24 hours before", "36 hours")}
+BURN_MAIN_METERS = (("claude", "week"), ("claude", "fable"), ("codex", "week"))
+BURN_NEEDS = ("A figure needs readings over at least half its window: 30 minutes for the last hour,"
+              " 3 hours for 6 hours, 12 hours for 24 hours")
+
+
+def _get_burn():
+    """burn.json, or None from a daemon that publishes none: a build from
+    before §92 and one with SUBROUTER_USAGE_HISTORY=0 both answer 404."""
+    try:
+        return _get(BURN_PATH)
+    except SrqError as e:
+        cause = e.__cause__
+        if isinstance(cause, urllib.error.HTTPError) and cause.code == 404:
+            return None
+        raise
+
+
+def _figure(value):
+    """A published figure, or None: null, a bool or a string is no figure."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def _share(value):
+    return f"{round(value * 100)}%"
+
+
+def _trend_words(trend, before, needs):
+    change = _figure((trend or {}).get("change"))
+    if change is None:
+        return f"no trend yet: it needs {needs} of history"
+    if abs(change) < 0.005:
+        return f"no change on {before}"
+    return f"{'up' if change > 0 else 'down'} {abs(change):.2f} on {before}"
+
+
+def _burn_accounts(n):
+    return f"{n} account{'' if n == 1 else 's'}"
+
+
+def _burn_meter_lines(meter):
+    """One meter: the pool figure per window with its counts and trend, the
+    share at the limit, then each account by its label (§87)."""
+    label = meter.get("label") or f"{meter.get('provider')} {meter.get('meter')}"
+    windows = meter.get("windows") or {}
+    held = meter.get("accounts") or []
+    if not held:
+        return [f"{label}: no account reads this meter", ""]
+    lines = [label]
+    limits = []
+    for key, words in BURN_WINDOWS:
+        window = windows.get(key) or {}
+        burn = _figure(window.get("burn"))
+        if burn is None:
+            lines.append(f"  {words:<14} not enough history yet")
+            continue
+        text = f"  {words:<14} {burn:4.2f}  over {_burn_accounts(window.get('accounts') or 0)}"
+        if window.get("not_enough_history"):
+            text += f" ({window['not_enough_history']} more without enough history yet)"
+        if key in BURN_TRENDS:
+            text += ", " + _trend_words((meter.get("trend") or {}).get(key), *BURN_TRENDS[key])
+        lines.append(text)
+        at_limit = _figure(window.get("at_limit"))
+        if at_limit is not None:
+            limits.append(f"{_share(at_limit)} in the {words}")
+    if limits:
+        lines.append("  at the limit   " + ", ".join(limits) + " (share of account-time at 99.5% used or more)")
+    names = []
+    for account in held:
+        name = account.get("label") or account.get("id") or "?"
+        if account.get("pool") not in (None, "", "local"):
+            name += f" on {account['pool']}"
+        names.append(name)
+    width = max(len(n) for n in names)
+    lines.append(f"  {'':<{width}}  last hour   6 hours  24 hours")
+    for name, account in zip(names, held):
+        figures = account.get("windows") or {}
+        cells = []
+        for key, _ in BURN_WINDOWS:
+            burn = _figure((figures.get(key) or {}).get("burn"))
+            cells.append("-" if burn is None else f"{burn:.2f}")
+        text = f"  {name:<{width}}  {cells[0]:>9}  {cells[1]:>8}  {cells[2]:>8}"
+        at_limit = _figure((figures.get("24h") or {}).get("at_limit"))
+        if at_limit:
+            text += f"  ({_share(at_limit)} of 24 hours at the limit)"
+        lines.append(text)
+    lines.append("")
+    return lines
+
+
+def render_burn(report):
+    """srq burn's text for a burn.json body."""
+    import textwrap
+    lines = textwrap.wrap("pool burn: how fast each weekly meter is spent. 1.00 spends the budget exactly as fast"
+                          " as the week lasts, 2.00 twice as fast, 0 not at all. Each account weighs the same.", 100)
+    lines.append("")
+    for meter in report.get("meters") or []:
+        lines.extend(_burn_meter_lines(meter))
+    for peer in report.get("peers") or []:
+        if not peer.get("counted"):
+            lines.append(f"not counted: peer {peer.get('name') or '?'}: {peer.get('reason') or 'no reason given'};"
+                         " its accounts are left out, not read as 0")
+    lines.extend(textwrap.wrap(f"(- = not enough history yet. {BURN_NEEDS}. A trend needs 9 hours of history for"
+                               " 6 hours and 36 hours for 24 hours. At the limit is demand those accounts could not"
+                               " serve, which burn alone reads as slack: a pool of spent accounts burns 0.)",
+                               100, subsequent_indent=" "))
+    return "\n".join(lines) + "\n"
+
+
+def burn_pool_line(report):
+    """srq pool's one line: the three main meters over 24 hours."""
+    if report is None:
+        return "pool burn: this daemon publishes none (a build from before §92, or SUBROUTER_USAGE_HISTORY=0)"
+    parts = []
+    meters = {(m.get("provider"), m.get("meter")): m for m in report.get("meters") or []}
+    for key in BURN_MAIN_METERS:
+        meter = meters.get(key) or {}
+        label = meter.get("label") or " ".join(key)
+        day = (meter.get("windows") or {}).get("24h") or {}
+        burn = _figure(day.get("burn"))
+        if not meter.get("accounts"):
+            parts.append(f"{label} no accounts")
+        elif burn is None:
+            parts.append(f"{label} not enough history yet")
+        else:
+            at_limit = _figure(day.get("at_limit"))
+            parts.append(f"{label} {burn:.2f}" + (f" ({_share(at_limit)} at the limit)" if at_limit and at_limit >= 0.005 else ""))
+    return "pool burn over 24 hours (1.00 = on pace): " + ", ".join(parts) + "; srq burn says more"
+
+
+def cmd_burn(argv):
+    report = _get_burn()
+    if "--json" in argv:
+        print(json.dumps(report, indent=2))
+        return 0 if report is not None else 1
+    if report is None:
+        print(burn_pool_line(None))
+        return 1
+    sys.stdout.write(render_burn(report))
     return 0
 
 
@@ -2217,6 +2380,138 @@ def cmd_selftest(_argv):
           and _in_how_long(_instant("2026-11-23T19:30:00Z"), _instant("2026-11-23T18:00:00Z")) == "in 1h 30m"
           and _in_how_long(_instant("2026-11-23T17:00:00Z"), _instant("2026-11-23T18:00:00Z")) == "ended 1h 0m ago")
 
+    print("srq burn words the pool's burn, its trend and the share at the limit; srq pool has one line (PATCHES §92.2)")
+    import contextlib, io
+
+    def figure(burn=None, covered=1.0, at_limit=0.0):
+        out = {"covered": covered}
+        if burn is not None:
+            out["burn"] = burn
+            if at_limit:
+                out["at_limit"] = at_limit
+        return out
+
+    def pool_window(burn, counted, few=0, at_limit=0.0):
+        return {"burn": burn, "accounts": counted, "not_enough_history": few,
+                "at_limit": at_limit if burn is not None else None}
+
+    report = {
+        "generated_at": "2026-11-23T08:00:00Z",
+        "meters": [
+            {"provider": "claude", "meter": "week", "label": "Claude week",
+             "windows": {"1h": pool_window(1.12, 2), "6h": pool_window(0.95, 2, at_limit=0.05),
+                         "24h": pool_window(0.8, 1, few=1, at_limit=0.4)},
+             "trend": {"6h": {"change": 0.2, "accounts": 2}, "24h": {"change": None, "accounts": 0}},
+             "accounts": [
+                 {"pool": "local", "id": "seat-a", "label": "alpha",
+                  "windows": {"1h": figure(1.3), "6h": figure(0.95), "24h": figure(0.8, at_limit=0.4)}},
+                 {"pool": "box", "id": "codex-owner-0123456789abcdef01",
+                  "windows": {"1h": figure(0.94), "6h": figure(0.95), "24h": figure(covered=0.3)}},
+             ]},
+            {"provider": "claude", "meter": "fable", "label": "Claude Fable",
+             "windows": {k: pool_window(None, 0) for k in ("1h", "6h", "24h")},
+             "trend": {}, "accounts": []},
+            {"provider": "codex", "meter": "week", "label": "Codex week",
+             "windows": {k: pool_window(None, 0, few=1) for k in ("1h", "6h", "24h")},
+             "trend": {"6h": {"change": None, "accounts": 0}, "24h": {"change": None, "accounts": 0}},
+             "accounts": [{"pool": "local", "id": "new@x", "label": "newest",
+                           "windows": {"1h": figure(covered=0.2)}}]},
+        ],
+        "peers": [{"name": "box", "counted": True, "accounts": 1},
+                  {"name": "old-box", "counted": False,
+                   "reason": "it publishes no burn: a build from before §92, or its usage history is off"}],
+    }
+    text = render_burn(report)
+    words = " ".join(text.split())
+    check("burn 1.00 is said in plain words",
+          words.startswith("pool burn: how fast each weekly meter is spent. 1.00 spends the budget exactly as fast as the"
+                           " week lasts, 2.00 twice as fast, 0 not at all. Each account weighs the same. Claude week"))
+    check("each window with its count",
+          "\nClaude week\n  last hour      1.12  over 2 accounts\n" in text)
+    check("the 6-hour trend, in words",
+          "\n  last 6 hours   0.95  over 2 accounts, up 0.20 on the 6 hours before\n" in text)
+    check("too few accounts and no trend yet are said plainly",
+          "\n  last 24 hours  0.80  over 1 account (1 more without enough history yet), no trend yet: it needs 36 hours"
+          " of history\n" in text)
+    check("the share of account-time at the limit, per window",
+          "\n  at the limit   0% in the last hour, 5% in the last 6 hours, 40% in the last 24 hours (share of account-time"
+          " at 99.5% used or more)\n" in text)
+    account_lines = [ln for ln in text.splitlines() if ln.startswith("  alpha") or ln.startswith("  codex-owner")]
+    check("each account by its label, a peer's with its peer, - where it has too little history",
+          "\n  alpha                                       1.30      0.95      0.80  (40% of 24 hours at the limit)\n" in text
+          and "\n  codex-owner-0123456789abcdef01 on box       0.94      0.95         -\n" in text
+          and len(account_lines) == 2)
+    check("a meter no account reads says so", "\nClaude Fable: no account reads this meter\n" in text)
+    check("a meter with no figures yet says not enough history yet, window by window",
+          "\nCodex week\n  last hour      not enough history yet\n  last 6 hours   not enough history yet\n"
+          "  last 24 hours  not enough history yet\n" in text)
+    check("an uncounted peer is named, with why, and its accounts are not read as 0",
+          "\nnot counted: peer old-box: it publishes no burn: a build from before §92, or its usage history is off;"
+          " its accounts are left out, not read as 0\n" in text and "peer box:" not in text)
+    check("the legend says how much history a figure needs",
+          "(- = not enough history yet. A figure needs readings over at least half its window: 30 minutes for the"
+          " last hour, 3 hours for 6 hours, 12 hours for 24 hours. A trend needs 9 hours of history for 6 hours"
+          " and 36 hours for 24 hours. At the limit is demand those accounts could not serve, which burn alone"
+          " reads as slack: a pool of spent accounts burns 0.)" in words)
+    down = json.loads(json.dumps(report))
+    down["meters"][0]["trend"]["6h"]["change"] = -0.004
+    check("a change under 0.005 is no change", "0.95  over 2 accounts, no change on the 6 hours before\n" in render_burn(down))
+    down["meters"][0]["trend"]["6h"]["change"] = -0.31
+    check("a fall reads down", "0.95  over 2 accounts, down 0.31 on the 6 hours before\n" in render_burn(down))
+
+    check("srq pool's line: the three meters over 24 hours, with the share at the limit",
+          burn_pool_line(report) == "pool burn over 24 hours (1.00 = on pace): Claude week 0.80 (40% at the limit),"
+          " Claude Fable no accounts, Codex week not enough history yet; srq burn says more")
+    check("a daemon with no burn says so, naming both reasons",
+          burn_pool_line(None) == "pool burn: this daemon publishes none (a build from before §92, or"
+          " SUBROUTER_USAGE_HISTORY=0)")
+    spent = {"meters": [{"provider": "codex", "meter": "week", "label": "Codex week",
+                         "windows": {k: pool_window(0, 2, at_limit=1.0) for k in ("1h", "6h", "24h")},
+                         "trend": {}, "accounts": [{"id": "a", "windows": {"24h": figure(0, at_limit=1.0)}},
+                                                   {"id": "b", "windows": {"24h": figure(0, at_limit=1.0)}}]}]}
+    check("a spent pool reads burn 0 at the limit, not under pace",
+          "Codex week 0.00 (100% at the limit)" in burn_pool_line(spent)
+          and "100% in the last 24 hours (share of account-time" in render_burn(spent))
+    odd = {"meters": [{"provider": "codex", "meter": "week", "label": "Codex week",
+                       "windows": {"1h": {"burn": "1.2", "accounts": 1}, "6h": {"burn": True, "accounts": 1},
+                                   "24h": {"burn": None, "accounts": 0}},
+                       "accounts": [{"id": "a", "windows": {"1h": {"burn": "1.2"}}}]}]}
+    check("a string, a bool or null is no figure",
+          render_burn(odd).count("not enough history yet\n") == 3 and "Codex week not enough history yet" in burn_pool_line(odd))
+
+    saved = {name: globals()[name] for name in ("_get", "_get_list", "remote_configs")}
+    burn_answer = {"value": report}
+
+    def fake_get(path):
+        if path != BURN_PATH:
+            raise SrqError(f"unexpected read of {path}")
+        if isinstance(burn_answer["value"], int):
+            raise SrqError(f"HTTP {burn_answer['value']}") from urllib.error.HTTPError(
+                BASE + path, burn_answer["value"], "status", {}, None)
+        return burn_answer["value"]
+
+    def pool_output(*argv):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            cmd_pool(list(argv))
+        return out.getvalue()
+
+    try:
+        globals().update(_get=fake_get, _get_list=lambda path: [], remote_configs=lambda env=None: [])
+        lines = pool_output().splitlines()
+        check("srq pool ends with the one burn line", lines[-1] == burn_pool_line(report)
+              and sum(ln.startswith("pool burn") for ln in lines) == 1)
+        check("srq pool --json carries the report", json.loads(pool_output("--json"))["burn"] == report)
+        check("srq pool --remote prints no burn line", "pool burn" not in pool_output("--remote"))
+        burn_answer["value"] = 404
+        check("a daemon from before §92 (404) reads as none",
+              pool_output().splitlines()[-1] == burn_pool_line(None) and json.loads(pool_output("--json"))["burn"] is None)
+        burn_answer["value"] = 500
+        check("another failure is said, and the rest of srq pool still prints",
+              pool_output().splitlines()[-1] == "pool burn: not read (HTTP 500)")
+    finally:
+        globals().update(saved)
+
     print()
     if failures:
         print(f"FAILED: {len(failures)}")
@@ -2226,7 +2521,7 @@ def cmd_selftest(_argv):
 
 
 COMMANDS = {"serving": cmd_serving, "pool": cmd_pool, "dir": cmd_dir,
-            "selftest": cmd_selftest, "resets": cmd_resets}
+            "selftest": cmd_selftest, "resets": cmd_resets, "burn": cmd_burn}
 
 
 def main(argv):
