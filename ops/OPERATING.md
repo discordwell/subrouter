@@ -82,7 +82,7 @@ A peer's send changes no ranking here. Until the peer's reading turns, this daem
 
 ### Read the pool's burn
 
-Burn says how fast the pool spends each weekly meter (§92.2). Each daemon keeps a history of its own accounts' meter readings, and from it each account's burn over the last hour, 6 hours and 24 hours: the rise in the meter's used fraction in that time, divided by that time's share of the week. 1.00 spends the budget exactly as fast as the week lasts, 2.00 twice as fast, and 0 not at all. A roll or a claim that gives budget back adds nothing. The meters are Claude's week, Claude's Fable meter and Codex's week.
+Burn says how fast the pool spends each weekly meter (§92.2). Each daemon keeps a history of its own accounts' meter readings, and from it each account's burn over the last hour, 6 hours and 24 hours: the rise in the meter's used fraction in that time, divided by that time's share of the week. 1.00 spends the budget exactly as fast as the week lasts, 2.00 twice as fast, and 0 not at all. A roll or a claim that gives budget back adds nothing. The meters are Claude's week, Claude's Fable meter and Codex's week. This is not `sr plot`'s burn pace, which divides what each week has spent so far by how much of it has passed: burn reads only the last hours, so a change in demand shows the same day.
 
 The pool figure is the mean over the accounts on this daemon and on every peer, each account weighing the same. Read it with `srq burn`, or one line at the end of `srq pool`:
 
