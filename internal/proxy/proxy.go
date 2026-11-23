@@ -1054,6 +1054,9 @@ type AccountRef struct {
 	// selfStartMemory is §90's sender memory (sharedSelfStarts): the
 	// sender's loop writes it, and usage-status and the pool board read it.
 	selfStartMemory atomic.Pointer[selfStarts]
+	// heldResetMemory is §91.1's (sharedHeldResets): the Codex credit
+	// expiry reader writes it, and usage-status reads it.
+	heldResetMemory atomic.Pointer[heldResets]
 }
 
 // sharedAdmission returns the ref's admission gate, creating it on first use.
@@ -2071,6 +2074,10 @@ type AccountUsageStatus struct {
 	// CapacityMarks is a Codex account's live capacity marks, one per
 	// (model, tier) pool; omitted when it has none.
 	CapacityMarks []AccountCapacityMark `json:"capacity_marks,omitempty"`
+	// Resets is every saved reset the account holds, one entry per kind and
+	// expiry (withHeldResets, PATCHES §91.1). [] is a reading that holds
+	// none; absent is no reading, as complimentary_reset's absence is.
+	Resets []accounts.HeldReset `json:"resets,omitzero"`
 }
 
 // NormalizedUsage is the provider-independent view of an account's capacity, as
@@ -5068,7 +5075,7 @@ func (s Server) handleUsageStatus(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "usage sweep in progress", http.StatusServiceUnavailable)
 			return
 		}
-		writeJSON(w, s.withNewSessionVerdicts(s.withNormalizedUsage(s.withCodexCapacityMarks(s.withClaudeCostTiers(s.AccountRef.withResetAdvice(withWeeklyCooked(s.withSessionActivity(s.withSessionCounts(s.withRequestTimeExhaustionWindows(s.withClaudeWebBalances(statuses)))))))))))
+		writeJSON(w, s.withHeldResets(s.withNewSessionVerdicts(s.withNormalizedUsage(s.withCodexCapacityMarks(s.withClaudeCostTiers(s.AccountRef.withResetAdvice(withWeeklyCooked(s.withSessionActivity(s.withSessionCounts(s.withRequestTimeExhaustionWindows(s.withClaudeWebBalances(statuses))))))))))))
 		return
 	}
 	accounts := s.accountListContext(r.Context())

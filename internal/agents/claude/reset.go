@@ -28,7 +28,6 @@ import (
 	"net/http"
 	"os"
 	"regexp"
-	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -148,31 +147,46 @@ func (g ResetGrant) ClearsExhausted(status *ResetStatus) bool {
 }
 
 // ResetKind is what claiming a grant gives back, read from its clears list
-// (PATCHES §64).
+// (PATCHES §64) by the reset kinds table (accounts.ClassifyReset, §91.1).
 type ResetKind string
 
 const (
-	// ResetKindWeek refills the general weekly limit ("seven_day"). A grant
-	// with no clears list is one too: that is how a block from before
-	// Anthropic listed them reads, and October's grant cleared the week.
-	ResetKindWeek ResetKind = "week"
+	// ResetKindWeek refills the general weekly limit ("seven_day").
+	ResetKindWeek ResetKind = ResetKind(accounts.ResetKindClaudeWeek)
 	// ResetKindFable clears the Fable limit ("seven_day_overage_included")
 	// and not the week: the claim zeroes the Fable meter and gives back only
 	// the part of the week that Fable usage spent.
-	ResetKindFable ResetKind = "fable"
-	// ResetKindOther clears neither.
+	ResetKindFable ResetKind = ResetKind(accounts.ResetKindClaudeFable)
+	// ResetKindOther is a grant the table does not know.
 	ResetKindOther ResetKind = "other"
 )
 
 // Kind is what claiming the grant gives back.
 func (g ResetGrant) Kind() ResetKind {
-	if len(g.Clears) == 0 || slices.Contains(g.Clears, "seven_day") {
-		return ResetKindWeek
-	}
-	if slices.Contains(g.Clears, "seven_day_overage_included") {
-		return ResetKindFable
+	if spec, ok := accounts.ClassifyReset(g.reading()); ok {
+		return ResetKind(spec.Kind)
 	}
 	return ResetKindOther
+}
+
+func (g ResetGrant) reading() accounts.ResetReading {
+	return accounts.ResetReading{Provider: accounts.ProviderClaude, Source: ResetProgram, Type: g.Type, Clears: g.Clears}
+}
+
+// held is what the grant leaves the account holding, for the row's resets.
+func (g ResetGrant) held() accounts.HeldResetReading {
+	expiry := accounts.ResetExpiryRead
+	if strings.TrimSpace(g.EndsAt) == "" {
+		expiry = accounts.ResetExpiryNoneGiven
+	}
+	needsLimit := g.UseRequiresLimit
+	return accounts.HeldResetReading{
+		ResetReading: g.reading(),
+		Count:        g.ResetsLeft,
+		ExpiresAt:    g.EndsAt,
+		Expiry:       expiry,
+		NeedsLimit:   &needsLimit,
+	}
 }
 
 // Expired reports whether the grant's use-by time has passed. A grant with
@@ -768,7 +782,8 @@ func parseResetClaim(raw []byte) (ResetClaim, error) {
 // left that expires first. RemainingByKind splits Remaining by what each
 // grant's claim gives back. WeekHeldUntil is read over every grant, not the
 // one that expires first: which grant expires first says nothing about
-// whether another clears the week. Nil in, nil out: a block that was not
+// whether another clears the week. Held lists every grant with a reset left
+// by kind and expiry (PATCHES §91.1). Nil in, nil out: a block that was not
 // read is not a block that says "none".
 func ResetInfo(status *ResetStatus, now time.Time) *accounts.ComplimentaryResetInfo {
 	if status == nil {
@@ -791,6 +806,7 @@ func ResetInfo(status *ResetStatus, now time.Time) *accounts.ComplimentaryResetI
 	}
 	remaining, total, expiredLeft := 0, 0, 0
 	byKind := map[string]int{}
+	var held []accounts.HeldResetReading
 	var soonest time.Time
 	var chosen *ResetGrant
 	for i := range status.Grants {
@@ -809,6 +825,7 @@ func ResetInfo(status *ResetStatus, now time.Time) *accounts.ComplimentaryResetI
 			continue
 		}
 		byKind[string(grant.Kind())] += grant.ResetsLeft
+		held = append(held, grant.held())
 		ends, ok := parseResetTime(grant.EndsAt)
 		if chosen == nil || (ok && (soonest.IsZero() || ends.Before(soonest))) {
 			chosen = &status.Grants[i]
@@ -842,6 +859,7 @@ func ResetInfo(status *ResetStatus, now time.Time) *accounts.ComplimentaryResetI
 	if eligible {
 		info.WeekHeldUntil = weekHeldUntil(status.Grants, now)
 	}
+	info.Held = accounts.HeldResets(held, now)
 	return info
 }
 

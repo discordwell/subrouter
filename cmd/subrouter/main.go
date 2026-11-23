@@ -230,6 +230,23 @@ func selfStartWeekEnabled() (bool, error) {
 	return false, fmt.Errorf("SUBROUTER_SELF_START_WEEK=%q: want 1 (the default) or 0", raw)
 }
 
+// readCodexResetExpiryEnabled reads SUBROUTER_READ_CODEX_RESET_EXPIRY, the
+// kill switch of PATCHES §91.1's reader: the daemon reads each of its own
+// Codex accounts' reset credit list for the credits' expiry dates. Off, every
+// Codex credit is shown with its expiry not read. Read like
+// SUBROUTER_SELF_START_WEEK: unset means on, 0/false/no/off turns it off,
+// anything else is an error.
+func readCodexResetExpiryEnabled() (bool, error) {
+	raw := os.Getenv("SUBROUTER_READ_CODEX_RESET_EXPIRY")
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "", "1", "true", "yes", "on":
+		return true, nil
+	case "0", "false", "no", "off":
+		return false, nil
+	}
+	return false, fmt.Errorf("SUBROUTER_READ_CODEX_RESET_EXPIRY=%q: want 1 (the default) or 0", raw)
+}
+
 // pacedAllowanceEnabled reads SUBROUTER_PACED_ALLOWANCE (PATCHES §72). 0 keeps
 // a burndown account at the taper of at most four sessions and gives every
 // account four refugees. It does not reopen a closed admission queue: that is
@@ -283,6 +300,11 @@ const paceSampleInterval = 30 * time.Second
 // week to start (PATCHES §90): a reading arrives about every two minutes, so
 // a pass this often sends within seconds of the one that says unstarted.
 const selfStartScanInterval = 10 * time.Second
+
+// codexResetExpiryScanInterval is how often the daemon looks for a Codex
+// account whose reset credit list is due a read (PATCHES §91.1). The pass
+// reads the last sweep's counts, so a changed count is read within seconds.
+const codexResetExpiryScanInterval = 10 * time.Second
 
 const maxSecretFileBytes = 64 << 10
 
@@ -1077,6 +1099,16 @@ func serve(args []string) error {
 		slog.Info("self-start of unstarted weeks disabled by SUBROUTER_SELF_START_WEEK; an account whose weekly window has not started waits for a session to start it",
 			"reenable", "unset SUBROUTER_SELF_START_WEEK and restart")
 	}
+	// PATCHES §91.1, the same way as §90.
+	readCodexResetExpiry, err := readCodexResetExpiryEnabled()
+	if err != nil {
+		return err
+	}
+	proxy.SetReadCodexResetExpiry(readCodexResetExpiry)
+	if !readCodexResetExpiry {
+		slog.Info("codex reset credit expiry reads disabled by SUBROUTER_READ_CODEX_RESET_EXPIRY; usage-status shows each Codex credit with its expiry not read",
+			"reenable", "unset SUBROUTER_READ_CODEX_RESET_EXPIRY and restart")
+	}
 	pacedAllowance, err := pacedAllowanceEnabled()
 	if err != nil {
 		return err
@@ -1720,6 +1752,10 @@ func serve(args []string) error {
 	// published, so it adds no usage fetch; SUBROUTER_SELF_START_WEEK=0 keeps
 	// every pass empty.
 	go server.RunSelfStartWeek(activeGenerationCtx, selfStartScanInterval)
+	// PATCHES §91.1: each pass reads the counts the last sweep published and
+	// only reads the credit list; SUBROUTER_READ_CODEX_RESET_EXPIRY=0 keeps
+	// every pass empty.
+	go server.RunCodexResetExpiryReader(activeGenerationCtx, codexResetExpiryScanInterval)
 
 	// No upstream idle score refresher (RunUsageScoreRefresher, #378): PATCHES
 	// 44.3 took #378's hand-off only. The auto-switch sweep and the usage-status
