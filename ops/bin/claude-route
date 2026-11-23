@@ -1508,11 +1508,12 @@ cmd_test() {
         echo "[resume $sid] -> ${out:0:200}"
         [[ "$out" == *"$word"* ]]
     }
-    served() { local a; a=$("$SRQ" serving "$1" 2>&1) || { echo "daemon has no row for $1: $a"; return 1; }; echo "$1 served by: $a"; SERVED_BY="$a"; }
-    unserved() { # only srq's own answer for a session the daemon does not list: a failing srq proves nothing
-        local a; if a=$("$SRQ" serving "$1" 2>&1); then echo "daemon has a row for $1: $a"; return 1; fi
-        [[ "$a" == "unassigned (session $1): not listed by the daemon"* ]] || { echo "srq serving $1 failed: $a"; return 1; }
+    served() { # 0: the daemon's row, in SERVED_BY; 1: srq's own answer that the daemon lists none; 2: srq failed, which proves nothing
+        local a; if a=$("$SRQ" serving "$1" 2>&1); then echo "$1 served by: $a"; SERVED_BY="$a"; return 0; fi
+        if [[ "$a" == "unassigned (session $1): not listed by the daemon"* ]]; then echo "daemon has no row for $1: $a"; return 1; fi
+        echo "srq serving $1 failed: $a"; return 2
     }
+    unserved() { served "$1"; [ $? = 1 ]; }
     uuid() { uuidgen | tr '[:upper:]' '[:lower:]'; }
     surface() { # route -> sorted tool names + mcp server names from the session's init record
         (cd "$cwd" && perl -e 'alarm shift; exec @ARGV' 180 env "${clean[@]}" PATH="$P_SHIM" CLAUDE_ROUTE="$1" "$SHIM" \
