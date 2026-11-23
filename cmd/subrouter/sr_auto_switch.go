@@ -58,6 +58,12 @@ type srAutoSwitchConfig struct {
 	// never made the active Claude profile: a direct `sr claude` launch on it
 	// would spend it, and would run a second refresher on its login.
 	ClaudeIdentityOnly func() string
+	// PinOnly reports whether an account takes pinned sessions only
+	// (SUBROUTER_PIN_ONLY_ACCOUNTS, PATCHES §98; AccountRef.PinOnlyAccount).
+	// Such an account is scored like any other but is never the pick for
+	// either provider: as the active Claude profile, a bare `sr claude` launch
+	// would spend it with no pin. Nil lists none.
+	PinOnly func(accountID string) bool
 }
 
 func runSRAutoSwitch(ctx context.Context, cfg srAutoSwitchConfig) {
@@ -305,6 +311,9 @@ func srAutoSwitchOnce(ctx context.Context, cfg srAutoSwitchConfig) (string, erro
 	}
 	var codexCandidates, claudeCandidates []accounts.Account
 	for _, account := range candidates {
+		if cfg.PinOnly != nil && cfg.PinOnly(account.ID) {
+			continue
+		}
 		switch account.Provider {
 		case "", accounts.ProviderCodex:
 			codexCandidates = append(codexCandidates, account)

@@ -245,6 +245,7 @@ For a listed account, the daemon does these things:
 - It publishes the verdict `new=NO (pin_only)` (`eligible: false`, `reason: pin_only`), so no peer places a session there either.
 - It claims none of the account's resets automatically (§93), never chooses the account for a reset (§95), and leaves the account out of the pool figures that need and the expiry windows read (§94, §96). The account's own `burn` stays on its row, and the usage history still records it. `sr claude reset` and `sr codex reset` still work.
 - It sends the account no paid Messages probe and no tiny turn to start a Codex week (§90).
+- Its sr auto-switch never makes the account the active Claude profile, which a bare `sr claude` launch would run on with no pin. It still reads the account's usage. `sr claude pick`, which you run by hand, does not read the verdict, so do not run it while the account is listed.
 - It serves a pinned session as before. When the account is spent or refused, the pin gets the provider's answer, or §89's, and never moves to another account.
 
 `srq pool` prints the account as `new=NO (pin_only)` with a legend line. Its `pool.json` row carries `"pin_only": true`, with a state note that says the account takes pinned sessions only.
