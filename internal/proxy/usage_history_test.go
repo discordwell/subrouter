@@ -167,6 +167,40 @@ func TestAnUnchangedMeterIsWrittenAtLeastEveryTenMinutes(t *testing.T) {
 	}
 }
 
+// Behaviour 1. A Codex model pool's own week is a meter of its own, beside
+// the account-wide week; the pool's shorter window is not recorded.
+func TestACodexModelPoolsOwnWeekIsAMeterOfItsOwn(t *testing.T) {
+	h, _, _ := testUsageHistory(t)
+	account := accounts.Account{ID: "pooled", Provider: accounts.ProviderCodex}
+	at := time.Now().Add(-time.Minute).Truncate(time.Second)
+	week, poolWeek := at.Add(72*time.Hour), at.Add(100*time.Hour)
+	h.observe(account, []accounts.UsageWindow{
+		{Name: "secondary", UsedPercent: 30, LimitWindowSeconds: 7 * 24 * 3600, ResetAt: week},
+		{Name: "secondary", Feature: "GPT-Test-Pool", UsedPercent: 70, LimitWindowSeconds: 7 * 24 * 3600, ResetAt: poolWeek},
+		{Name: "primary", Feature: "GPT-Test-Pool", UsedPercent: 90, LimitWindowSeconds: 5 * 3600, ResetAt: at.Add(time.Hour)},
+	}, at)
+	var meters []string
+	h.mu.Lock()
+	for key := range h.series {
+		meters = append(meters, key.meter)
+	}
+	h.mu.Unlock()
+	slices.Sort(meters)
+	if want := []string{usageMeterWeek, usageMeterPoolPrefix + "GPT-Test-Pool"}; !slices.Equal(meters, want) {
+		t.Fatalf("the series holds meters %v, want %v", meters, want)
+	}
+	for _, c := range []struct {
+		meter string
+		used  float64
+		roll  time.Time
+	}{{usageMeterWeek, 0.30, week}, {usageMeterPoolPrefix + "GPT-Test-Pool", 0.70, poolWeek}} {
+		points := historyPoints(h, "codex", "pooled", c.meter)
+		if len(points) != 1 || points[0].Used != c.used || points[0].Roll != c.roll.Unix() {
+			t.Fatalf("meter %s holds %+v, want one point at %.2f used rolling at %v", c.meter, points, c.used, c.roll)
+		}
+	}
+}
+
 // Behaviour 2. A second daemon on the same state directory loads what the
 // first wrote; a point two workers both wrote is stored once.
 func TestTheSeriesSurvivesARestartAndAPointWrittenTwiceIsStoredOnce(t *testing.T) {
