@@ -832,24 +832,36 @@ func TestAFailedClaimLeavesTheTurnWithTodaysAnswer(t *testing.T) {
 			t.Fatalf("last decision %+v", decision)
 		}
 	})
-	t.Run("a codex consume refused", func(t *testing.T) {
-		f := newCodexClaimFake(t, map[string]*codexClaimAccount{
-			heldCodex:  {used: 90, credits: heldCodexCredits("credit")},
-			spareCodex: {used: 30},
+	// A consume answered 4xx was refused, so no credit was used: failed. One
+	// answered 5xx may have landed.
+	for _, c := range []struct {
+		name    string
+		status  int
+		verdict AutoResetVerdict
+		reason  string
+	}{
+		{"a codex consume refused", http.StatusBadRequest, AutoResetFailed, "so no credit was used"},
+		{"a codex consume that may have landed", http.StatusBadGateway, AutoResetMayHaveLanded, "it may have landed"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			f := newCodexClaimFake(t, map[string]*codexClaimAccount{
+				heldCodex:  {used: 90, credits: heldCodexCredits("credit")},
+				spareCodex: {used: 30},
+			})
+			f.consumeStatus = c.status
+			f.pinSession("conversation", heldCodex)
+			f.set(heldCodex, func(a *codexClaimAccount) { a.used = 100 })
+			status, body := f.post("conversation")
+			consumes, served := f.counts()
+			if status != http.StatusOK || !strings.Contains(body, "served-from-"+spareCodex) || consumes != 1 ||
+				!reflect.DeepEqual(served, []string{heldCodex + " 429", spareCodex + " 200"}) {
+				t.Fatalf("the turn got %d %.200q; %d consumes, served %v; want today's move after one consume", status, body, consumes, served)
+			}
+			if decision := f.decision(heldCodex); decision.Verdict != c.verdict || !strings.Contains(decision.Reason, c.reason) {
+				t.Fatalf("last decision %+v, want %s saying %q", decision, c.verdict, c.reason)
+			}
 		})
-		f.consumeStatus = http.StatusBadRequest
-		f.pinSession("conversation", heldCodex)
-		f.set(heldCodex, func(a *codexClaimAccount) { a.used = 100 })
-		status, body := f.post("conversation")
-		consumes, served := f.counts()
-		if status != http.StatusOK || !strings.Contains(body, "served-from-"+spareCodex) || consumes != 1 ||
-			!reflect.DeepEqual(served, []string{heldCodex + " 429", spareCodex + " 200"}) {
-			t.Fatalf("the turn got %d %.200q; %d consumes, served %v; want today's move after one consume", status, body, consumes, served)
-		}
-		if decision := f.decision(heldCodex); decision.Verdict != AutoResetMayHaveLanded || !strings.Contains(decision.Reason, "it may have landed") {
-			t.Fatalf("last decision %+v", decision)
-		}
-	})
+	}
 }
 
 // 5. Never twice. After a claim that landed, a wall inside 10 minutes makes
@@ -1167,18 +1179,24 @@ func TestTheClaimSpendsOnlyTheResetTheDecisionJudged(t *testing.T) {
 // B(2) in real mode, Codex: a reading at 99.6% used with a credit and a warm
 // session claims, with the cooked rule lifted (the account is not at its
 // limit); the live reading before the consume must still have under 1% left.
+// With the owner's condition off the live week must still be the moment, at
+// least 99.5% used: a week that rolled between the reading and the claim is
+// not redeemed.
 func TestRealClaimsOnACodexReadingAtTheLimit(t *testing.T) {
-	setAutoResetForTest(t, AutoResetReal, true)
 	for _, c := range []struct {
-		name     string
-		liveUsed float64
-		consumes int
-		verdict  AutoResetVerdict
+		name      string
+		nearEmpty bool
+		liveUsed  float64
+		consumes  int
+		verdict   AutoResetVerdict
 	}{
-		{"the live week has 0.4% left", 99.6, 1, AutoResetClaimed},
-		{"the live week has 5% left", 95, 0, AutoResetFailed},
+		{"the live week has 0.4% left", true, 99.6, 1, AutoResetClaimed},
+		{"the live week has 5% left", true, 95, 0, AutoResetFailed},
+		{"the condition off, the live week has 0.4% left", false, 99.6, 1, AutoResetClaimed},
+		{"the condition off, the live week rolled", false, 0, 0, AutoResetFailed},
 	} {
 		t.Run(c.name, func(t *testing.T) {
+			setAutoResetForTest(t, AutoResetReal, c.nearEmpty)
 			f := newCodexClaimFake(t, map[string]*codexClaimAccount{heldCodex: {used: 99.6, credits: heldCodexCredits("credit")}})
 			f.pinSession("warm", heldCodex)
 			f.set(heldCodex, func(a *codexClaimAccount) { a.used = c.liveUsed })
@@ -1188,8 +1206,8 @@ func TestRealClaimsOnACodexReadingAtTheLimit(t *testing.T) {
 			if consumes, _ := f.counts(); consumes != c.consumes || decision.Verdict != c.verdict || decision.Moment != "reading" {
 				t.Fatalf("%d consumes, decision %+v; want %d and %s", consumes, decision, c.consumes, c.verdict)
 			}
-			if c.consumes == 0 && !strings.Contains(decision.Reason, "live reading") {
-				t.Fatalf("decision %+v, want the live reading named", decision)
+			if c.consumes == 0 && (!strings.Contains(decision.Reason, "nothing was sent") || !strings.Contains(decision.Reason, "live reading")) {
+				t.Fatalf("decision %+v, want nothing sent and the live reading named", decision)
 			}
 		})
 	}

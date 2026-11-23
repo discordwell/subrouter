@@ -494,8 +494,9 @@ func autoResetWallsSeen(response *http.Response) bool {
 }
 
 // autoResetTurnAfterFailover says what the retry transport did with a turn
-// that met a wall on walled: the answer it returned, and from which account.
-func autoResetTurnAfterFailover(walled string, response *http.Response, err error) string {
+// that met a wall on walled: the answer it returned, and from which account
+// of the same provider, by its label (§87).
+func (s Server) autoResetTurnAfterFailover(walled accounts.Account, response *http.Response, err error) string {
 	switch {
 	case err != nil || response == nil:
 		return "failed before an answer"
@@ -504,12 +505,22 @@ func autoResetTurnAfterFailover(walled string, response *http.Response, err erro
 		switch {
 		case !ok || routed.ID == "":
 			return "served by a fallback stage (an API key, Bedrock or the peer)"
-		case routed.ID == walled:
+		case routed.ID == walled.ID:
 			return "served on the same account by another model"
 		}
-		return "moved to another account (" + routed.ID + ")"
+		row := s.autoResetRow(accounts.Account{ID: routed.ID, Provider: walled.Provider})
+		return "moved to another account (" + autoResetLabel(row, routed.ID) + ")"
 	}
 	return fmt.Sprintf("answered %d", response.StatusCode)
+}
+
+// autoResetLabel is how the views name an account (§87): its usage row's
+// label, else id.
+func autoResetLabel(row *AccountUsageStatus, id string) string {
+	if row != nil && strings.TrimSpace(row.Label) != "" {
+		return row.Label
+	}
+	return id
 }
 
 // Turns at a Codex websocket wall, as the relay answers them.
@@ -652,10 +663,7 @@ func (s Server) considerAutoReset(ctx context.Context, account accounts.Account,
 		d = decideAutoReset(f)
 	}
 	d.At, d.Account, d.Provider, d.Mode, d.Turn = f.now, account.ID, provider, mode.String(), turn
-	d.Label = account.ID
-	if row != nil && strings.TrimSpace(row.Label) != "" {
-		d.Label = row.Label
-	}
+	d.Label = autoResetLabel(row, account.ID)
 	return d, f
 }
 

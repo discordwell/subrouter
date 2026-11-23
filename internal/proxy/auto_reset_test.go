@@ -523,6 +523,8 @@ type autoResetCodexAccount struct {
 	reset   int64   // seconds to the weekly reset
 	credits []accounts.RateLimitResetCredit
 	turn    http.HandlerFunc
+	// label, when set, is the name the record was enrolled under (§87).
+	label string
 }
 
 // autoResetCodex is a Codex daemon over stored accounts, measured through its
@@ -544,8 +546,10 @@ func newAutoResetCodex(t *testing.T, held map[string]*autoResetCodexAccount) *au
 	t.Helper()
 	t.Setenv("HOME", t.TempDir())
 	store := accounts.CodexStore{Dir: t.TempDir()}
-	for id := range held {
-		if err := store.SaveStored(proxyStoredOAuthAccount(id, strings.Split(id, "@")[0], time.Now().Add(time.Hour))); err != nil {
+	for id, account := range held {
+		stored := proxyStoredOAuthAccount(id, strings.Split(id, "@")[0], time.Now().Add(time.Hour))
+		stored.Label = account.label
+		if err := store.SaveStored(stored); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -681,13 +685,14 @@ const (
 
 // 5, Codex. An account at its usage limit with credits: a would-claim of kind
 // codex_credit naming the credit that expires soonest, and the turn moves as
-// it does today. A credit of a type the daemon does not know is never claimed.
+// it does today. The line names both accounts by their labels (§87). A credit
+// of a type the daemon does not know is never claimed.
 func TestShadowNamesTheCodexCreditThatExpiresSoonest(t *testing.T) {
 	setAutoResetForTest(t, AutoResetShadow, true)
 	d := newAutoResetCodex(t, map[string]*autoResetCodexAccount{
-		heldCodex: {used: 90, reset: 518400, turn: codexWall,
+		heldCodex: {used: 90, reset: 518400, turn: codexWall, label: "Held workspace",
 			credits: []accounts.RateLimitResetCredit{autoResetTestCredit("credit-late", 20*24*time.Hour), autoResetTestCredit("credit-soon", 5*24*time.Hour)}},
-		spareCodex: {used: 30, reset: 300000},
+		spareCodex: {used: 30, reset: 300000, label: "Spare workspace"},
 	})
 	d.pinSession("conversation", heldCodex)
 	status, body := d.turn("conversation")
@@ -696,11 +701,12 @@ func TestShadowNamesTheCodexCreditThatExpiresSoonest(t *testing.T) {
 	}
 	decision, ok := d.decision(heldCodex)
 	if !ok || decision.Verdict != AutoResetWouldClaim || decision.Kind != "codex_credit" || decision.Reset != "credit-soon" ||
-		decision.Moment != "wall" || decision.Left != "0.0%" || decision.Turn != "moved to another account ("+spareCodex+")" {
-		t.Fatalf("decision %+v, want a would-claim of credit-soon at the wall", decision)
+		decision.Moment != "wall" || decision.Left != "0.0%" || decision.Turn != "moved to another account (Spare workspace)" {
+		t.Fatalf("decision %+v, want a would-claim of credit-soon at the wall, the turn moved to Spare workspace", decision)
 	}
 	lines := wouldClaimLines(d.logs)
-	if len(lines) != 1 || lines[0]["reset"] != "credit-soon" || lines[0]["kind"] != "codex_credit" || lines[0]["account"] != heldCodex {
+	if len(lines) != 1 || lines[0]["reset"] != "credit-soon" || lines[0]["kind"] != "codex_credit" || lines[0]["account"] != "Held workspace" ||
+		lines[0]["turn"] != "moved to another account (Spare workspace)" {
 		t.Fatalf("would-claim lines %v", lines)
 	}
 
@@ -797,7 +803,10 @@ func TestNeverForTheDaemonsOwnSelfStartRequest(t *testing.T) {
 
 // 6. Never for a peer's account. The box's account and the laptop's own read
 // the same: the week spent, a credit left, a session on it. The laptop reads
-// the box's body, and its pass decides for its own account only.
+// the box's body, and its pass decides for its own account only. A wall that
+// names the box's account, as every wall hook hands its account to
+// autoResetAtTheWall, decides nothing; the same wall naming the laptop's own
+// account is a would-claim.
 func TestNeverForAPeersAccount(t *testing.T) {
 	setAutoResetForTest(t, AutoResetShadow, true)
 	const boxAccount, laptopAccount = "box-held@example.com", "laptop-held@example.com"
@@ -830,6 +839,16 @@ func TestNeverForAPeersAccount(t *testing.T) {
 	}
 	if decision, decided := laptop.decision(boxAccount); decided {
 		t.Fatalf("the laptop decided for the box's account: %+v", decision)
+	}
+	for _, id := range []string{boxAccount, laptopAccount} {
+		laptop.server.autoResetAtTheWall(autoResetWall{account: accounts.Account{ID: id, Provider: accounts.ProviderCodex}, meter: autoResetWeek}, "answered 429")
+	}
+	settle(t, laptop.server)
+	if decision, _ := laptop.decision(laptopAccount); decision.Verdict != AutoResetWouldClaim || decision.Moment != "wall" {
+		t.Fatalf("calibration: a wall on the laptop's own account decided %+v, want a would-claim at the wall", decision)
+	}
+	if decision, decided := laptop.decision(boxAccount); decided {
+		t.Fatalf("a wall naming the box's account decided %+v, want nothing", decision)
 	}
 	for _, line := range wouldClaimLines(laptop.logs) {
 		if line["account"] != laptopAccount {

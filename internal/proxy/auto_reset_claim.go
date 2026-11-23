@@ -392,9 +392,11 @@ func (s Server) autoResetClaimClaude(account accounts.Account, grant string) (au
 // redeem lock and consumes the available credit that expires soonest. At a
 // reading moment the account is not yet at its limit, so the cooked rule is
 // lifted there (anytime). The last check sees the exact credit and the live
-// reading: a credit of a kind this daemon does not know is never redeemed,
-// and while the owner's condition is on the live week must have under 1%
-// left.
+// reading: a credit of a kind this daemon does not know is never redeemed;
+// at a reading moment the live week must still read at least 99.5% used,
+// whatever the owner's condition, since nothing else stops a redeem of a
+// week that rolled; and while the condition is on the live week must have
+// under 1% left.
 func (s Server) autoResetClaimCodex(account accounts.Account, f autoResetFacts) (autoResetClaimResult, []accounts.UsageWindow) {
 	ctx, cancel := context.WithTimeout(context.Background(), autoResetCodexClaimBudget)
 	defer cancel()
@@ -403,11 +405,12 @@ func (s Server) autoResetClaimCodex(account accounts.Account, f autoResetFacts) 
 		if resetType := strings.TrimSpace(live.credit.ResetType); resetType != "" && resetType != codexRateLimitsResetType {
 			return fmt.Errorf("the credit it would spend is of a kind this daemon does not know (reset_type %s)", resetType)
 		}
-		if f.nearEmpty {
-			week, ok := autoResetReadingsIn(accounts.ProviderCodex, live.before, now)[autoResetWeek]
-			if !ok || week.left >= autoResetNearEmptyLeft {
-				return errors.New("refused by the under-1-percent condition on the live reading before the consume")
-			}
+		week, read := autoResetReadingsIn(accounts.ProviderCodex, live.before, now)[autoResetWeek]
+		if f.moment == autoResetOnAReading && (!read || (1-week.left)*100 < autoResetReadingUsed) {
+			return errors.New("the live reading before the consume no longer says the week is at least 99.5% used")
+		}
+		if f.nearEmpty && (!read || week.left >= autoResetNearEmptyLeft) {
+			return errors.New("refused by the under-1-percent condition on the live reading before the consume")
 		}
 		sent = true
 		return nil
@@ -427,6 +430,8 @@ func (s Server) autoResetClaimCodex(account accounts.Account, f autoResetFacts) 
 		}
 		s.AccountRef.InvalidateUsageStatusCache()
 		return autoResetClaimResult{landed: true, sent: true, reason: "the credit " + credit + " was redeemed"}, result.WindowsAfter
+	case sent && result.consumeStatus >= 400 && result.consumeStatus < 500:
+		return autoResetClaimResult{sent: true, reason: "the consume was refused (" + result.Error + "), so no credit was used"}, nil
 	case sent:
 		return autoResetClaimResult{sent: true, unsure: true, reason: "the consume did not come back as a redeem (" + result.Error + "); it may have landed"}, nil
 	}
