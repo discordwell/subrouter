@@ -1033,7 +1033,7 @@ For the Claude Opus 5.5 launch, Anthropic gave every Pro and Max account one sav
 
 - Knobs: `SUBROUTER_CLAUDE_CODE_VERSION` (default `2.1.284`; a plain `x.y.z` replaces the `User-Agent` version on daemon restart), `SUBROUTER_PUBLIC_ADMIN=1` (off keeps `claude-reset` 404 on `:31416`), `--server <name>` (picks the holding daemon; `local` is this machine), `--yes`/`-y` (answers the waste question; required without a terminal), `--dry-run` (hidden; one preview request that never asks or waits).
 - Code: `internal/agents/claude/reset.go` (`ParseResetStatus`), `internal/proxy/claude_reset.go` (`ClaudeResetPath`), `cmd/subrouter/sr_provider_reset.go`.
-- Related: §56 builds on this (until claimed or expired, the router ranks the account at 2x and drains it early below 25 % of its week). §46.9 reverses §46.4's private-only rule and builds on §43.2's public admin listener. §46.11 supersedes parts of §46.10.
+- Related: §56 builds on this (until claimed or expired, the router ranks the account at 2x and drains it early below 25 % of its week). §46.9 reverses §46.4's private-only rule and builds on §43.2's public admin listener. §46.11 supersedes parts of §46.10. §64 adds Fable resets to the cell (`2 Fable 3/9`, `1 +1F 12/10`) and the kind claimed to the claim's line.
 
 ## 47. Ended macOS login session: `sr status` reads the daemon, verbs that need the session and deploy scripts refuse
 
@@ -1256,6 +1256,8 @@ anchors the hold at now (2x up to an hour past expiry).
   §57 amends it: by default early burndown takes the full taper (4 / 3 / 2 / 1 below 25 % and at or
   below 18.75 / 12.5 / 6.25 % measured); only with `SUBROUTER_FABLE_RESERVATION=1` is it 2 at 25 % and 1
   below about 12.5 %. Lifting the reservation was cut: 4 Fable sessions on a Fable meter with 5 % left.
+  §64 amends it: only a reset that gives back the week holds an account, and the hold is published as
+  `seconds_to_held_week_reset_expiry`, with the legacy key beside it.
 
 ## 57. The Fable weekly reservation is off unless `SUBROUTER_FABLE_RESERVATION=1`
 
@@ -1541,18 +1543,34 @@ used and the Fable meter from 116 % to 0 %. So the Fable limit is half the week,
 only refunds the Fable usage off it. A claim loses nothing left in the week, so §56's reason
 to hold an account does not apply.
 
-The week hold (`WeekHeldUntil`) is now the soonest `ends_at` among live grants whose
-`clears` contains `seven_day` or is absent (October's shape). Live is the account eligible
-and the grant with a reset left, not expired and not paused. An `ends_at` that does not
-parse holds nothing. A Fable-only account is no holder. It is published as
-`normalized.seconds_to_held_week_reset_expiry` and, for week holds only, as the legacy
-`seconds_to_held_reset_expiry`. Readers take only the new key, so a pre-§64 body ranks 1x.
+A grant's kind (`ResetGrant.Kind`) is read from its `clears`: `week` when it lists
+`seven_day` or nothing (October's shape), `fable` when it lists `seven_day_overage_included`
+and not `seven_day`, else `other`. The week hold (`WeekHeldUntil`, published on the row's
+`complimentary_reset` as `week_held_until`) is the soonest `ends_at` among live `week`
+grants. Live is the account eligible and the grant with a reset left, not expired and not
+paused. An `ends_at` that does not parse holds nothing. A Fable-only account is no holder:
+it ranks exactly as an account with no reset, on every pool, and its row still shows the
+resets. On 2026-11-22 the pool read two shapes: one week reset per account, clearing
+`seven_day` and `seven_day_overage_included`, to be used by 2026-12-10 22:00Z, with Fable
+resets to 2027-03-09 behind it. Such an account is a week holder until 12-10, never until a
+Fable reset's end, and with two live week resets until the sooner end. The hold is
+published as `normalized.seconds_to_held_week_reset_expiry` and, with the same value, as the
+legacy `seconds_to_held_reset_expiry`, for week holds only. Every reader (the peer score,
+the board's box rows, `srq`) takes the week key, else the legacy key
+(`heldWeekResetSeconds`): a body with the legacy key alone is from a pre-§64 daemon, which
+held an account on any grant, and it ranks as it did before, at 2x. Changed in the
+2026-11-22 port: the first version read only the new key, so a pre-§64 body ranked 1x.
+
 The Fable meter (`FableLimit`) is the usage answer's `limits[]` `weekly_scoped` row whose
 display name starts with "fable" (case-insensitive; of several, the most used), else
 `seven_day_oauth_apps`. Rows decode one by one, so drift never fails the usage read. A gap
 of more than one point between the two logs a WARN at most once an hour per account.
-`ResetGrant` also decodes `type`, `gives_back_weekly` and `unavailable_reason`, as Claude
-Code 2.1.321 does. Nothing routes on them. Every Fable model now falls to `claude-opus-5-5`
+`ResetGrant` also decodes `type` (`session`, `weekly`, `full`), `gives_back_weekly` (false
+when absent or not a boolean) and `unavailable_reason` (`cooldown`, `blocked_five_hour`,
+`blocked_seven_day`, `blocked_opus`, `blocked_sonnet`, `blocked_other`, `cannot_clear`,
+`needs_limit`, `unavailable`), as Claude Code 2.1.321 does: a value it does not know reads as
+absent, and the grant is kept. Nothing routes on them; a claim's answer carries them in its
+`grant`. Every Fable model now falls to `claude-opus-5-5`
 with the client's bracketed suffix kept, because Opus and Fable versions do not release in
 lockstep. The latent Bedrock path maps `claude-fable-5-2` to `us.anthropic.claude-fable-5-2`
 and prices Fable 5.2 per MTok at input 8, output 40, cache write 10 (5 m) and 16 (1 h),
@@ -1560,17 +1578,31 @@ cache read 0.2, and Fable 5.1's cache read at 0.25. The `fable` alias or no mode
 `us.anthropic.claude-fable-5`. Its quota bump still keys every Fable id to Fable 5's code
 (`bedrockTPMQuotaByModel`, `L-9B258944`).
 
+The views name the kind. `complimentary_reset.remaining_by_kind` splits `remaining` by kind
+(`{"week":1,"fable":1}`; absent from a pre-§64 daemon). `sr status`'s `1x reset` cell reads
+`2 Fable 3/9` when every reset left is a Fable reset and `1 +1F 12/10` when a week reset has
+Fable resets behind it (the week reset's date); undated, `2 Fable` and `1 +1F`. pool.json
+rows carry `reset_hold_s` (seconds to the week hold's end) and `fable_resets`, and the board
+shows `F2` beside the pace, apart from the `2x`. `srq pool` adds an `Fn` column. The board's
+notes, its legend, `srq`'s legend and the decision reason say "week reset" where they said
+"saved reset". `sr claude reset` still claims Anthropic's `next_grant_id`, of either kind,
+and its line names the kind and what Anthropic cleared, with the Fable meter beside the
+week: `Fable reset claimed — cleared seven_day_overage_included; 7d 100% -> 42% used, 5h 3%,
+Fable 116% -> 0%; …` (an older daemon's answer, which names no grant, reads `reset claimed`).
+
 Owner decision, 2026-11-09: "The resets last until March; we will absolutely chill on them,
 we don't need to build around resets". Claiming stays manual (`sr claude reset <name>`). Its
 y/N asks about the general week (when it has more than 10 % left), so read `Fable wk` in
 `sr status` first. The §57 Fable reservation stays off. Deploy the box, then the laptop: a
 pre-§64 box still drains its Fable holders under 25 % of their week through its `burndown`
-verdict, which a laptop honours (§31). A pre-§64 laptop keeps its own Fable holders at 4x
-and burns them down early until it is deployed. Nothing is misrouted in either. Whether the
-`limits[]` row and `seven_day_oauth_apps` are one bucket is unmeasured.
+verdict, which a laptop honours (§31), and a §64 laptop ranks them at 2x off its legacy key
+until the box is deployed. A pre-§64 laptop keeps its own Fable holders at 4x and burns them
+down early until it is deployed. Nothing is misrouted in either. Whether the `limits[]` row
+and `seven_day_oauth_apps` are one bucket is unmeasured.
 
 - Knobs: `SUBROUTER_RESET_HOLD_PRIORITY` (still switches the week hold; `0` on a pre-§64 box stops its early drain)
-- Code: `internal/agents/claude/reset.go` (`ResetInfo`), `internal/proxy/claude_fable_meter.go`, `internal/proxy/claude_opus_substitute.go` (`claudeOpusModel`)
+- Code: `internal/agents/claude/reset.go` (`ResetGrant.Kind`, `ResetInfo`, `weekHeldUntil`), `internal/proxy/claude_reset.go` (`resetHeldUntil`, `heldWeekResetSeconds`), `internal/proxy/claude_fable_meter.go`, `internal/proxy/claude_opus_substitute.go` (`claudeOpusModel`)
+- Tests (the reset half; each run in Docker, red with its change taken out and green with it): `internal/agents/claude/reset_test.go` (`TestResetGrantKindIsWhatItsClaimGivesBack`, `TestResetInfoCountsWhatIsLeftByKind`, `TestResetInfoHoldsTheWeekOnlyOnGrantsThatClearIt`, `TestParseResetGrantKeepsTypeGivesBackWeeklyAndUnavailableReason`); `internal/proxy/reset_hold_test.go` (`TestAFableOnlyResetRanksAsNoReset`, `TestAWeekResetHoldsTheAccountUntilItsEnd`, `TestTheWeekHoldEndsWithTheSoonerWeekReset`, `TestTheWeekHoldTravelsApartFromFableResets`, and §56's tests with Fable-only, mixed and legacy-key rows); `internal/proxy/claude_reset_test.go` (`TestClaudeResetClaimsTheNextGrantOfEitherKind`); `cmd/subrouter/sr_provider_reset_test.go` (`TestClaudeResetCellNamesAFableResetAsOne`, `TestClaudeResetSaysWhichKindItClaimedAndWhatItGaveBack`); `srq selftest` (the §64 block)
 - Related: amends §11 (the Opus target and the Fable meter), §46 (which grant is current) and §56 (which grants hold an account).
 
 ## 65. An Opus or Sonnet turn ranks an account whose Fable meter is spent at up to 2x

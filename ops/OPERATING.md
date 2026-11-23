@@ -18,7 +18,7 @@ A Codex account enrolled with owner claims has the ID `codex-owner-<hash>`, and 
 
 ### The CLI's "protected" is not the router's gate
 
-When an account fails `UsableForNewSession`, the Use column of `sr status` reads `<n>% left, not routable`. `sr status --json` gives the account `"state": "protected"`, unless another state, such as `active` or `cooked`, takes precedence. The table's State column never prints `protected`. The router also routes an account in its burndown window, and there it ranks the account above every healthy one until the account reaches its session allowance (`at_cap`). Burndown covers the last 24 hours before the weekly roll. It also covers an account that holds an unclaimed saved reset once less than 25% of its week is left (§56). An account at 8% left can be the router's first pick for a new session.
+When an account fails `UsableForNewSession`, the Use column of `sr status` reads `<n>% left, not routable`. `sr status --json` gives the account `"state": "protected"`, unless another state, such as `active` or `cooked`, takes precedence. The table's State column never prints `protected`. The router also routes an account in its burndown window, and there it ranks the account above every healthy one until the account reaches its session allowance (`at_cap`). Burndown covers the last 24 hours before the weekly roll. It also covers an account that holds an unclaimed reset that gives back the week once less than 25% of its week is left (§56). A Fable reset, which clears only the Fable limit, holds nothing (§64). An account at 8% left can be the router's first pick for a new session.
 
 The router's verdict is `normalized.new_session` on each `usage-status` row. `srq pool` prints it as `new=`:
 
@@ -434,15 +434,15 @@ While the daemon serves its socket, the stand-in asks it for `policy_limits` as 
 
 ## Saved resets
 
-A saved reset clears an account's meters once. Anthropic has granted Claude accounts a one-time saved reset, and Codex accounts hold rate-limit reset credits. Each claim spends one for good, and it discards what is left of the account's current week. Never claim one unless the account owner asked for that claim.
+A saved reset clears an account's meters once. Anthropic has granted Claude accounts saved resets of two kinds, and Codex accounts hold rate-limit reset credits. A week reset clears the general week and discards what is left of it. A Fable reset clears only the Fable limit and gives back the part of the week that Fable spent, so it loses nothing left in the week (§64). Each claim spends one for good. Never claim one unless the account owner asked for that claim.
 
-- `sr status` shows a `1x reset` column on Claude and Codex tables (§46).
-- `sr claude reset <name|email>` claims one Claude account's reset through the daemon that holds it. It asks first only when more than 10% of the week is left or the week rolls within a day.
+- `sr status` shows a `1x reset` column on Claude and Codex tables (§46). A Claude cell names Fable resets: `2 Fable 3/9`, or `1 +1F 12/10` for a week reset with a Fable reset behind it (§64).
+- `sr claude reset <name|email>` claims one Claude account's next reset, of either kind, through the daemon that holds it, and says which kind it claimed and what it cleared. It asks first only when more than 10% of the week is left or the week rolls within a day.
 - `sr codex reset <name|email>` redeems one Codex credit at any time.
 - `sr reset [email]` redeems a Codex credit only for an account that is out of quota.
 - `SUBROUTER_CODEX_AUTO_RATE_LIMIT_RESET=1` lets failover spend a Codex credit when the whole Codex pool is out. It is off by default.
 
-An account that holds an unclaimed Claude reset ranks at twice a non-holder until the reset is claimed or expires, and it enters burndown below 25% of its week (§56). `SUBROUTER_RESET_HOLD_PRIORITY=0` turns that off. `srq pool` marks such accounts `2x`, and their burndown as `burndown·reset`.
+An account that holds an unclaimed Claude week reset ranks at twice a non-holder until the reset is claimed or expires, and it enters burndown below 25% of its week (§56). A Fable reset does neither (§64). `SUBROUTER_RESET_HOLD_PRIORITY=0` turns that off. `srq pool` marks week holders `2x`, their burndown as `burndown·reset`, and Fable resets `F1`, `F2` and so on; the board shows the same marks.
 
 ## Troubleshoot
 
