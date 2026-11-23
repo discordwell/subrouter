@@ -113,7 +113,7 @@ tr.row td:last-child{border-radius:0 8px 8px 0}
 /* unclaimed Fable resets, which hold nothing (PATCHES §64) */
 .freset{font-family:var(--mono);font-size:9.5px;color:var(--dim)}
 /* each kind of saved reset with its soonest expiry (PATCHES §91.2) */
-.wreset,.creset,.ureset,.rpart{font-family:var(--mono);font-size:9.5px;color:var(--dim);white-space:nowrap}
+.wreset,.creset,.ureset,.rpart,.rclaim{font-family:var(--mono);font-size:9.5px;color:var(--dim);white-space:nowrap}
 .ureset{color:var(--burn)}
 /* an account its holder chose to run to its limit for its next saved reset (PATCHES §95) */
 .chosen,.wouldchoose{font-family:var(--mono);font-size:9.5px;white-space:nowrap}
@@ -242,6 +242,7 @@ input.filter:focus{border-color:rgba(59,233,199,.5)}
   <span><b class="creset">R3 12/14</b> holds 3 Codex reset credits, the soonest ending 12/14; <b>R3 ?</b> its daemon has not read their dates yet; <b>12/14*</b> the date is from the last good read of the credit list</span>
   <span><b class="ureset">U1</b> a saved reset of a kind its daemon does not know: shown, never claimed automatically</span>
   <span><b class="rpart">~</b> its daemon publishes no full list of resets (before PATCHES §91), so this is what its complimentary_reset says</span>
+  <span><b class="rclaim">^</b> known from the claim just made, not read since: the last block read with the reset it used counted as used; no automatic claim goes by it until a reading (PATCHES §102)</span>
   <span><b class="chosen">chosen week #1</b> its daemon chose it to run to its limit on its week (or Fable meter) so that its next saved reset is claimed there: new sessions go there first, #1 first; the title says why</span>
   <span><b class="wouldchoose">would choose week #1</b> what real mode would choose; its daemon is in shadow mode, so nothing ranks on it</span>
   <span><b class="st burn">◐</b> burn &mdash; refused for new sessions, but a pin still holds</span>
@@ -409,6 +410,7 @@ function resetMarks(r){
     html += ' <span class="'+cls+'" title="'+esc(k.lines.join("; "))+'">'+esc(text)+'</span>';
   }
   if(html && r.resets_partial) html += ' <span class="rpart" title="its daemon publishes no full list; this is what its complimentary_reset says">~</span>';
+  if(r.resets_from_claim) html += ' <span class="rclaim" title="known from the claim just made, not read since">'+(html?'^':'0^')+'</span>';
   return html;
 }
 

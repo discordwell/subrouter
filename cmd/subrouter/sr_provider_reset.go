@@ -1200,6 +1200,7 @@ func fillResetsFromLocalDaemon(ctx context.Context, r srRunner, rows []srUsageRo
 			reset := status.ComplimentaryReset
 			if rows[i].provider == accounts.ProviderClaude && reset != nil && reset.Source == agentclaude.ResetProgram {
 				rows[i].complimentaryReset = reset
+				rows[i].resetsFromClaim = status.ResetsFromClaim
 			}
 			if rows[i].provider == accounts.ProviderCodex && codexCreditCount(reset) == codexCreditCount(rows[i].complimentaryReset) {
 				rows[i].resets = status.Resets

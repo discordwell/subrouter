@@ -179,6 +179,21 @@ test('the board marks each kind of saved reset with its count and soonest expiry
     'the mark\'s title lists every entry')
 })
 
+// The rows carry the mark as TestPoolJSONMarksABlockFromAClaim checks pool.json sends it.
+test('the board marks resets known from a claim, not a reading (PATCHES §102)', async () => {
+  const { board, flash } = await render(boardOf([
+    claudeRow('a-claimed', { resets_from_claim: true, resets: [{ kind: 'fable', count: 1, expires_at: FABLE_ENDS, expiry: 'read' }] }),
+    claudeRow('b-used-last', { resets_from_claim: true, resets: [] }),
+    claudeRow('c-read', { resets: [{ kind: 'fable', count: 1, expires_at: FABLE_ENDS, expiry: 'read' }] }),
+  ]))
+  assert.equal(flash, '', 'the page read pool.json')
+  const text = (id) => [...rowHTML(board, id).matchAll(/class="(freset|rclaim)"[^>]*>([^<]*)</g)].map((m) => m[1] + ':' + m[2])
+  assert.deepEqual(text('a-claimed'), ['freset:F1 ' + monthDay(FABLE_ENDS), 'rclaim:^'], 'the marks, then ^')
+  assert.deepEqual(text('b-used-last'), ['rclaim:0^'], 'a claim that used the last reset reads 0^')
+  assert.deepEqual(text('c-read'), ['freset:F1 ' + monthDay(FABLE_ENDS)], 'a reading is not marked')
+  assert.match(PAGE, /<b class="rclaim">\^<\/b> known from the claim just made/, 'the legend says what ^ means')
+})
+
 // The rows carry choices as TestPoolJSONCarriesEachRowsResetChoice checks pool.json sends them:
 // reset_choice from a daemon in real mode, would_choose from one in shadow mode.
 test('the board marks an account chosen for a reset, with its meter, its order and why (PATCHES §95.3)', async () => {

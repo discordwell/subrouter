@@ -318,6 +318,10 @@ type poolRow struct {
 	// §91.2). Absent with no reading. Shown, never ranked on.
 	Resets        []poolReset `json:"resets,omitzero"`
 	ResetsPartial bool        `json:"resets_partial,omitempty"`
+	// ResetsFromClaim marks Resets as known from the account's last landed
+	// claim, not from a reading (its daemon's resets_from_claim, PATCHES
+	// §102). Absent from a daemon before §102.
+	ResetsFromClaim bool `json:"resets_from_claim,omitempty"`
 
 	// ResetChoice is the account's holder's choice to run it to its limit for
 	// its next saved reset, as the holder publishes it in real mode
@@ -869,6 +873,7 @@ func applyPoolReadings(row *poolRow, status AccountUsageStatus, scheduler select
 		row.FableResets = reset.RemainingByKind[string(agentclaude.ResetKindFable)]
 	}
 	row.Resets, row.ResetsPartial = poolResetsOf(status)
+	row.ResetsFromClaim = status.ResetsFromClaim
 	row.ResetChoice, row.WouldChoose = nil, nil
 	if status.Normalized != nil && status.Normalized.ResetChoice != nil && status.Normalized.ResetChoice.Known() {
 		row.ResetChoice = status.Normalized.ResetChoice
