@@ -19,7 +19,7 @@ import (
 // claim the reset for a fresh week before the grant lapses.
 
 const (
-	reasonEarlyBurndown       = "early burndown: holds an unclaimed saved reset and under 25% of its week is left"
+	reasonEarlyBurndown       = "early burndown: holds an unclaimed week reset and under 25% of its week is left"
 	reasonResetHold2x         = "higher weekly pace after the reset-hold 2x and the live-session discount"
 	reasonSteadyEarlyBurndown = "the other is in early burndown on a saved reset; not a place to park a session"
 )

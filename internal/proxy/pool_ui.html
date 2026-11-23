@@ -110,6 +110,8 @@ tr.row td:last-child{border-radius:0 8px 8px 0}
 .st.active{text-shadow:0 0 9px currentColor}
 /* the reset-hold 2x beside a raw pace (PATCHES §56) */
 .hold{font-family:var(--mono);font-size:9.5px;color:var(--drain)}
+/* unclaimed Fable resets, which hold nothing (PATCHES §64) */
+.freset{font-family:var(--mono);font-size:9.5px;color:var(--dim)}
 
 /* pool badge */
 .pool{font-family:var(--mono);font-size:9.5px;letter-spacing:.04em;padding:1px 5px;border-radius:5px;border:1px solid var(--edge);color:var(--dim)}
@@ -225,8 +227,9 @@ input.filter:focus{border-color:rgba(59,233,199,.5)}
 <div class="legend" id="legend">
   <span><b class="st ok">●</b> ok</span>
   <span><b class="st pristine">◇</b> pristine &mdash; weekly window not started; the next new session goes here first</span>
-  <span><b class="st drain">◈</b> drain &mdash; rolls within 24h, budget expires either way; or holds an unclaimed saved reset with under 25% of its week left, which the claim would wipe</span>
-  <span><b class="hold">2x</b> holds an unclaimed saved reset: ranks at twice its pace until it expires or is claimed</span>
+  <span><b class="st drain">◈</b> drain &mdash; rolls within 24h, budget expires either way; or holds an unclaimed week reset with under 25% of its week left, which the claim would wipe</span>
+  <span><b class="hold">2x</b> holds an unclaimed week reset: ranks at twice its pace until it expires or is claimed</span>
+  <span><b class="freset">F2</b> holds 2 unclaimed Fable resets: no 2x and no early burndown, since a Fable claim gives back the Fable limit, not the week</span>
   <span><b class="st burn">◐</b> burn &mdash; refused for new sessions, but a pin still holds</span>
   <span><b class="st week">○</b> exhausted</span>
   <span><b class="st unknown">?</b> unmeasured &mdash; not measured, which is not the same as healthy</span>
@@ -345,7 +348,7 @@ function claudeCells(r){
     + '<td class="num">'+(r.weekly_left!==undefined?pct(r.weekly_left):"–")+'</td>'
     + '<td>'+meter(r.weekly_left, r.state, null)+'</td>'
     + '<td class="num">'+dur(live(r.weekly_roll_s))+'</td>'
-    + '<td class="num">'+(r.pace!==undefined?(r.pace*1e7).toFixed(1):"–")+(r.reset_hold?' <span class="hold">2x</span>':'')+'</td>';
+    + '<td class="num">'+(r.pace!==undefined?(r.pace*1e7).toFixed(1):"–")+(r.reset_hold?' <span class="hold">2x</span>':'')+(r.fable_resets?' <span class="freset">F'+r.fable_resets+'</span>':'')+'</td>';
 }
 function codexCells(r){
   const f=r.fuse;

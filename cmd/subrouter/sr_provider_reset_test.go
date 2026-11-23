@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -197,6 +198,102 @@ func TestClaudeResetCellReadings(t *testing.T) {
 	}
 }
 
+// PATCHES §64: the 1x reset cell names a reset that clears only the Fable
+// limit as a Fable reset, never as one that gives back the week. The rows are
+// the daemon's reading of the two shapes the pool held on 2026-11-22, sent
+// over usage-status as JSON; a row from a daemon before §64 reads as before.
+func TestClaudeResetCellNamesAFableResetAsOne(t *testing.T) {
+	now := time.Date(2026, 11, 22, 20, 0, 0, 0, time.UTC)
+	week := `{"id":"week_reset","resets_total":1,"resets_left":1,"ends_at":"2026-12-10T22:00:00Z","clears":["seven_day","seven_day_overage_included"]}`
+	fable := func(left int) string {
+		return fmt.Sprintf(`{"id":"fable_5_2_launch","resets_total":%d,"resets_left":%d,"ends_at":"2027-03-09T07:59:00Z","clears":["seven_day_overage_included"]}`, left, left)
+	}
+	row := func(t *testing.T, grants ...string) srUsageRow {
+		t.Helper()
+		status, err := agentclaude.ParseResetStatus([]byte(`{"eligible":true,"grants":[` + strings.Join(grants, ",") + `]}`))
+		if err != nil || status == nil {
+			t.Fatalf("calibration: %v %+v", err, status)
+		}
+		raw, _ := json.Marshal(agentclaude.ResetInfo(status, now))
+		var info accounts.ComplimentaryResetInfo
+		if err := json.Unmarshal(raw, &info); err != nil {
+			t.Fatal(err)
+		}
+		return srUsageRow{provider: accounts.ProviderClaude, authMode: accounts.AuthModeOAuth, complimentaryReset: &info}
+	}
+	weekDate := time.Date(2026, 12, 10, 22, 0, 0, 0, time.UTC).Local().Format("1/2")
+	fableDate := time.Date(2027, 3, 9, 7, 59, 0, 0, time.UTC).Local().Format("1/2")
+	older := row(t, week, fable(1))
+	older.complimentaryReset.RemainingByKind = nil
+	for _, tc := range []struct {
+		name           string
+		row            srUsageRow
+		dated, undated string
+	}{
+		{"Fable resets alone", row(t, fable(2)), "2 Fable " + fableDate, "2 Fable"},
+		{"the week reset and a Fable reset queued behind it", row(t, week, fable(1)), "1 +1F " + weekDate, "1 +1F"},
+		{"the week reset alone", row(t, week), "1 left " + weekDate, "1 left"},
+		{"a daemon from before §64", older, "2 left " + weekDate, "2 left"},
+	} {
+		if got := usageGridResetCell(tc.row).Text; got != tc.dated {
+			t.Errorf("%s: dated cell %q, want %q", tc.name, got, tc.dated)
+		}
+		if got := usageGridResetCellUndated(tc.row).Text; got != tc.undated {
+			t.Errorf("%s: undated cell %q, want %q", tc.name, got, tc.undated)
+		}
+	}
+}
+
+// PATCHES §64: a claim names which kind of reset it spent and what Anthropic
+// says it cleared, with the Fable meter beside the week. The Fable claim is
+// shaped as the one measured on 2026-11-09: the week 100% -> 42% used, the
+// Fable meter 116% -> 0%. An older daemon's answer with no grant reads as
+// before, with what it cleared.
+func TestClaudeResetSaysWhichKindItClaimedAndWhatItGaveBack(t *testing.T) {
+	opts := providerResetOptions{provider: accounts.ProviderClaude, account: "held"}
+	weekly := resetWeekly.Local().Format("Mon Jan 2 15:04 MST")
+	fable := claimedResponse()
+	one := 1
+	fable.ResetsLeftAfter = &one
+	fable.Grant = &agentclaude.ResetGrant{ID: "fable_5_2_launch", ResetsTotal: 2, ResetsLeft: 2, EndsAt: resetUseBy.Format(time.RFC3339),
+		Clears: []string{"seven_day_overage_included"}, GivesBackWeekly: true, UsableNow: true, UseRequiresLimit: true}
+	fable.Cleared = []string{"seven_day_overage_included"}
+	fable.Windows = []accounts.UsageWindow{{Name: "5h", UsedPercent: 3}, {Name: "7d", UsedPercent: 100}, {Name: agentclaude.FableWindowName, UsedPercent: 116}}
+	fable.WindowsAfter = []accounts.UsageWindow{{Name: "5h", UsedPercent: 3}, {Name: "7d", UsedPercent: 42}, {Name: agentclaude.FableWindowName, UsedPercent: 0}}
+	noGrant := claimedResponse()
+	noGrant.Grant = nil
+	for _, tc := range []struct {
+		name   string
+		result proxy.ClaudeResetResponse
+		want   string
+	}{
+		{"a Fable reset", fable, "held (local): Fable reset claimed — cleared seven_day_overage_included; 7d 100% -> 42% used, 5h 3%, " +
+			"Fable 116% -> 0%; weekly reset still " + weekly + "; 1 reset left"},
+		{"a week reset", claimedResponse(), claimedLine("local")},
+		{"an older daemon's answer", noGrant, "held (local): reset claimed — cleared five_hour, seven_day; 7d 100% -> 0% used, 5h 0%; " +
+			"weekly reset still " + weekly + "; 0 resets left"},
+	} {
+		line, claimed := claudeResetOutcome(tc.result, "held", "local", opts, time.Now())
+		if !claimed || line != tc.want {
+			t.Errorf("%s: %v %q\nwant %q", tc.name, claimed, line, tc.want)
+		}
+	}
+
+	// The same line end to end: one call to the holding daemon, which named a
+	// Fable grant next and claimed it.
+	daemon := &resetDaemonFake{t: t, statuses: claudeResetStatuses(), preview: claimablePreview(), claim: fable}
+	store := resetMachine(t, daemon)
+	devNull, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer devNull.Close()
+	got, err := runReset(t, store, devNull, "claude", "reset", "held")
+	if err != nil || !strings.HasPrefix(strings.TrimSpace(got), "held (local): Fable reset claimed — cleared seven_day_overage_included;") {
+		t.Fatalf("claim: %v\n%s", err, got)
+	}
+}
+
 // resetDaemonFake is a daemon (local or a box) as the reset verbs see it.
 type resetDaemonFake struct {
 	t        *testing.T
@@ -330,11 +427,14 @@ func claimablePreview() proxy.ClaudeResetResponse {
 var resetWeekly = time.Date(2026, 10, 4, 19, 0, 0, 0, time.UTC)
 
 // claimedResponse is the daemon's answer to a claim that reset held, shaped
-// like the first real claim (2026-09-29): 7d 100% -> 0%, no resets left.
+// like the first real claim (2026-09-29): a grant that clears the week, 7d
+// 100% -> 0%, no resets left.
 func claimedResponse() proxy.ClaudeResetResponse {
 	left := 0
 	return proxy.ClaudeResetResponse{
 		Account: "held", Claimable: true, Claimed: true, Result: "reset", RequestID: "req-1", ClaimAttempts: 1,
+		Grant: &agentclaude.ResetGrant{ID: "opus_5_5_launch", ResetsTotal: 1, ResetsLeft: 1, EndsAt: resetUseBy.Format(time.RFC3339),
+			Clears: []string{"five_hour", "seven_day"}, UsableNow: true, UseRequiresLimit: true},
 		ResetsLeftAfter: &left, Cleared: []string{"five_hour", "seven_day"}, WeeklyResetsAt: resetWeekly.Format(time.RFC3339),
 		Status:       &agentclaude.ResetStatus{Eligible: true, AtLimit: true, Exhausted: []string{"seven_day"}},
 		Windows:      []accounts.UsageWindow{{Name: "5h", UsedPercent: 0}, {Name: "7d", UsedPercent: 100}},
@@ -344,7 +444,7 @@ func claimedResponse() proxy.ClaudeResetResponse {
 
 // claimedLine is what `sr claude reset held` prints for claimedResponse.
 func claimedLine(label string) string {
-	return "held (" + label + "): reset claimed — 7d 100% -> 0% used, 5h 0%; weekly reset still " +
+	return "held (" + label + "): week reset claimed — cleared five_hour, seven_day; 7d 100% -> 0% used, 5h 0%; weekly reset still " +
 		resetWeekly.Local().Format("Mon Jan 2 15:04 MST") + "; 0 resets left"
 }
 

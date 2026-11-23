@@ -850,18 +850,18 @@ func usageWindowPercent(windows []accounts.UsageWindow, name string) (float64, b
 	return 0, false
 }
 
-// claudeResetBeforeAfter is "7d 100% -> 0% used, 5h 0%": each meter after the
-// claim, with where it stood before when that differs.
+// claudeResetBeforeAfter is "7d 100% -> 0% used, 5h 0%, Fable 116% -> 0%":
+// each meter after the claim, with where it stood before when that differs.
 func claudeResetBeforeAfter(before, after []accounts.UsageWindow) string {
 	var parts []string
-	for _, name := range []string{"7d", "5h"} {
-		now, ok := usageWindowPercent(after, name)
+	for _, meter := range []struct{ name, label string }{{"7d", "7d"}, {"5h", "5h"}, {agentclaude.FableWindowName, "Fable"}} {
+		now, ok := usageWindowPercent(after, meter.name)
 		if !ok {
 			continue
 		}
-		part := fmt.Sprintf("%s %g%%", name, now)
-		if was, ok := usageWindowPercent(before, name); ok && was != now {
-			part = fmt.Sprintf("%s %g%% -> %g%%", name, was, now)
+		part := fmt.Sprintf("%s %g%%", meter.label, now)
+		if was, ok := usageWindowPercent(before, meter.name); ok && was != now {
+			part = fmt.Sprintf("%s %g%% -> %g%%", meter.label, was, now)
 		}
 		if len(parts) == 0 {
 			part += " used"
@@ -942,6 +942,9 @@ func claudeResetOutcome(result proxy.ClaudeResetResponse, account, label string,
 			asOf = "the daemon's read " + formatDuration(atLeastAMinute(result.StatusAgeSeconds)) + " ago"
 		}
 		var parts []string
+		if len(result.Cleared) > 0 {
+			parts = append(parts, "cleared "+strings.Join(result.Cleared, ", "))
+		}
 		if meters := claudeResetBeforeAfter(result.Windows, result.WindowsAfter); meters != "" {
 			if asOf != "" && strings.Contains(meters, "->") {
 				meters += " (before: " + asOf + ")"
@@ -954,7 +957,7 @@ func claudeResetOutcome(result proxy.ClaudeResetResponse, account, label string,
 		if result.ResetsLeftAfter != nil {
 			parts = append(parts, resetsLeftText(*result.ResetsLeftAfter))
 		}
-		line := who + ": reset claimed"
+		line := who + ": " + claudeResetKindLabel(result.Grant) + " claimed"
 		if len(parts) > 0 {
 			line += " — " + strings.Join(parts, "; ")
 		}
@@ -1026,6 +1029,22 @@ func claudeResetOutcome(result proxy.ClaudeResetResponse, account, label string,
 		// already_used, not_limited, and anything newer: verbatim.
 		return who + ": not claimed: Anthropic answered " + result.Result + reason + earlier + waited, false
 	}
+}
+
+// claudeResetKindLabel names what the claimed grant gives back (PATCHES
+// §64): a week reset refills the general week, a Fable reset only the Fable
+// limit and the part of the week Fable usage spent.
+func claudeResetKindLabel(grant *agentclaude.ResetGrant) string {
+	if grant == nil {
+		return "reset"
+	}
+	switch grant.Kind() {
+	case agentclaude.ResetKindWeek:
+		return "week reset"
+	case agentclaude.ResetKindFable:
+		return "Fable reset"
+	}
+	return "reset"
 }
 
 func strconvQuote(value string) string {
