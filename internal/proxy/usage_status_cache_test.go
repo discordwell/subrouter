@@ -43,6 +43,19 @@ func (u *blockingUsageRoundTripper) RoundTrip(req *http.Request) (*http.Response
 	return usageOKResponse(), nil
 }
 
+// waitingContext closes waiting the first time a caller asks for Done, which
+// a caller does when it starts waiting on something it may give up on.
+type waitingContext struct {
+	context.Context
+	once    sync.Once
+	waiting chan struct{}
+}
+
+func (c *waitingContext) Done() <-chan struct{} {
+	c.once.Do(func() { close(c.waiting) })
+	return c.Context.Done()
+}
+
 func (u *usageRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	u.calls++
 	if len(u.responses) == 0 {
@@ -122,14 +135,29 @@ func TestUsageStatusesFreshSharesConcurrentSweep(t *testing.T) {
 	first := make(chan []AccountUsageStatus, 1)
 	go func() { first <- ref.UsageStatusesFresh(context.Background()) }()
 	<-transport.started
+	// Release the first sweep only once the second request waits on it. A
+	// second request that arrives after the sweep ended rightly starts its own,
+	// and on a busy machine the second goroutine often arrived that late.
+	waiting := &waitingContext{Context: context.Background(), waiting: make(chan struct{})}
 	second := make(chan []AccountUsageStatus, 1)
-	go func() { second <- ref.UsageStatusesFresh(context.Background()) }()
-	close(transport.release)
+	go func() { second <- ref.UsageStatusesFresh(waiting) }()
+	var secondRows []AccountUsageStatus
+	select {
+	case <-waiting.waiting:
+		close(transport.release)
+		secondRows = <-second
+	case secondRows = <-second:
+		close(transport.release)
+		t.Fatalf("second fresh request returned %d rows without waiting for the sweep in flight", len(secondRows))
+	case <-time.After(10 * time.Second):
+		close(transport.release)
+		t.Fatal("second fresh request neither returned nor watched its context for 10 s")
+	}
 	if got := <-first; len(got) != 1 {
 		t.Fatalf("first fresh sweep returned %d rows, want 1", len(got))
 	}
-	if got := <-second; len(got) != 1 {
-		t.Fatalf("second fresh sweep returned %d rows, want 1", len(got))
+	if len(secondRows) != 1 {
+		t.Fatalf("second fresh sweep returned %d rows, want 1", len(secondRows))
 	}
 	transport.mu.Lock()
 	calls := transport.calls
