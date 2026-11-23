@@ -3404,6 +3404,10 @@ A Codex OAuth login is keyed by `accounts.CodexOAuthIdentifier`: `codex-owner-` 
 
 §88.2 The launches that `test` and `check` make now keep `CLAUDE_ROUTE_SOCKET`, `CLAUDE_ROUTE_TCP` and `CLAUDE_ROUTE_PLIST`, as they already kept `CLAUDE_ROUTE_HOME`. Before, they dropped them. With the daemon moved, the shims they launched went to the default socket and port, not to the daemon `claude-route` was checking.
 
+§88.3 `check` and `check codex` take `srq serving`'s answer as the pool account only when it names one. They used to print and accept srq's "unassigned (session ...)" line as an account, so a launch that the pool never served could pass.
+
+§88.4 `test`'s check on a pin to a spent or held-out laptop account passes in exactly two states: the session is served by exactly the pinned account, or it has no row and the launch's answer is the daemon's refusal of the pin (§89 refuses such a pin before any assignment). A row on any other account, a launch that never reached the daemon, or an `srq` that cannot answer each fail it. `served` tells srq's "unassigned" answer apart from its other failures, and `unserved` builds on it.
+
 - Code: `ops/bin/claude-route` (`launch_front`, `build_launch_env`, `cmd_check`, `cmd_check_codex`, `cmd_test`)
 - Tests: `ops/deploy/tests/deploy-scripts-test.sh` (`route-check-without-paradev-launches-through-the-shim`, `route-test-without-paradev-skips-only-the-paradev-cases`, `route-check-and-test-with-paradev-go-through-its-wrapper`, `route-check-finds-paradev-build-and-superset-wrappers`, `route-failed-check-without-paradev-blocks-the-gate`), `ops/deploy/tests/deploy_scripts_test.go`
 - Docs: `ops/GETTING-STARTED.md`, `ops/OPERATING.md`
