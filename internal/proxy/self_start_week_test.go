@@ -3,9 +3,13 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
@@ -318,7 +322,7 @@ func TestTheDaemonSendsAgainWithAGrowingWait(t *testing.T) {
 // 5. A failed send is logged with its status, counts for the growing wait,
 // is not retried inside the send, and moves no session and marks nothing.
 func TestAFailedSelfStartCountsAndMovesNothing(t *testing.T) {
-	setStartUnstartedWeekForTest(t, false) // the client session goes on pace and leaves no mark
+	setStartUnstartedWeekForTest(t, true)
 	setSelfStartWeekForTest(t, true, "")
 	for _, c := range []struct {
 		name   string
@@ -337,14 +341,20 @@ func TestAFailedSelfStartCountsAndMovesNothing(t *testing.T) {
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			d := newUnstartedCodexDaemon(t, map[string][2]float64{freshAccount: {0, 604800}, midweekAccount: {20, 300000}})
-			if got := d.newSession(t, "client-session"); got != midweekAccount {
-				t.Fatalf("the client session went to %q, want %q", got, midweekAccount)
+			// A session on each account, the failed one included: §86 sends
+			// the first to the unstarted week and marks it, the second goes
+			// on pace.
+			for _, placed := range [][2]string{{"session-on-the-unstarted-week", freshAccount}, {"session-midweek", midweekAccount}} {
+				if got := d.newSession(t, placed[0]); got != placed[1] {
+					t.Fatalf("%s went to %q, want %q", placed[0], got, placed[1])
+				}
 			}
 			sessionsBefore := d.server.Sessions.All()
 			hitsBefore := len(d.upstreamRequests())
 			c.fail(d)
 			starts := newSelfStarts()
-			t0 := time.Now()
+			// After the session's mark, so the daemon may send.
+			t0 := time.Now().Add(selectacct.StartSentMarkDuration + time.Second)
 			d.selfStartPass(starts, t0)
 
 			failed := jsonLogLines(d.logs, selfStartFailedMessage)
@@ -820,6 +830,92 @@ func TestUsageStatusAndTheBoardShowTheDaemonsOwnStart(t *testing.T) {
 	if row := d.board(t)[freshAccount]; row.State == poolStatePristine || row.Fuse == nil || row.Fuse.State != poolFuseRunning {
 		t.Fatalf("pool.json row once the clock runs: %+v", row)
 	}
+}
+
+// 12b. The board page itself, run by node on the pool.json the daemon serves:
+// once this daemon has sent its own turn on an unstarted week, the row says
+// "start sent HH:MM" beside its PRISTINE fuse, in the browser's time, with
+// ×2 from the second send in a row. Before a send, on a running week, and once
+// the clock runs, no row says it. Skipped where there is no node.
+func TestTheBoardPageShowsTheDaemonsOwnStart(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skipf("no node to run the board page: %v", err)
+	}
+	setStartUnstartedWeekForTest(t, true)
+	setSelfStartWeekForTest(t, true, "")
+	d := newUnstartedCodexDaemon(t, map[string][2]float64{freshAccount: {0, 604800}, midweekAccount: {20, 300000}})
+	drawn := func(t *testing.T, when, fuse string) {
+		t.Helper()
+		rows := d.renderBoardPage(t, node)
+		if !strings.Contains(rows[freshAccount], fuse) {
+			t.Fatalf("%s, the page drew %s's row as\n%s\nwant it to contain\n%s", when, freshAccount, rows[freshAccount], fuse)
+		}
+		if row := rows[midweekAccount]; row == "" || strings.Contains(row, "start sent") {
+			t.Fatalf("%s, the page drew the running week %s as\n%s", when, midweekAccount, row)
+		}
+	}
+	drawn(t, "before any send", `PRISTINE</span></td>`)
+
+	starts := d.server.AccountRef.sharedSelfStarts()
+	first := time.Now().Add(-2 * time.Hour).Truncate(time.Second)
+	d.selfStartPass(starts, first)
+	drawn(t, "after the first send", `PRISTINE</span> <span class="started">start sent `+first.UTC().Format("15:04")+`</span></td>`)
+
+	second := time.Now().Truncate(time.Second)
+	d.publishReading(t, freshAccount, 0, 604800, second.Add(-time.Second))
+	d.selfStartPass(starts, second)
+	drawn(t, "after the second send", `PRISTINE</span> <span class="started">start sent `+second.UTC().Format("15:04")+` &times;2</span></td>`)
+
+	d.setReading(freshAccount, 1, 604000)
+	d.read(t)
+	drawn(t, "once the clock runs", `RUNNING</span></td>`)
+}
+
+// renderBoardPage runs the board page the daemon serves on the pool.json it
+// serves, in node (testdata/pool_ui_render.mjs), with the browser's clock on
+// UTC, and returns each account's row as the page drew it.
+func (d *unstartedCodexDaemon) renderBoardPage(t *testing.T, node string) map[string]string {
+	t.Helper()
+	page := httptest.NewRecorder()
+	d.server.handlePoolPage(page, loopbackRequest(http.MethodGet, "/_subrouter/pool", ""))
+	dir := t.TempDir()
+	pagePath, poolPath := filepath.Join(dir, "pool.html"), filepath.Join(dir, "pool.json")
+	if err := os.WriteFile(pagePath, page.Body.Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(poolPath, d.poolJSON(t), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, node, filepath.Join("testdata", "pool_ui_render.mjs"), pagePath, poolPath)
+	cmd.Env = append(os.Environ(), "TZ=UTC")
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("node could not run the board page: %v\n%s", err, stderr.String())
+	}
+	var result struct {
+		Board string `json:"board"`
+		Flash string `json:"flash"`
+	}
+	if err := json.Unmarshal(out, &result); err != nil {
+		t.Fatalf("node printed %q: %v", out, err)
+	}
+	if result.Flash != "" {
+		t.Fatalf("the page failed to draw: %s", result.Flash)
+	}
+	rows := map[string]string{}
+	for _, row := range strings.Split(result.Board, `<tr class="row `)[1:] {
+		row, _, _ = strings.Cut(row, "</tr>")
+		if _, rest, ok := strings.Cut(row, `class="acct" title="`); ok {
+			id, _, _ := strings.Cut(rest, `"`)
+			rows[id] = row
+		}
+	}
+	return rows
 }
 
 // 13. A box that sent its own turn publishes it, and this daemon's board shows

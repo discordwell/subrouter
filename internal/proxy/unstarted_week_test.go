@@ -326,16 +326,22 @@ func (d *unstartedCodexDaemon) board(t *testing.T) map[string]poolRow {
 // poolBoard is the whole pool.json document.
 func (d *unstartedCodexDaemon) poolBoard(t *testing.T) poolBoard {
 	t.Helper()
+	var board poolBoard
+	if err := json.Unmarshal(d.poolJSON(t), &board); err != nil {
+		t.Fatal(err)
+	}
+	return board
+}
+
+// poolJSON is pool.json as the daemon serves it.
+func (d *unstartedCodexDaemon) poolJSON(t *testing.T) []byte {
+	t.Helper()
 	rec := httptest.NewRecorder()
 	d.server.handlePoolData(rec, loopbackRequest(http.MethodGet, "/_subrouter/pool.json", ""))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("pool.json = %d: %s", rec.Code, rec.Body.String())
 	}
-	var board poolBoard
-	if err := json.Unmarshal(rec.Body.Bytes(), &board); err != nil {
-		t.Fatal(err)
-	}
-	return board
+	return rec.Body.Bytes()
 }
 
 func (d *unstartedCodexDaemon) usageStatus(t *testing.T) map[string]map[string]any {
