@@ -316,6 +316,16 @@ func (d *unstartedCodexDaemon) newSession(t *testing.T, sessionID string) string
 
 func (d *unstartedCodexDaemon) board(t *testing.T) map[string]poolRow {
 	t.Helper()
+	rows := map[string]poolRow{}
+	for _, row := range d.poolBoard(t).Rows {
+		rows[row.ID] = row
+	}
+	return rows
+}
+
+// poolBoard is the whole pool.json document.
+func (d *unstartedCodexDaemon) poolBoard(t *testing.T) poolBoard {
+	t.Helper()
 	rec := httptest.NewRecorder()
 	d.server.handlePoolData(rec, loopbackRequest(http.MethodGet, "/_subrouter/pool.json", ""))
 	if rec.Code != http.StatusOK {
@@ -325,11 +335,7 @@ func (d *unstartedCodexDaemon) board(t *testing.T) map[string]poolRow {
 	if err := json.Unmarshal(rec.Body.Bytes(), &board); err != nil {
 		t.Fatal(err)
 	}
-	rows := map[string]poolRow{}
-	for _, row := range board.Rows {
-		rows[row.ID] = row
-	}
-	return rows
+	return board
 }
 
 func (d *unstartedCodexDaemon) usageStatus(t *testing.T) map[string]map[string]any {

@@ -138,6 +138,7 @@ tr.row td:last-child{border-radius:0 8px 8px 0}
 .fuse.pristine{color:var(--pristine);border-color:rgba(56,189,248,.4);background:rgba(56,189,248,.1)}
 .fuse.running{color:var(--burn);border-color:rgba(251,191,36,.3);background:rgba(251,191,36,.07)}
 .fuse.none{color:var(--faint)}
+.started{font-family:var(--mono);font-size:9.5px;color:var(--pristine);white-space:nowrap}
 .why{color:var(--dim);font-size:11px;max-width:290px;overflow:hidden;text-overflow:ellipsis;display:inline-block;vertical-align:bottom}
 .rk{color:var(--faint);font-family:var(--mono);font-size:10px}
 .note-row td{padding:0 7px 6px 34px;color:var(--dim);font-size:11px;white-space:normal}
@@ -227,6 +228,7 @@ input.filter:focus{border-color:rgba(59,233,199,.5)}
 <div class="legend" id="legend">
   <span><b class="st ok">●</b> ok</span>
   <span><b class="st pristine">◇</b> pristine &mdash; weekly window not started; the next new session goes here first</span>
+  <span><b class="started">start sent 14:05</b> its daemon sent one tiny request itself at that time to start the week&rsquo;s clock; &times;3 is the third in a row</span>
   <span><b class="st drain">◈</b> drain &mdash; rolls within 24h, budget expires either way; or holds an unclaimed week reset with under 25% of its week left, which the claim would wipe</span>
   <span><b class="hold">2x</b> holds an unclaimed week reset: ranks at twice its pace until it expires or is claimed</span>
   <span><b class="freset">F2</b> holds 2 unclaimed Fable resets: no 2x and no early burndown, since a Fable claim gives back the Fable limit, not the week</span>
@@ -261,6 +263,8 @@ function dur(s){
   return sec+"s";
 }
 function pct(f){ return (f===null||f===undefined) ? "–" : Math.round(f*100); }
+// clock is a published instant as this browser's HH:MM.
+function clock(iso){ const d=new Date(iso); return isNaN(d) ? "" : String(d.getHours()).padStart(2,"0")+":"+String(d.getMinutes()).padStart(2,"0"); }
 function esc(t){ const n=document.createElement("div"); n.textContent=(t===null||t===undefined)?"":String(t); return n.innerHTML; }
 // Countdowns tick from the snapshot's own timestamp, so a codex fuse visibly falls
 // between polls instead of stepping once every 5 seconds.
@@ -358,11 +362,13 @@ function codexCells(r){
   const sp=r.spark;
   const sparkTag = sp ? '<span class="fuse '+sp.state+'">'+(sp.state==="pristine"?"ARMED":"LIT")+'</span>'
                       : '<span class="fuse none">–</span>';
+  const st = r.self_start;
+  const startTag = st ? ' <span class="started">start sent '+esc(clock(st.sent_at))+(st.sends>1?' &times;'+esc(st.sends):'')+'</span>' : '';
   return ''
     + '<td class="num">'+(r.weekly_left!==undefined?pct(r.weekly_left):(r.headroom!==undefined?pct(r.headroom):"–"))+'</td>'
     + '<td>'+meter(r.weekly_left!==undefined?r.weekly_left:r.headroom, r.state, f)+'</td>'
     + '<td class="num">'+dur(live(r.weekly_roll_s))+'</td>'
-    + '<td>'+fuseTag+'</td>'
+    + '<td>'+fuseTag+startTag+'</td>'
     + '<td class="num warn">'+forfeit+'</td>'
     + '<td>'+sparkTag+'</td>';
 }

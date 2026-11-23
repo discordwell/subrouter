@@ -146,6 +146,10 @@ func TestTheDaemonStartsAnUnstartedCodexWeekByItself(t *testing.T) {
 	if sent := jsonLogLines(d.logs, selfStartSentMessage); len(sent) != 1 || sent[0]["account"] != freshAccount || sent[0]["status"] != float64(200) {
 		t.Fatalf("send log lines %v, want one for %s with status 200", sent, freshAccount)
 	}
+	// The loop's sends are the ones usage-status publishes (§90.2).
+	if start, _ := d.usageStatus(t)[freshAccount]["self_start"].(map[string]any); start["sends"] != float64(1) {
+		t.Fatalf("usage-status self_start after the loop's send = %v, want 1 send", start)
+	}
 
 	t.Run("SUBROUTER_SELF_START_MODEL names the model", func(t *testing.T) {
 		setSelfStartWeekForTest(t, true, "gpt-test-model")
@@ -702,5 +706,217 @@ func TestTheSelfStartAnswerIsNeverLogged(t *testing.T) {
 		if token := d.account(t, freshAccount).Token; strings.Contains(logs, token) {
 			t.Fatalf("status %d: the access token reached the log", status)
 		}
+	}
+}
+
+// --- PATCHES §90.2: what the operator sees ---------------------------------
+
+// selfStartShown is what usage-status and pool.json say of the daemon's own
+// turns on account: the normalized block's self_start, nil when it is left
+// out, and the board's row.
+func (d *unstartedCodexDaemon) selfStartShown(t *testing.T, account string) (map[string]any, poolRow) {
+	t.Helper()
+	published := d.usageStatus(t)[account]
+	start, _ := published["self_start"].(map[string]any)
+	if value, present := published["self_start"]; present && start == nil {
+		t.Fatalf("usage-status self_start = %v, want an object or nothing", value)
+	}
+	return start, d.board(t)[account]
+}
+
+// codexSpill is the board's cross-pool verdict for Codex.
+func codexSpill(t *testing.T, board poolBoard) poolSpill {
+	t.Helper()
+	for _, spill := range board.Spill {
+		if spill.Provider == string(accounts.ProviderCodex) {
+			return spill
+		}
+	}
+	t.Fatalf("the board has no Codex spill: %+v", board.Spill)
+	return poolSpill{}
+}
+
+// 12. usage-status's normalized block and pool.json say, for an account whose
+// week still reads unstarted, when this daemon last sent its own turn there
+// and how many it has sent in a row; before any send, and once the clock
+// runs, neither does. The board's row says it in words, its fuse follows the
+// router's fact throughout, and once the mark has expired the next new
+// session still goes there first (§86), as for a send that did not start it.
+func TestUsageStatusAndTheBoardShowTheDaemonsOwnStart(t *testing.T) {
+	setStartUnstartedWeekForTest(t, true)
+	setSelfStartWeekForTest(t, true, "")
+	d := newUnstartedCodexDaemon(t, map[string][2]float64{freshAccount: {0, 604800}, midweekAccount: {20, 300000}})
+	noSendAt := func(t *testing.T, when string) {
+		t.Helper()
+		for _, account := range []string{freshAccount, midweekAccount} {
+			if start, row := d.selfStartShown(t, account); start != nil || row.SelfStart != nil {
+				t.Fatalf("%s, %s: usage-status self_start %v, pool.json self_start %+v; want neither", when, account, start, row.SelfStart)
+			}
+		}
+	}
+	noSendAt(t, "before any send")
+	if row := d.board(t)[freshAccount]; strings.Contains(row.StateNote, "sent one request") {
+		t.Fatalf("before any send the note says %q", row.StateNote)
+	}
+
+	// The first send, two hours ago: its mark has expired, and no reading
+	// since has turned.
+	starts := d.server.AccountRef.sharedSelfStarts()
+	first := time.Now().Add(-2 * time.Hour).Truncate(time.Second)
+	d.selfStartPass(starts, first)
+	if got := d.sentTo(); !reflect.DeepEqual(got, map[string]int{freshAccount: 1}) {
+		t.Fatalf("sent %v, want one request on %s", got, freshAccount)
+	}
+	start, row := d.selfStartShown(t, freshAccount)
+	if want := map[string]any{"sent_at": first.UTC().Format(time.RFC3339), "sends": float64(1)}; !reflect.DeepEqual(start, want) {
+		t.Fatalf("usage-status self_start after the first send = %v, want %v", start, want)
+	}
+	if row.SelfStart == nil || !row.SelfStart.SentAt.Equal(first) || row.SelfStart.Sends != 1 {
+		t.Fatalf("pool.json self_start after the first send = %+v, want sent at %v, 1 send", row.SelfStart, first)
+	}
+	wantNote := "weekly window not started; this daemon sent one request to start its clock at " + first.UTC().Format("15:04 MST") +
+		"; until a reading shows its clock running, the next new session goes here first"
+	if row.StateNote != wantNote {
+		t.Fatalf("pool.json note after the first send:\n%q\nwant\n%q", row.StateNote, wantNote)
+	}
+	if row.State != poolStatePristine || row.Fuse == nil || row.Fuse.State != poolFusePristine || row.Rank != 1 || row.Reason != reasonWeekNotStarted {
+		t.Fatalf("pool.json row once the mark expired: %+v; want pristine, a PRISTINE fuse, rank 1 for %q", row, reasonWeekNotStarted)
+	}
+	if _, present := d.usageStatus(t)[midweekAccount]["self_start"]; present {
+		t.Fatalf("the running week %s carries self_start", midweekAccount)
+	}
+
+	// A second send in a row, now, on a newer reading that still says
+	// unstarted: its mark stands.
+	second := time.Now().Truncate(time.Second)
+	d.publishReading(t, freshAccount, 0, 604800, second.Add(-time.Second))
+	d.selfStartPass(starts, second)
+	if got := d.sentTo(); !reflect.DeepEqual(got, map[string]int{freshAccount: 2}) {
+		t.Fatalf("sent %v, want a second request on %s", got, freshAccount)
+	}
+	start, row = d.selfStartShown(t, freshAccount)
+	if want := map[string]any{"sent_at": second.UTC().Format(time.RFC3339), "sends": float64(2)}; !reflect.DeepEqual(start, want) {
+		t.Fatalf("usage-status self_start after the second send = %v, want %v", start, want)
+	}
+	if row.SelfStart == nil || !row.SelfStart.SentAt.Equal(second) || row.SelfStart.Sends != 2 {
+		t.Fatalf("pool.json self_start after the second send = %+v, want sent at %v, 2 sends", row.SelfStart, second)
+	}
+	wantNote = "weekly window not started; this daemon sent one request to start its clock at " + second.UTC().Format("15:04 MST") +
+		" (2 sent in a row); it ranks on its pace until " + second.Add(selectacct.StartSentMarkDuration).UTC().Format("15:04 MST") +
+		", while a usage reading catches up"
+	if row.StateNote != wantNote {
+		t.Fatalf("pool.json note while the second send's mark stands:\n%q\nwant\n%q", row.StateNote, wantNote)
+	}
+	if row.State != poolStatePristine || row.Fuse == nil || row.Fuse.State != poolFusePristine || row.Reason == reasonWeekNotStarted {
+		t.Fatalf("pool.json row while the mark stands: %+v; want pristine, a PRISTINE fuse, and no priority", row)
+	}
+
+	// The clock runs: neither surface carries the sends any more.
+	d.setReading(freshAccount, 1, 604000)
+	d.read(t)
+	noSendAt(t, "once the clock runs")
+	d.selfStartPass(starts, time.Now())
+	noSendAt(t, "once the clock runs and the sender has read it")
+	if row := d.board(t)[freshAccount]; row.State == poolStatePristine || row.Fuse == nil || row.Fuse.State != poolFuseRunning {
+		t.Fatalf("pool.json row once the clock runs: %+v", row)
+	}
+}
+
+// 13. A box that sent its own turn publishes it, and this daemon's board shows
+// it on the box's row, in words. It changes no ranking: this daemon still
+// gives the box's unstarted week the next new session, exactly as before the
+// box sent, until a reading there turns.
+func TestAPeersOwnStartIsShownAndRanksNothing(t *testing.T) {
+	setStartUnstartedWeekForTest(t, true)
+	setSelfStartWeekForTest(t, true, "")
+	box := newUnstartedCodexDaemon(t, map[string][2]float64{freshAccount: {0, 604800}})
+	laptop := newUnstartedCodexDaemon(t, map[string][2]float64{midweekAccount: {20, 300000}})
+	// A new peer link for each look, so neither reads the other's cached body.
+	read := func(t *testing.T) poolBoard {
+		t.Helper()
+		laptop.server.RemotePool = NewRemotePool(box.proxy.URL, "", "")
+		return laptop.poolBoard(t)
+	}
+	rowOf := func(t *testing.T, board poolBoard) poolRow {
+		t.Helper()
+		for _, row := range board.Rows {
+			if row.ID == freshAccount {
+				return row
+			}
+		}
+		t.Fatalf("the board has no row for the box's %s: %+v", freshAccount, board.Rows)
+		return poolRow{}
+	}
+
+	before := read(t)
+	if row := rowOf(t, before); !reflect.DeepEqual(row.Pools, []string{poolNameBox}) || row.State != poolStatePristine || row.SelfStart != nil {
+		t.Fatalf("the box's row before its send: %+v; want a pristine box row with no self_start", row)
+	}
+	ranked := codexSpill(t, before)
+	if !ranked.PreferPeer || ranked.TargetAccount != freshAccount || ranked.Clause != reasonWeekNotStarted {
+		t.Fatalf("calibration: before the box's send the ranking is %+v; want the box's %s first by %q", ranked, freshAccount, reasonWeekNotStarted)
+	}
+
+	sent := time.Now().Truncate(time.Second)
+	box.selfStartPass(box.server.AccountRef.sharedSelfStarts(), sent)
+	if got := box.sentTo(); !reflect.DeepEqual(got, map[string]int{freshAccount: 1}) {
+		t.Fatalf("the box sent %v, want one request on %s", got, freshAccount)
+	}
+	if start, _ := box.usageStatus(t)[freshAccount]["self_start"].(map[string]any); start["sends"] != float64(1) {
+		t.Fatalf("the box's usage-status self_start = %v, want its send", start)
+	}
+
+	after := read(t)
+	row := rowOf(t, after)
+	if row.SelfStart == nil || !row.SelfStart.SentAt.Equal(sent) || row.SelfStart.Sends != 1 {
+		t.Fatalf("the box's row after its send: self_start %+v, want sent at %v, 1 send", row.SelfStart, sent)
+	}
+	wantNote := "weekly window not started; its daemon sent one request to start its clock at " + sent.UTC().Format("15:04 MST") +
+		"; until a reading shows its clock running, the next new session goes here first"
+	if row.StateNote != wantNote {
+		t.Fatalf("the box's row note:\n%q\nwant\n%q", row.StateNote, wantNote)
+	}
+	if row.State != poolStatePristine || row.Fuse == nil || row.Fuse.State != poolFusePristine {
+		t.Fatalf("the box's row after its send: %+v; want pristine with a PRISTINE fuse", row)
+	}
+	if got := codexSpill(t, after); got.PreferPeer != ranked.PreferPeer || got.TargetPeer != ranked.TargetPeer ||
+		got.TargetAccount != ranked.TargetAccount || got.Clause != ranked.Clause || got.LocalBest != ranked.LocalBest {
+		t.Fatalf("the box's send changed the ranking here: %+v, before it %+v", got, ranked)
+	}
+}
+
+// 14. Each send logs one line with the account, the model, the status, how
+// long it took and when the next send may go; a reading that shows the clock
+// running after sends logs one line with their count.
+func TestEachSelfStartLogsWhatTheOperatorReads(t *testing.T) {
+	setSelfStartWeekForTest(t, true, "")
+	d := newUnstartedCodexDaemon(t, map[string][2]float64{freshAccount: {0, 604800}})
+	starts := newSelfStarts()
+	t0 := time.Now().Truncate(time.Second)
+	d.selfStartPass(starts, t0)
+	d.publishReading(t, freshAccount, 0, 604800, t0.Add(10*time.Minute-time.Second))
+	d.selfStartPass(starts, t0.Add(10*time.Minute))
+
+	sent := jsonLogLines(d.logs, selfStartSentMessage)
+	if len(sent) != 2 {
+		t.Fatalf("send log lines %v, want one per send", sent)
+	}
+	for i, next := range []time.Time{t0.Add(10 * time.Minute), t0.Add(30 * time.Minute)} {
+		line := sent[i]
+		if line["level"] != "INFO" || line["account"] != freshAccount || line["model"] != SelfStartDefaultModel ||
+			line["status"] != float64(200) || line["sends"] != float64(i+1) || line["next_send_after"] != next.UTC().Format(time.RFC3339) {
+			t.Fatalf("send %d logged %v; want INFO for %s, model %s, status 200, sends %d, next_send_after %s",
+				i+1, line, freshAccount, SelfStartDefaultModel, i+1, next.UTC().Format(time.RFC3339))
+		}
+		if took, ok := line["duration_ms"].(float64); !ok || took < 0 {
+			t.Fatalf("send %d logged duration_ms %v, want how long it took", i+1, line["duration_ms"])
+		}
+	}
+
+	d.publishReading(t, freshAccount, 1, 604000, t0.Add(11*time.Minute))
+	d.selfStartPass(starts, t0.Add(12*time.Minute))
+	started := jsonLogLines(d.logs, selfStartStartedMessage)
+	if len(started) != 1 || started[0]["level"] != "INFO" || started[0]["account"] != freshAccount || started[0]["sends"] != float64(2) {
+		t.Fatalf("started log lines %v, want one INFO line for %s after 2 sends", started, freshAccount)
 	}
 }

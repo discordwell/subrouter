@@ -107,9 +107,10 @@ func SelfStartWeek() (bool, string) {
 	return !setting.off, setting.model
 }
 
-// selfStarts is the sender's memory, held by RunSelfStartWeek's loop: one run
-// per account (ScoreKey). A run is the sends in a row whose reading has not
-// turned. A newer reading that says the week runs ends it.
+// selfStarts is the sender's memory: one run per account (ScoreKey). A run is
+// the sends in a row whose reading has not turned. A newer reading that says
+// the week runs ends it. The daemon's loop keeps one (sharedSelfStarts), which
+// usage-status and the pool board read.
 type selfStarts struct {
 	mu      sync.Mutex
 	runs    map[string]*selfStartRun
@@ -127,6 +128,40 @@ type selfStartRun struct {
 
 func newSelfStarts() *selfStarts {
 	return &selfStarts{runs: map[string]*selfStartRun{}, timeout: selfStartTimeout}
+}
+
+// sharedSelfStarts returns the daemon's sender memory, created on first use.
+// Handlers and the loop run on separate copies of Server, so the memory lives
+// on the ref they share.
+func (r *AccountRef) sharedSelfStarts() *selfStarts {
+	if r == nil {
+		return newSelfStarts()
+	}
+	if starts := r.selfStartMemory.Load(); starts != nil {
+		return starts
+	}
+	r.selfStartMemory.CompareAndSwap(nil, newSelfStarts())
+	return r.selfStartMemory.Load()
+}
+
+// SelfStartSent is what the operator sees of a run (PATCHES §90.2): when the
+// daemon sent its last turn on the account, to the second, and how many it
+// has sent in a row.
+type SelfStartSent struct {
+	SentAt time.Time `json:"sent_at"`
+	Sends  int       `json:"sends"`
+}
+
+// sent is the run on key, nil when this daemon has sent the account nothing
+// since its week last read as running.
+func (st *selfStarts) sent(key string) *SelfStartSent {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	run := st.runs[key]
+	if run == nil || run.sends == 0 {
+		return nil
+	}
+	return &SelfStartSent{SentAt: run.lastSendAt.UTC().Truncate(time.Second), Sends: run.sends}
 }
 
 // selfStartWait is how long a run waits after its last send, the sends-th,
@@ -148,7 +183,7 @@ func (s Server) RunSelfStartWeek(ctx context.Context, every time.Duration) {
 	if s.SchedulerRef == nil || every <= 0 {
 		return
 	}
-	starts := newSelfStarts()
+	starts := s.AccountRef.sharedSelfStarts()
 	defer starts.sends.Wait()
 	ticker := time.NewTicker(every)
 	defer ticker.Stop()

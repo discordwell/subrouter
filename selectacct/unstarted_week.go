@@ -11,8 +11,10 @@ import (
 //
 // A Codex weekly window starts on the account's first request and then counts
 // down whether or not anyone spends. An account whose week has not started
-// therefore holds a full week that the pool cannot spend until a session
+// therefore holds a full week that the pool cannot spend until a request
 // opens it, and every day it waits is a day of budget the pool never gets.
+// The daemon that holds the account sends that request itself (PATCHES §90,
+// ClaimStartMark); this priority stays for a send that did not start it.
 // The owner, 2026-11-22: "accounts that are at exactly 7 days need some
 // traffic as soon as possible to start it." Weekly pace ranks such an account
 // like one spending at exactly even pace, behind every account with unspent
