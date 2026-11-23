@@ -554,6 +554,38 @@ def _weekly_unstarted(norm):
     return isinstance(norm, dict) and norm.get("weekly_unstarted") is True
 
 
+def _instant(text):
+    """An ISO 8601 instant with its offset, as Go marshals a time, to the second, else None."""
+    import datetime
+    import re
+    m = re.fullmatch(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.\d+)?(Z|[+-]\d\d:\d\d)", text) if isinstance(text, str) else None
+    if not m:
+        return None
+    try:
+        return datetime.datetime.fromisoformat(m.group(1) + ("+00:00" if m.group(2) == "Z" else m.group(2)))
+    except ValueError:
+        return None
+
+
+def _self_start(norm):
+    """normalized.self_start as published: (sent_at, sends), else (None, None).
+
+    PATCHES §90: the daemon that holds an account whose weekly window has not
+    started sends one tiny request itself to start its clock, and again with a
+    growing wait while its readings still say unstarted. sent_at is the last
+    send, sends how many it has sent in a row. Absent is no send since the
+    week last read as running, a week that runs, or a daemon from before §90.
+    """
+    start = norm.get("self_start") if isinstance(norm, dict) else None
+    if not isinstance(start, dict):
+        return None, None
+    sent_at, sends = start.get("sent_at"), start.get("sends")
+    # bool is an int in Python; a true here is not a count.
+    if _instant(sent_at) is None or type(sends) is not int or sends < 1:
+        return None, None
+    return sent_at, sends
+
+
 def _fable_week_spent_percent(norm):
     """The account's Fable meter, percent used, as its daemon publishes it, else None.
 
@@ -578,6 +610,7 @@ def _verdicts(norm):
     fable = pools.get(FABLE_POOL) if isinstance(pools, dict) else None
     fable_eligible, fable_reason = new_session_verdict(fable)
     fable_live, fable_allowed = _session_counts(fable)
+    self_start_sent_at, self_start_sends = _self_start(norm)
     return {
         "fable_week_spent_percent": _fable_week_spent_percent(norm),
         "new_session": eligible,
@@ -593,6 +626,8 @@ def _verdicts(norm):
         "fable_new_session_burndown_cause": _burndown_cause(fable),
         "held_reset_expires_in_hours": _held_reset_hours(norm),
         "weekly_unstarted": _weekly_unstarted(norm),
+        "self_start_sent_at": self_start_sent_at,
+        "self_start_sends": self_start_sends,
     }
 
 
@@ -814,8 +849,10 @@ def _render_sections(rows, where, peer=False):
         show_hold = any(r["held_reset_expires_in_hours"] is not None for r in sub)
         # Likewise a column only where an account holds a Fable reset (§64).
         fable_reset_width = max((len(f"F{r['fable_resets']}") for r in sub if r["fable_resets"]), default=0)
-        # Likewise a column only where an account's week has not started (§86).
+        # Likewise a column only where an account's week has not started (§86),
+        # and beside it one only where its daemon sent a request to start it (§90).
         show_unstarted = any(r["weekly_unstarted"] for r in sub)
+        start_width = max((len(_start_sent(r)) for r in sub), default=0)
         lines, any_slots, any_reset = [], False, False
         # A column only where the daemon published a spent Fable meter (§65),
         # so a section from an older daemon, or with no Fable spent, reads as
@@ -838,6 +875,8 @@ def _render_sections(rows, where, peer=False):
                 roll += f"  {'F' + str(r['fable_resets']) if r['fable_resets'] else '':<{fable_reset_width}}"
             if show_unstarted:
                 roll += "  unstarted" if r["weekly_unstarted"] else " " * 11
+            if start_width:
+                roll += f"  {_start_sent(r):<{start_width}}"
             fallback = not peer and local_fallback(r)
             slots = _slots(r)
             any_slots = any_slots or bool(slots)
@@ -901,6 +940,14 @@ def _render_sections(rows, where, peer=False):
                          if peer else
                          "unstarted = its weekly window has not started: it takes the next new session first, to start"
                          " its clock, while SUBROUTER_START_UNSTARTED_WEEK is on")
+        if start_width:
+            # The send is the account's own daemon's; the daemon that places a
+            # session ranks on the reading alone, so a peer's send ranks nothing.
+            extra.append("start sent = the peer sent one tiny request itself at that time to start the week's clock"
+                         " (§90); a new session from here still goes there first until its reading turns"
+                         if peer else
+                         "start sent = this daemon sent one tiny request itself at that time to start the week's clock"
+                         " (§90); xN = N sent in a row, the week still unstarted")
         end = ";" if extra else ")"
         if peer:
             print(f"      ({fable_legend}new = would this peer take a NEW session placed from here{end}")
@@ -912,6 +959,15 @@ def _render_sections(rows, where, peer=False):
         for line in lines:
             print(line)
         print()
+
+
+def _start_sent(r):
+    """`start sent HH:MM` in this machine's time, xN from the second send in a
+    row, for an unstarted row whose daemon sent a request to start it, else ""."""
+    if not r["weekly_unstarted"] or r["self_start_sends"] is None:
+        return ""
+    label = "start sent " + _instant(r["self_start_sent_at"]).astimezone().strftime("%H:%M")
+    return label + (f" x{r['self_start_sends']}" if r["self_start_sends"] > 1 else "")
 
 
 def _context_error(message):
@@ -1683,6 +1739,45 @@ def cmd_selftest(_argv):
     older = rendered([summarize(codex_row(0, 0, 604800)), summarize(codex_row(1, 20, 300000))])
     check("a daemon from before §86 (no field) prints no column and no legend",
           "unstarted" not in older and "rolls   168h  new=yes\n" in older)
+
+    print("the daemon's own request to start an unstarted week shows beside unstarted (PATCHES §90)")
+    sent_at = "2026-11-22T14:05:00Z"
+    hhmm = _instant(sent_at).astimezone().strftime("%H:%M")
+    started = [codex_row(0, 0, 604800, weekly_unstarted=True, self_start={"sent_at": sent_at, "sends": 1}),
+               codex_row(1, 0, 604800, weekly_unstarted=True),
+               codex_row(2, 20, 300000)]
+    text = rendered([summarize(r) for r in started])
+    lines = [ln for ln in text.splitlines() if ln.startswith("  cx")]
+    check("a send reads start sent HH:MM beside unstarted",
+          f"rolls   168h  unstarted  start sent {hhmm}  new=yes\n" in text)
+    check("an unstarted week with no send and a running week keep the columns aligned",
+          len(lines) == 3 and sum("start sent" in ln for ln in lines) == 1
+          and len({ln.index("new=") for ln in lines}) == 1)
+    check("the legend explains start sent",
+          "\n       start sent = this daemon sent one tiny request itself at that time to start the week's clock"
+          " (§90); xN = N sent in a row, the week still unstarted)\n" in text)
+    again = rendered([summarize(codex_row(0, 0, 604800, weekly_unstarted=True, self_start={"sent_at": sent_at, "sends": 3})),
+                      summarize(codex_row(1, 20, 300000))])
+    again_lines = [ln for ln in again.splitlines() if ln.startswith("  cx")]
+    check("three in a row read x3, and the columns stay aligned",
+          f"unstarted  start sent {hhmm} x3  new=yes\n" in again
+          and len({ln.index("new=") for ln in again_lines}) == 1)
+    remote = rendered([summarize(r) for r in started], peer=True)
+    check("peer: start sent is the peer's own request, and ranks nothing here",
+          f"rolls   168h  unstarted  start sent {hhmm}  new=yes\n" in remote
+          and "\n       start sent = the peer sent one tiny request itself at that time to start the week's clock"
+              " (§90); a new session from here still goes there first until its reading turns)\n" in remote)
+    s = summarize(started[0])
+    check("--json carries the published send",
+          s["self_start_sent_at"] == sent_at and s["self_start_sends"] == 1
+          and summarize(started[1])["self_start_sent_at"] is None and summarize(started[1])["self_start_sends"] is None)
+    check("a malformed self_start reads as none",
+          not any(summarize(codex_row(0, 0, 604800, weekly_unstarted=True, self_start=v))["self_start_sends"]
+                  for v in ({"sent_at": sent_at, "sends": True}, {"sent_at": sent_at, "sends": "1"},
+                            {"sent_at": "14:05", "sends": 1}, {"sends": 1}, {"sent_at": sent_at, "sends": 0}, "yes")))
+    unstarted_only = rendered([summarize(codex_row(0, 0, 604800, weekly_unstarted=True)), summarize(codex_row(1, 20, 300000))])
+    check("a daemon from before §90 (no field) prints no start sent column and no legend",
+          "start sent" not in unstarted_only and "rolls   168h  unstarted  new=yes\n" in unstarted_only)
 
     print("reauth: the dir comes from the DAEMON, never from `sr claude env`")
     rows = [{"id": "main", "source": "/x/_p1787439913450"},
