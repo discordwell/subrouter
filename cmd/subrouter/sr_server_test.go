@@ -1926,7 +1926,6 @@ type recordingSRCommandRunner struct {
 	mu                  sync.Mutex
 	loginAuth           accounts.CodexAuthFile
 	loginAuths          []accounts.CodexAuthFile
-	loginDelay          time.Duration
 	onLogin             func(env []string)
 	commands            [][]string
 	envs                [][]string
@@ -1958,13 +1957,9 @@ func (r *recordingSRCommandRunner) RunWithEnv(_ context.Context, name string, ar
 			r.loginAuths = r.loginAuths[1:]
 		}
 		onLogin := r.onLogin
-		delay := r.loginDelay
 		r.mu.Unlock()
 		if onLogin != nil {
 			onLogin(env)
-		}
-		if delay > 0 {
-			time.Sleep(delay)
 		}
 		body, err := jsonMarshalIndent(loginAuth)
 		if err != nil {
@@ -2105,46 +2100,38 @@ func TestParallelServerLoginSerializesAndPreservesLocalAuth(t *testing.T) {
 	defer remote.Close()
 	server := srServerConfig{Name: "team", URL: remote.URL, AdminToken: "import-secret"}
 
-	started := make(chan struct{}, 2)
-	releaseFirst := make(chan struct{})
-	var firstStarted sync.Once
-	fakeA := &recordingSRCommandRunner{
-		loginAuth:  testCodexAuth("lc+4@cmux.com", "acct_lc4"),
-		loginDelay: 80 * time.Millisecond,
-		onLogin: func([]string) {
-			firstStarted.Do(func() { close(releaseFirst) })
-			started <- struct{}{}
-		},
-	}
-	fakeB := &recordingSRCommandRunner{
-		loginAuth: testCodexAuth("lc+5@cmux.com", "acct_lc5"),
-		onLogin: func([]string) {
-			<-releaseFirst
-			started <- struct{}{}
-		},
-	}
-
-	var outA, outB bytes.Buffer
-	errA := make(chan error, 1)
+	var outA bytes.Buffer
+	outB := &signalingWriter{marker: "Another sr add/login is in progress; waiting...", seen: make(chan struct{})}
 	errB := make(chan error, 1)
-	go func() {
-		runner := srRunner{store: store, out: &outA, errOut: &outA, cmd: fakeA, client: remote.Client()}
-		errA <- runner.serverLoginOne(context.Background(), server, true, "")
-	}()
-	go func() {
-		// Ensure B contends for the lock while A holds it during login.
-		time.Sleep(20 * time.Millisecond)
-		runner := srRunner{store: store, out: &outB, errOut: &outB, cmd: fakeB, client: remote.Client()}
-		errB <- runner.serverLoginOne(context.Background(), server, true, "")
-	}()
+	doneB := make(chan struct{})
+	fakeB := &recordingSRCommandRunner{loginAuth: testCodexAuth("lc+5@cmux.com", "acct_lc5")}
+	fakeA := &recordingSRCommandRunner{
+		loginAuth: testCodexAuth("lc+4@cmux.com", "acct_lc4"),
+		// A holds the login lock while it logs in. B starts here, and A stays
+		// in its login until B says it waits, so B always finds the lock held.
+		// A B that ends without waiting, or waits without saying so, fails
+		// the checks below instead of hanging the test.
+		onLogin: func([]string) {
+			go func() {
+				defer close(doneB)
+				runner := srRunner{store: store, out: outB, errOut: outB, cmd: fakeB, client: remote.Client()}
+				errB <- runner.serverLoginOne(context.Background(), server, true, "")
+			}()
+			select {
+			case <-outB.seen:
+			case <-doneB:
+			case <-time.After(10 * time.Second):
+			}
+		},
+	}
 
-	if err := <-errA; err != nil {
+	runner := srRunner{store: store, out: &outA, errOut: &outA, cmd: fakeA, client: remote.Client()}
+	if err := runner.serverLoginOne(context.Background(), server, true, ""); err != nil {
 		t.Fatalf("login A: %v\n%s", err, outA.String())
 	}
 	if err := <-errB; err != nil {
-		t.Fatalf("login B: %v\n%s", err, outB.String())
+		t.Fatalf("login B: %v\n%s", err, outB.buf.String())
 	}
-	close(started)
 
 	active, ok, err := accounts.ReadActiveCodexAuth()
 	if err != nil {
@@ -2153,7 +2140,7 @@ func TestParallelServerLoginSerializesAndPreservesLocalAuth(t *testing.T) {
 	if !ok || active.Tokens.RefreshToken != local.Tokens.RefreshToken {
 		t.Fatalf("local active auth was mutated by parallel server logins")
 	}
-	combined := outA.String() + outB.String()
+	combined := outA.String() + outB.buf.String()
 	if !strings.Contains(combined, "Another sr add/login is in progress; waiting...") {
 		t.Fatalf("expected waiter message for concurrent login:\n%s", combined)
 	}
