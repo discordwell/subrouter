@@ -15,7 +15,6 @@ import (
 	"reflect"
 	"slices"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -266,23 +265,18 @@ func TestTheSeriesKeepsThirtyFiveDaysUnderItsSizeBound(t *testing.T) {
 // session and for its board, never enter its series.
 func TestOnlyThisDaemonsOwnAccountsEnterTheSeries(t *testing.T) {
 	d := newUnstartedCodexDaemon(t, map[string][2]float64{midweekAccount: {20, 300000}})
-	box := codexBox(t, codexWeekScore("box-late", 90, 400000))
-	var peerReads atomic.Int64
+	box := codexBox(t)
 	// The peer's rows carry their windows, as a real peer's usage-status does.
 	peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != remotePoolUsagePath {
 			box.serve(w, r)
 			return
 		}
-		peerReads.Add(1)
-		var rows []map[string]any
-		_ = json.Unmarshal(box.usageBody(), &rows)
-		for _, row := range rows {
-			row["windows"] = []map[string]any{{"Name": "primary", "UsedPercent": 90, "LimitWindowSeconds": 604800,
-				"ResetAfterSeconds": 400000, "reset_at": time.Now().Add(400000 * time.Second).UTC().Format(time.RFC3339)}}
-		}
-		body, _ := json.Marshal(rows)
-		_, _ = w.Write(body)
+		writeJSON(w, []AccountUsageStatus{{
+			AccountStatus: AccountStatus{ID: "box-late", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, AuthChecked: true, AuthValid: true},
+			Windows:       codexWeekRead(90, 400000, time.Now()),
+			Normalized:    &NormalizedUsage{Fresh: true},
+		}})
 	}))
 	t.Cleanup(peer.Close)
 	d.server.RemotePool = NewRemotePool(peer.URL, "", "")
@@ -294,10 +288,9 @@ func TestOnlyThisDaemonsOwnAccountsEnterTheSeries(t *testing.T) {
 	if status, body := codexEgressPost(t, laptop.URL, "own-accounts-only"); status != http.StatusOK {
 		t.Fatalf("new session: %d %.200q", status, body)
 	}
-	_ = d.poolJSON(t)
 	_ = d.usageStatus(t)
-	if peerReads.Load() == 0 {
-		t.Fatal("calibration: the daemon never read the peer's usage rows")
+	if _, ok := d.board(t)["box-late"]; !ok {
+		t.Fatalf("calibration: the board did not read the peer's account: %v", d.board(t))
 	}
 	if got := historyAccounts(h); !slices.Equal(got, []string{midweekAccount}) {
 		t.Fatalf("the series holds accounts %v, want only this daemon's own %v", got, []string{midweekAccount})
