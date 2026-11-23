@@ -115,7 +115,7 @@ func (s Server) redeemForFailover(ctx context.Context, provider accounts.Provide
 
 	candidates := filterAccountsForProvider(s.accountListContext(ctx), provider)
 	for _, candidate := range candidates {
-		if candidate.AuthMode != accounts.AuthModeOAuth || candidate.Token == "" {
+		if candidate.AuthMode != accounts.AuthModeOAuth || candidate.Token == "" || s.pinOnlyAccount(candidate.ID) {
 			continue
 		}
 		if _, ok := tried[candidate.ID]; ok {

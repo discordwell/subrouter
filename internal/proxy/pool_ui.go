@@ -281,6 +281,10 @@ type poolRow struct {
 	// still reads unstarted, as its usage-status publishes them (PATCHES
 	// §90.2). It is shown, never ranked on.
 	SelfStart *SelfStartSent `json:"self_start,omitempty"`
+	// PinOnly is one of this daemon's accounts that takes pinned sessions
+	// only (PATCHES §98, SUBROUTER_PIN_ONLY_ACCOUNTS). A peer's row says it
+	// through its verdict, which the board does not read.
+	PinOnly bool `json:"pin_only,omitempty"`
 
 	// FableSpentFactor is the factor an Opus or Sonnet turn ranks this
 	// account's weekly pace by because its Fable meter is spent
@@ -858,6 +862,7 @@ func (s Server) poolBoard(ctx context.Context, boardModel, machineID string) poo
 
 // applyPoolReadings fills the measured half of a row from one daemon's status.
 func applyPoolReadings(row *poolRow, status AccountUsageStatus, scheduler selectacct.Scheduler, measurable bool, now time.Time) {
+	row.PinOnly = scheduler.PinOnly(status.Provider, status.ID)
 	row.Windows = projectWindows(status.Windows)
 	row.BindingWindow = bindingWindowName(status.Windows)
 	if reset := status.ComplimentaryReset; reset != nil && reset.Source == agentclaude.ResetProgram && reset.Available {
@@ -1039,6 +1044,9 @@ func classifyPoolState(
 			return poolStateShort, "5h window at zero; it refills on its own within hours, but nothing routes here until it does"
 		}
 		return poolStateWeek, "weekly window at zero; the router will not route here and a pin would be dropped"
+	}
+	if scheduler.PinOnly(provider, accountID) {
+		return poolStateBurn, "takes pinned sessions only (SUBROUTER_PIN_ONLY_ACCOUNTS): no new session, failover or refugee is placed here, and a pin by name is served"
 	}
 	if !scheduler.UsableForNewSession(provider, accountID) {
 		return poolStateBurn, burnNote(score)

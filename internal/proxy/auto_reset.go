@@ -723,7 +723,8 @@ func (s Server) autoResetAtTheWall(wall autoResetWall, turn string) {
 // flight (then nothing is decided again), or nil.
 func (s Server) autoResetDecideAtTheWall(ctx context.Context, wall autoResetWall, turn string) *autoResetClaim {
 	account, own := s.autoResetOwnAccount(accountProviderOrCodex(wall.account), wall.account.ID)
-	if !own {
+	// A pin-only account's resets are claimed by hand only (§98).
+	if !own || s.pinOnlyAccount(account.ID) {
 		return nil
 	}
 	if claim := s.autoResetRunningClaim(account); claim != nil {
@@ -787,7 +788,7 @@ func (s Server) autoResetReadings(ctx context.Context) {
 			continue
 		}
 		meter, spent := autoResetSpentMeter(provider, autoResetReadingsOf(&row))
-		if !spent {
+		if !spent || s.pinOnlyAccount(account.ID) {
 			continue
 		}
 		if next := s.autoResetNextFor(account, &row, autoResetOnAReading, now); next.none != "" {

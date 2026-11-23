@@ -691,7 +691,9 @@ func (s Server) resetPoolOf(statuses []AccountUsageStatus, now time.Time) resetP
 	var holders []resetHolder
 	for _, status := range statuses {
 		provider := usageHistoryProvider(accounts.Account{ID: status.ID, Provider: status.Provider})
-		if provider == "" {
+		// A pin-only account is no part of the pool (§98): its burn and
+		// headroom would count as another account's.
+		if provider == "" || s.pinOnlyAccount(status.ID) {
 			continue
 		}
 		if len(status.Burn) > 0 {

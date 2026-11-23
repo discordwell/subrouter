@@ -164,6 +164,9 @@ type Score struct {
 	// Zero is none.
 	ResetChoice ResetChoice
 	queueClosed bool
+	// pinOnly marks one of this daemon's own accounts that takes pinned
+	// sessions only (PATCHES §98, WithPinOnlyAccounts).
+	pinOnly bool
 	// loading is set by the scheduler that reads the score: its ResetChoice
 	// is for a meter the request spends (Scheduler.loads).
 	loading bool
@@ -276,6 +279,9 @@ type Scheduler struct {
 	resetChoices   map[string]ResetChoice
 	paces          map[string]Pace
 	closedAccounts map[string]bool
+	// pinOnly is this daemon's own accounts that take pinned sessions only,
+	// keyed by bare account ID (WithPinOnlyAccounts, PATCHES §98).
+	pinOnly map[string]bool
 	// startSent is when each account's start mark expires (PATCHES §86),
 	// keyed by ScoreKey. SchedulerRef.Get attaches it.
 	startSent map[string]time.Time
@@ -940,7 +946,7 @@ func selectionTier(acct account.Account, score Score, now time.Time, allowEndgam
 	// A holdout account ranks with the exhausted ones: when nothing is
 	// routable, Pick falls back to this tier, and starting a session inside
 	// the owner's holdout is exactly what the holdout forbids.
-	if acct.AuthMode == account.AuthModeOAuth && !score.evicted() && !score.queueClosed {
+	if acct.AuthMode == account.AuthModeOAuth && !score.evicted() && !score.queueClosed && !score.pinOnly {
 		return 2
 	}
 	if acct.AuthMode == account.AuthModeOAuth {
@@ -1180,6 +1186,7 @@ func (s Scheduler) measuredScore(provider account.Provider, accountID string) Sc
 		score.Pace = s.paces[key]
 	}
 	score.queueClosed = s.closedAccounts[key]
+	score.pinOnly = s.pinOnly[accountID]
 	if s.reserves != nil {
 		score.Reserve = s.reserveFor(provider, accountID)
 		if score.reserveReleased(time.Now()) {
@@ -1366,7 +1373,7 @@ func (s Score) routableForNewSession(now time.Time, allowEndgame bool) bool {
 	if verdict, ok := s.peerVerdict(); ok {
 		return verdict.Eligible
 	}
-	if s.queueClosed {
+	if s.queueClosed || s.pinOnly {
 		return false
 	}
 	return s.usableForNewSession() || (allowEndgame && (s.endgameDrainEligible(now) || s.loadEligible(now)))

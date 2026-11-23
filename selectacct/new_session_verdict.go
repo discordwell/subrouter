@@ -46,6 +46,10 @@ const (
 	// its next saved reset (PATCHES §95.2), below its allowance: it takes a
 	// new session below the short floor.
 	VerdictChosen = "chosen"
+	// VerdictPinOnly is an account that takes pinned sessions only (PATCHES
+	// §98, SUBROUTER_PIN_ONLY_ACCOUNTS): no new session, refugee or failover
+	// from the pool, here or from a peer. A pin by name is still served.
+	VerdictPinOnly = "pin_only"
 )
 
 // NewSessionVerdict is one daemon's answer, for one of its own accounts, to
@@ -152,7 +156,7 @@ func (c *RefugeeCap) UnmarshalJSON(data []byte) error {
 // verdict is exactly as narrow as routing.
 //
 // The eligibility DECISION is usableForNewSession / endgameDrainEligible /
-// endgameAtCap / evicted / a closed admission queue; the reason for an
+// endgameAtCap / evicted / a closed admission queue / pin-only; the reason for an
 // ineligible, non-evicted, not-capped, open account is a label for which
 // clause of usableForNewSession refused it, read in that function's own order.
 func (s Scheduler) NewSessionVerdict(provider account.Provider, accountID string, now time.Time) NewSessionVerdict {
@@ -172,6 +176,8 @@ func (s Scheduler) NewSessionVerdict(provider account.Provider, accountID string
 		verdict.RefugeeCap = published.RefugeeCap
 	}
 	switch {
+	case score.pinOnly:
+		verdict.Reason = VerdictPinOnly
 	case score.exhausted():
 		verdict.Reason = VerdictExhausted
 	case score.inHoldout():

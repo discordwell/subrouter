@@ -265,6 +265,10 @@ func (s Server) selfStartAllowed(account accounts.Account, provider accounts.Pro
 	if _, dead := s.AccountRef.terminalCredFailure(account); dead {
 		return false
 	}
+	// Only its pinned sessions spend a pin-only account (§98).
+	if s.pinOnlyAccount(account.ID) {
+		return false
+	}
 	if _, blocked := s.SchedulerRef.BlockedUntilFor(provider, account.ID, "", time.Now()); blocked {
 		return false
 	}

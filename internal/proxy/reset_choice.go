@@ -505,6 +505,8 @@ func (s Server) resetCandidateOf(row *AccountUsageStatus, scheduler selectacct.S
 	score, _ := scheduler.KnownScore(schedulerAccountProvider(provider), account.ID)
 	unsettled := s.autoResetUnsettledClaim(c.key, c.readings)
 	switch dead := s.autoResetDeadCredential(account); {
+	case s.pinOnlyAccount(account.ID):
+		c.out = "it takes pinned sessions only (SUBROUTER_PIN_ONLY_ACCOUNTS)"
 	case dead != "":
 		c.out = "its credential is dead: " + dead
 	case score.Reserve > 0:

@@ -153,7 +153,7 @@ func (s Scheduler) MeasuredSpendable(provider account.Provider, accountID string
 const UnmeasuredRefugeeCap = 4
 
 func (s Score) refugeeCap(now time.Time) int {
-	if s.queueClosed {
+	if s.queueClosed || s.pinOnly {
 		return 0
 	}
 	if !PacedAllowance() || (s.WeeklyHeadroom <= 0 && s.WeeklyResetAt.IsZero()) {

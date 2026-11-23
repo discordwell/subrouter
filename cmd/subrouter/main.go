@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -513,6 +514,21 @@ func accountReserves(raw string) (map[string]float64, []string) {
 		reserves[id] = fraction
 	}
 	return reserves, problems
+}
+
+// pinOnlyAccounts parses SUBROUTER_PIN_ONLY_ACCOUNTS (PATCHES §98): a
+// comma-separated list of the account IDs this daemon holds that take pinned
+// sessions only. Unset or empty lists none, and nothing changes.
+//
+// 2026-11-23 owner: an account listed here takes pinned sessions only (the meter test).
+func pinOnlyAccounts(raw string) []string {
+	var ids []string
+	for _, entry := range strings.Split(raw, ",") {
+		if id := strings.TrimSpace(entry); id != "" && !slices.Contains(ids, id) {
+			ids = append(ids, id)
+		}
+	}
+	return ids
 }
 
 func secretValue(explicit, valueName, fileName string) (string, error) {
@@ -1528,6 +1544,12 @@ func serve(args []string) error {
 			// Before any sweep can start: none may send the identity-only
 			// account a paid Messages probe.
 			accountRef.SetClaudeIdentityOnly(identityPin)
+		}
+		// PATCHES §98, before any sweep or pass can start.
+		if pinOnly := pinOnlyAccounts(os.Getenv("SUBROUTER_PIN_ONLY_ACCOUNTS")); len(pinOnly) > 0 {
+			accountRef.SetPinOnlyAccounts(pinOnly)
+			slog.Default().Warn("SUBROUTER_PIN_ONLY_ACCOUNTS: these accounts take pinned sessions only; the pool places no new session, failover or refugee on them and claims none of their resets",
+				"accounts", strings.Join(pinOnly, ","))
 		}
 		var generation, revision uint64
 		initialAccounts, generation, revision = accountRef.CredentialSnapshot()

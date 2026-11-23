@@ -1049,6 +1049,9 @@ type AccountRef struct {
 	// claudeIdentityOnly is the identity-only pin (SetClaudeIdentityOnly):
 	// that account is sent no paid Messages probe.
 	claudeIdentityOnly atomic.Pointer[string]
+	// pinOnly is this daemon's accounts that take pinned sessions only
+	// (SetPinOnlyAccounts, PATCHES §98).
+	pinOnly atomic.Pointer[map[string]bool]
 	// admission is the admission gate shared by every Server copy over this
 	// ref (see sharedAdmission): the private and the public listener each
 	// build their handler from their own copy of Server, and one account's
@@ -12813,11 +12816,14 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 			// A side request reads the placement the last model turn left and
 			// decides nothing: only eviction sends it elsewhere, and then
 			// without moving the pin -- the next model turn does that.
+			// A session on a pin-only account without its pin leaves it at its
+			// next model turn (§98): the pool's work never stays there.
+			pinOnly := scheduler.PinOnly(schedulerAccountProvider(account.Provider), account.ID)
 			if options.sideChannel {
 				if !scheduler.Evicted(schedulerAccountProvider(account.Provider), account.ID) {
 					return account, sessionID, userEmail, routingCapacity{}, nil
 				}
-			} else if !options.forcedSwitch && (s.reuseStickyAssignmentAcross(agentType, sessionID, account, stickyScheduler, availableAccounts, options.crossPool) ||
+			} else if !options.forcedSwitch && !pinOnly && (s.reuseStickyAssignmentAcross(agentType, sessionID, account, stickyScheduler, availableAccounts, options.crossPool) ||
 				// Released by capacity eviction alone, but the pool has no
 				// account that is not shedding and can hold it: stay (§27).
 				// A forced switch (P8: the account refused or cannot serve)
@@ -12966,7 +12972,8 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 		// scheduler's current recommendation instead of failing the pooled
 		// launch before a request.
 		if ok && !scheduler.Evicted(schedulerAccountProvider(preferred.Provider), preferred.ID) &&
-			!scheduler.QueueClosed(schedulerAccountProvider(preferred.Provider), preferred.ID) && !credentialStoreNotAnswering(preferred) {
+			!scheduler.QueueClosed(schedulerAccountProvider(preferred.Provider), preferred.ID) &&
+			!scheduler.PinOnly(schedulerAccountProvider(preferred.Provider), preferred.ID) && !credentialStoreNotAnswering(preferred) {
 			picked = &preferred
 		}
 	}
@@ -13147,7 +13154,8 @@ func selectionRefusesAccount(provider accounts.Provider, scheduler selectacct.Sc
 	}
 	scoreProvider := schedulerAccountProvider(account.Provider)
 	return (provider == accounts.ProviderClaude && scheduler.Exhausted(scoreProvider, account.ID)) ||
-		scheduler.InHoldout(scoreProvider, account.ID) || scheduler.QueueClosed(scoreProvider, account.ID)
+		scheduler.InHoldout(scoreProvider, account.ID) || scheduler.QueueClosed(scoreProvider, account.ID) ||
+		scheduler.PinOnly(scoreProvider, account.ID)
 }
 
 func withoutClosedQueues(scheduler selectacct.Scheduler, candidates []accounts.Account) []accounts.Account {
@@ -13610,7 +13618,8 @@ func (s Server) migrateIdleSessionAcross(agentType, sessionID string, account ac
 	// A closed winner is refused the same way: the session would arrive there
 	// as a new one, and a closed queue takes none.
 	if scheduler.Evicted(schedulerAccountProvider(best.Provider), best.ID) ||
-		scheduler.QueueClosed(schedulerAccountProvider(best.Provider), best.ID) {
+		scheduler.QueueClosed(schedulerAccountProvider(best.Provider), best.ID) ||
+		scheduler.PinOnly(schedulerAccountProvider(best.Provider), best.ID) {
 		return false
 	}
 	if s.Logger != nil {
@@ -14349,7 +14358,7 @@ func (s Server) retryAccount(ctx context.Context, provider accounts.Provider, ag
 		scheduler = scheduler.WithSessionCounts(SchedulerSessionCounts(s.Sessions)).
 			WithLiveSessionCounts(SchedulerActiveSessionCounts(s.Sessions, s.ActiveSessions))
 	}
-	untried = withoutClosedQueues(scheduler, untried)
+	untried = withoutClosedQueues(scheduler, withoutPinOnly(scheduler, untried))
 	if len(untried) == 0 {
 		return accounts.Account{}, fmt.Errorf("no untried %s accounts with an open admission queue", provider)
 	}
@@ -16432,7 +16441,7 @@ func (t usageLimitRetryTransport) admissionSpill(ctx context.Context, accountID 
 			// accounts as oauthRetryCandidate applies it; the spill starts this
 			// request on the account, so it must not be either.
 			if (candidate.AuthMode == accounts.AuthModeOAuth && scheduler.Evicted(candidateProvider, candidate.ID)) ||
-				!scheduler.UsableForStickySession(candidateProvider, candidate.ID) {
+				!scheduler.UsableForStickySession(candidateProvider, candidate.ID) || scheduler.PinOnly(candidateProvider, candidate.ID) {
 				continue
 			}
 			if movesSession && candidate.AuthMode == accounts.AuthModeOAuth && scheduler.QueueClosed(candidateProvider, candidate.ID) {
@@ -17318,6 +17327,8 @@ func (s Server) oauthCandidate(ctx context.Context, provider accounts.Provider, 
 		if !overflow {
 			candidates = withoutClosedQueues(scheduler, candidates)
 		}
+		// Even one overflowed request is the pool's work (§98).
+		candidates = withoutPinOnly(scheduler, candidates)
 		// A live controller cooldown is stronger evidence than a stale score.
 		// Do not spend replay attempts on accounts the controller has
 		// explicitly held out after an authoritative 429/401 (upstream #544).
@@ -17441,7 +17452,8 @@ func (s Server) oauthRecoveryProbeCandidate(ctx context.Context, provider accoun
 			continue
 		}
 		scoreProvider := schedulerAccountProvider(account.Provider)
-		if !scheduler.Exhausted(scoreProvider, account.ID) || scheduler.InHoldout(scoreProvider, account.ID) {
+		if !scheduler.Exhausted(scoreProvider, account.ID) || scheduler.InHoldout(scoreProvider, account.ID) ||
+			scheduler.PinOnly(scoreProvider, account.ID) {
 			continue
 		}
 		if _, blocked := s.SchedulerRef.BlockedUntilFor(scoreProvider, account.ID, poolModel, time.Now()); blocked {
@@ -17864,9 +17876,9 @@ func (s Server) scheduler() selectacct.Scheduler {
 		// carries concurrency, PATCHES §10). InflightCounts stays
 		// bookkeeping for diagnostics.
 		return s.withIdentityOnlyOverlay(s.withClaudeCostOverlay(s.SchedulerRef.Get().
-			WithLiveDebits(s.SchedulerRef.LiveDebits())))
+			WithLiveDebits(s.SchedulerRef.LiveDebits()))).WithPinOnlyAccounts(s.AccountRef.pinOnlyAccounts())
 	}
-	return s.withIdentityOnlyOverlay(s.withClaudeCostOverlay(s.Scheduler))
+	return s.withIdentityOnlyOverlay(s.withClaudeCostOverlay(s.Scheduler)).WithPinOnlyAccounts(s.AccountRef.pinOnlyAccounts())
 }
 
 func findAccount(haystack []accounts.Account, id string) (accounts.Account, bool) {
