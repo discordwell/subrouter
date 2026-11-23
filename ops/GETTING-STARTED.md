@@ -160,7 +160,7 @@ claude-route test
 
 It makes real launches with Haiku, a few tokens each, on the pool and on your own login, and checks each one against the daemon's session table. The last line counts the results, as in `== claude: <n> passed, 0 failed;  codex: <n> passed, 0 failed ==`.
 
-Its first lines say how it launches. With the Paradev app, a launch goes through Paradev's wrapper in `~/.paradev/bin`, as a new Paradev session does. Without Paradev, a launch goes through the shim, as a new Terminal window does, and the checks of Paradev's wrapper print `SKIP`. A skipped check counts as neither a pass nor a failure.
+Its first lines say how it launches. The launches that a new session would make go through Paradev's wrapper in `~/.paradev/bin` when the Paradev app is installed. Without Paradev, they go through the shim, as a new Terminal window does, and the checks of Paradev's wrapper print `SKIP`. A skipped check counts as neither a pass nor a failure.
 
 Switch new launches to the pool:
 
