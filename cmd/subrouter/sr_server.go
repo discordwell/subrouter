@@ -1659,6 +1659,10 @@ type remoteServerUsageStatus struct {
 	// Resets is every saved reset the account holds (PATCHES §91.1). The
 	// Codex 1x reset cell shows its soonest read expiry (§91.2).
 	Resets []accounts.HeldReset `json:"resets,omitzero"`
+	// Burn is the account's burn per meter from its daemon's usage history
+	// (PATCHES §92.2). Decoded so this type takes every field the daemon
+	// publishes (the §47 wire test); `srq burn` shows it, no table here does.
+	Burn proxy.UsageBurn `json:"burn,omitempty"`
 }
 
 func (r srRunner) fetchServerAccountsResponse(ctx context.Context, server srServerConfig) (*http.Response, error) {
