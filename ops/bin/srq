@@ -28,6 +28,7 @@ Usage:
   srq pool    [--json]     per-provider pool status, LOCAL + REMOTE peer
               [--local|--remote]  restrict to one side
   srq dir <label>          the profile dir for one account, from the DAEMON
+  srq resets  [--json]     every saved reset in the pool, soonest expiry first
   srq selftest             run the regression fixtures (no daemon needed)
 """
 
@@ -687,6 +688,7 @@ def summarize(row):
             **raw_usage(row),
             **_verdicts(norm),
             "fable_resets": _fable_resets(row),
+            **_held_resets(row),
         }
 
     w = weekly_window(row)
@@ -709,6 +711,7 @@ def summarize(row):
         **raw_usage(row),
         **_verdicts(norm),
         "fable_resets": _fable_resets(row),
+        **_held_resets(row),
     }
 
 
@@ -847,8 +850,10 @@ def _render_sections(rows, where, peer=False):
         # daemon before §56 (and every pool past the grant's expiry) reads as
         # before.
         show_hold = any(r["held_reset_expires_in_hours"] is not None for r in sub)
-        # Likewise a column only where an account holds a Fable reset (§64).
-        fable_reset_width = max((len(f"F{r['fable_resets']}") for r in sub if r["fable_resets"]), default=0)
+        # Likewise a column only where an account holds a saved reset: each
+        # kind with its count and soonest expiry (§91.2). It holds §64's Fn.
+        reset_marks = {id(r): _reset_marks(r["resets"], r["resets_partial"]) for r in sub}
+        reset_width = max(map(len, reset_marks.values()), default=0)
         # Likewise a column only where an account's week has not started (§86),
         # and beside it one only where its daemon sent a request to start it (§90).
         show_unstarted = any(r["weekly_unstarted"] for r in sub)
@@ -871,8 +876,8 @@ def _render_sections(rows, where, peer=False):
             roll = "    -" if r["weekly_reset_hours"] is None else f"{r['weekly_reset_hours']:>5.0f}h"
             if show_hold:
                 roll += "  2x" if r["held_reset_expires_in_hours"] is not None else "    "
-            if fable_reset_width:
-                roll += f"  {'F' + str(r['fable_resets']) if r['fable_resets'] else '':<{fable_reset_width}}"
+            if reset_width:
+                roll += f"  {reset_marks[id(r)]:<{reset_width}}"
             if show_unstarted:
                 roll += "  unstarted" if r["weekly_unstarted"] else " " * 11
             if start_width:
@@ -929,9 +934,14 @@ def _render_sections(rows, where, peer=False):
             extra.append("2x = the peer says it holds an unclaimed week reset; ranked 2x here only on §56 with its switch on"
                          if peer else
                          "2x = holds an unclaimed week reset: ranked at twice a local non-holder until claimed or expired")
-        if fable_reset_width:
-            extra.append("Fn = n unclaimed Fable resets: a Fable claim gives back the Fable limit, not the week,"
-                         " so they bring no 2x and no early burndown")
+        if reset_width:
+            extra.append("W, F, R, U = a week reset, Fable resets, Codex reset credits, a kind the daemon does not know"
+                         " (never claimed automatically)")
+            extra.append("each with its count and soonest expiry in this machine's time; a Fable claim gives back the"
+                         " Fable limit, not the week, so Fn brings no 2x and no early burndown")
+            if any(mark in text for text in reset_marks.values() for mark in ("?", "*", "~")):
+                extra.append("? = its expiry not read yet; * = from the last good read of the credit list;"
+                             " ~ = its daemon publishes no full list (before §91): what complimentary_reset says")
         if show_unstarted:
             # The fact is published whatever the owner's switch says; the
             # daemon that places the session ranks on it with its own switch.
@@ -1065,6 +1075,265 @@ def cmd_dir(argv):
     if not argv or argv[0].startswith("-"):
         raise SrqError("usage: srq dir <label>")
     print(profile_dir(argv[0], _get_list("/_subrouter/usage-status")))
+    return 0
+
+
+# --- saved resets (PATCHES §91.2) --------------------------------------------
+# Each kind of saved reset as usage-status names it (§91.1): the letter srq
+# pool and the board mark it with, its name, and its name for many.
+RESET_KINDS = {
+    "week": ("W", "week reset", "week resets"),
+    "fable": ("F", "Fable reset", "Fable resets"),
+    "codex_rate_limits": ("R", "Codex credit", "Codex credits"),
+}
+UNKNOWN_RESET_KIND = ("U", "reset of an unknown kind", "resets of an unknown kind")
+# The provider's order of use for the Claude kinds remaining_by_kind names.
+CLAUDE_RESET_ORDER = {"week": 1, "fable": 2}
+PEERS_USAGE_PATH = "/_subrouter/peers/usage-status"
+
+
+def _held_resets(row):
+    """The row's saved resets, flattened for summarize(): `resets`, one entry
+    per kind and expiry, and `resets_partial`, true when the row's daemon
+    publishes no list (before §91, or a block restored from its persisted
+    snapshot) and the entries are what complimentary_reset says.
+    """
+    listed = row.get("resets")
+    if not isinstance(listed, list):
+        derived = _resets_from_complimentary(row)
+        return {"resets": derived, "resets_partial": bool(derived)}
+    entries = []
+    for e in listed:
+        # bool is an int in Python; a true here is not a count.
+        if not isinstance(e, dict) or type(e.get("count")) is not int or e["count"] <= 0:
+            continue
+        kind = e.get("kind")
+        entries.append({"kind": kind if isinstance(kind, str) and kind else "unknown",
+                        "raw_type": e.get("raw_type"), "count": e["count"],
+                        "expires_at": e.get("expires_at"), "expiry": e.get("expiry"),
+                        "expiry_age_seconds": e.get("expiry_age_seconds")})
+    return {"resets": entries, "resets_partial": False}
+
+
+def _resets_from_complimentary(row):
+    """What a complimentary_reset block says of the resets an account holds,
+    as the board reads it (poolResetsOf). It guesses nothing: a Codex count is
+    the kind its key names, its expiry not read; a Claude kind is one
+    remaining_by_kind names (§64), dated only where the block ties a date to
+    it (week_held_until to the week reset, expires_at to the only kind left);
+    a block from before §64 is one entry of an unknown kind.
+    """
+    reset = row.get("complimentary_reset")
+    remaining = reset.get("remaining") if isinstance(reset, dict) and reset.get("known") is True else None
+    if type(remaining) is not int or remaining <= 0:
+        return []
+
+    def entry(kind, count, expires_at, expiry=None):
+        return {"kind": kind, "raw_type": None, "count": count, "expires_at": expires_at or None,
+                "expiry": expiry or ("read" if expires_at else "none_given"), "expiry_age_seconds": None}
+
+    if reset.get("source") != "cedar_ember":
+        if (row.get("provider") or "").lower() != "codex":
+            return []
+        kind = "codex_rate_limits" if reset.get("source") == "rate_limit_reset_credits" else "unknown"
+        return [entry(kind, remaining, None, "not_read")]
+    kinds = reset.get("remaining_by_kind")
+    live = {k: v for k, v in kinds.items() if type(v) is int and v > 0} if isinstance(kinds, dict) else {}
+    if not live:
+        return [entry("unknown", remaining, reset.get("expires_at"))]
+    out = []
+    for name in sorted(live, key=lambda k: (CLAUDE_RESET_ORDER.get(k, len(CLAUDE_RESET_ORDER) + 1), k)):
+        expires = None
+        if name == "week" and reset.get("week_held_until"):
+            expires = reset["week_held_until"]
+        elif len(live) == 1:
+            expires = reset.get("expires_at")
+        out.append(entry("unknown" if name == "other" else name, live[name], expires))
+    return out
+
+
+def _reset_kind_words(kind):
+    return RESET_KINDS.get(kind, UNKNOWN_RESET_KIND)
+
+
+def _month_day(when):
+    local = when.astimezone()
+    return f"{local.month}/{local.day}"
+
+
+def _reset_marks(entries, partial):
+    """One mark per kind the row holds, in the provider's order: its letter,
+    its count and its soonest expiry in this machine's time, as the board
+    draws it. "W1 12/10 F2 3/9", "R3 ?" (expiry not read), "R3 12/14*" (from
+    the last good read), "U1" (a kind the daemon does not know), and "~" after
+    them when the row's daemon publishes no full list. "" for none.
+    """
+    kinds = {}
+    for e in entries:
+        k = kinds.setdefault(e["kind"], {"count": 0, "soonest": None, "last_good": False, "unread": False})
+        k["count"] += e["count"]
+        when = _instant(e["expires_at"])
+        if when is not None and (k["soonest"] is None or when < k["soonest"]):
+            k["soonest"], k["last_good"] = when, e["expiry"] == "last_good"
+        k["unread"] = k["unread"] or e["expiry"] == "not_read"
+    marks = []
+    for kind, k in kinds.items():
+        mark = f"{_reset_kind_words(kind)[0]}{k['count']}"
+        if k["soonest"] is not None:
+            mark += " " + _month_day(k["soonest"]) + ("*" if k["last_good"] else "")
+        elif k["unread"]:
+            mark += " ?"
+        marks.append(mark)
+    return " ".join(marks) + ("~" if partial and marks else "")
+
+
+def pool_resets(sources):
+    """Every saved reset in the pool, one item per account, kind and expiry,
+    soonest expiry first, undated last. sources is [(where, usage-status
+    rows)], this daemon first. An account two daemons hold is one budget: it
+    is listed once, from the first daemon that holds it, and names both.
+    """
+    accounts = {}
+    for where, rows in sources:
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            key = (row.get("provider"), row.get("id"))
+            if key in accounts:
+                accounts[key]["on"].append(where)
+            else:
+                accounts[key] = {"summary": summarize(row), "on": [where]}
+    items = []
+    for held in accounts.values():
+        s = held["summary"]
+        for e in s["resets"]:
+            items.append({**e, "account": s["name"], "id": s["id"], "provider": s["provider"], "on": held["on"],
+                          "partial": s["resets_partial"], "week_used_percent": s["weekly_used_percent"],
+                          "fable_used_percent": s["fable_used_percent"] if s["has_fable_window"] else None,
+                          "has_fable_window": s["has_fable_window"],
+                          "week_rolls_in_hours": s["weekly_reset_hours"]})
+
+    def soonest(item):
+        when = _instant(item["expires_at"])
+        return (when is None, when.timestamp() if when else 0, str(item["account"]))
+    return sorted(items, key=soonest)
+
+
+def reset_totals(items):
+    """The count per kind and expiry date, soonest first: [(count, kind, "12/10" or None, expiry)]."""
+    totals = {}
+    # items come soonest first, and a dict keeps the order keys arrive in.
+    for item in items:
+        when = _instant(item["expires_at"])
+        day = _month_day(when) if when else None
+        key = (item["kind"], day, None if day else item["expiry"])
+        totals[key] = totals.get(key, 0) + item["count"]
+    return [(n, kind, day, expiry) for (kind, day, expiry), n in totals.items()]
+
+
+def _in_how_long(when, now):
+    secs = int((when - now).total_seconds())
+    if secs < 0:
+        return "ended " + _span(-secs) + " ago"
+    return "in " + _span(secs)
+
+
+def _span(secs):
+    days, rest = divmod(secs, 86400)
+    hours, rest = divmod(rest, 3600)
+    if days:
+        return f"{days}d {hours}h"
+    if hours:
+        return f"{hours}h {rest // 60}m"
+    return f"{rest // 60}m"
+
+
+def _render_resets(items, notes, now):
+    """srq resets as text: one line per reset, then the totals per kind and date."""
+    rows = []
+    for item in items:
+        when = _instant(item["expires_at"])
+        if when is not None:
+            expires = f"{_month_day(when)} {when.astimezone():%H:%M} {_in_how_long(when, now)}"
+        elif item["expiry"] == "not_read":
+            expires = "expiry not read"
+        else:
+            expires = "no date given"
+        notes_here = []
+        if item["kind"] in RESET_KINDS:
+            kind = _reset_kind_words(item["kind"])[1]
+        elif item["kind"] == "unknown":
+            kind = "unknown " + (item.get("raw_type") or "kind")
+            notes_here.append("never claimed automatically")
+        else:
+            # A kind the row's daemon knows and this srq does not.
+            kind = item["kind"]
+        if item["expiry"] == "last_good":
+            age = item.get("expiry_age_seconds")
+            notes_here.append("from the last good read" + (f", {_span(age)} old" if type(age) is int and age >= 0 else ""))
+        if item["partial"]:
+            notes_here.append("its daemon gives no full list")
+        week = "??" if item["week_used_percent"] is None else f"{item['week_used_percent']}%"
+        fable = "-" if not item["has_fable_window"] else ("??" if item["fable_used_percent"] is None else f"{item['fable_used_percent']}%")
+        rolls = "-" if item["week_rolls_in_hours"] is None else f"{item['week_rolls_in_hours']:.0f}h"
+        rows.append((expires, kind, str(item["count"]), str(item["account"]), ", ".join(item["on"]),
+                     week, fable, rolls, "; ".join(notes_here)))
+    print(f"=== every saved reset in the pool, soonest expiry first ({len(items)} entries)")
+    for line in notes:
+        print(line)
+    if rows:
+        head = ("expires", "kind", "n", "account", "on", "week", "fable", "rolls", "")
+        widths = [max(len(r[i]) for r in rows + [head]) for i in range(len(head))]
+        right = {2, 5, 6, 7}
+
+        def fmt(cells):
+            out = [f"{c:>{w}}" if i in right else f"{c:<{w}}" for i, (c, w) in enumerate(zip(cells, widths))]
+            return ("  " + "  ".join(out)).rstrip()
+        print(fmt(head))
+        for r in rows:
+            print(fmt(r))
+    totals = []
+    for n, kind, day, expiry in reset_totals(items):
+        one, many = _reset_kind_words(kind)[1:]
+        name = one if n == 1 else many
+        if day:
+            totals.append(f"{n} {name} expire{'s' if n == 1 else ''} {day}")
+        else:
+            totals.append(f"{n} {name}, {'expiry not read' if expiry == 'not_read' else 'no date given'}")
+    print("totals: " + ("; ".join(totals) if totals else "no saved resets"))
+
+
+def cmd_resets(argv):
+    """Every saved reset in the pool: this daemon's accounts and those of each
+    peer it reads, from its peers/usage-status (§32), so no peer credential is
+    needed here."""
+    import datetime
+    sources = [("local", _get_list("/_subrouter/usage-status"))]
+    notes = []
+    try:
+        body = _get(PEERS_USAGE_PATH)
+        peers = body.get("peers") if isinstance(body, dict) else None
+    except SrqError as e:
+        if "HTTP 404" not in str(e):
+            raise
+        peers = None
+        notes.append("(this daemon does not list its peers -- before PATCHES §32 -- so only its own accounts are shown)")
+    for peer in peers if isinstance(peers, list) else []:
+        name = peer.get("name") or _peer_label(peer.get("url"))
+        accounts = peer.get("accounts")
+        if not isinstance(accounts, list):
+            notes.append(f"{REMOTE_UNREADABLE}  peer {name}: {peer.get('error') or 'no reading'}; its resets are MISSING")
+            continue
+        if peer.get("reachable") is not True:
+            notes.append(f"(peer {name}: the last good reading, from {peer.get('as_of')}; its latest read failed: {peer.get('error')})")
+        sources.append((f"peer {name}", accounts))
+    items = pool_resets(sources)
+    if "--json" in argv:
+        print(json.dumps({"resets": items, "notes": notes,
+                          "totals": [{"count": n, "kind": k, "expires_on": d, "expiry": e} for n, k, d, e in reset_totals(items)]},
+                         indent=2))
+        return 0
+    _render_resets(items, notes, datetime.datetime.now(datetime.timezone.utc))
     return 0
 
 
@@ -1447,14 +1716,16 @@ def cmd_selftest(_argv):
     mixed = [fable_reset_row(0, 1, 1, **week_hold), fable_reset_row(1, 2), holder_row(2, True, "eligible")]
     text = rendered([summarize(r) for r in mixed])
     lines = [ln for ln in text.splitlines() if ln.startswith("  acct")]
-    check("a week holder with a Fable reset reads 2x and F1", "rolls   100h  2x  F1  new=yes\n" in text)
-    check("a Fable-only holder reads F2 and no 2x", len(lines) == 3 and "      F2  new=yes" in lines[1] and "2x" not in lines[1])
+    # These rows are a §64 daemon's, with no resets list (§91.2): the column
+    # holds what complimentary_reset says, marked ~.
+    check("a week holder with a Fable reset reads 2x, W1 and F1", "rolls   100h  2x  W1 F1~  new=yes\n" in text)
+    check("a Fable-only holder reads F2 and no 2x", len(lines) == 3 and "      F2~     new=yes" in lines[1] and "2x" not in lines[1])
     check("a row with neither keeps the columns aligned",
           "2x" not in lines[2] and "F" not in lines[2].split("rolls")[1]
           and lines[0].index("new=") == lines[1].index("new=") == lines[2].index("new="))
     check("the legend explains Fn",
-          "\n       Fn = n unclaimed Fable resets: a Fable claim gives back the Fable limit, not the week,"
-          " so they bring no 2x and no early burndown)\n" in text)
+          "a Fable claim gives back the\n" not in text and
+          "; a Fable claim gives back the Fable limit, not the week, so Fn brings no 2x and no early burndown;\n" in text)
     check("--json carries the Fable resets, and their absence as 0",
           summarize(mixed[1])["fable_resets"] == 2 and summarize(mixed[2])["fable_resets"] == 0)
     check("an unavailable reading or a boolean count is no Fable reset",
@@ -1801,6 +2072,151 @@ def cmd_selftest(_argv):
     check("a row with no source REFUSES rather than returning None",
           raises2(lambda: profile_dir("x", [{"id": "x"}])))
 
+    print("every saved reset with its kind and soonest expiry, in srq pool and srq resets (PATCHES §91.2)")
+    # A row showed how many resets it held, the Fable ones apart, and nothing
+    # showed a Codex credit's date, a kind the daemon does not know, or every
+    # reset in the pool in one place.
+    week_ends, fable_ends = "2026-12-10T22:00:00Z", "2027-03-09T07:59:00Z"
+    credit_a, credit_b, credit_c = "2026-12-14T09:13:00Z", "2026-12-21T09:13:00Z", "2026-12-29T09:13:00Z"
+    md = {when: _month_day(_instant(when)) for when in (week_ends, fable_ends, credit_a, credit_b, credit_c)}
+
+    def held(kind, count, expires_at=None, expiry="read", **extra):
+        return {"kind": kind, "count": count, "expiry": expiry, **({"expires_at": expires_at} if expires_at else {}), **extra}
+
+    def listing(row, resets, **fields):
+        return dict(row, resets=resets, **fields)
+
+    pool_rows = [listing(holder_row(0, True, "eligible", hold_secs=580000), [held("week", 1, week_ends), held("fable", 2, fable_ends)]),
+                 listing(holder_row(1, True, "eligible"), []),
+                 listing(holder_row(2, True, "eligible"), [held("unknown", 1, raw_type="promo_reset", expiry="none_given")])]
+    text = rendered([summarize(r) for r in pool_rows])
+    lines = [ln for ln in text.splitlines() if ln.startswith("  acct")]
+    check("srq pool: a week holder reads 2x, then each kind with its count and soonest expiry",
+          f"rolls   100h  2x  W1 {md[week_ends]} F2 {md[fable_ends]}  new=yes\n" in text)
+    check("srq pool: a kind the daemon does not know reads U, and a row with none keeps the columns aligned",
+          len(lines) == 3 and "  U1 " in lines[2] and "U" not in lines[1].split("rolls")[1]
+          and len({ln.index("new=") for ln in lines}) == 1)
+    check("srq pool: the legend names the letters, and no ?, * or ~ line where none is drawn",
+          "\n       W, F, R, U = a week reset, Fable resets, Codex reset credits, a kind the daemon does not know"
+          " (never claimed automatically);\n" in text and "? = its expiry not read yet" not in text)
+    codex_rows = [listing(codex_row(0, 20, 300000), [held("codex_rate_limits", 1, credit_b), held("codex_rate_limits", 1, credit_a),
+                                                     held("codex_rate_limits", 1, expiry="not_read")]),
+                  listing(codex_row(1, 20, 300000), [held("codex_rate_limits", 2, credit_a, "last_good", expiry_age_seconds=10800)]),
+                  listing(codex_row(2, 20, 300000), [held("codex_rate_limits", 3, expiry="not_read")]),
+                  codex_row(3, 20, 300000)]
+    text = rendered([summarize(r) for r in codex_rows])
+    lines = [ln for ln in text.splitlines() if ln.startswith("  cx")]
+    check("srq pool: a Codex row reads its credit count with the soonest date",
+          f"rolls    83h  R3 {md[credit_a]}   new=yes\n" in text)
+    check("srq pool: a date from the last good read reads *, and a count not read yet reads ?",
+          f"  R2 {md[credit_a]}*  new=" in lines[1] and "  R3 ?" in lines[2] and len({ln.index("new=") for ln in lines}) == 1)
+    check("srq pool: the legend explains ?, * and ~ where they are drawn",
+          "\n       ? = its expiry not read yet; * = from the last good read of the credit list;"
+          " ~ = its daemon publishes no full list (before §91): what complimentary_reset says)\n" in text)
+    check("srq pool --json carries the list and whether it is partial",
+          summarize(codex_rows[1])["resets"][0]["expiry"] == "last_good" and summarize(codex_rows[1])["resets_partial"] is False
+          and summarize(codex_rows[3])["resets"] == [] and summarize(codex_rows[3])["resets_partial"] is False)
+    check("a malformed entry is skipped, and an entry with no kind is an unknown kind",
+          [e["kind"] for e in summarize(listing(codex_row(0, 20, 300000), [{"count": True}, "x", {"count": 0, "kind": "week"},
+                                                                           {"count": 1}]))["resets"]] == ["unknown"])
+    old_codex = dict(codex_row(0, 20, 300000), complimentary_reset={"known": True, "available": True, "remaining": 3,
+                                                                   "source": "rate_limit_reset_credits"})
+    old_claude = dict(holder_row(0, True, "eligible"), complimentary_reset={
+        "known": True, "available": True, "remaining": 3, "source": "cedar_ember", "expires_at": week_ends,
+        "remaining_by_kind": {"week": 1, "fable": 2}, "week_held_until": week_ends})
+    check("a daemon before §91: what complimentary_reset says, dated only where it ties a date to the kind, marked ~",
+          _reset_marks(summarize(old_claude)["resets"], summarize(old_claude)["resets_partial"]) == f"W1 {md[week_ends]} F2~"
+          and _reset_marks(summarize(old_codex)["resets"], summarize(old_codex)["resets_partial"]) == "R3 ?~")
+    before_64 = dict(holder_row(0, True, "eligible"), complimentary_reset={
+        "known": True, "available": True, "remaining": 2, "source": "cedar_ember", "expires_at": fable_ends})
+    check("a block from before §64 names no kinds: one entry of an unknown kind, never a guess",
+          [(e["kind"], e["count"], e["expires_at"]) for e in summarize(before_64)["resets"]] == [("unknown", 2, fable_ends)])
+
+    def resets_output(usage, peers, argv=()):
+        def fake_get(path):
+            if path == PEERS_USAGE_PATH:
+                if peers is None:
+                    raise SrqError(f"HTTP 404 from {BASE}{path}")
+                return peers
+            return usage
+        saved = globals()["_get"]
+        globals()["_get"] = fake_get
+        out = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out):
+                cmd_resets(list(argv))
+        finally:
+            globals()["_get"] = saved
+        return out.getvalue()
+
+    shared = listing(dict(holder_row(5, True, "eligible"), label="shared@example.com"), [held("week", 1, week_ends)])
+    local = [listing(dict(holder_row(0, True, "eligible"), label="alpha@example.com"),
+                     [held("week", 1, week_ends), held("fable", 2, fable_ends)]), shared]
+    box = [shared,
+           listing(dict(codex_row(0, 20, 300000), id="codex-owner-0a1b2c", label="dev@example.com"),
+                   [held("codex_rate_limits", 1, credit_a), held("codex_rate_limits", 1, credit_c, "last_good", expiry_age_seconds=10800),
+                    held("codex_rate_limits", 1, expiry="not_read")]),
+           listing(dict(codex_row(1, 20, 300000), label="spark@example.com"),
+                   [held("unknown", 1, credit_b, raw_type="codex_spark_limits", gives_back=["weekly"], manual_only=True)])]
+    old = [dict(old_claude, id="old0", label="old@example.com")]
+    peers = {"peers": [
+        {"name": "box", "url": "https://box:31416", "reachable": True, "as_of": "2026-11-23T08:00:00Z", "error": "", "accounts": box},
+        {"name": "old", "url": "https://old:31416", "reachable": False, "as_of": "2026-11-23T07:00:00Z",
+         "error": "peer returned 502 Bad Gateway", "accounts": old},
+        {"name": "dead", "url": "https://dead:31416", "reachable": False, "as_of": "", "error": "dial tcp: i/o timeout", "accounts": None}]}
+    text = resets_output(local, peers)
+    lines = text.splitlines()
+    rows = [ln for ln in lines if ln.startswith("  ") and not ln.startswith("  expires")]
+    accounts_in_order = [next((a for a in ("alpha", "shared", "dev", "spark", "old") if a + "@" in ln), "?") for ln in rows]
+    check("srq resets: one line per reset, soonest expiry first, undated last",
+          accounts_in_order == ["alpha", "old", "shared", "dev", "spark", "dev", "alpha", "dev", "old"])
+    check("srq resets: an account by its label, never its ID", "codex-owner-0a1b2c" not in text and "dev@example.com" in text)
+    week_line = next(ln for ln in rows if "alpha@" in ln and "week reset" in ln)
+    check("srq resets: when it expires, the kind, the count, where it lives, its week and Fable meters and its roll",
+          week_line.startswith(f"  {md[week_ends]} {_instant(week_ends).astimezone():%H:%M} ")
+          and " week reset " in week_line and "  local  " in week_line
+          and week_line.split()[-3:] == ["40%", "104%", "100h"])
+    shared_line = next(ln for ln in rows if "shared@" in ln)
+    check("srq resets: an account two daemons hold is listed once and names both",
+          sum("shared@" in ln for ln in rows) == 1 and "local, peer box" in shared_line)
+    codex_line = next(ln for ln in rows if "dev@" in ln and md[credit_a] in ln)
+    check("srq resets: a Codex credit is on its peer, with no Fable meter", "peer box" in codex_line and "  -  " in codex_line)
+    check("srq resets: a count whose expiry was not read says so",
+          any(ln.startswith("  expiry not read") and "dev@" in ln for ln in rows))
+    check("srq resets: a date from the last good read says how old it is",
+          any("dev@" in ln and ln.rstrip().endswith("from the last good read, 3h 0m old") for ln in rows))
+    check("srq resets: a kind the daemon does not know is shown, never claimed automatically",
+          any("unknown codex_spark_limits" in ln and ln.rstrip().endswith("never claimed automatically") for ln in rows))
+    check("srq resets: a peer before §91 shows what complimentary_reset says, and says it is not the full list",
+          sum("old@" in ln and ln.rstrip().endswith("its daemon gives no full list") for ln in rows) == 2
+          and any(ln.startswith("  no date given") and "old@" in ln for ln in rows))
+    check("srq resets: a peer read from its last good body says so, and an unreadable one is LOUD",
+          "(peer old: the last good reading, from 2026-11-23T07:00:00Z; its latest read failed: peer returned 502 Bad Gateway)" in lines
+          and f"{REMOTE_UNREADABLE}  peer dead: dial tcp: i/o timeout; its resets are MISSING" in lines)
+    check("srq resets: the last line totals each kind and expiry date",
+          lines[-1] == f"totals: 3 week resets expire {md[week_ends]}; 1 Codex credit expires {md[credit_a]};"
+                       f" 1 reset of an unknown kind expires {md[credit_b]}; 1 Codex credit expires {md[credit_c]};"
+                       f" 2 Fable resets expire {md[fable_ends]}; 1 Codex credit, expiry not read; 2 Fable resets, no date given")
+    alone = resets_output(local, {"peers": []}).splitlines()
+    check("srq resets: a daemon with no peers lists its own",
+          alone[-1] == f"totals: 2 week resets expire {md[week_ends]}; 2 Fable resets expire {md[fable_ends]}"
+          and not any("peer" in ln for ln in alone))
+    before_32 = resets_output(local, None)
+    check("srq resets: a daemon before §32 lists its own and says the peers are not shown",
+          "(this daemon does not list its peers -- before PATCHES §32 -- so only its own accounts are shown)" in before_32
+          and f"totals: 2 week resets expire {md[week_ends]}" in before_32)
+    check("srq resets: no reset anywhere is a line, not an empty page",
+          resets_output([holder_row(0, True, "eligible")], {"peers": []}).splitlines()[-1] == "totals: no saved resets")
+    as_json = json.loads(resets_output(local, peers, ["--json"]))
+    check("srq resets --json: every entry with its account, where it lives and the totals",
+          len(as_json["resets"]) == 9 and as_json["resets"][0]["account"] == "alpha@example.com"
+          and as_json["resets"][0]["on"] == ["local"] and as_json["totals"][0] == {
+              "count": 3, "kind": "week", "expires_on": md[week_ends], "expiry": None})
+    check("in how long, from a fixed now",
+          _in_how_long(_instant(week_ends), _instant("2026-11-23T18:00:00Z")) == "in 17d 4h"
+          and _in_how_long(_instant("2026-11-23T19:30:00Z"), _instant("2026-11-23T18:00:00Z")) == "in 1h 30m"
+          and _in_how_long(_instant("2026-11-23T17:00:00Z"), _instant("2026-11-23T18:00:00Z")) == "ended 1h 0m ago")
+
     print()
     if failures:
         print(f"FAILED: {len(failures)}")
@@ -1810,7 +2226,7 @@ def cmd_selftest(_argv):
 
 
 COMMANDS = {"serving": cmd_serving, "pool": cmd_pool, "dir": cmd_dir,
-            "selftest": cmd_selftest}
+            "selftest": cmd_selftest, "resets": cmd_resets}
 
 
 def main(argv):
