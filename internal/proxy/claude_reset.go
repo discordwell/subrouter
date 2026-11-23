@@ -323,6 +323,7 @@ func (s Server) readClaudeResetStatus(work, caller context.Context, account acco
 		if err == nil {
 			windows := displayClaudeWindows(claudeUsageWindows(usage))
 			ref.noteClaudeResetStatus(account.ID, account.Token, status, windows, started)
+			ref.history().observe(account, windows, started)
 			return claudeResetState{status: status, windows: windows, source: "live", at: started}, nil
 		}
 		var httpErr *agentclaude.ResetHTTPError
@@ -513,6 +514,7 @@ func (s Server) claudeReset(work, caller context.Context, request ClaudeResetReq
 	response.RequestID = requestID
 	var claim agentclaude.ResetClaim
 	var claimErr error
+	draft := ref.history().startClaim(account, string(grant.Kind()), time.Now())
 	for {
 		response.ClaimAttempts++
 		if s.Logger != nil {
@@ -564,7 +566,9 @@ func (s Server) claudeReset(work, caller context.Context, request ClaudeResetReq
 	// Claude Code applies too -- drops the marks and reads the account again.
 	// Whatever the answer, no block read before this POST is gone by again
 	// (noteClaudeResetClaimSent): the next call reads live.
-	if claim.Result == agentclaude.ResetResultReset || (claim.MayHaveLanded() && len(claim.Cleared) > 0) {
+	landed := claim.Result == agentclaude.ResetResultReset || (claim.MayHaveLanded() && len(claim.Cleared) > 0)
+	ref.history().finishClaim(draft, string(claim.Result), landed)
+	if landed {
 		response.WindowsAfter = s.afterClaudeReset(work, account)
 	}
 	if s.Logger != nil {

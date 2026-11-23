@@ -1057,6 +1057,9 @@ type AccountRef struct {
 	// heldResetMemory is §91.1's (sharedHeldResets): the Codex credit
 	// expiry reader writes it, and usage-status reads it.
 	heldResetMemory atomic.Pointer[heldResets]
+	// usageHistory is §92.1's series and claim records (SetUsageHistory),
+	// nil when SUBROUTER_USAGE_HISTORY=0.
+	usageHistory *UsageHistory
 }
 
 // sharedAdmission returns the ref's admission gate, creating it on first use.
@@ -1736,7 +1739,14 @@ func (r *AccountRef) fetchAccountUsageWindowsLiveWithFreshness(ctx context.Conte
 // no provider makes a second one for it.
 func (r *AccountRef) fetchAccountUsageLive(ctx context.Context, client *http.Client, account accounts.Account) ([]accounts.UsageWindow, *agentclaude.ResetStatus, bool, error) {
 	if account.Provider == accounts.ProviderClaude && account.AuthMode == accounts.AuthModeOAuth {
+		// The reading is as old as its read's start (PATCHES §29); every
+		// live read of this daemon's own Claude account is recorded here,
+		// and its Codex reads in fetchCodexUsageDetails (§92.1).
+		started := time.Now()
 		windows, reset, err := r.fetchClaudeOAuthUsageLive(ctx, client, account)
+		if err == nil {
+			r.history().observe(account, windows, started)
+		}
 		return windows, reset, true, err
 	}
 	if account.AuthMode == accounts.AuthModeOAuth {
@@ -1873,8 +1883,17 @@ func (r *AccountRef) fetchClaudeOAuthUsageLive(ctx context.Context, client *http
 // chain and reads once more with the new token. The bool reports whether this
 // call renewed the chain.
 func (r *AccountRef) fetchCodexUsageDetails(ctx context.Context, client *http.Client, account accounts.Account) (accounts.CodexUsageDetails, bool, error) {
+	// Every live read of this daemon's own Codex account passes here, and
+	// is recorded as old as its read's start (PATCHES §29, §92.1).
+	record := func(account accounts.Account, started time.Time, details accounts.CodexUsageDetails, err error) {
+		if err == nil {
+			r.history().observe(account, details.Windows, started)
+		}
+	}
+	started := time.Now()
 	details, err := accounts.FetchCodexUsageDetails(ctx, client, account)
 	if !accounts.CodexAccessTokenRejectedAsExpired(err) {
+		record(account, started, details, err)
 		return details, false, err
 	}
 	stored, ok, findErr := r.store.FindStored(account.ID)
@@ -1892,7 +1911,9 @@ func (r *AccountRef) fetchCodexUsageDetails(ctx context.Context, client *http.Cl
 		return details, false, err
 	}
 	r.replace(next)
+	started = time.Now()
 	details, err = accounts.FetchCodexUsageDetails(ctx, client, next)
+	record(next, started, details, err)
 	return details, didRefresh, err
 }
 
@@ -4158,6 +4179,12 @@ func scoreUsableForNewSession(score selectacct.Score) bool {
 }
 
 func scoreFromUsageWindows(provider accounts.Provider, accountID string, windows []accounts.UsageWindow) selectacct.Score {
+	// A cached reading's seconds to reset count from when it was read, and the
+	// score reads them against now: re-anchored first, a reading served from
+	// the 2-minute cache rolls its week at the reading's own reset time
+	// (PATCHES §92.1).
+	now := time.Now()
+	windows = accounts.ResetsAsOf(windows, now)
 	limitWindows := make([]selectacct.LimitWindow, 0, len(windows)*2)
 	// A model-pool request (fable/opus/sonnet) consumes the account-wide 5h/7d
 	// windows too, so every feature pool's score must also reflect the base
@@ -4200,7 +4227,7 @@ func scoreFromUsageWindows(provider accounts.Provider, accountID string, windows
 			}
 		}
 	}
-	score := selectacct.ScoreFromLimitWindows(accountID, 0, limitWindows)
+	score := selectacct.ScoreFromLimitWindowsAt(accountID, 0, limitWindows, now)
 	score.Provider = provider
 	// Paid Claude extra usage is reported (the "extra" window, ExtraUsage on the
 	// usage-status row) but deliberately NOT copied into the routing score: the
@@ -6891,11 +6918,14 @@ func (s Server) redeemAccountChecked(ctx context.Context, account accounts.Accou
 		defer rateLimitRedeemMu.Unlock()
 	}
 	result := RateLimitResetResult{Email: account.ID, DryRun: dryRun}
+	history := s.AccountRef.history()
+	beforeAt := time.Now()
 	before, err := accounts.FetchCodexUsageDetails(ctx, s.AccountRef.client, account)
 	if err != nil {
 		result.Error = err.Error()
 		return result
 	}
+	history.observe(account, before.Windows, beforeAt)
 	result.WindowsBefore = before.Windows
 	if !rateLimitCooked(before) {
 		if !anytime {
@@ -6913,25 +6943,36 @@ func (s Server) redeemAccountChecked(ctx context.Context, account accounts.Accou
 	if dryRun {
 		return result
 	}
-	var check func(accounts.RateLimitResetCredit) error
-	if approve != nil {
-		check = func(credit accounts.RateLimitResetCredit) error {
+	// The draft is taken once the credit passed every check, just before
+	// its consume is sent: every redeem path comes through here, so every
+	// credit this daemon spends is recorded (PATCHES §92.1).
+	var draft *usageClaimDraft
+	check := func(credit accounts.RateLimitResetCredit) error {
+		if approve != nil {
 			live := rateLimitResetCandidate{account: account, before: before.Windows, wait: weeklyResetWait(before.Windows)}
 			live.creditExpires, _ = time.Parse(time.RFC3339, credit.ExpiresAt)
-			return approve(live, time.Now())
+			if err := approve(live, time.Now()); err != nil {
+				return err
+			}
 		}
+		draft = history.startClaim(account, credit.ResetType, time.Now())
+		return nil
 	}
 	credit, err := accounts.RedeemRateLimitResetIf(ctx, s.AccountRef.client, account, check)
 	if err != nil {
+		history.finishClaim(draft, err.Error(), false)
 		result.Error = err.Error()
 		return result
 	}
+	history.finishClaim(draft, "redeemed", true)
 	result.Credit = &credit
 	result.Reset = true
 	// The 429 that cooked the account also paused its admission gate; every
 	// redeem path comes through here, so the reset ends the pause here.
 	s.admissionGate().clearAccount(schedulerAccountProvider(accounts.ProviderCodex), account.ID)
+	afterAt := time.Now()
 	if after, err := accounts.FetchCodexUsageDetails(ctx, s.AccountRef.client, account); err == nil {
+		history.observe(account, after.Windows, afterAt)
 		result.WindowsAfter = after.Windows
 	}
 	return result
