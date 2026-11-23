@@ -4839,6 +4839,8 @@ if [ -n "$pin" ] && [ -n "${FAKE_SPENT_PIN:-}" ]; then
     failover) echo "$sid acct-pool" >> "$HOME/served" ;;
     slow) echo "$sid $pin" >> "$HOME/served"; echo 60 > "$HOME/clock-skew" ;;
     answers) echo "$sid $pin" >> "$HOME/served"; echo "$word"; exit 0 ;;
+    refused) echo "API Error: Server is temporarily limiting requests (not your usage limit) · subrouter: pinned account \"$pin\" is inside its owner's holdout"; exit 1 ;;
+    unreached) echo "Error: the launch broke before it sent anything"; exit 1 ;;
   esac
   echo "API Error: 429 rate_limit_error" >&2; exit 1
 fi
@@ -5012,7 +5014,8 @@ fi
 # serves it. The daemon names the pin's control plane, since the stub world has
 # no PlistBuddy to read the identity account from the plist. FAKE_SPENT_PIN says
 # where the daemon put the pinned turn: refused (answered once, finally, before
-# any assignment: no row, PATCHES §89), limited (the provider's limit, on that
+# any assignment: no row, PATCHES §89), unreached (failed before the daemon saw
+# it: no row, and no refusal from the daemon), limited (the provider's limit, on that
 # account's row), failover (another account's row), slow (limited, and 60 s late)
 # or answers (answered, on that account's row). sleep is a stub here, so date +%s
 # runs 60 s ahead from a slow turn on.
@@ -5062,6 +5065,12 @@ if begin route-test-spent-pin-that-fails-slowly-fails; then
   route_spent_setup; run_spent_test FAKE_SPENT_PIN=slow
   expect_spent FAIL
   grep -Eq "^took [0-9]+s, limit 45s$" "$H/.claude-route/test.err" && ok || bad "test.err lacks: took <n>s, limit 45s"
+  finish
+fi
+
+if begin route-test-spent-pin-that-never-reached-the-daemon-fails; then
+  route_spent_setup; run_spent_test FAKE_SPENT_PIN=unreached
+  expect_spent FAIL; expect_spent_said "not the daemon's refusal of the pin"
   finish
 fi
 
