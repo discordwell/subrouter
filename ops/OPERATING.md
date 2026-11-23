@@ -28,9 +28,10 @@ The router's verdict is `normalized.new_session` on each `usage-status` row. `sr
 | `yes (burndown n/m)` | Draining before its roll. `n/m` is the sessions in flight against its allowance. |
 | `fallback (<reason>)` | Takes a new session on this daemon only when nothing preferred is left. |
 | `NO (<reason>)` | Evicted. It takes no new session. |
+| `NO (pin_only)` | Takes pinned sessions only ([Keep an account for pinned sessions only](#keep-an-account-for-pinned-sessions-only)). It takes no new session from the pool. |
 | `?` | The daemon published no verdict. |
 
-The reasons are `eligible`, `burndown`, `exhausted`, `holdout`, `at_cap`, `short_floor`, `below_reserve`, `burn_projection`, and `queue_closed`, plus `auth_invalid` for a login this daemon checked and found dead. A peer that refuses a forwarded turn names one of these, or `unknown_account`, `machine_policy`, or `not_oauth`. The order the router itself uses is `rank` and `reason` in `GET /_subrouter/pool.json`.
+The reasons are `eligible`, `burndown`, `exhausted`, `holdout`, `at_cap`, `short_floor`, `below_reserve`, `burn_projection`, `queue_closed`, and `pin_only`, plus `auth_invalid` for a login this daemon checked and found dead. A peer that refuses a forwarded turn names one of these, or `unknown_account`, `machine_policy`, or `not_oauth`. The order the router itself uses is `rank` and `reason` in `GET /_subrouter/pool.json`.
 
 ### Window names differ by provider
 
@@ -232,6 +233,25 @@ A credential command (`claude auth`, `claude login`, `claude logout`, `claude se
 A pool launch's token names no plan, so the shim names the one every pooled account has: pool and pool-tcp launches set `CLAUDE_CODE_SUBSCRIPTION_TYPE=max`, unless you set it yourself. With it, Claude Code runs its built-in web-fetch agent on Haiku, as it does for your own Max login. Without it, the agent ran on the session's own model (§100).
 
 Your own login sends Claude Code's advisor tool with each request. The plan brings a pool session the same tool as a standby: it is in each request, but asked to call it, the model found no such tool. While the advisor is off, pool and pool-tcp launches therefore also set `CLAUDE_CODE_DISABLE_ADVISOR_TOOL=1`, and their requests carry no advisor tool. To add it, run `claude-route advisor on`. New pool and pool-tcp launches then leave out `CLAUDE_CODE_DISABLE_ADVISOR_TOOL`, set `CLAUDE_CODE_ENABLE_EXPERIMENTAL_ADVISOR_TOOL=1` and pass `--settings '{"advisorModel":"opus"}'`. The `--settings` is needed: without it, a pool session gets at most the standby, which its model cannot call. Each request is then about 1,360 tokens larger, and each `advisor()` call has a second model read the conversation on the pool account. In one measured call, Opus read about 38,000 uncached tokens. A launch with its own `--settings` keeps that file, so it gets no advisor model unless its settings name one. `claude-route advisor off` turns it off. `claude-route status` shows the state on its `advisor:` line (§97, §100).
+
+### Keep an account for pinned sessions only
+
+`SUBROUTER_PIN_ONLY_ACCOUNTS` lists account IDs, separated by commas, that the daemon holding them serves only for a session pinned to them by name (`claude <account>`, which sends `X-Subrouter-Account-ID`). Use it for an account that the pool must leave alone, such as one you measure. The owner set it up on 2026-11-23 for a meter test (§98).
+
+For a listed account, the daemon does these things:
+
+- It places no new session there, by its ranking or by any fallback. It moves no session there when another account is spent, evicted or refused, and it spills, overflows and places no refugee there.
+- It moves a session that is already there without its pin, at that session's next turn.
+- It publishes the verdict `new=NO (pin_only)` (`eligible: false`, `reason: pin_only`), so no peer places a session there either.
+- It claims none of the account's resets automatically (§93), never chooses the account for a reset (§95), and leaves the account out of the pool figures that need and the expiry windows read (§94, §96). The account's own `burn` stays on its row, and the usage history still records it. `sr claude reset` and `sr codex reset` still work.
+- It sends the account no paid Messages probe and no tiny turn to start a Codex week (§90).
+- It serves a pinned session as before. When the account is spent or refused, the pin gets the provider's answer, or §89's, and never moves to another account.
+
+`srq pool` prints the account as `new=NO (pin_only)` with a legend line. Its `pool.json` row carries `"pin_only": true`, with a state note that says the account takes pinned sessions only.
+
+To set it, see [Change the daemon's environment](#change-the-daemons-environment). On the supervised laptop job, add the variable to `env` in `~/.subrouter/worker-config.json`, such as `"SUBROUTER_PIN_ONLY_ACCOUNTS": "test-account"`, then deploy. Set it before you add the account, so that no new session reaches the account in between. An ID that the daemon does not hold yet is harmless. To undo it, remove the variable and deploy.
+
+`claude-route` still applies its own checks to a pin. It reads `pin_only` as a refused verdict. So it refuses the launch when the account can bill past its plan, or reports no extra-usage state, unless `CLAUDE_ROUTE_ALLOW_PAID=1` is set. Otherwise it launches with a note. On this build it also refuses a pin to a Claude account on this Mac other than `SUBROUTER_IDENTITY_ACCOUNT` (see [Use claude-route](#use-claude-route)).
 
 ### Fix 401s after `sr setup`
 
@@ -715,6 +735,7 @@ The daemon reads these from its environment when it starts.
 | `SUBROUTER_ALLOW_LOOPBACK_PROXY` | unset | `1` lets loopback callers in without the proxy token. |
 | `SUBROUTER_LOG_LEVEL` | info | `debug` adds the lines for turns kept on their account. |
 | `SUBROUTER_RESERVED_ACCOUNTS` | unset | Comma-separated account IDs, each optionally `id=fraction`. The router holds back that share of each one's week (default 0.05), so you keep a way in, and releases it in the last 24 hours before the roll (§60). |
+| `SUBROUTER_PIN_ONLY_ACCOUNTS` | unset | Comma-separated IDs of this daemon's accounts that take pinned sessions only: no new session, failover or refugee from the pool, here or from a peer (verdict `pin_only`), no automatic reset, and no part of the pool's figures ([Keep an account for pinned sessions only](#keep-an-account-for-pinned-sessions-only), §98). On the supervised laptop job it goes in `env` in `~/.subrouter/worker-config.json`. Unset or empty lists none. |
 | `SUBROUTER_REMOTE_POOLS_FILE` | unset | The peers file. |
 | `SUBROUTER_REMOTE_POOL` and its `_TOKEN`, `_FINGERPRINT`, `_ALLOW` | unset | A single peer. |
 | `SUBROUTER_PEER_TAILNET` | unset | `name=IP` pairs to dial over Tailscale first (§68). |

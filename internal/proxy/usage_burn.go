@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/manaflow-ai/subrouter/selectacct"
 )
 
 // Burn (PATCHES §92.2): how fast each account spends each meter, read from
@@ -277,7 +278,9 @@ func (s Server) handleUsageBurn(w http.ResponseWriter, r *http.Request) {
 	var rows []usageBurnAccount
 	for _, account := range s.accountListContext(r.Context()) {
 		provider := usageHistoryProvider(account)
-		if provider == "" {
+		// Left out as resetPoolOf leaves it out (§98), so burn.json, the
+		// decision and the choice read one pool.
+		if provider == "" || s.pinOnlyAccount(account.ID) {
 			continue
 		}
 		if burn := h.accountBurn(provider, account.ID, now); len(burn) > 0 {
@@ -338,6 +341,12 @@ func readPeerBurn(name string, usage AdminSnapshot) usageBurnPeerRead {
 		Burn     UsageBurn              `json:"burn"`
 		Resets   []accounts.HeldReset   `json:"resets"`
 		Windows  []accounts.UsageWindow `json:"windows"`
+		// The peer's own verdict: pin_only is no part of its pool (§98).
+		Normalized struct {
+			NewSession *struct {
+				Reason string `json:"reason"`
+			} `json:"new_session"`
+		} `json:"normalized"`
 	}
 	if err := json.Unmarshal(usage.Body, &rows); err != nil {
 		read.peer.Reason = "its usage body did not decode"
@@ -345,6 +354,9 @@ func readPeerBurn(name string, usage AdminSnapshot) usageBurnPeerRead {
 	}
 	var holders []resetHolder
 	for _, row := range rows {
+		if verdict := row.Normalized.NewSession; verdict != nil && verdict.Reason == selectacct.VerdictPinOnly {
+			continue
+		}
 		provider := string(accountProviderOrCodex(accounts.Account{Provider: accounts.Provider(row.Provider)}))
 		if holder, ok := resetHolderOf(provider, row.ID, row.Resets, row.Windows); ok {
 			holders = append(holders, holder)

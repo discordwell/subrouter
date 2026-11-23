@@ -855,8 +855,11 @@ def local_fallback(r):
     not evicted ranks in tier 2 -- demoted, not refused -- and takes new
     sessions whenever nothing in tier 0 is left (selectionTier; proxy.go routes
     it "optimistically"). A peer never does: for a peer the verdict is exact.
+    A pin_only account (§98) takes no new session at all, so it is never a
+    fallback either.
     """
-    return r.get("new_session") is False and r.get("new_session_evicted") is False
+    return (r.get("new_session") is False and r.get("new_session_evicted") is False
+            and r.get("new_session_reason") != "pin_only")
 
 
 SLOT_REASONS = ("burndown", "at_cap", "chosen")
@@ -1073,6 +1076,10 @@ def _render_sections(rows, where, peer=False):
                          " new sessions go there first, #1 first per meter (week, Fable or a Codex week), up to the"
                          " paced ceiling and below the 5% floor; would choose = what real mode would choose (shadow):"
                          " nothing ranks on it")
+        if any(r["new_session_reason"] == "pin_only" for r in sub):
+            extra.append("pin_only = it takes pinned sessions only (SUBROUTER_PIN_ONLY_ACCOUNTS, §98): no new session,"
+                         " failover or refugee from the pool, here or from a peer, and no automatic reset; a pin by"
+                         " name is served")
         if any(r["auto_reset_verdict"] for r in sub):
             # The decision is the account's own daemon's: a peer's is shown,
             # and this daemon decides nothing for a peer's account.
@@ -1971,6 +1978,14 @@ def cmd_selftest(_argv):
     unmarked = summarize(claude_row(0, False, "at_cap"))
     unmarked["new_session_evicted"] = None
     check("a verdict with no evicted field is not called a fallback", not local_fallback(unmarked))
+
+    print("regression: a pin-only account is a NO, never a fallback, and its legend says why (§98)")
+    pin_only = [summarize(claude_row(0, False, "pin_only")), summarize(claude_row(1, True, "eligible"))]
+    for text, where in ((rendered(pin_only), "local"), (rendered(pin_only, peer=True), "peer")):
+        check(f"{where}: the pin-only row reads NO (pin_only)", "new=NO (pin_only)" in text and "fallback (pin_only)" not in text)
+        check(f"{where}: the legend explains pin_only", "pin_only = it takes pinned sessions only (SUBROUTER_PIN_ONLY_ACCOUNTS" in text)
+    check("local: the header counts no fallback for it", "more only as fallback" not in rendered(pin_only))
+    check("a section with no pin-only row has no pin_only legend", "pin_only =" not in rendered(refused))
 
     print("regression: the Fable meter has a column and a count of its own")
     fable_spent = [summarize(claude_row(i, True, "eligible", fable_eligible=False)) for i in range(3)]
