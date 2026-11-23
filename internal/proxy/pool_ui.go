@@ -338,7 +338,10 @@ type poolSession struct {
 	AgentType string `json:"agent_type"`
 	SessionID string `json:"session_id"`
 	AccountID string `json:"account_id"`
-	Live      bool   `json:"live"`
+	// AccountLabel is the account row's label, when this daemon or its peer
+	// holds the account. The page names the account by it; pins take the ID.
+	AccountLabel string `json:"account_label,omitempty"`
+	Live         bool   `json:"live"`
 	// Orphaned means this daemon holds no such account, so the pin is inert:
 	// findAccount misses, the scheduler picks locally anyway, and the sticky
 	// write at the end of selection overwrites the row on that same turn.
@@ -1294,12 +1297,14 @@ func (s Server) poolSessions(localAccounts []accounts.Account, boxStatuses []Acc
 			// re-Put, so a session in daily use carries an old stamp.
 			entry.UpdatedAt = assignment.UpdatedAt.UTC().Format(time.RFC3339)
 		}
-		if held {
-			key := string(providerForAgent(assignment.AgentType)) + "\x00" + assignment.AccountID
-			if row, ok := rows[key]; ok {
+		key := string(providerForAgent(assignment.AgentType)) + "\x00" + assignment.AccountID
+		if row, ok := rows[key]; ok {
+			entry.AccountLabel = row.Label
+			if held {
 				entry.State = row.State
 			}
-		} else {
+		}
+		if !held {
 			orphans++
 		}
 		out = append(out, entry)

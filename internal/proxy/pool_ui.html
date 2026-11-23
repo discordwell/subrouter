@@ -421,7 +421,7 @@ function render(){ if(!BOARD) return; renderHeader(); if(VIEW==="pool") renderBo
 function renderSessions(){
   const s = BOARD.sessions||[];
   const f = FILTER.trim().toLowerCase();
-  const rows = s.filter(x=>!f||x.session_id.toLowerCase().includes(f)||x.account_id.toLowerCase().includes(f));
+  const rows = s.filter(x=>!f||x.session_id.toLowerCase().includes(f)||x.account_id.toLowerCase().includes(f)||(x.account_label||"").toLowerCase().includes(f));
   let html = '<div class="grouphead"><span class="tag">SESSIONS</span><span>'
     + s.length+' sticky assignments · '+s.filter(x=>x.live).length+' live · '
     + s.filter(x=>x.orphaned).length+' orphaned</span><span class="rule"></span></div>';
@@ -432,7 +432,7 @@ function renderSessions(){
       + '<td>'+(x.live?'<span class="st ok">⚡</span>':(x.orphaned?'<span class="st week">⚠</span>':''))+'</td>'
       + '<td class="lbl">'+esc(x.agent_type)+'</td>'
       + '<td><span class="acct">'+esc(x.session_id)+'</span></td>'
-      + '<td><span class="acct">'+esc(x.account_id)+'</span></td>'
+      + '<td><span class="acct" title="'+esc(x.account_id)+'">'+esc(x.account_label||x.account_id)+'</span></td>'
       + '<td>'+(x.orphaned ? '<span class="fuse none warn">'+(x.on_peer?"ON BOX — INERT":"NO SUCH ACCOUNT")+'</span>'
                            : '<span class="st '+(x.state||"unknown")+'">'+(GLYPH[x.state]||"?")+'</span> '+esc(x.state||""))+'</td>'
       + '<td class="num" style="color:var(--faint)">'+esc((x.updated_at||"").replace("T"," ").replace("Z",""))+'</td>'

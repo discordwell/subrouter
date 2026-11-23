@@ -875,8 +875,8 @@ func TestBoardMergesSharedAccountIntoOneRow(t *testing.T) {
 }
 
 // An owner-keyed Codex account's ID is an opaque hash, and its row carries the
-// hash in email too. The board names it by the label this daemon and its peer
-// publish.
+// hash in email too. The board names it, on its row and on each session pinned
+// to it, by the label this daemon and its peer publish.
 func TestBoardCarriesEachAccountsLabel(t *testing.T) {
 	owner := func(c string) string { return "codex-owner-" + strings.Repeat(c, 64) }
 	payload := `[{"id":"` + owner("b") + `","label":"owner-b@example.com","email":"` + owner("b") + `",
@@ -895,14 +895,28 @@ func TestBoardCarriesEachAccountsLabel(t *testing.T) {
 	server := poolTestServer(t, []accounts.Account{{ID: owner("a"), Provider: accounts.ProviderCodex,
 		AuthMode: accounts.AuthModeOAuth, Label: "owner-a@example.com", Email: owner("a")}})
 	server.RemotePool = NewRemotePool(peer.URL, "token", "")
+	for sessionID, accountID := range map[string]string{"here": owner("a"), "there": owner("b"), "nowhere": "gone-from-this-daemon"} {
+		if _, err := server.Sessions.Put("codex", sessionID, accountID, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
 
+	board := server.poolBoard(t.Context(), "", "")
 	labels := map[string]string{}
-	for _, row := range server.poolBoard(t.Context(), "", "").Rows {
+	for _, row := range board.Rows {
 		labels[row.ID] = row.Label
 	}
 	want := map[string]string{owner("a"): "owner-a@example.com", owner("b"): "owner-b@example.com"}
 	if !maps.Equal(labels, want) {
 		t.Fatalf("labels by ID = %v, want %v: this daemon's account and the peer's", labels, want)
+	}
+	sessionLabels := map[string]string{}
+	for _, entry := range board.Sessions {
+		sessionLabels[entry.SessionID] = entry.AccountLabel
+	}
+	wantSessions := map[string]string{"here": "owner-a@example.com", "there": "owner-b@example.com", "nowhere": ""}
+	if !maps.Equal(sessionLabels, wantSessions) {
+		t.Fatalf("account labels by session = %v, want %v: pinned here, pinned to the peer's account, pinned to no account", sessionLabels, wantSessions)
 	}
 }
 
