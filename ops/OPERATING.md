@@ -14,6 +14,8 @@ The daemon decides where a session goes, and it publishes that decision. Read it
 
 `sr status` is a view for the human at the terminal. Its columns explain your own direct login and the CLI's switch recommendation. They do not show the router's ranking.
 
+A Codex account enrolled with owner claims has the ID `codex-owner-<hash>`, and its `usage-status` row carries the hash in `email` as well. Its login email is in `label`. `sr status` shows such an account by its login email. `sr plot`, `srq pool`, `srdash` and the pool board name every account by its `label`, or by its ID when it has none, and `srq pool --json` gives both, as `id` and `name`. A command that takes an account, such as `srq dir`, takes the ID.
+
 ### The CLI's "protected" is not the router's gate
 
 When an account fails `UsableForNewSession`, the Use column of `sr status` reads `<n>% left, not routable`. `sr status --json` gives the account `"state": "protected"`, unless another state, such as `active` or `cooked`, takes precedence. The table's State column never prints `protected`. The router also routes an account in its burndown window, and there it ranks the account above every healthy one until the account reaches its session allowance (`at_cap`). Burndown covers the last 24 hours before the weekly roll. It also covers an account that holds an unclaimed saved reset once less than 25% of its week is left (§56). An account at 8% left can be the router's first pick for a new session.
