@@ -2114,7 +2114,7 @@ def cmd_selftest(_argv):
           "\n       ? = its expiry not read yet; * = from the last good read of the credit list;"
           " ~ = its daemon publishes no full list (before §91): what complimentary_reset says)\n" in text)
     check("srq pool --json carries the list and whether it is partial",
-          summarize(codex_rows[1])["resets"][0]["expiry"] == "last_good" and summarize(codex_rows[1])["resets_partial"] is False
+          [e["expiry"] for e in summarize(codex_rows[1])["resets"][:1]] == ["last_good"] and summarize(codex_rows[1])["resets_partial"] is False
           and summarize(codex_rows[3])["resets"] == [] and summarize(codex_rows[3])["resets_partial"] is False)
     check("a malformed entry is skipped, and an entry with no kind is an unknown kind",
           [e["kind"] for e in summarize(listing(codex_row(0, 20, 300000), [{"count": True}, "x", {"count": 0, "kind": "week"},
@@ -2171,15 +2171,15 @@ def cmd_selftest(_argv):
     check("srq resets: one line per reset, soonest expiry first, undated last",
           accounts_in_order == ["alpha", "old", "shared", "dev", "spark", "dev", "alpha", "dev", "old"])
     check("srq resets: an account by its label, never its ID", "codex-owner-0a1b2c" not in text and "dev@example.com" in text)
-    week_line = next(ln for ln in rows if "alpha@" in ln and "week reset" in ln)
+    week_line = next((ln for ln in rows if "alpha@" in ln and "week reset" in ln), "")
     check("srq resets: when it expires, the kind, the count, where it lives, its week and Fable meters and its roll",
           week_line.startswith(f"  {md[week_ends]} {_instant(week_ends).astimezone():%H:%M} ")
           and " week reset " in week_line and "  local  " in week_line
           and week_line.split()[-3:] == ["40%", "104%", "100h"])
-    shared_line = next(ln for ln in rows if "shared@" in ln)
+    shared_line = next((ln for ln in rows if "shared@" in ln), "")
     check("srq resets: an account two daemons hold is listed once and names both",
           sum("shared@" in ln for ln in rows) == 1 and "local, peer box" in shared_line)
-    codex_line = next(ln for ln in rows if "dev@" in ln and md[credit_a] in ln)
+    codex_line = next((ln for ln in rows if "dev@" in ln and md[credit_a] in ln), "")
     check("srq resets: a Codex credit is on its peer, with no Fable meter", "peer box" in codex_line and "  -  " in codex_line)
     check("srq resets: a count whose expiry was not read says so",
           any(ln.startswith("  expiry not read") and "dev@" in ln for ln in rows))
@@ -2210,8 +2210,8 @@ def cmd_selftest(_argv):
     as_json = json.loads(resets_output(local, peers, ["--json"]))
     check("srq resets --json: every entry with its account, where it lives and the totals",
           len(as_json["resets"]) == 9 and as_json["resets"][0]["account"] == "alpha@example.com"
-          and as_json["resets"][0]["on"] == ["local"] and as_json["totals"][0] == {
-              "count": 3, "kind": "week", "expires_on": md[week_ends], "expiry": None})
+          and as_json["resets"][0]["on"] == ["local"] and as_json["totals"][:1] == [{
+              "count": 3, "kind": "week", "expires_on": md[week_ends], "expiry": None}])
     check("in how long, from a fixed now",
           _in_how_long(_instant(week_ends), _instant("2026-11-23T18:00:00Z")) == "in 17d 4h"
           and _in_how_long(_instant("2026-11-23T19:30:00Z"), _instant("2026-11-23T18:00:00Z")) == "in 1h 30m"
