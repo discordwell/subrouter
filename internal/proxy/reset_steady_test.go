@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -185,6 +187,35 @@ func TestBurnJSONTheDecisionAndTheChoiceReadOneNeed(t *testing.T) {
 	if would := choice(shared); would == nil || !strings.Contains(would.Why, stillYes) {
 		t.Fatalf("the choice after burn.json alone read the yes: %+v", would)
 	}
+}
+
+// 3, under -race. burn.json is read while passes choose and a turn meets the
+// wall, all reading need through the one memory; the race detector finds
+// nothing, and burn.json then still says yes.
+func TestNeedIsReadWhilePassesHoldIt(t *testing.T) {
+	setAutoResetWorthForTest(t, true)
+	setResetLoadingForTest(t, true)
+	d := worthClaude(t, AutoResetShadow, map[string]float64{"spare": 1.02}, heldAtTheWall(time.Now().Add(17*burnDay), false, 0))
+	var wg sync.WaitGroup
+	for range 4 {
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			for range 10 {
+				rec := httptest.NewRecorder()
+				d.server.handleUsageBurn(rec, loopbackRequest(http.MethodGet, UsageBurnPath, ""))
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			for range 10 {
+				d.server.autoResetPass(context.Background())
+			}
+		}()
+	}
+	d.wallDecision("during")
+	wg.Wait()
+	wantNeed(t, "after the readers", weekNeedOf(t, d.server), ResetNeedYes, false, "the 24-hour pressure is 1.02")
 }
 
 // gapPasses chooses as the daemon's passes do, each from what the one before

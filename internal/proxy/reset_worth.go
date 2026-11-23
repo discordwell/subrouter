@@ -350,18 +350,18 @@ func (r *AccountRef) sharedResetNeeds() *resetNeeds {
 func (n *resetNeeds) hold(meters []UsagePoolMeter, now time.Time) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
+	if n.yesAt == nil {
+		n.yesAt = map[string]time.Time{}
+	}
 	for i := range meters {
 		if meters[i].Need == nil {
 			continue
 		}
 		key := meters[i].Provider + "\x00" + meters[i].Meter
 		need, yesAt := holdNeed(*meters[i].Need, n.yesAt[key], now)
-		switch {
-		case yesAt.IsZero():
+		if yesAt.IsZero() {
 			delete(n.yesAt, key)
-		case n.yesAt == nil:
-			n.yesAt = map[string]time.Time{key: yesAt}
-		default:
+		} else {
 			n.yesAt[key] = yesAt
 		}
 		meters[i].Need = &need
