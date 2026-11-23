@@ -459,3 +459,46 @@ func TestCheckCatchesEachKindOfMissingName(t *testing.T) {
 		t.Errorf("check found problems in names that exist: %q", got)
 	}
 }
+
+// The skill's saved-resets section mirrors the operating guide's: each
+// setting the guide's section names, the switches that turn a reset
+// behaviour off, the skill names too (PATCHES §91.2), so an agent reading
+// only the skill can say how to turn each one off.
+func TestSubrouterSkillNamesEverySavedResetSetting(t *testing.T) {
+	root, err := filepath.Abs(filepath.Join("..", ".."))
+	if err != nil {
+		t.Fatal(err)
+	}
+	guide, err := os.ReadFile(filepath.Join(root, "ops", "OPERATING.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	skill, err := os.ReadFile(filepath.Join("subrouter", "SKILL.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	guideSettings := envNameRE.FindAllString(markdownSection(t, string(guide), "Saved resets"), -1)
+	if len(guideSettings) == 0 {
+		t.Fatal("calibration: ops/OPERATING.md's Saved resets section names no setting")
+	}
+	mirror := markdownSection(t, string(skill), "Saved resets")
+	for _, name := range guideSettings {
+		if !strings.Contains(mirror, name) {
+			t.Errorf("ops/OPERATING.md's Saved resets section names %s; say what it does in the Saved resets section of subrouter/SKILL.md too", name)
+		}
+	}
+}
+
+// markdownSection is the body of the first "## " section whose heading starts
+// with title, up to the next "## " heading.
+func markdownSection(t *testing.T, text, title string) string {
+	t.Helper()
+	parts := regexp.MustCompile(`(?m)^## `).Split(text, -1)
+	for _, part := range parts[1:] {
+		if strings.HasPrefix(part, title) {
+			return part
+		}
+	}
+	t.Fatalf("no section headed %q", title)
+	return ""
+}
