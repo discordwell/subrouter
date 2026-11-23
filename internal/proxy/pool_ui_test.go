@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"encoding/json"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -870,6 +871,38 @@ func TestBoardMergesSharedAccountIntoOneRow(t *testing.T) {
 	}
 	if board.Rollup.Accounts != 1 || board.Rollup.Instances != 2 {
 		t.Fatalf("rollup = %+v, want 1 account / 2 instances", board.Rollup)
+	}
+}
+
+// An owner-keyed Codex account's ID is an opaque hash, and its row carries the
+// hash in email too. The board names it by the label this daemon and its peer
+// publish.
+func TestBoardCarriesEachAccountsLabel(t *testing.T) {
+	owner := func(c string) string { return "codex-owner-" + strings.Repeat(c, 64) }
+	payload := `[{"id":"` + owner("b") + `","label":"owner-b@example.com","email":"` + owner("b") + `",
+	  "provider":"codex","auth_mode":"oauth","auth_valid":true,
+	  "windows":[{"Name":"primary","UsedPercent":10,"LimitWindowSeconds":604800,"ResetAfterSeconds":500000}],
+	  "normalized":{"headroom":0.9,"short_headroom":0.9,"fresh":true}}]`
+	peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == poolPeerUsagePath {
+			_, _ = w.Write([]byte(payload))
+			return
+		}
+		_, _ = w.Write([]byte(`{"draining":false,"active_proxy_requests":0}`))
+	}))
+	defer peer.Close()
+
+	server := poolTestServer(t, []accounts.Account{{ID: owner("a"), Provider: accounts.ProviderCodex,
+		AuthMode: accounts.AuthModeOAuth, Label: "owner-a@example.com", Email: owner("a")}})
+	server.RemotePool = NewRemotePool(peer.URL, "token", "")
+
+	labels := map[string]string{}
+	for _, row := range server.poolBoard(t.Context(), "", "").Rows {
+		labels[row.ID] = row.Label
+	}
+	want := map[string]string{owner("a"): "owner-a@example.com", owner("b"): "owner-b@example.com"}
+	if !maps.Equal(labels, want) {
+		t.Fatalf("labels by ID = %v, want %v: this daemon's account and the peer's", labels, want)
 	}
 }
 

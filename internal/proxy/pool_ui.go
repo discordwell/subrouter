@@ -225,6 +225,7 @@ type poolRow struct {
 	Key      string `json:"key"`
 	Provider string `json:"provider"`
 	ID       string `json:"id"`
+	Label    string `json:"label,omitempty"`
 	Email    string `json:"email,omitempty"`
 	// Pools lists the daemons holding this account. Two entries means one
 	// subscription loaded twice, NOT two subscriptions.
@@ -726,6 +727,7 @@ func (s Server) poolBoard(ctx context.Context, boardModel, machineID string) poo
 				Key:       key,
 				Provider:  string(status.Provider),
 				ID:        status.ID,
+				Label:     status.Label,
 				Email:     status.Email,
 				AuthMode:  string(status.AuthMode),
 				AuthValid: status.AuthValid,
@@ -772,6 +774,7 @@ func (s Server) poolBoard(ctx context.Context, boardModel, machineID string) poo
 			AccountStatus: AccountStatus{
 				ID:       account.ID,
 				Provider: account.Provider,
+				Label:    account.Label,
 				AuthMode: account.AuthMode,
 				Email:    account.Email,
 				Source:   account.Source,
