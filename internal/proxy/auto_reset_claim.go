@@ -79,15 +79,88 @@ type autoResetClaim struct {
 type autoResetClaimResult struct {
 	// landed: the provider says the reset was used.
 	landed bool
-	// back: the reading after the claim shows every meter it gives back
-	// back (autoResetBackUsed), so the waiting turns go to the same account.
-	back bool
+	// after is what the reading after a landed claim showed; "" when the
+	// claim did not land.
+	after autoResetAfter
 	// sent: a claim request may have reached the provider.
 	sent bool
 	// unsure: the provider's answer leaves it unknown whether the reset was
 	// used.
 	unsure bool
 	reason string
+}
+
+// autoResetAfter is what the reading after a landed claim showed (§99).
+type autoResetAfter string
+
+const (
+	// autoResetAfterBack: a reading was taken and every meter the claim gives
+	// back reads back (autoResetBackUsed). It settles the latch.
+	autoResetAfterBack autoResetAfter = "back"
+	// autoResetAfterSpent: a reading was taken and a meter still reads spent.
+	autoResetAfterSpent autoResetAfter = "still_spent"
+	// autoResetAfterNotTaken: no reading could be taken after the claim: the
+	// read failed, served only figures read before it, or carried no figure
+	// for a meter the claim gives back.
+	autoResetAfterNotTaken autoResetAfter = "not_taken"
+)
+
+// servesInPlace reports a claim whose waiting turns go on the same account:
+// the provider says it used the reset, and no reading after it says a meter
+// is still spent. The provider's answer is the evidence when no reading could
+// be taken; a turn sent again that meets the wall again gets today's answer,
+// since the latch forbids a second claim.
+func (r autoResetClaimResult) servesInPlace() bool {
+	return r.landed && (r.after == autoResetAfterBack || r.after == autoResetAfterNotTaken)
+}
+
+// resetReadAfter is the account's usage read the claim functions take once
+// the provider used a reset (afterClaudeReset, the read after a redeem). It
+// never reaches a route's answer.
+type resetReadAfter struct {
+	// asked is when the read was asked for, after the reset was used.
+	asked time.Time
+	// measuredAt is when the figures it got were measured: before asked when
+	// the usage endpoint was holding the account off and older figures were
+	// served.
+	measuredAt time.Time
+	// servedOver is why older figures were served; err is why none were.
+	servedOver, err error
+}
+
+// autoResetAfterOf judges the reading after a landed claim for meters, the
+// meters the claim must give back, and words it for the claim's reason.
+func autoResetAfterOf(provider accounts.Provider, meters []autoResetMeter, windows []accounts.UsageWindow, read resetReadAfter) (autoResetAfter, string) {
+	notTaken := func(why string) (autoResetAfter, string) {
+		return autoResetAfterNotTaken, "the reading after it could not be taken (" + why +
+			"); the provider used the reset, so the waiting turns go on the same account"
+	}
+	switch {
+	case read.err != nil:
+		return notTaken(read.err.Error())
+	case read.measuredAt.Before(read.asked):
+		why := "the usage endpoint served only figures read before the claim"
+		if read.servedOver != nil {
+			why += ", after " + read.servedOver.Error()
+		}
+		return notTaken(why)
+	}
+	readings := autoResetReadingsIn(provider, windows, read.measuredAt)
+	var missing []autoResetMeter
+	for _, meter := range meters {
+		reading, ok := readings[meter]
+		switch {
+		case !ok:
+			missing = append(missing, meter)
+		case (1-reading.left)*100 > autoResetBackUsed:
+			return autoResetAfterSpent, "the reading after it does not show " + autoResetMetersWords(meters) +
+				" back, so the waiting turns get today's answer"
+		}
+	}
+	if len(missing) > 0 {
+		return notTaken("it carried no figure for " + autoResetMetersWords(missing))
+	}
+	return autoResetAfterBack, "the reading after it shows " + autoResetMetersWords(meters) + " back"
 }
 
 // waitFor waits for c's answer while ctx lasts, until its deadline, and only
@@ -330,15 +403,17 @@ func newerAutoResetLatch(mine, stored autoResetLatch) autoResetLatch {
 	return mine
 }
 
-// runAutoResetClaim sends the claim and reads the account again.
+// runAutoResetClaim sends the claim and judges the claim functions' own
+// reading after it.
 func (s Server) runAutoResetClaim(account accounts.Account, key string, claim *autoResetClaim, f autoResetFacts, d AutoResetDecision) {
 	var result autoResetClaimResult
 	var after []accounts.UsageWindow
+	var read resetReadAfter
 	switch d.Provider {
 	case accounts.ProviderClaude:
-		result, after = s.autoResetClaimClaude(account, d.Reset, f)
+		result, after, read = s.autoResetClaimClaude(account, d.Reset, f)
 	case accounts.ProviderCodex:
-		result, after = s.autoResetClaimCodex(account, f)
+		result, after, read = s.autoResetClaimCodex(account, f)
 	default:
 		result.reason = "nothing was sent: no claim exists for provider " + string(d.Provider)
 	}
@@ -347,13 +422,9 @@ func (s Server) runAutoResetClaim(account accounts.Account, key string, claim *a
 		memory.mu.Lock()
 		meters := memory.latches[key].Meters
 		memory.mu.Unlock()
-		// The claim functions read the account again once the reset is used.
-		_, result.back = autoResetMetersBack(meters, autoResetReadingsIn(d.Provider, after, time.Now()), time.Time{})
-		if result.back {
-			result.reason += "; the reading after it shows " + autoResetMetersWords(meters) + " back"
-		} else {
-			result.reason += "; the reading after it does not show " + autoResetMetersWords(meters) + " back"
-		}
+		var words string
+		result.after, words = autoResetAfterOf(d.Provider, meters, after, read)
+		result.reason += "; " + words
 	}
 	s.finishAutoResetClaim(key, claim, d, result)
 }
@@ -366,7 +437,7 @@ func (s Server) finishAutoResetClaim(key string, claim *autoResetClaim, d AutoRe
 	now := memory.now()
 	latch := memory.latches[key]
 	latch.Finished, latch.Sent, latch.Outcome = true, result.sent, result.reason
-	if result.back {
+	if result.after == autoResetAfterBack {
 		latch.BackAt = now
 	}
 	memory.latches[key] = latch
@@ -384,8 +455,12 @@ func (s Server) finishAutoResetClaim(key string, claim *autoResetClaim, d AutoRe
 	close(claim.done)
 	s.saveAutoResetLatch(key, latch)
 	if s.Logger != nil {
-		s.Logger.Warn(autoResetFinishedMessage, append(autoResetLineFields(d),
-			"verdict", string(d.Verdict), "landed", result.landed, "back", result.back, "sent", result.sent)...)
+		fields := append(autoResetLineFields(d), "verdict", string(d.Verdict), "landed", result.landed,
+			"back", result.after == autoResetAfterBack, "sent", result.sent)
+		if result.after != "" {
+			fields = append(fields, "reading_after", string(result.after))
+		}
+		s.Logger.Warn(autoResetFinishedMessage, fields...)
 	}
 }
 
@@ -400,7 +475,7 @@ func (s Server) finishAutoResetClaim(key string, claim *autoResetClaim, d AutoRe
 // the owner's condition is on the reset's meter must have under 1% left. At
 // the wall the refusal is the evidence, and nothing more is read. It returns
 // what came of it and the reading after it.
-func (s Server) autoResetClaimClaude(account accounts.Account, grant string, f autoResetFacts) (autoResetClaimResult, []accounts.UsageWindow) {
+func (s Server) autoResetClaimClaude(account accounts.Account, grant string, f autoResetFacts) (autoResetClaimResult, []accounts.UsageWindow, resetReadAfter) {
 	work, cancelWork := context.WithTimeout(context.Background(), ClaudeResetBudget)
 	defer cancelWork()
 	caller, cancelCaller := context.WithTimeout(work, autoResetClaudePatience)
@@ -431,14 +506,14 @@ func (s Server) autoResetClaimClaude(account accounts.Account, grant string, f a
 		if why == "" {
 			why = response.Error
 		}
-		return autoResetClaimResult{reason: "nothing was sent: " + why}, nil
+		return autoResetClaimResult{reason: "nothing was sent: " + why}, nil, resetReadAfter{}
 	case response.Result == agentclaude.ResetResultReset:
-		return autoResetClaimResult{landed: true, sent: true, reason: "Anthropic used the reset (result reset)"}, response.WindowsAfter
+		return autoResetClaimResult{landed: true, sent: true, reason: "Anthropic used the reset (result reset)"}, response.WindowsAfter, response.readAfter
 	case response.Unconfirmed:
 		return autoResetClaimResult{sent: true, unsure: true, reason: "Anthropic's answer, " + answered + " " + response.Error +
-			", leaves it unknown whether the reset was used: it may have landed"}, nil
+			", leaves it unknown whether the reset was used: it may have landed"}, nil, resetReadAfter{}
 	}
-	return autoResetClaimResult{sent: true, reason: "Anthropic answered " + answered + " " + response.Error}, nil
+	return autoResetClaimResult{sent: true, reason: "Anthropic answered " + answered + " " + response.Error}, nil, resetReadAfter{}
 }
 
 // autoResetClaimCodex redeems a credit on account through the manual
@@ -451,7 +526,7 @@ func (s Server) autoResetClaimClaude(account accounts.Account, grant string, f a
 // whatever the owner's condition, since nothing else stops a redeem of a
 // week that rolled; and while the condition is on the live week must have
 // under 1% left.
-func (s Server) autoResetClaimCodex(account accounts.Account, f autoResetFacts) (autoResetClaimResult, []accounts.UsageWindow) {
+func (s Server) autoResetClaimCodex(account accounts.Account, f autoResetFacts) (autoResetClaimResult, []accounts.UsageWindow, resetReadAfter) {
 	ctx, cancel := context.WithTimeout(context.Background(), autoResetCodexClaimBudget)
 	defer cancel()
 	sent := false
@@ -477,19 +552,22 @@ func (s Server) autoResetClaimCodex(account accounts.Account, f autoResetFacts) 
 			credit = result.Credit.ID
 		}
 		// As the failover redeem does: routing still holds the marks and the
-		// score that made the account unroutable.
+		// score that made the account unroutable. Cleared whatever the read
+		// after the consume got, so a turn sent again in place is not refused
+		// by the daemon itself (§99); redeemAccountChecked ended the
+		// admission pause.
 		if s.SchedulerRef != nil {
 			s.SchedulerRef.ClearExhausted(schedulerAccountProvider(accounts.ProviderCodex), account.ID)
 			s.SchedulerRef.SetUpdatedAt(time.Time{})
 		}
 		s.AccountRef.InvalidateUsageStatusCache()
-		return autoResetClaimResult{landed: true, sent: true, reason: "the credit " + credit + " was redeemed"}, result.WindowsAfter
+		return autoResetClaimResult{landed: true, sent: true, reason: "the credit " + credit + " was redeemed"}, result.WindowsAfter, result.readAfter
 	case sent && result.consumeStatus >= 400 && result.consumeStatus < 500:
-		return autoResetClaimResult{sent: true, reason: "the consume was refused (" + result.Error + "), so no credit was used"}, nil
+		return autoResetClaimResult{sent: true, reason: "the consume was refused (" + result.Error + "), so no credit was used"}, nil, resetReadAfter{}
 	case sent:
-		return autoResetClaimResult{sent: true, unsure: true, reason: "the consume did not come back as a redeem (" + result.Error + "); it may have landed"}, nil
+		return autoResetClaimResult{sent: true, unsure: true, reason: "the consume did not come back as a redeem (" + result.Error + "); it may have landed"}, nil, resetReadAfter{}
 	}
-	return autoResetClaimResult{reason: "nothing was sent: " + result.Error}, nil
+	return autoResetClaimResult{reason: "nothing was sent: " + result.Error}, nil, resetReadAfter{}
 }
 
 // settleAutoResetLatch settles the account's last automatic claim with a

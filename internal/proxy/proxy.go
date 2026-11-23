@@ -1754,7 +1754,11 @@ func (r *AccountRef) fetchAccountUsageLive(ctx context.Context, client *http.Cli
 		// and its Codex reads in fetchCodexUsageDetails (§92.1).
 		started := time.Now()
 		windows, reset, err := r.fetchClaudeOAuthUsageLive(ctx, client, account)
-		if err == nil {
+		// A 429 from the usage endpoint can carry Anthropic's own unified
+		// figures (used and roll, per meter): each is a reading of its meter
+		// (§99). An answer with none records nothing.
+		var throttled *agentclaude.UsageThrottleError
+		if err == nil || errors.As(err, &throttled) {
 			r.history().observe(account, windows, started)
 		}
 		return windows, reset, true, err
@@ -6497,6 +6501,9 @@ type RateLimitResetResult struct {
 	// none came back: §93.4 tells a refusal (4xx) from a consume that may
 	// have landed.
 	consumeStatus int
+	// readAfter is how the read behind WindowsAfter went, for an automatic
+	// claim (§99).
+	readAfter resetReadAfter
 }
 
 // handleRateLimitReset redeems a ChatGPT Pro "rate-limit reset" credit for one
@@ -7018,10 +7025,14 @@ func (s Server) redeemAccountChecked(ctx context.Context, account accounts.Accou
 	// redeem path comes through here, so the reset ends the pause here.
 	s.admissionGate().clearAccount(schedulerAccountProvider(accounts.ProviderCodex), account.ID)
 	afterAt := time.Now()
-	if after, err := accounts.FetchCodexUsageDetails(ctx, s.AccountRef.client, account); err == nil {
-		history.observe(account, after.Windows, afterAt)
-		result.WindowsAfter = after.Windows
+	result.readAfter = resetReadAfter{asked: afterAt, measuredAt: afterAt}
+	after, err := accounts.FetchCodexUsageDetails(ctx, s.AccountRef.client, account)
+	if err != nil {
+		result.readAfter.err = err
+		return result
 	}
+	history.observe(account, after.Windows, afterAt)
+	result.WindowsAfter = after.Windows
 	return result
 }
 
@@ -16094,16 +16105,18 @@ func (t usageLimitRetryTransport) roundTrip(req *http.Request, walls *[]autoRese
 		if (exhausted || poolRejected) && !credentialFailure && !modelUnsupported && t.server != nil && autoResetOn() {
 			if wall, ok := autoResetWallOf(accounts.Account{ID: accountID, Provider: t.provider}, response, t.clock()); ok {
 				// Real mode (§93.2): the turn waits here, before the marks and
-				// the failover, for the claim; when the reading after it shows
-				// the meter back, it is sent again on the same account (once:
-				// at a second wall the claim's latch forbids another).
-				// Otherwise it goes on below exactly as it would have.
+				// the failover, for the claim. When the provider says it used
+				// the reset and the reading after it shows the meter back, or
+				// no reading could be taken (§99), it is sent again on the same
+				// account (once: at a second wall the claim's latch forbids
+				// another). Otherwise it goes on below exactly as it would
+				// have.
 				if t.autoResetWaitsInPlace(req) && a.replayable() {
 					wall.decided = true
 					considerCtx, cancel := context.WithTimeout(context.WithoutCancel(req.Context()), autoResetConsiderTimeout)
 					claim := t.server.autoResetDecideAtTheWall(considerCtx, wall, autoResetTurnWaits)
 					cancel()
-					if result, answered := claim.waitFor(req.Context(), t.server.Lifecycle); answered && result.back {
+					if result, answered := claim.waitFor(req.Context(), t.server.Lifecycle); answered && result.servesInPlace() {
 						if current, own := t.server.autoResetOwnAccount(t.provider, accountID); own {
 							if nextReq, replayErr := a.replay(replayReq, &current); replayErr == nil {
 								if response.Body != nil {

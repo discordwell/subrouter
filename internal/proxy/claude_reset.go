@@ -165,6 +165,9 @@ type ClaudeResetResponse struct {
 	// RequestID and a retry within 10 minutes resends it.
 	Unconfirmed bool   `json:"unconfirmed,omitempty"`
 	Error       string `json:"error,omitempty"`
+	// readAfter is how the read behind WindowsAfter went, for an automatic
+	// claim (§99); never on the route's answer.
+	readAfter resetReadAfter
 }
 
 type pendingClaudeResetClaim struct {
@@ -583,7 +586,7 @@ func (s Server) claudeReset(work, caller context.Context, request ClaudeResetReq
 	landed := claim.Result == agentclaude.ResetResultReset || (claim.MayHaveLanded() && len(claim.Cleared) > 0)
 	ref.history().finishClaim(draft, string(claim.Result), landed)
 	if landed {
-		response.WindowsAfter = s.afterClaudeReset(work, account)
+		response.WindowsAfter, response.readAfter = s.afterClaudeReset(work, account)
 	}
 	if s.Logger != nil {
 		after := ""
@@ -604,9 +607,14 @@ func (s Server) claudeReset(work, caller context.Context, request ClaudeResetReq
 // afterClaudeReset makes routing see the reset at once: the exhaustion marks
 // and admission pauses the limit left behind are dropped, the cached usage
 // read and usage-status snapshot are thrown away, and the account is read
-// again.
-func (s Server) afterClaudeReset(ctx context.Context, account accounts.Account) []accounts.UsageWindow {
+// again. The marks go before the read, whatever it gets, so a turn an
+// automatic claim sends again in place is not refused by the daemon itself
+// (§99). It returns the windows read and how the read went.
+func (s Server) afterClaudeReset(ctx context.Context, account accounts.Account) ([]accounts.UsageWindow, resetReadAfter) {
 	ref := s.AccountRef
+	// Every read that starts after forgetUsageWindows below is measured
+	// after this.
+	read := resetReadAfter{asked: time.Now()}
 	if s.SchedulerRef != nil {
 		s.SchedulerRef.ClearExhausted(schedulerAccountProvider(accounts.ProviderClaude), account.ID)
 		s.SchedulerRef.SetUpdatedAt(time.Time{})
@@ -616,15 +624,16 @@ func (s Server) afterClaudeReset(ctx context.Context, account accounts.Account) 
 	ref.forgetUsageWindows(account)
 	ref.forgetClaudeResetStatus(account.ID)
 	ref.InvalidateUsageStatusCache()
-	windows, _, _, _, err := ref.fetchUsageWindowsCachedReason(ctx, ref.client, account)
-	if err != nil {
+	var windows []accounts.UsageWindow
+	windows, _, read.measuredAt, read.servedOver, read.err = ref.fetchUsageWindowsCachedReason(ctx, ref.client, account)
+	if read.err != nil {
 		if s.Logger != nil {
-			s.Logger.Warn("claude reset re-read failed", "account", account.ID, "error", err)
+			s.Logger.Warn("claude reset re-read failed", "account", account.ID, "error", read.err)
 		}
-		return nil
+		return nil, read
 	}
 	ref.InvalidateUsageStatusCache()
-	return displayClaudeWindows(windows)
+	return displayClaudeWindows(windows), read
 }
 
 // displayClaudeWindows keeps the meters a person reads (5h, 7d, the model
