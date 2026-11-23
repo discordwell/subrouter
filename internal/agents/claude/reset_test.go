@@ -506,6 +506,31 @@ func TestGrantPercentUsedAndClearsExhausted(t *testing.T) {
 	}
 }
 
+// A grant's type, gives_back_weekly and unavailable_reason are read as Claude
+// Code 2.1.321 reads them: kept when they are values it knows, absent
+// (and the grant still kept) when they are missing or drifted.
+func TestParseResetGrantKeepsTypeGivesBackWeeklyAndUnavailableReason(t *testing.T) {
+	status, err := ParseResetStatus([]byte(`{"eligible":true,"grants":[
+		{"id":"fable","resets_left":1,"clears":["seven_day_overage_included"],"type":"weekly","gives_back_weekly":true,"unavailable_reason":"needs_limit"},
+		{"id":"plain","resets_left":1},
+		{"id":"drifted","resets_left":1,"type":"monthly","gives_back_weekly":"yes","unavailable_reason":"some_new_reason"}
+	]}`))
+	if err != nil || status == nil || len(status.Grants) != 3 {
+		t.Fatalf("parse: %+v %v; want all three grants kept", status, err)
+	}
+	for i, want := range []ResetGrant{
+		{Type: "weekly", GivesBackWeekly: true, UnavailableReason: "needs_limit"},
+		{},
+		{},
+	} {
+		got := status.Grants[i]
+		if got.Type != want.Type || got.GivesBackWeekly != want.GivesBackWeekly || got.UnavailableReason != want.UnavailableReason {
+			t.Fatalf("grant %s: type %q gives_back_weekly %v unavailable_reason %q; want %q %v %q",
+				got.ID, got.Type, got.GivesBackWeekly, got.UnavailableReason, want.Type, want.GivesBackWeekly, want.UnavailableReason)
+		}
+	}
+}
+
 // The profile read names the organization a claim is addressed to and the
 // account it belongs to; it is a GET and nothing else.
 func TestFetchResetProfileNamesTheOrganizationAndAccount(t *testing.T) {

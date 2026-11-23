@@ -118,6 +118,15 @@ type ResetGrant struct {
 	// PercentUsed is how much of each limit the grant clears is used, as
 	// Claude Code reads it (whole percents 0-100, known limits only).
 	PercentUsed map[string]int `json:"percent_used,omitempty"`
+	// Type is "session", "weekly" or "full"; anything else reads as "".
+	Type string `json:"type,omitempty"`
+	// GivesBackWeekly is a grant whose claim also hands back to the general
+	// week what the limits it clears had spent of it: Claude Code calls such
+	// a grant a Fable reset.
+	GivesBackWeekly bool `json:"gives_back_weekly,omitempty"`
+	// UnavailableReason is why the grant cannot be used now, one of
+	// resetUnavailableReasons; anything else reads as "".
+	UnavailableReason string `json:"unavailable_reason,omitempty"`
 }
 
 // ClearsExhausted reports whether any limit the grant clears is one the
@@ -238,6 +247,13 @@ func parseResetGrant(value any) (ResetGrant, bool) {
 	}
 	grant.Paused, _ = object["paused"].(bool)
 	grant.UsableNow, _ = object["usable_now"].(bool)
+	grant.GivesBackWeekly, _ = object["gives_back_weekly"].(bool)
+	if kind := resetString(object["type"]); resetGrantTypes[kind] {
+		grant.Type = kind
+	}
+	if reason := resetString(object["unavailable_reason"]); resetUnavailableReasons[reason] {
+		grant.UnavailableReason = reason
+	}
 	if requires, ok := object["use_requires_limit"].(bool); ok {
 		grant.UseRequiresLimit = requires
 	}
@@ -252,6 +268,16 @@ func parseResetGrant(value any) (ResetGrant, bool) {
 		}
 	}
 	return grant, true
+}
+
+// resetGrantTypes and resetUnavailableReasons are the values Claude Code
+// 2.1.321 accepts for a grant's type and unavailable_reason; it reads any
+// other value as absent, and so does this decoder.
+var resetGrantTypes = map[string]bool{"session": true, "weekly": true, "full": true}
+
+var resetUnavailableReasons = map[string]bool{
+	"cooldown": true, "blocked_five_hour": true, "blocked_seven_day": true, "blocked_opus": true,
+	"blocked_sonnet": true, "blocked_other": true, "cannot_clear": true, "needs_limit": true, "unavailable": true,
 }
 
 // resetLimitNames are the limits Claude Code knows a grant can clear.
