@@ -45,8 +45,12 @@ func startTestSupervisorWith(t *testing.T, config supervisorConfig, prepare func
 	}
 	go s.monitorWorker(initial)
 	ts := &testSupervisor{supervisor: s, signals: make(chan os.Signal, 1), exited: make(chan struct{})}
+	// A supervisor that cannot start, because its port is taken for one, says
+	// why at once. Without this the wait below only reports that it timed out.
+	ended := make(chan error, 1)
 	go func() {
 		ts.err = s.run(ts.signals)
+		ended <- ts.err
 		close(ts.exited)
 	}()
 	t.Cleanup(func() {
@@ -61,7 +65,7 @@ func startTestSupervisorWith(t *testing.T, config supervisorConfig, prepare func
 		}
 		s.terminateAllWorkers()
 	})
-	waitForSupervisorStatus(t, unixHTTPClient(config.ControlSocket), nil)
+	waitForSupervisorStatus(t, unixHTTPClient(config.ControlSocket), ended)
 	return ts
 }
 
