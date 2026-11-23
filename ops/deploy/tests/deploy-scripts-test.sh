@@ -4812,7 +4812,7 @@ fi
 # socket serving, pool mode. The Claude Code and Codex answer the word their
 # prompt asks for, and a launch the shim routed to the daemon is a session in
 # $H/served, which srq serving reads (FAKE_NO_SESSIONS=1: the daemon has none).
-# A pinned Claude turn under FAKE_SPENT_PIN fails (route_spent_setup).
+# A pinned Claude turn under FAKE_SPENT_PIN goes as route_spent_setup says.
 route_launch_setup() {
   route_setup SUBROUTER_CLAUDE_SOCKET="$C/home/.subrouter/claude.sock"
   rm -f "$H/.claude/settings.json"   # it names a route, and a route word refuses then
@@ -4834,7 +4834,12 @@ for a; do
 done
 pin=$(printf '%s\n' "${ANTHROPIC_CUSTOM_HEADERS:-}" | sed -n 's/^X-Subrouter-Account-ID: //p')
 if [ -n "$pin" ] && [ -n "${FAKE_SPENT_PIN:-}" ]; then
-  case "$FAKE_SPENT_PIN" in limited) echo "$sid $pin" >> "$HOME/served" ;; failover) echo "$sid acct-pool" >> "$HOME/served" ;; esac
+  case "$FAKE_SPENT_PIN" in
+    limited) echo "$sid $pin" >> "$HOME/served" ;;
+    failover) echo "$sid acct-pool" >> "$HOME/served" ;;
+    slow) echo "$sid $pin" >> "$HOME/served"; echo 60 > "$HOME/clock-skew" ;;
+    answers) echo "$sid $pin" >> "$HOME/served"; echo "$word"; exit 0 ;;
+  esac
   echo "API Error: 429 rate_limit_error" >&2; exit 1
 fi
 [ -n "$sid" ] && [ -n "${ANTHROPIC_UNIX_SOCKET:-}${ANTHROPIC_BASE_URL:-}" ] && echo "$sid acct-pool" >> "$HOME/served"
@@ -5006,12 +5011,15 @@ fi
 # inside its owner's holdout): the launch fails, fast, and no other account
 # serves it. The daemon names the pin's control plane, since the stub world has
 # no PlistBuddy to read the identity account from the plist. FAKE_SPENT_PIN says
-# where the daemon put the failing turn: refused (answered once, finally, before
+# where the daemon put the pinned turn: refused (answered once, finally, before
 # any assignment: no row, PATCHES §89), limited (the provider's limit, on that
-# account's row) or failover (another account's row).
+# account's row), failover (another account's row), slow (limited, and 60 s late)
+# or answers (answered, on that account's row). sleep is a stub here, so date +%s
+# runs 60 s ahead from a slow turn on.
 route_spent_setup() {
   route_launch_setup
   printf 'claude\tcl-spent\tcl-spent\t\tlocal\tno:inside its owner holdout\tno\n' >> "$H/.claude-route/accounts.tsv"
+  stub date 'if [ "${1:-}" = +%s ] && [ -s "$HOME/clock-skew" ]; then echo $(( $(/bin/date +%s) + $(cat "$HOME/clock-skew") )); else exec /bin/date "$@"; fi'
 }
 run_spent_test() { run_route_launch FAKE_PIN_CONTROL_PLANE=identity "$@" -- test; }
 spent_sid() { sed -n 's/.* route=pool word=account pin=cl-spent at=local sid=\([^ ]*\).*/\1/p' "$H/.claude-route/launch.log"; }
@@ -5041,6 +5049,19 @@ fi
 if begin route-test-spent-pin-on-another-account-fails; then
   route_spent_setup; run_spent_test FAKE_SPENT_PIN=failover
   expect_spent FAIL; expect_spent_said "acct-pool"
+  finish
+fi
+
+if begin route-test-spent-pin-that-answers-fails; then
+  route_spent_setup; run_spent_test FAKE_SPENT_PIN=answers
+  expect_spent FAIL; expect_spent_said "-> hotel"
+  finish
+fi
+
+if begin route-test-spent-pin-that-fails-slowly-fails; then
+  route_spent_setup; run_spent_test FAKE_SPENT_PIN=slow
+  expect_spent FAIL
+  grep -Eq "^took [0-9]+s, limit 45s$" "$H/.claude-route/test.err" && ok || bad "test.err lacks: took <n>s, limit 45s"
   finish
 fi
 

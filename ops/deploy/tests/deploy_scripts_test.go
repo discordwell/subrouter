@@ -437,10 +437,13 @@ var requiredCases = []string{
 	"route-failed-check-without-paradev-blocks-the-gate",
 	// test's check on a pin to a spent laptop Claude account: the daemon's
 	// refusal before assignment (PATCHES §89) or a row on exactly that account
-	// passes; a row on another account, or srq failing, fails.
+	// passes; a row on another account, a launch that answers or fails slowly,
+	// or srq failing, fails.
 	"route-test-spent-pin-refused-before-assignment-passes",
 	"route-test-spent-pin-on-exactly-that-account-passes",
 	"route-test-spent-pin-on-another-account-fails",
+	"route-test-spent-pin-that-answers-fails",
+	"route-test-spent-pin-that-fails-slowly-fails",
 	"route-test-spent-pin-with-srq-failing-fails",
 	// sr-triage: rc-file exports by name only, probes bounded without
 	// timeout(1), the install found off PATH (§48).
