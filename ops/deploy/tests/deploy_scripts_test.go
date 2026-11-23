@@ -441,6 +441,9 @@ var requiredCases = []string{
 	"route-check-and-test-with-paradev-go-through-its-wrapper",
 	"route-check-finds-paradev-build-and-superset-wrappers",
 	"route-failed-check-without-paradev-blocks-the-gate",
+	// test with the advisor on passes what it passes off: a pool launch's
+	// arguments start with the advisor's --settings (PATCHES §97).
+	"route-test-with-the-advisor-on-passes-what-it-passes-off",
 	// test's check on a pin to a spent laptop Claude account: the daemon's
 	// refusal before assignment (PATCHES §89) or a row on exactly that account
 	// passes; a row on another account, a launch that answers or fails slowly,

@@ -5093,6 +5093,32 @@ if begin route-failed-check-without-paradev-blocks-the-gate; then
   finish
 fi
 
+if begin route-test-with-the-advisor-on-passes-what-it-passes-off; then
+  # test's dry runs use this route home, so with the advisor on a pool launch's
+  # arguments start with its --settings (PATCHES §97). Checks that wanted
+  # nothing there failed, and with them the gate for pool. In mode off too:
+  # that is where the gate is run, before claude-route pool.
+  route_launch_setup; route_paradev
+  for mode in pool off; do
+    echo "$mode" > "$H/.claude-route/mode"
+    for adv in off on; do
+      run_route_launch -- advisor "$adv"
+      expect_rc 0
+      run_route_launch -- test
+      expect_line "  PASS  advisor $adv: a pool launch follows it"
+      expect_line "  PASS    ...and claude local never has it"
+      grep -E '^  (PASS|FAIL)  ' "$C/out" | grep -v '^  ....  advisor o' > "$C/$adv.lines"
+    done
+    for name in "'-- local' is a prompt" "'local please' is a prompt" "a word after a flag is a prompt" \
+      "an @-mention is a prompt, never a word" "Paradev's launch shape is never a word" \
+      "CLAUDE_ROUTE_WORDS=0 turns words off" "an unknown plain word is a prompt"; do
+      expect_line "  PASS  $name"
+    done
+    cmp -s "$C/off.lines" "$C/on.lines" && ok || bad "mode $mode: test with the advisor on differs from off: $(diff "$C/off.lines" "$C/on.lines" | grep '^[<>]' | head -5 | tr '\n' ' ')"
+  done
+  finish
+fi
+
 # test's check on a pin to a laptop Claude account flagged ineligible (spent, or
 # inside its owner's holdout): the launch fails, fast, and no other account
 # serves it. The daemon names the pin's control plane, since the stub world has
