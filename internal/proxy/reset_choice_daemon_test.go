@@ -361,7 +361,8 @@ func TestAnAccountWithADeadCredentialIsNeverChosen(t *testing.T) {
 // minutes old, and then reads need from the whole pool: here the peer's
 // fresh body takes the pool's pressure from 0.6 to 1.5, and held is chosen.
 // Reading usage-status and a turn at the wall make no peer request, and with
-// the mode off no pass does.
+// the mode off no pass does; a new session's turn does, which shows the turns
+// can see the peer.
 func TestTheBackgroundPassReadsAStalePeerAndNothingElseDoes(t *testing.T) {
 	profiles := choiceProfiles("")
 	profiles["held"].turn = claudeWall("7d")
@@ -430,4 +431,6 @@ func TestTheBackgroundPassReadsAStalePeerAndNothingElseDoes(t *testing.T) {
 	if requests.Load() != 1 {
 		t.Fatalf("a pass on a body 4 minutes old made %d peer requests in all, want one", requests.Load())
 	}
+	d.turn("new", opusModel, "")
+	waitFor(t, "calibration: a new session's turn reads the peer, as a turn at the wall could", func() bool { return requests.Load() > 1 })
 }
