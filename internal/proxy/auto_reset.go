@@ -17,8 +17,8 @@ import (
 // The daemon claims an account's next saved reset by itself when the account
 // runs out (PATCHES §93). This file is §93.1: the mode, the two moments a
 // claim is considered, the owner's under-1-percent condition, which reset,
-// the one decision, and shadow mode. Nothing here claims: shadow mode logs
-// what real mode would claim, and real mode's claim is not in this build.
+// the one decision, and shadow mode, which logs what real mode would claim.
+// Real mode's claim, in place and never twice, is §93.2 (auto_reset_claim.go).
 //
 // Only the daemon that holds an account's credential decides for it. The wall
 // is seen on this daemon's own upstream answers, and a reading is one of this
@@ -35,7 +35,7 @@ const (
 	// AutoResetShadow decides and logs what real mode would claim, and
 	// claims nothing.
 	AutoResetShadow
-	// AutoResetReal claims. In this build it decides and logs as shadow does.
+	// AutoResetReal claims (§93.2).
 	AutoResetReal
 )
 
@@ -171,6 +171,10 @@ const (
 	// under-1-percent condition failed.
 	AutoResetRefusedByCondition AutoResetVerdict = "refused_by_condition"
 	AutoResetNoClaim            AutoResetVerdict = "no_claim"
+	// AutoResetClaimed is a real-mode claim the provider says used the reset
+	// (§93.2); AutoResetFailed one that did not come back as used.
+	AutoResetClaimed AutoResetVerdict = "claimed"
+	AutoResetFailed  AutoResetVerdict = "failed"
 )
 
 // AutoResetDecision is one decision about claiming an account's next saved
@@ -318,6 +322,11 @@ type autoResets struct {
 	readings map[string]time.Time
 	// credits are the Codex credit lists a decision read, by ScoreKey.
 	credits map[string]autoResetCreditList
+	// running is the automatic claim in flight on an account, by ScoreKey,
+	// and latches each account's last one until a reading settles it
+	// (§93.2, auto_reset_claim.go).
+	running map[string]*autoResetClaim
+	latches map[string]autoResetLatch
 }
 
 type autoResetCreditList struct {
@@ -328,7 +337,8 @@ type autoResetCreditList struct {
 
 func newAutoResets() *autoResets {
 	return &autoResets{now: time.Now, last: map[string]AutoResetDecision{}, lines: map[string]time.Time{},
-		readings: map[string]time.Time{}, credits: map[string]autoResetCreditList{}}
+		readings: map[string]time.Time{}, credits: map[string]autoResetCreditList{},
+		running: map[string]*autoResetClaim{}, latches: map[string]autoResetLatch{}}
 }
 
 func (r *AccountRef) sharedAutoResets() *autoResets {
@@ -388,10 +398,12 @@ func (s Server) LastAutoResetDecision(provider accounts.Provider, id string) (Au
 }
 
 // autoResetWall is one refusal at a wall: the account it was on, and the
-// meter it named ("" for none).
+// meter it named ("" for none). decided is a wall the retry transport
+// already decided for while the turn waited on it (§93.2).
 type autoResetWall struct {
 	account accounts.Account
 	meter   autoResetMeter
+	decided bool
 }
 
 // claudeAutoResetWallMeter reads a Claude answer: a 429 that rejects the week
@@ -507,7 +519,8 @@ const (
 // autoResetAtTheWall considers a claim for the account a real request just
 // met a wall on; its callers look for a wall only when autoResetOn. The
 // decision runs in the background, so the turn never waits for it; what the
-// turn got (turn) is today's whatever the mode.
+// turn got (turn) is today's whatever the mode. In real mode a claim it
+// decides on runs too (§93.2), and later turns for the account wait on it.
 func (s Server) autoResetAtTheWall(wall autoResetWall, turn string) {
 	if s.AccountRef == nil || s.CredentialBroker != nil {
 		return
@@ -515,14 +528,26 @@ func (s Server) autoResetAtTheWall(wall autoResetWall, turn string) {
 	s.Lifecycle.StartBackground(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), autoResetConsiderTimeout)
 		defer cancel()
-		account, own := s.autoResetOwnAccount(accountProviderOrCodex(wall.account), wall.account.ID)
-		if !own {
-			return
-		}
-		s.considerAutoReset(ctx, account, s.autoResetRow(account), autoResetFacts{
-			moment: autoResetAtTheWall, wallMeter: wall.meter, demand: true,
-		}, turn)
+		s.autoResetDecideAtTheWall(ctx, wall, turn)
 	})
+}
+
+// autoResetDecideAtTheWall decides for wall and acts on the decision. It
+// returns the claim that runs on the account, a new one or one already in
+// flight (then nothing is decided again), or nil.
+func (s Server) autoResetDecideAtTheWall(ctx context.Context, wall autoResetWall, turn string) *autoResetClaim {
+	account, own := s.autoResetOwnAccount(accountProviderOrCodex(wall.account), wall.account.ID)
+	if !own {
+		return nil
+	}
+	if claim := s.autoResetRunningClaim(account); claim != nil {
+		return claim
+	}
+	row := s.autoResetRow(account)
+	d, f := s.considerAutoReset(ctx, account, row, autoResetFacts{
+		moment: autoResetAtTheWall, wallMeter: wall.meter, demand: true,
+	}, turn)
+	return s.actOnAutoReset(account, f, d)
 }
 
 // RunAutoReset looks at each new usage reading of this daemon's own accounts
@@ -565,10 +590,13 @@ func (s Server) autoResetReadings(ctx context.Context) {
 			continue
 		}
 		account, own := s.autoResetOwnAccount(provider, row.ID)
-		if !own || !row.UsageFresh || row.UsageMeasuredAt.IsZero() || now.Sub(row.UsageMeasuredAt) > autoResetReadingMaxAge {
+		if !own || !row.UsageFresh || row.UsageMeasuredAt.IsZero() {
 			continue
 		}
-		if !memory.firstLook(selectacct.ScoreKey(schedulerAccountProvider(provider), account.ID), row.UsageMeasuredAt) {
+		key := selectacct.ScoreKey(schedulerAccountProvider(provider), account.ID)
+		// Any reading may settle an earlier automatic claim (§93.2).
+		s.settleAutoResetLatch(memory, key, autoResetReadingsOf(&row))
+		if now.Sub(row.UsageMeasuredAt) > autoResetReadingMaxAge || !memory.firstLook(key, row.UsageMeasuredAt) {
 			continue
 		}
 		meter, spent := autoResetSpentMeter(provider, autoResetReadingsOf(&row))
@@ -578,9 +606,13 @@ func (s Server) autoResetReadings(ctx context.Context) {
 		if next := s.autoResetNextFor(account, &row, autoResetOnAReading, now); next.none != "" {
 			continue
 		}
-		s.considerAutoReset(ctx, account, &row, autoResetFacts{
+		if s.autoResetRunningClaim(account) != nil {
+			continue
+		}
+		d, f := s.considerAutoReset(ctx, account, &row, autoResetFacts{
 			moment: autoResetOnAReading, readingMeter: meter, demand: s.autoResetWarmSessionOn(account),
 		}, "")
+		s.actOnAutoReset(account, f, d)
 	}
 }
 
@@ -599,11 +631,11 @@ func autoResetSpentMeter(provider accounts.Provider, readings map[autoResetMeter
 	return "", false
 }
 
-// considerAutoReset gathers the rest of f, decides, and keeps and logs the
-// decision. A Codex decision that would claim reads the account's credit
-// list once to name the credit a claim would spend: the available one that
-// expires soonest.
-func (s Server) considerAutoReset(ctx context.Context, account accounts.Account, row *AccountUsageStatus, f autoResetFacts, turn string) {
+// considerAutoReset gathers the rest of f and decides; it returns the
+// decision, filled in, and the facts it went by. A Codex decision that would
+// claim reads the account's credit list once to name the credit a claim
+// would spend: the available one that expires soonest.
+func (s Server) considerAutoReset(ctx context.Context, account accounts.Account, row *AccountUsageStatus, f autoResetFacts, turn string) (AutoResetDecision, autoResetFacts) {
 	mode, nearEmpty := AutoReset()
 	memory := s.AccountRef.sharedAutoResets()
 	provider := accountProviderOrCodex(account)
@@ -622,15 +654,37 @@ func (s Server) considerAutoReset(ctx context.Context, account accounts.Account,
 	if row != nil && strings.TrimSpace(row.Label) != "" {
 		d.Label = row.Label
 	}
-	if !memory.record(selectacct.ScoreKey(schedulerAccountProvider(provider), account.ID), d) || s.Logger == nil {
-		return
+	return d, f
+}
+
+// actOnAutoReset keeps d as the account's last decision and acts on it:
+// shadow mode logs a would-claim; real mode starts the claim (§93.2), unless
+// the account's last automatic claim is not settled. It returns the claim
+// that runs, or nil.
+func (s Server) actOnAutoReset(account accounts.Account, f autoResetFacts, d AutoResetDecision) *autoResetClaim {
+	if mode, _ := AutoReset(); mode == AutoResetReal && d.Verdict == AutoResetWouldClaim {
+		claim, why := s.startAutoResetClaim(account, f, d)
+		if claim != nil {
+			return claim
+		}
+		d.Verdict, d.Reason = AutoResetNoClaim, why+"; "+d.Reason
 	}
-	fields := []any{"account", d.Label, "provider", string(provider), "mode", d.Mode, "moment", d.Moment,
+	memory := s.AccountRef.sharedAutoResets()
+	if !memory.record(selectacct.ScoreKey(schedulerAccountProvider(d.Provider), d.Account), d) || s.Logger == nil {
+		return nil
+	}
+	s.Logger.Info(autoResetWouldClaimMessage, autoResetLineFields(d)...)
+	return nil
+}
+
+// autoResetLineFields are a decision's fields for its log line.
+func autoResetLineFields(d AutoResetDecision) []any {
+	fields := []any{"account", d.Label, "provider", string(d.Provider), "mode", d.Mode, "moment", d.Moment,
 		"kind", d.Kind, "reset", d.Reset, "reset_expires_at", d.ResetExpiresAt, "left", d.Left, "reason", d.Reason}
 	if d.Turn != "" {
 		fields = append(fields, "turn", d.Turn)
 	}
-	s.Logger.Info(autoResetWouldClaimMessage, fields...)
+	return fields
 }
 
 // autoResetOwnAccount is this daemon's own OAuth account id of provider.
@@ -664,18 +718,22 @@ func (s Server) autoResetRow(account accounts.Account) *AccountUsageStatus {
 // autoResetReadingsOf is the meters a saved reset gives back, as row's
 // reading measured them: Claude's week (7d) and Fable meter, Codex's week.
 func autoResetReadingsOf(row *AccountUsageStatus) map[autoResetMeter]autoResetReading {
-	out := map[autoResetMeter]autoResetReading{}
 	if row == nil || !row.UsageFresh || row.UsageMeasuredAt.IsZero() {
-		return out
+		return map[autoResetMeter]autoResetReading{}
 	}
-	provider := accountProviderFor(row.Provider)
+	return autoResetReadingsIn(accountProviderFor(row.Provider), row.Windows, row.UsageMeasuredAt)
+}
+
+// autoResetReadingsIn is those meters in windows, a reading measured at.
+func autoResetReadingsIn(provider accounts.Provider, windows []accounts.UsageWindow, at time.Time) map[autoResetMeter]autoResetReading {
+	out := map[autoResetMeter]autoResetReading{}
 	note := func(meter autoResetMeter, used float64) {
 		left := min(max((100-used)/100, 0), 1)
 		if current, ok := out[meter]; !ok || left < current.left {
-			out[meter] = autoResetReading{left: left, at: row.UsageMeasuredAt}
+			out[meter] = autoResetReading{left: left, at: at}
 		}
 	}
-	for _, window := range row.Windows {
+	for _, window := range windows {
 		if window.ExtraUsage != nil {
 			continue
 		}

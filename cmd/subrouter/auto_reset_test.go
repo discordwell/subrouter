@@ -53,7 +53,7 @@ func TestServeSetsTheAutoReset(t *testing.T) {
 	t.Setenv("SUBROUTER_CLOUD_CONFIG", dir)
 	args := []string{"--addr", "127.0.0.1:0", "--fetch-usage=false", "--sr-switch-interval=0"}
 	const offLine, realLine, conditionLine = "automatic resets disabled by SUBROUTER_AUTO_RESET=0",
-		"SUBROUTER_AUTO_RESET=1: this build makes no automatic claim yet",
+		"SUBROUTER_AUTO_RESET=1: this daemon claims its accounts' saved resets by itself",
 		"the under-1-percent condition on automatic claims is off"
 
 	for _, c := range []struct {
@@ -97,6 +97,46 @@ func TestServeSetsTheAutoReset(t *testing.T) {
 		t.Setenv(name, value)
 		if err := serveMustReturn(t, args); err == nil || !strings.Contains(err.Error(), name) {
 			t.Fatalf("serve with %s=%s returned %v, want a refusal naming it", name, value, err)
+		}
+	}
+}
+
+// 8. PATCHES §93.2: only one thing may spend Codex credits by itself.
+// SUBROUTER_AUTO_RESET=1 beside the failover redeem or beside the background
+// spender in its spending mode refuses to start and names both settings; in
+// shadow or off both older paths start as they did.
+func TestAutoResetRefusesToStartBesideTheOlderCodexSpenders(t *testing.T) {
+	prevMode, prevNearEmpty := proxy.AutoReset()
+	t.Cleanup(func() { proxy.SetAutoReset(prevMode, prevNearEmpty) })
+	clearControlSecretEnv(t)
+	dir := t.TempDir()
+	t.Setenv("SUBROUTER_STATE_DIR", dir)
+	t.Setenv("SUBROUTER_CLOUD_CONFIG", dir)
+	t.Setenv("SUBROUTER_AUTO_RESET_NEAR_EMPTY", "")
+	for _, c := range []struct {
+		mode, failoverRedeem, spender string
+		refusal                       []string
+	}{
+		{"1", "1", "warn", []string{"SUBROUTER_AUTO_RESET=1", "SUBROUTER_CODEX_AUTO_RATE_LIMIT_RESET=1"}},
+		{"1", "", "spend", []string{"SUBROUTER_AUTO_RESET=1", "--reset-credit-autospend=spend"}},
+		{"1", "", "warn", nil},
+		{"shadow", "1", "spend", nil},
+		{"0", "1", "spend", nil},
+	} {
+		t.Setenv("SUBROUTER_AUTO_RESET", c.mode)
+		t.Setenv("SUBROUTER_CODEX_AUTO_RATE_LIMIT_RESET", c.failoverRedeem)
+		err := serveMustReturn(t, []string{"--addr", "127.0.0.1:0", "--fetch-usage=false", "--sr-switch-interval=0",
+			"--reset-credit-autospend=" + c.spender})
+		if c.refusal == nil {
+			if err == nil || !strings.Contains(err.Error(), "cmux.com config") {
+				t.Fatalf("%+v: serve returned %v, want it to start (and meet the deliberate cloud-config failure)", c, err)
+			}
+			continue
+		}
+		for _, name := range c.refusal {
+			if err == nil || !strings.Contains(err.Error(), name) {
+				t.Fatalf("%+v: serve returned %v, want a refusal naming %s", c, err, name)
+			}
 		}
 	}
 }

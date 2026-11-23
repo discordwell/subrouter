@@ -301,6 +301,23 @@ func autoResetNearEmptyEnabled() (bool, error) {
 	return false, fmt.Errorf("SUBROUTER_AUTO_RESET_NEAR_EMPTY=%q: want 1 (the default) or 0", raw)
 }
 
+// autoResetSpendsAlone refuses SUBROUTER_AUTO_RESET=1 beside either older
+// path that redeems Codex credits by itself, the failover redeem
+// (SUBROUTER_CODEX_AUTO_RATE_LIMIT_RESET) and the background spender in its
+// spending mode: only one thing may spend credits (PATCHES §93.2).
+func autoResetSpendsAlone(mode proxy.AutoResetMode, failoverRedeem bool, spender proxy.ResetCreditAutospend) error {
+	if mode != proxy.AutoResetReal {
+		return nil
+	}
+	if failoverRedeem {
+		return errors.New("SUBROUTER_AUTO_RESET=1 and SUBROUTER_CODEX_AUTO_RATE_LIMIT_RESET=1 both spend Codex reset credits by themselves; set only one")
+	}
+	if spender == proxy.ResetCreditAutospendSpend {
+		return errors.New("SUBROUTER_AUTO_RESET=1 and --reset-credit-autospend=spend both spend Codex reset credits by themselves; set only one")
+	}
+	return nil
+}
+
 // pacedAllowanceEnabled reads SUBROUTER_PACED_ALLOWANCE (PATCHES §72). 0 keeps
 // a burndown account at the taper of at most four sessions and gives every
 // account four refugees. It does not reopen a closed admission queue: that is
@@ -1186,13 +1203,18 @@ func serve(args []string) error {
 	if err != nil {
 		return err
 	}
+	// §93.2: only one thing may spend Codex credits by itself.
+	if err := autoResetSpendsAlone(autoReset, envTrue("SUBROUTER_CODEX_AUTO_RATE_LIMIT_RESET"), resetCreditAutospend); err != nil {
+		return err
+	}
 	proxy.SetAutoReset(autoReset, autoResetNearEmpty)
 	switch {
 	case autoReset == proxy.AutoResetOff:
 		slog.Info("automatic resets disabled by SUBROUTER_AUTO_RESET=0; nothing decides or logs a claim",
 			"reenable", "unset SUBROUTER_AUTO_RESET and restart")
 	case autoReset == proxy.AutoResetReal:
-		slog.Warn("SUBROUTER_AUTO_RESET=1: this build makes no automatic claim yet; it decides and logs as shadow mode does")
+		slog.Warn("SUBROUTER_AUTO_RESET=1: this daemon claims its accounts' saved resets by itself when they run out",
+			"shadow", "unset SUBROUTER_AUTO_RESET and restart")
 	}
 	if !autoResetNearEmpty {
 		slog.Warn("the under-1-percent condition on automatic claims is off (SUBROUTER_AUTO_RESET_NEAR_EMPTY=0)",
@@ -1718,6 +1740,9 @@ func serve(args []string) error {
 		// Named access tokens (PATCHES §43), from the same state dir as the
 		// session store and the box identity. No file means none.
 		AccessTokens: serveAccessTokens(filepath.Dir(*sessionPath), slog.Default()),
+		// Each account's last automatic claim (PATCHES §93.2), kept for the
+		// next worker generation.
+		AutoResetStateDir: filepath.Dir(*sessionPath),
 	}
 	logClientRetryAfterMax(server.ClientRetryAfterMax, slog.Default())
 	if err := server.ValidateCredentialUpstreams(); err != nil {

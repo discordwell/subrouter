@@ -278,11 +278,11 @@ func heldAndSpare(heldTurn http.HandlerFunc) map[string]*autoResetProfile {
 // 2 and 8. Shadow, at the wall: a turn on an account that holds a week reset
 // meets the weekly usage-limit refusal. The daemon logs one would-claim line
 // and keeps the decision, sends no claim, and the turn gets exactly what it
-// gets with automatic resets off, and with them real (which in this build
-// claims nothing either). Off decides and logs nothing.
+// gets with automatic resets off. Off decides and logs nothing. (Real mode
+// claims: auto_reset_claim_test.go.)
 func TestShadowLogsAWouldClaimAtTheClaudeWeekWallAndTheTurnIsUnchanged(t *testing.T) {
 	answers := map[AutoResetMode]claudeAnswer{}
-	for _, mode := range []AutoResetMode{AutoResetOff, AutoResetShadow, AutoResetReal} {
+	for _, mode := range []AutoResetMode{AutoResetOff, AutoResetShadow} {
 		setAutoResetForTest(t, mode, true)
 		d := newAutoResetClaude(t, heldAndSpare(claudeWall("7d")))
 		d.pinSession("conversation", "held")
@@ -321,7 +321,7 @@ func TestShadowLogsAWouldClaimAtTheClaudeWeekWallAndTheTurnIsUnchanged(t *testin
 			t.Fatalf("mode %s: last decision %+v, want the line's would-claim", mode, decision)
 		}
 	}
-	for _, mode := range []AutoResetMode{AutoResetShadow, AutoResetReal} {
+	for _, mode := range []AutoResetMode{AutoResetShadow} {
 		if !reflect.DeepEqual(answers[mode], answers[AutoResetOff]) {
 			t.Fatalf("mode %s answered the turn %+v; with automatic resets off it is %+v", mode, answers[mode], answers[AutoResetOff])
 		}
