@@ -4807,6 +4807,170 @@ if begin route-plain-pool-launch-keeps-the-pool-store; then
   finish
 fi
 
+# check, check codex and test, on a Mac with no Paradev app unless
+# route_paradev adds its wrappers. Both shims as install writes them, the
+# socket serving, pool mode. The Claude Code and Codex answer the word their
+# prompt asks for, and a launch the shim routed to the daemon is a session in
+# $H/served, which srq serving reads (FAKE_NO_SESSIONS=1: the daemon has none).
+route_launch_setup() {
+  route_setup SUBROUTER_CLAUDE_SOCKET="$C/home/.subrouter/claude.sock"
+  rm -f "$H/.claude/settings.json"   # it names a route, and a route word refuses then
+  sed '/^case "${1:-status}" in/,$d' "$ROUTE_SH" > "$C/route-lib.sh"
+  env -i PATH="$C/bin:/usr/bin:/bin" HOME="$H" CLAUDE_ROUTE_HOME="$H/.claude-route" \
+    "$LAPTOP_BASH" -c 'source "$1"; write_shim "$HOME/.claude-route/bin/claude" && write_codex_shim "$HOME/.claude-route/bin/codex"' _ "$C/route-lib.sh"
+  route_shim_pool
+  printf '\n# >>> claude-route >>>\nexport PATH="$HOME/.claude-route/bin:$PATH"\n# <<< claude-route <<<\n' > "$H/.zshrc"
+  printf 'codex\tcx-box\tcx-box\t\tbox\tyes\tno\n' > "$H/.claude-route/accounts.tsv"   # a Codex account, so codex pool routes
+  mkdir -p "$H/.local/bin"
+  cat > "$H/.local/bin/claude" <<'SH'
+#!/bin/bash
+sid=""; word=""; prev=""
+for a; do
+  case "$prev" in --session-id|--resume) sid="$a" ;; esac
+  case "$a" in --version) echo "9.9.9 (Claude Code)"; exit 0 ;; "Reply with exactly one word, in lowercase: "*) word="${a##*: }" ;; esac
+  prev="$a"
+done
+[ -n "$sid" ] && [ -n "${ANTHROPIC_UNIX_SOCKET:-}${ANTHROPIC_BASE_URL:-}" ] && echo "$sid acct-pool" >> "$HOME/served"
+echo "$word"
+SH
+  chmod 755 "$H/.local/bin/claude"
+  stub codex 'out=""; word=""; pool=""; prev=""
+for a; do
+  case "$prev" in -o) out="$a" ;; esac
+  case "$a" in --version) echo "codex-cli 9.9.9"; exit 0 ;; "Reply with exactly one word, in lowercase: "*) word="${a##*: }" ;; model_provider=\"subrouter\") pool=1 ;; esac
+  prev="$a"
+done
+[ -n "$word" ] || exit 0
+sid="cx-$$-$RANDOM"; echo "session id: $sid"
+[ -n "$pool" ] && echo "$sid cx-pool" >> "$HOME/served"
+[ -n "$out" ] && echo "$word" > "$out"
+exit 0'
+  stub uuidgen 'printf "%08x-%04x-4%03x-8%03x-%012x\n" "$$" "$RANDOM" "$((RANDOM % 4096))" "$((RANDOM % 4096))" "$RANDOM$RANDOM"'
+  cat > "$C/srq" <<'SH'
+#!/bin/bash
+[ "$1" = serving ] && [ -z "${FAKE_NO_SESSIONS:-}" ] || exit 1
+a=$(awk -v s="$2" '$1 == s { a = $2 } END { print a }' "$HOME/served" 2>/dev/null)
+[ -n "$a" ] && echo "$a"
+SH
+  chmod 755 "$C/srq"
+}
+# Paradev's wrappers in ~/.paradev/bin: each runs the first other one on PATH
+# (the shim), Codex's with Paradev's hooks prefix, and logs the launch.
+route_paradev() {
+  local tool
+  mkdir -p "$H/.paradev/bin"
+  for tool in claude codex; do
+    cat > "$H/.paradev/bin/$tool" <<'SH'
+#!/bin/bash
+tool="${0##*/}"; self="$(cd "$(dirname "$0")" && pwd -P)"
+echo "paradev wrapper $tool $*" >> "$FAKE_LOG"
+pre=(); [ "$tool" = codex ] && pre=(--enable hooks --dangerously-bypass-hook-trust)
+IFS=: read -r -a dirs <<< "$PATH"
+for d in "${dirs[@]}"; do
+  [ "$(cd "$d" 2>/dev/null && pwd -P)" = "$self" ] && continue
+  [ -x "$d/$tool" ] && exec "$d/$tool" "${pre[@]}" "$@"
+done
+exit 127
+SH
+    chmod 755 "$H/.paradev/bin/$tool"
+  done
+  stub paradev 'echo "[{\"presetId\": \"claude\", \"args\": [\"--dangerously-skip-permissions\"]}, {\"presetId\": \"codex\", \"promptArgs\": [\"--\"]}]"'
+}
+run_route_launch() { run_route_as "$ROUTE_SH" CLAUDE_ROUTE_SRQ="$C/srq" "$@"; }
+pass_today() { echo "PASS $(date +%Y-%m-%d) 00:00:00 (1 checks)" > "$1"; }
+# test's cases about Paradev's wrapper itself: skipped on a Mac without one.
+ROUTE_PARADEV_CASES=("HOME with a trailing slash never picks Paradev's wrapper" "Paradev's wrapper execs the shim"
+  "Paradev's launch shape is never a word" "a word through Paradev's wrapper"
+  "Paradev's presets still put a flag first (claude) and the prompt after -- (codex)"
+  "codex local through Paradev's wrapper: prefix kept, word dropped, subrouter URL dropped"
+  "Paradev's Codex preset shape (-- prompt) is never a word" "pool via Paradev's wrapper answers" "  ...and the pool served it")
+# The summary's counts are the PASS and FAIL lines: a SKIP is neither.
+expect_test_counts() {
+  local p f cp cf
+  read -r p f cp cf <<< "$(sed -n 's/^== claude: \([0-9]*\) passed, \([0-9]*\) failed;  codex: \([0-9]*\) passed, \([0-9]*\) failed ==$/\1 \2 \3 \4/p' "$C/out")"
+  [ -n "$cf" ] || { bad "test printed no summary line"; return; }
+  [ "$((p + cp))" = "$(grep -c '^  PASS  ' "$C/out")" ] && ok || bad "the summary counts $((p + cp)) passed, the output $(grep -c '^  PASS  ' "$C/out") PASS lines"
+  [ "$((f + cf))" = "$(grep -c '^  FAIL  ' "$C/out")" ] && ok || bad "the summary counts $((f + cf)) failed, the output $(grep -c '^  FAIL  ' "$C/out") FAIL lines"
+}
+
+if begin route-check-without-paradev-launches-through-the-shim; then
+  # check and check codex launched through ~/.paradev/bin unconditionally, so
+  # without Paradev they failed and codex pool could not pass its gate.
+  route_launch_setup
+  run_route_launch -- check
+  expect_rc 0; expect_out "launch: shim $H/.claude-route/bin/claude -> claude, as a new terminal launches it (no Paradev wrapper)"
+  expect_out "mode=pool  route=pool  answer=ready  pool account=acct-pool"
+  run_route_launch -- check codex
+  expect_rc 0; expect_out "launch: shim $H/.claude-route/bin/codex -> codex, as a new terminal launches it (no Paradev wrapper)"
+  expect_out "answer=ready  pool account=cx-pool"
+  grep -q "^PASS $(date +%Y-%m-%d) .*; CODEX_HOME=$H/.codex)$" "$H/.claude-route/last-codex-check" && ok || bad "last-codex-check: $(cat "$H/.claude-route/last-codex-check")"
+  expect_no_log "paradev wrapper"
+  pass_today "$H/.claude-route/last-test"; pass_today "$H/.claude-route/last-codex-test"
+  run_route_launch -- pool
+  expect_rc 0; expect_out "mode: pool. NEW Claude Code launches"
+  run_route_launch -- codex pool
+  expect_rc 0; expect_out "codex mode: pool. NEW Codex launches"
+  finish
+fi
+
+if begin route-test-without-paradev-skips-only-the-paradev-cases; then
+  route_launch_setup
+  run_route_launch -- test
+  expect_out "claude launches: shim $H/.claude-route/bin/claude -> claude, as a new terminal launches it (no Paradev wrapper)"
+  for name in "${ROUTE_PARADEV_CASES[@]}"; do
+    expect_line "  SKIP  $name   (no Paradev wrapper)"
+  done
+  [ "$(grep -c '^  SKIP  ' "$C/out")" = "${#ROUTE_PARADEV_CASES[@]}" ] && ok || bad "$(grep -c '^  SKIP  ' "$C/out") SKIP lines, want ${#ROUTE_PARADEV_CASES[@]}"
+  # A launch that is not about the wrapper went through it; now through the shim.
+  expect_line "  PASS  'claude local' answers on your own login"
+  expect_line "  PASS    ...logged route=off word=local, and the daemon never saw it"
+  expect_test_counts
+  finish
+fi
+
+if begin route-check-and-test-with-paradev-go-through-its-wrapper; then
+  route_launch_setup; route_paradev
+  run_route_launch -- check
+  expect_rc 0; expect_out "launch: Paradev's wrapper $H/.paradev/bin/claude -> shim -> claude, as a new Paradev session launches it"
+  expect_out "pool account=acct-pool"; expect_log "^paradev wrapper claude -p Reply with exactly one word"
+  run_route_launch -- check codex
+  expect_rc 0; expect_out "launch: Paradev's wrapper $H/.paradev/bin/codex -> shim -> codex, as a new Paradev session launches it"
+  expect_out "pool account=cx-pool"; expect_log "^paradev wrapper codex exec --skip-git-repo-check"
+  run_route_launch -- test
+  expect_out "claude launches: Paradev's wrapper $H/.paradev/bin/claude -> shim -> claude"
+  for name in "${ROUTE_PARADEV_CASES[@]}"; do expect_line "  PASS  $name"; done
+  expect_no_out "  SKIP  "
+  expect_line "  PASS  'claude local' answers on your own login"
+  expect_log "^paradev wrapper claude local -p Reply with exactly one word, in lowercase: juliet"
+  expect_test_counts
+  finish
+fi
+
+if begin route-failed-check-without-paradev-blocks-the-gate; then
+  # The daemon serves no session: every check that applies fails, and both
+  # gates refuse, though the cases about Paradev's wrapper were skipped.
+  route_launch_setup
+  run_route_launch FAKE_NO_SESSIONS=1 -- check
+  expect_rc 1; expect_out "pool account=none (not through the pool)"
+  run_route_launch FAKE_NO_SESSIONS=1 -- check codex
+  expect_rc 1; expect_out "pool account=none (not through the pool)"
+  grep -q "^FAIL " "$H/.claude-route/last-codex-check" && ok || bad "last-codex-check: $(cat "$H/.claude-route/last-codex-check")"
+  pass_today "$H/.claude-route/last-codex-test"
+  run_route_launch -- codex pool
+  expect_rc 1; expect_out "no passing 'claude-route check codex' today"
+  [ "$(cat "$H/.claude-route/codex-mode" 2>/dev/null)" = pool ] && bad "codex mode is pool" || ok
+  echo off > "$H/.claude-route/mode"
+  run_route_launch FAKE_NO_SESSIONS=1 -- test
+  expect_line "  FAIL    ...and the pool served it   (details: $H/.claude-route/test.err)"
+  expect_line "  SKIP  Paradev's wrapper execs the shim   (no Paradev wrapper)"
+  expect_test_counts
+  grep -q "^FAIL " "$H/.claude-route/last-test" && ok || bad "last-test: $(cat "$H/.claude-route/last-test")"
+  run_route_launch -- pool
+  expect_rc 1; expect_out "no passing 'claude-route test' today"
+  [ "$(cat "$H/.claude-route/mode")" = off ] && ok || bad "mode is $(cat "$H/.claude-route/mode")"
+  finish
+fi
+
 # --- sr-triage ------------------------------------------------------------------
 # Read-only triage. Run under macOS's stock bash, with no
 # timeout(1) (stock macOS has none: the stub answers as a missing command does).
