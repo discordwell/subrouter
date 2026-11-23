@@ -1509,7 +1509,10 @@ cmd_test() {
         [[ "$out" == *"$word"* ]]
     }
     served() { local a; a=$("$SRQ" serving "$1" 2>&1) || { echo "daemon has no row for $1: $a"; return 1; }; echo "$1 served by: $a"; SERVED_BY="$a"; }
-    unserved() { local a; if a=$("$SRQ" serving "$1" 2>&1); then echo "daemon has a row for $1: $a"; return 1; fi; return 0; }
+    unserved() { # only srq's own answer for a session the daemon does not list: a failing srq proves nothing
+        local a; if a=$("$SRQ" serving "$1" 2>&1); then echo "daemon has a row for $1: $a"; return 1; fi
+        [[ "$a" == "unassigned (session $1): not listed by the daemon"* ]] || { echo "srq serving $1 failed: $a"; return 1; }
+    }
     uuid() { uuidgen | tr '[:upper:]' '[:lower:]'; }
     surface() { # route -> sorted tool names + mcp server names from the session's init record
         (cd "$cwd" && perl -e 'alarm shift; exec @ARGV' 180 env "${clean[@]}" PATH="$P_SHIM" CLAUDE_ROUTE="$1" "$SHIM" \
@@ -1907,8 +1910,10 @@ sys.exit(1)' "$f"
             t0=$(date +%s)
             check "pinned '$LC': refused before launch, nothing sent" eval '(cd "$cwd" && env "${clean[@]}" PATH="$P_SHIM" "$SHIM" "$LC" -p hi --session-id "$w2" >/dev/null 2>&1); code_is $? 2 && quick $t0 10 && unserved "$w2"'
         elif [[ "$o" == *flags=*ineligible* ]]; then
+            # The daemon refuses a pin inside its owner's holdout before any assignment, so no row (PATCHES §89);
+            # a pin the provider itself limits has its row on exactly that account.
             t0=$(date +%s)
-            check "pinned '$LC' (spent) fails fast with the provider's limit, no failover" eval '! ask "$w2" hotel PATH="$P_FRONT" "$F_CLAUDE" "$LC" && quick $t0 45 && served "$w2" && test "$SERVED_BY" = "$LC"'
+            check "pinned '$LC' (spent) fails fast, no failover" eval '! ask "$w2" hotel PATH="$P_FRONT" "$F_CLAUDE" "$LC" && quick $t0 45 && { unserved "$w2" || { served "$w2" && test "$SERVED_BY" = "$LC"; }; }'
         else
             check "pinned '$LC' answers"                                  ask "$w2" hotel PATH="$P_FRONT" "$F_CLAUDE" "$LC"
             check "  ...on exactly that account"                          eval 'served "$w2" && test "$SERVED_BY" = "$LC"'
