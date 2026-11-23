@@ -2091,6 +2091,10 @@ type AccountUsageStatus struct {
 	// accounts (PATCHES §93.3): the mode, the owner's condition, a claim in
 	// flight and the last decision.
 	AutoReset *AutoResetStatus `json:"auto_reset,omitempty"`
+	// WouldChoose is the choice this daemon would publish for one of its own
+	// accounts in real mode, published in shadow mode (PATCHES §95.1). Outside
+	// normalized, so nothing ranks on it.
+	WouldChoose *ResetChoice `json:"would_choose,omitempty"`
 	// UsageFresh is an internal signal used to decide whether a live fetch
 	// succeeded. UsageFetchedAt is the time represented by Windows and is
 	// exposed so clients can distinguish a last-known-good fallback from a
@@ -2218,6 +2222,13 @@ type NormalizedUsage struct {
 	// its own start marks (§86.2). Top level only: the turn starts the
 	// account's binding week, not a quota pool's.
 	SelfStart *SelfStartSent `json:"self_start,omitempty"`
+	// ResetChoice is the holder's choice to run this account to its limit
+	// for its next saved reset (PATCHES §95.1), published by the daemon that
+	// holds the account in real mode only. Every daemon that ranks the
+	// account honours it (§95.2). Absent is not chosen, or a daemon from
+	// before §95. Top level only: the choice is the account's, and its meter
+	// says which pools it covers.
+	ResetChoice *ResetChoice `json:"reset_choice,omitempty"`
 	// Fresh distinguishes a score computed from a current usage fetch from one
 	// carried forward as a seed after a failed fetch. A stale reading is still
 	// the scheduler's working belief, but it is not evidence.
@@ -5123,7 +5134,7 @@ func (s Server) handleUsageStatus(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "usage sweep in progress", http.StatusServiceUnavailable)
 			return
 		}
-		statuses = s.withAutoResets(s.withHeldResets(s.withNewSessionVerdicts(s.withNormalizedUsage(s.withCodexCapacityMarks(s.withClaudeCostTiers(s.AccountRef.withResetAdvice(withWeeklyCooked(s.withSessionActivity(s.withSessionCounts(s.withRequestTimeExhaustionWindows(s.withClaudeWebBalances(statuses))))))))))))
+		statuses = s.withResetChoices(s.withAutoResets(s.withHeldResets(s.withNewSessionVerdicts(s.withNormalizedUsage(s.withCodexCapacityMarks(s.withClaudeCostTiers(s.AccountRef.withResetAdvice(withWeeklyCooked(s.withSessionActivity(s.withSessionCounts(s.withRequestTimeExhaustionWindows(s.withClaudeWebBalances(statuses)))))))))))))
 		writeJSON(w, s.withResetWindows(s.AccountRef.withUsageBurn(statuses)))
 		return
 	}

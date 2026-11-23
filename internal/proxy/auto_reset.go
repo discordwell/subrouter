@@ -495,6 +495,11 @@ type autoResets struct {
 	// (§93.2, auto_reset_claim.go).
 	running map[string]*autoResetClaim
 	latches map[string]autoResetLatch
+	// choices is the accounts chosen to load at the last pass, by ScoreKey,
+	// replaced whole at each pass (PATCHES §95.1, reset_choice.go); codexHold
+	// is the Codex account loaded one at a time, and since when.
+	choices   map[string]resetChosen
+	codexHold resetCodexHold
 }
 
 type autoResetCreditList struct {
@@ -729,9 +734,10 @@ func (s Server) autoResetDecideAtTheWall(ctx context.Context, wall autoResetWall
 	return s.actOnAutoReset(account, f, d)
 }
 
-// RunAutoReset looks at each new usage reading of this daemon's own accounts
-// every interval, for the reading moment. It reads the rows the usage reads
-// already published, so it adds no usage fetch.
+// RunAutoReset runs a background pass every interval (autoResetPass): each
+// new usage reading of this daemon's own accounts is looked at for the
+// reading moment, and the accounts to load are chosen (§95.1). It reads the
+// rows the usage reads already published, so it adds no usage fetch.
 func (s Server) RunAutoReset(ctx context.Context, every time.Duration) {
 	if s.AccountRef == nil || every <= 0 {
 		return
@@ -739,7 +745,7 @@ func (s Server) RunAutoReset(ctx context.Context, every time.Duration) {
 	ticker := time.NewTicker(every)
 	defer ticker.Stop()
 	for {
-		s.autoResetReadings(ctx)
+		s.autoResetPass(ctx)
 		select {
 		case <-ctx.Done():
 			return

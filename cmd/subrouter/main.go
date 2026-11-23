@@ -315,6 +315,21 @@ func autoResetWorthEnabled() (bool, error) {
 	return false, fmt.Errorf("SUBROUTER_AUTO_RESET_WORTH=%q: want 1 (the default) or 0", raw)
 }
 
+// resetLoadingEnabled reads SUBROUTER_RESET_LOADING (PATCHES §95.1): unset
+// or 1, the daemon chooses the accounts to run to their limit for their saved
+// resets, in shadow or real mode; 0, it chooses none and ignores a peer's
+// choice. Anything else is an error.
+func resetLoadingEnabled() (bool, error) {
+	raw := os.Getenv("SUBROUTER_RESET_LOADING")
+	switch strings.TrimSpace(raw) {
+	case "", "1":
+		return true, nil
+	case "0":
+		return false, nil
+	}
+	return false, fmt.Errorf("SUBROUTER_RESET_LOADING=%q: want 1 (the default) or 0", raw)
+}
+
 // autoResetFoldWarnings names each older path that redeems Codex credits by
 // itself and that SUBROUTER_AUTO_RESET=1 turns off: the failover redeem
 // (SUBROUTER_CODEX_AUTO_RATE_LIMIT_RESET) and the background spender in its
@@ -1223,8 +1238,17 @@ func serve(args []string) error {
 	if err != nil {
 		return err
 	}
+	resetLoading, err := resetLoadingEnabled()
+	if err != nil {
+		return err
+	}
 	proxy.SetAutoReset(autoReset, autoResetNearEmpty)
 	proxy.SetAutoResetWorth(autoResetWorth)
+	proxy.SetResetLoading(resetLoading)
+	if !resetLoading {
+		slog.Warn("SUBROUTER_RESET_LOADING=0: this daemon chooses no account to run to its limit for a saved reset, and ignores a peer's choice",
+			"reenable", "unset SUBROUTER_RESET_LOADING and restart")
+	}
 	// §94.2: in real mode only automatic resets spend Codex credits.
 	for _, warning := range autoResetFoldWarnings(autoReset, envTrue("SUBROUTER_CODEX_AUTO_RATE_LIMIT_RESET"), resetCreditAutospend) {
 		slog.Warn(warning)
