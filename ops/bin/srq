@@ -1489,15 +1489,30 @@ def _burn_accounts(n):
     return f"{n} account{'' if n == 1 else 's'}"
 
 
+NEED_WORDS = {"yes": "yes", "no": "no", "unknown": "not known yet"}
+
+
+def _need_line(meter):
+    """Whether the pool needs its saved resets on the meter (PATCHES §94.1),
+    in one line with the daemon's reason; None from a daemon from before §94
+    or a need that does not read."""
+    need = meter.get("need")
+    if not isinstance(need, dict) or need.get("answer") not in NEED_WORDS or not isinstance(need.get("why"), str):
+        return None
+    return f"  {'resets needed':<14} {NEED_WORDS[need['answer']]}: {need['why']}"
+
+
 def _burn_meter_lines(meter):
-    """One meter: the pool figure per window with its counts and trend, the
-    share at the limit, then each account by its label (§87)."""
+    """One meter: whether the pool needs its resets, the pool figure per
+    window with its counts and trend, the share at the limit, then each
+    account by its label (§87)."""
     label = meter.get("label") or f"{meter.get('provider')} {meter.get('meter')}"
     windows = meter.get("windows") or {}
     held = meter.get("accounts") or []
+    need = _need_line(meter)
     if not held:
-        return [f"{label}: no account reads this meter", ""]
-    lines = [label]
+        return [f"{label}: no account reads this meter"] + ([need] if need else []) + [""]
+    lines = [label] + ([need] if need else [])
     limits = []
     for key, words in BURN_WINDOWS:
         window = windows.get(key) or {}
@@ -1555,6 +1570,10 @@ def render_burn(report):
                                " 6 hours and 36 hours for 24 hours. At the limit is demand those accounts could not"
                                " serve, which burn alone reads as slack: a pool of spent accounts burns 0.)",
                                100, subsequent_indent=" "))
+    if any(_need_line(m) for m in report.get("meters") or []):
+        lines.extend(textwrap.wrap("(resets needed: pressure is the burn of the accounts not at their limit. Yes at a"
+                                   " 24-hour pressure of 1.0 or more, or when the 6-hour pressure plus its rise on the"
+                                   " 6 hours before reaches 1.1. Nothing claims on it yet.)", 100, subsequent_indent=" "))
     return "\n".join(lines) + "\n"
 
 
@@ -2615,6 +2634,36 @@ def cmd_selftest(_argv):
           " last hour, 3 hours for 6 hours, 12 hours for 24 hours. A trend needs 9 hours of history for 6 hours"
           " and 36 hours for 24 hours. At the limit is demand those accounts could not serve, which burn alone"
           " reads as slack: a pool of spent accounts burns 0.)" in words)
+    check("a daemon from before §94 publishes no need, and srq burn says nothing about it",
+          "resets needed" not in text)
+    needs = json.loads(json.dumps(report))
+    needs["meters"][0]["need"] = {
+        "answer": "yes", "window": "6h", "pressure": {"1h": 1.12, "6h": 0.95, "24h": 0.8}, "trend": 0.2,
+        "why": "the 24-hour pressure is 0.80, under 1.0, but the 6-hour pressure 0.95 plus its trend +0.20 is 1.15,"
+               " at or above 1.1"}
+    needs["meters"][1]["need"] = {"answer": "unknown", "pressure": {"1h": None, "6h": None, "24h": None}, "trend": None,
+                                  "why": "no window has enough history for a pressure yet"}
+    needs["meters"][2]["need"] = {"answer": "no", "window": "1h", "pressure": {"1h": "all_at_limit"}, "trend": None,
+                                  "why": "the 24-hour window has too little history; the 1-hour pressure is 0.40, under 1.0"}
+    need_text = render_burn(needs)
+    check("need is one line per meter, under its label, with the daemon's reason: yes",
+          "\nClaude week\n  resets needed  yes: the 24-hour pressure is 0.80, under 1.0, but the 6-hour pressure 0.95"
+          " plus its trend +0.20 is 1.15, at or above 1.1\n  last hour      1.12" in need_text)
+    check("need: not known yet, on a meter no account reads",
+          "\nClaude Fable: no account reads this meter\n  resets needed  not known yet: no window has enough history"
+          " for a pressure yet\n" in need_text)
+    check("need: no",
+          "\nCodex week\n  resets needed  no: the 24-hour window has too little history; the 1-hour pressure is 0.40,"
+          " under 1.0\n" in need_text)
+    check("the legend says what pressure is and when resets are needed",
+          "(resets needed: pressure is the burn of the accounts not at their limit. Yes at a 24-hour pressure of 1.0 or"
+          " more, or when the 6-hour pressure plus its rise on the 6 hours before reaches 1.1. Nothing claims on it yet.)"
+          in " ".join(need_text.split()))
+    odd_need = json.loads(json.dumps(needs))
+    odd_need["meters"][0]["need"] = {"answer": "maybe", "why": "?"}
+    odd_need["meters"][2]["need"] = "yes"
+    check("a need that does not read is no need",
+          render_burn(odd_need).count("\n  resets needed ") == 1)
     down = json.loads(json.dumps(report))
     down["meters"][0]["trend"]["6h"]["change"] = -0.004
     check("a change under 0.005 is no change", "0.95  over 2 accounts, no change on the 6 hours before\n" in render_burn(down))
