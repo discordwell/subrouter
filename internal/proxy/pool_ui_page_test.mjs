@@ -129,3 +129,62 @@ test('the legend explains the Fable reset mark (PATCHES §64)', () => {
   assert.ok(entry, 'the legend has an entry for the Fable reset mark')
   assert.match(entry, /no 2x and no early burndown/, 'the entry says a Fable reset holds nothing')
 })
+
+const monthDay = (iso) => { const d = new Date(iso); return (d.getMonth() + 1) + '/' + d.getDate() }
+const WEEK_ENDS = '2026-12-10T22:00:00Z'
+const FABLE_ENDS = '2027-03-09T07:59:00Z'
+const CREDIT_A = '2026-12-14T09:13:00Z'
+const CREDIT_B = '2026-12-21T09:13:00Z'
+
+function rowHTML(html, id) {
+  const row = html.split('<tr class="row ').find((part) => part.includes('>' + id + '</span>'))
+  assert.ok(row, 'the board draws a row for ' + id)
+  return row.split('</tr>')[0]
+}
+
+// The rows carry resets as TestThePoolBoardCarriesEveryResetOfThisDaemonAndItsPeer checks pool.json
+// sends them: each kind with its count and expiry, read, from the last good read, not read, or none
+// given, and from a daemon that publishes no list, marked partial.
+test('the board marks each kind of saved reset with its count and soonest expiry (PATCHES §91.2)', async () => {
+  const codexRow = (id, fields) => claudeRow(id, { provider: 'codex', pace: undefined, ...fields })
+  const { board, flash } = await render(boardOf([
+    claudeRow('a-both', { reset_hold: true, reset_hold_s: WEEK_HOLD_S, fable_resets: 2, resets: [
+      { kind: 'week', count: 1, expires_at: WEEK_ENDS, expiry: 'read' },
+      { kind: 'fable', count: 2, expires_at: FABLE_ENDS, expiry: 'read' }] }),
+    claudeRow('b-none', { resets: [] }),
+    claudeRow('c-unknown', { resets: [{ kind: 'unknown', count: 1, expiry: 'none_given' }] }),
+    claudeRow('d-old', { fable_resets: 1, resets_partial: true, resets: [
+      { kind: 'week', count: 1, expires_at: WEEK_ENDS, expiry: 'read' },
+      { kind: 'fable', count: 1, expiry: 'none_given' }] }),
+    codexRow('e-credits', { resets: [
+      { kind: 'codex_rate_limits', count: 1, expires_at: CREDIT_B, expiry: 'read' },
+      { kind: 'codex_rate_limits', count: 1, expires_at: CREDIT_A, expiry: 'read' },
+      { kind: 'codex_rate_limits', count: 1, expiry: 'not_read' }] }),
+    codexRow('f-last-good', { resets: [{ kind: 'codex_rate_limits', count: 2, expires_at: CREDIT_A, expiry: 'last_good' }] }),
+    codexRow('g-unread', { resets: [{ kind: 'codex_rate_limits', count: 3, expiry: 'not_read' }] }),
+    codexRow('h-none', {}),
+  ]))
+  assert.equal(flash, '', 'the page read pool.json')
+  const text = (id) => [...rowHTML(board, id).matchAll(/class="([wfcu]reset|rpart)"[^>]*>([^<]*)</g)].map((m) => m[1] + ':' + m[2])
+  assert.deepEqual(text('a-both'), ['wreset:W1 ' + monthDay(WEEK_ENDS), 'freset:F2 ' + monthDay(FABLE_ENDS)], 'a week reset and Fable resets, each dated')
+  assert.match(paceCell(board, 'a-both'), /^2\.5 <span class="hold">2x<\/span> <span class="wreset"/, 'the marks follow the 2x')
+  assert.deepEqual(text('b-none'), [], 'a row that holds none is not marked')
+  assert.deepEqual(text('c-unknown'), ['ureset:U1'], 'a kind the daemon does not know is U')
+  assert.deepEqual(text('d-old'), ['wreset:W1 ' + monthDay(WEEK_ENDS), 'freset:F1', 'rpart:~'], 'a partial list is marked ~, the F badge not drawn twice')
+  assert.deepEqual(text('e-credits'), ['creset:R3 ' + monthDay(CREDIT_A)], 'Codex credits: the count with the soonest date')
+  assert.deepEqual(text('f-last-good'), ['creset:R2 ' + monthDay(CREDIT_A) + '*'], 'a date from the last good read is starred')
+  assert.deepEqual(text('g-unread'), ['creset:R3 ?'], 'a count whose dates were not read says ?')
+  assert.deepEqual(text('h-none'), [], 'a row with no list is not marked')
+  assert.match(rowHTML(board, 'e-credits'), /title="1 codex_rate_limits ending 2026-12-21T09:13:00Z \(read\); 1 codex_rate_limits ending 2026-12-14T09:13:00Z \(read\); 1 codex_rate_limits \(not read\)"/,
+    'the mark\'s title lists every entry')
+})
+
+test('the legend explains every reset mark (PATCHES §91.2)', () => {
+  const legend = PAGE.match(/<div class="legend" id="legend">([\s\S]*?)<\/div>/)
+  assert.ok(legend, 'the page has its legend')
+  const entry = (cls) => legend[1].split('\n').find((line) => line.includes('class="' + cls + '"'))
+  assert.match(entry('wreset') || '', /unclaimed week reset/, 'W')
+  assert.match(entry('creset') || '', /Codex reset credits.*not read.*last good read/, 'R, ? and *')
+  assert.match(entry('ureset') || '', /never claimed automatically/, 'U')
+  assert.match(entry('rpart') || '', /no full list/, '~')
+})

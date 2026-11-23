@@ -112,6 +112,9 @@ tr.row td:last-child{border-radius:0 8px 8px 0}
 .hold{font-family:var(--mono);font-size:9.5px;color:var(--drain)}
 /* unclaimed Fable resets, which hold nothing (PATCHES §64) */
 .freset{font-family:var(--mono);font-size:9.5px;color:var(--dim)}
+/* each kind of saved reset with its soonest expiry (PATCHES §91.2) */
+.wreset,.creset,.ureset,.rpart{font-family:var(--mono);font-size:9.5px;color:var(--dim);white-space:nowrap}
+.ureset{color:var(--burn)}
 
 /* pool badge */
 .pool{font-family:var(--mono);font-size:9.5px;letter-spacing:.04em;padding:1px 5px;border-radius:5px;border:1px solid var(--edge);color:var(--dim)}
@@ -231,7 +234,11 @@ input.filter:focus{border-color:rgba(59,233,199,.5)}
   <span><b class="started">start sent 14:05</b> its daemon sent one tiny request itself at that time to start the week&rsquo;s clock; &times;3 is the third in a row</span>
   <span><b class="st drain">◈</b> drain &mdash; rolls within 24h, budget expires either way; or holds an unclaimed week reset with under 25% of its week left, which the claim would wipe</span>
   <span><b class="hold">2x</b> holds an unclaimed week reset: ranks at twice its pace until it expires or is claimed</span>
-  <span><b class="freset">F2</b> holds 2 unclaimed Fable resets: no 2x and no early burndown, since a Fable claim gives back the Fable limit, not the week</span>
+  <span><b class="wreset">W1 12/10</b> holds 1 unclaimed week reset, ending 12/10 in this browser&rsquo;s time</span>
+  <span><b class="freset">F2 3/9</b> holds 2 unclaimed Fable resets, the soonest ending 3/9: no 2x and no early burndown, since a Fable claim gives back the Fable limit, not the week</span>
+  <span><b class="creset">R3 12/14</b> holds 3 Codex reset credits, the soonest ending 12/14; <b>R3 ?</b> its daemon has not read their dates yet; <b>12/14*</b> the date is from the last good read of the credit list</span>
+  <span><b class="ureset">U1</b> a saved reset of a kind its daemon does not know: shown, never claimed automatically</span>
+  <span><b class="rpart">~</b> its daemon publishes no full list of resets (before PATCHES §91), so this is what its complimentary_reset says</span>
   <span><b class="st burn">◐</b> burn &mdash; refused for new sessions, but a pin still holds</span>
   <span><b class="st week">○</b> exhausted</span>
   <span><b class="st unknown">?</b> unmeasured &mdash; not measured, which is not the same as healthy</span>
@@ -352,7 +359,8 @@ function claudeCells(r){
     + '<td class="num">'+(r.weekly_left!==undefined?pct(r.weekly_left):"–")+'</td>'
     + '<td>'+meter(r.weekly_left, r.state, null)+'</td>'
     + '<td class="num">'+dur(live(r.weekly_roll_s))+'</td>'
-    + '<td class="num">'+(r.pace!==undefined?(r.pace*1e7).toFixed(1):"–")+(r.reset_hold?' <span class="hold">2x</span>':'')+(r.fable_resets?' <span class="freset">F'+r.fable_resets+'</span>':'')+'</td>';
+    + '<td class="num">'+(r.pace!==undefined?(r.pace*1e7).toFixed(1):"–")+(r.reset_hold?' <span class="hold">2x</span>':'')
+    + (r.resets ? resetMarks(r) : (r.fable_resets?' <span class="freset">F'+r.fable_resets+'</span>':''))+'</td>';
 }
 function codexCells(r){
   const f=r.fuse;
@@ -368,9 +376,35 @@ function codexCells(r){
     + '<td class="num">'+(r.weekly_left!==undefined?pct(r.weekly_left):(r.headroom!==undefined?pct(r.headroom):"–"))+'</td>'
     + '<td>'+meter(r.weekly_left!==undefined?r.weekly_left:r.headroom, r.state, f)+'</td>'
     + '<td class="num">'+dur(live(r.weekly_roll_s))+'</td>'
-    + '<td>'+fuseTag+startTag+'</td>'
+    + '<td>'+fuseTag+startTag+resetMarks(r)+'</td>'
     + '<td class="num warn">'+forfeit+'</td>'
     + '<td>'+sparkTag+'</td>';
+}
+
+/* One mark per kind of saved reset the row holds: its letter, its count and
+   its soonest expiry in this browser's time (PATCHES §91.2). */
+const RESET_MARKS = {week:["W","wreset"], fable:["F","freset"], codex_rate_limits:["R","creset"]};
+function resetMarks(r){
+  const kinds = [];
+  for(const e of (r.resets||[])){
+    let k = kinds.find(k=>k.kind===e.kind);
+    if(!k){ k = {kind:e.kind, count:0, soonest:null, unread:false, lines:[]}; kinds.push(k); }
+    k.count += e.count;
+    const t = e.expires_at ? new Date(e.expires_at) : null;
+    if(t && !isNaN(t) && (!k.soonest || t < k.soonest.t)) k.soonest = {t:t, lastGood:e.expiry==="last_good"};
+    if(e.expiry==="not_read") k.unread = true;
+    k.lines.push(e.count+" "+e.kind+(e.expires_at?" ending "+e.expires_at:"")+" ("+String(e.expiry).replace("_"," ")+")");
+  }
+  let html = "";
+  for(const k of kinds){
+    const [letter, cls] = RESET_MARKS[k.kind] || ["U","ureset"];
+    let text = letter+k.count;
+    if(k.soonest) text += " "+(k.soonest.t.getMonth()+1)+"/"+k.soonest.t.getDate()+(k.soonest.lastGood?"*":"");
+    else if(k.unread) text += " ?";
+    html += ' <span class="'+cls+'" title="'+esc(k.lines.join("; "))+'">'+esc(text)+'</span>';
+  }
+  if(html && r.resets_partial) html += ' <span class="rpart" title="its daemon publishes no full list; this is what its complimentary_reset says">~</span>';
+  return html;
 }
 
 function renderBoard(){
