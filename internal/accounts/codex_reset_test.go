@@ -216,7 +216,7 @@ func TestRateLimitResetRejectsAPIKeyAndEmptyToken(t *testing.T) {
 }
 
 func TestNewUUIDv4Shape(t *testing.T) {
-	u := newUUIDv4()
+	u := NewUUIDv4()
 	// 8-4-4-4-12 hex with the v4 and variant bits set.
 	if len(u) != 36 {
 		t.Fatalf("uuid len = %d (%q)", len(u), u)
@@ -227,7 +227,7 @@ func TestNewUUIDv4Shape(t *testing.T) {
 	if u[19] != '8' && u[19] != '9' && u[19] != 'a' && u[19] != 'b' {
 		t.Errorf("expected variant at index 19, got %q", u[19])
 	}
-	if newUUIDv4() == newUUIDv4() {
+	if NewUUIDv4() == NewUUIDv4() {
 		t.Error("expected unique uuids")
 	}
 }

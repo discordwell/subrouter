@@ -101,7 +101,7 @@ func ConsumeRateLimitResetCredit(ctx context.Context, client *http.Client, accou
 		return RateLimitResetCredit{}, fmt.Errorf("credit_id is required")
 	}
 	if redeemRequestID == "" {
-		redeemRequestID = newUUIDv4()
+		redeemRequestID = NewUUIDv4()
 	}
 	if account.AuthMode != AuthModeOAuth {
 		return RateLimitResetCredit{}, fmt.Errorf("rate-limit reset is only available for OAuth accounts")
@@ -205,7 +205,7 @@ func RedeemRateLimitResetIf(ctx context.Context, client *http.Client, account Ac
 			return RateLimitResetCredit{}, err
 		}
 	}
-	return ConsumeRateLimitResetCredit(ctx, client, account, credit.ID, newUUIDv4())
+	return ConsumeRateLimitResetCredit(ctx, client, account, credit.ID, NewUUIDv4())
 }
 
 // applyCodexWhamHeaders sets the headers Codex.app sends to the wham API
@@ -223,9 +223,10 @@ func applyCodexWhamHeaders(req *http.Request, account Account) {
 	}
 }
 
-// newUUIDv4 returns an RFC 4122 version 4 UUID string using crypto/rand so the
-// redeem idempotency key does not pull in a third-party dependency.
-func newUUIDv4() string {
+// NewUUIDv4 returns an RFC 4122 version 4 UUID string using crypto/rand, so the
+// redeem idempotency key and the self-start request's session ID (PATCHES
+// §90) do not pull in a third-party dependency.
+func NewUUIDv4() string {
 	var b [16]byte
 	if _, err := rand.Read(b[:]); err != nil {
 		// crypto/rand should never fail on macOS/Linux; fall back to a

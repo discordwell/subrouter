@@ -214,6 +214,22 @@ func startUnstartedWeekEnabled() (bool, error) {
 	return false, fmt.Errorf("SUBROUTER_START_UNSTARTED_WEEK=%q: want 1 (the default) or 0", raw)
 }
 
+// selfStartWeekEnabled reads SUBROUTER_SELF_START_WEEK, the kill switch of
+// PATCHES §90: the daemon sends one tiny Codex turn itself on each of its own
+// accounts whose weekly window has not started. Independent of
+// SUBROUTER_START_UNSTARTED_WEEK, and read like it: unset means on,
+// 0/false/no/off turns it off, anything else is an error.
+func selfStartWeekEnabled() (bool, error) {
+	raw := os.Getenv("SUBROUTER_SELF_START_WEEK")
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "", "1", "true", "yes", "on":
+		return true, nil
+	case "0", "false", "no", "off":
+		return false, nil
+	}
+	return false, fmt.Errorf("SUBROUTER_SELF_START_WEEK=%q: want 1 (the default) or 0", raw)
+}
+
 // pacedAllowanceEnabled reads SUBROUTER_PACED_ALLOWANCE (PATCHES §72). 0 keeps
 // a burndown account at the taper of at most four sessions and gives every
 // account four refugees. It does not reopen a closed admission queue: that is
@@ -262,6 +278,11 @@ func pacedSessionCeiling() (int, error) {
 }
 
 const paceSampleInterval = 30 * time.Second
+
+// selfStartScanInterval is how often the daemon looks for an unstarted Codex
+// week to start (PATCHES §90): a reading arrives about every two minutes, so
+// a pass this often sends within seconds of the one that says unstarted.
+const selfStartScanInterval = 10 * time.Second
 
 const maxSecretFileBytes = 64 << 10
 
@@ -1045,6 +1066,17 @@ func serve(args []string) error {
 		slog.Info("unstarted week priority disabled by SUBROUTER_START_UNSTARTED_WEEK; an account whose weekly window has not started ranks on its weekly pace like any other",
 			"reenable", "unset SUBROUTER_START_UNSTARTED_WEEK and restart")
 	}
+	// PATCHES §90, the same way as §86. SUBROUTER_SELF_START_MODEL names the
+	// turn's model; unset, it is proxy.SelfStartDefaultModel.
+	selfStartWeek, err := selfStartWeekEnabled()
+	if err != nil {
+		return err
+	}
+	proxy.SetSelfStartWeek(selfStartWeek, os.Getenv("SUBROUTER_SELF_START_MODEL"))
+	if !selfStartWeek {
+		slog.Info("self-start of unstarted weeks disabled by SUBROUTER_SELF_START_WEEK; an account whose weekly window has not started waits for a session to start it",
+			"reenable", "unset SUBROUTER_SELF_START_WEEK and restart")
+	}
 	pacedAllowance, err := pacedAllowanceEnabled()
 	if err != nil {
 		return err
@@ -1684,6 +1716,10 @@ func serve(args []string) error {
 	}
 
 	go server.RunPaceSampler(activeGenerationCtx, paceSampleInterval)
+	// PATCHES §90: each pass reads the scores the usage reads already
+	// published, so it adds no usage fetch; SUBROUTER_SELF_START_WEEK=0 keeps
+	// every pass empty.
+	go server.RunSelfStartWeek(activeGenerationCtx, selfStartScanInterval)
 
 	// No upstream idle score refresher (RunUsageScoreRefresher, #378): PATCHES
 	// 44.3 took #378's hand-off only. The auto-switch sweep and the usage-status

@@ -113,8 +113,9 @@ type SchedulerRef struct {
 	rateLimitedUntil map[string]time.Time
 	// startSentUntil holds start marks per account (ScoreKey): a new session
 	// was given to an account whose week had not started, so the priority of
-	// PATCHES §86 is off it until the mark expires (unstarted_week.go). Never
-	// cleared early and never persisted.
+	// PATCHES §86 is off it until the mark expires (unstarted_week.go); the
+	// daemon's own start request sets the same mark (ClaimStartMark, §90).
+	// Never cleared early and never persisted.
 	startSentUntil map[string]time.Time
 	// placementReservations counts picks that have been made but have not yet
 	// crossed the caller's upstream-success boundary (PickAndReserve, upstream

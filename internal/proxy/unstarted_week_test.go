@@ -187,14 +187,28 @@ func TestUsageStatusPublishesWhetherTheWeekHasStarted(t *testing.T) {
 // with the weekly reading set for it, and the fake upstream names the account
 // each turn spent.
 type unstartedCodexDaemon struct {
-	server Server
-	proxy  *httptest.Server
-	logs   *syncBuffer
+	server   Server
+	proxy    *httptest.Server
+	upstream *httptest.Server
+	logs     *syncBuffer
 
 	mu       sync.Mutex
 	readings map[string][2]float64 // account -> used percent, reset seconds
 	byAuth   map[string]string     // Authorization header -> account
 	served   []string
+	// requests is every request the fake upstream received, in order.
+	requests []upstreamRequest
+	// answer, when set, answers the upstream's requests in place of a
+	// completed turn.
+	answer http.HandlerFunc
+}
+
+// upstreamRequest is one request as the fake upstream received it.
+type upstreamRequest struct {
+	account string
+	path    string
+	header  http.Header
+	body    []byte
 }
 
 func newUnstartedCodexDaemon(t *testing.T, readings map[string][2]float64) *unstartedCodexDaemon {
@@ -234,14 +248,21 @@ func newUnstartedCodexDaemon(t *testing.T, readings map[string][2]float64) *unst
 		return &http.Response{StatusCode: http.StatusOK, Header: header, Body: io.NopCloser(bytes.NewReader(body)), Request: req}, nil
 	})}
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = io.Copy(io.Discard, r.Body)
+		body, _ := io.ReadAll(r.Body)
 		d.mu.Lock()
 		account := d.byAuth[r.Header.Get("Authorization")]
 		d.served = append(d.served, account)
+		d.requests = append(d.requests, upstreamRequest{account: account, path: r.URL.Path, header: r.Header.Clone(), body: body})
+		answer := d.answer
 		d.mu.Unlock()
+		if answer != nil {
+			answer(w, r)
+			return
+		}
 		codexEgressWriteCompleted(w, account)
 	}))
 	t.Cleanup(upstream.Close)
+	d.upstream = upstream
 	upstreamURL, _ := url.Parse(upstream.URL)
 	d.server = Server{
 		AccountRef:    NewAccountRef(store, stored, usage),
