@@ -1,12 +1,17 @@
 package main
 
 import (
+	"encoding/json"
 	"io"
 	"log/slog"
+	"net"
+	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/proxy"
 )
@@ -86,5 +91,105 @@ func TestServeReadsTheUsageHistorySwitch(t *testing.T) {
 	t.Setenv("SUBROUTER_USAGE_HISTORY", "disabled")
 	if err := serveMustReturn(t, args); err == nil || !strings.Contains(err.Error(), "SUBROUTER_USAGE_HISTORY") {
 		t.Fatalf("serve with SUBROUTER_USAGE_HISTORY=disabled returned %v, want a refusal naming it", err)
+	}
+}
+
+// serve attaches the history to its accounts only with the switch on. serve
+// runs in a child of the test binary, as §90's test runs it, on a loopback
+// port and reaching nothing else; its burn route answers 404 naming the
+// switch with it off and the pool figure with it on.
+func TestServeAttachesTheUsageHistoryOnlyWithTheSwitchOn(t *testing.T) {
+	for _, c := range []struct {
+		env    string
+		status int
+	}{
+		{"0", http.StatusNotFound},
+		{"", http.StatusOK},
+	} {
+		t.Run("SUBROUTER_USAGE_HISTORY="+c.env, func(t *testing.T) {
+			sandboxHostConfig(t)
+			clearControlSecretEnv(t)
+			t.Setenv("SUBROUTER_USAGE_HISTORY", c.env)
+			base, output := startServeChild(t, "--fetch-usage=false", "--sr-switch-interval=0", "--reset-credit-autospend", "off")
+			resp, err := http.Get(base + proxy.UsageBurnPath)
+			if err != nil {
+				t.Fatalf("GET %s: %v\nserve's output:\n%s", proxy.UsageBurnPath, err, output.String())
+			}
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if resp.StatusCode != c.status {
+				t.Fatalf("%s = %d %q, want %d\nserve's output:\n%s", proxy.UsageBurnPath, resp.StatusCode, body, c.status, output.String())
+			}
+			if c.status == http.StatusNotFound {
+				if !strings.Contains(string(body), "SUBROUTER_USAGE_HISTORY=0") {
+					t.Fatalf("the 404 says %q, want it to name the switch", body)
+				}
+				return
+			}
+			var report proxy.UsageBurnReport
+			if err := json.Unmarshal(body, &report); err != nil || len(report.Meters) != 3 {
+				t.Fatalf("the burn route answered %s (err %v), want the three meters", body, err)
+			}
+		})
+	}
+}
+
+// startServeChild runs serve with args on a free loopback port in a child of
+// the test binary, as runServeChild does, and returns its base URL once it
+// answers. Every address but loopback goes to a closed port.
+func startServeChild(t *testing.T, args ...string) (string, *lockedBuffer) {
+	t.Helper()
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := listener.Addr().String()
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+	argv, err := json.Marshal(append([]string{"--addr", addr}, args...))
+	if err != nil {
+		t.Fatal(err)
+	}
+	output := &lockedBuffer{}
+	child := exec.Command(binary, "-test.run=^$")
+	child.Env = append(os.Environ(),
+		"SUBROUTER_TEST_SERVE_CHILD="+string(argv),
+		"HTTPS_PROXY=http://127.0.0.1:1", "HTTP_PROXY=http://127.0.0.1:1", "NO_PROXY=",
+	)
+	child.Stdout, child.Stderr = output, output
+	if err := child.Start(); err != nil {
+		t.Fatal(err)
+	}
+	exited := make(chan struct{})
+	go func() {
+		_ = child.Wait()
+		close(exited)
+	}()
+	t.Cleanup(func() {
+		_ = child.Process.Kill()
+		<-exited
+	})
+	base := "http://" + addr
+	client := &http.Client{Timeout: 2 * time.Second}
+	deadline := time.Now().Add(90 * time.Second)
+	for {
+		select {
+		case <-exited:
+			t.Fatalf("serve exited before it answered; its output:\n%s", output.String())
+		default:
+		}
+		if resp, err := client.Get(base + "/_subrouter/health"); err == nil {
+			resp.Body.Close()
+			return base, output
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("serve did not answer on %s within 90s; its output:\n%s", addr, output.String())
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
 }
