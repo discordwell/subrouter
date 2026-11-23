@@ -182,6 +182,7 @@ func plotRows(statuses []remoteServerUsageStatus) []burnpace.Row {
 		rows = append(rows, burnpace.Row{
 			Provider:    string(status.Provider),
 			ID:          strings.TrimSpace(status.ID),
+			Label:       strings.TrimSpace(status.Label),
 			AuthMode:    string(status.AuthMode),
 			AuthChecked: status.AuthChecked,
 			AuthValid:   status.AuthValid,

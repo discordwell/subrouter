@@ -35,7 +35,7 @@ const (
 	headRoomTrim = 15
 	wrapTrim     = 6
 	wrapMin      = 20
-	idCells      = 30
+	accountCells = 30
 )
 
 const (
@@ -292,10 +292,10 @@ func leftOutNotes(m Model) []Note {
 		return nil
 	}
 	var count [LeftRolled + 1]int
-	ids := make([]string, len(m.LeftOut))
+	names := make([]string, len(m.LeftOut))
 	for i, lo := range m.LeftOut {
 		count[lo.Why]++
-		ids[i] = lo.ID
+		names[i] = lo.Name()
 	}
 	var parts []string
 	for why := LeftUnmeasured; why <= LeftRolled; why++ {
@@ -303,7 +303,7 @@ func leftOutNotes(m Model) []Note {
 			parts = append(parts, fmt.Sprintf("%d %s", count[why], why))
 		}
 	}
-	return []Note{{Tone: Amber, Text: strings.Join(parts, " · ") + " — not in the numbers: " + strings.Join(ids, ", ")}}
+	return []Note{{Tone: Amber, Text: strings.Join(parts, " · ") + " — not in the numbers: " + strings.Join(names, ", ")}}
 }
 
 // chart draws the next 168 h of p's ceiling at this terminal's resolution.
@@ -379,7 +379,7 @@ func expiring(accounts []Account, c paint) []string {
 	}
 	lines := []string{"", "  " + c.span(sgrBold, "unspent · expiring soonest")}
 	for _, a := range accounts {
-		lines = append(lines, "  "+c.span(sgrGrey, padRight(firstRunes(a.ID, idCells), idCells+2))+
+		lines = append(lines, "  "+c.span(sgrGrey, padRight(firstRunes(a.Name(), accountCells), accountCells+2))+
 			c.span(sgrBold, fmt.Sprintf("%3.0f%%", (1-a.Used)*100))+
 			c.span(sgrDim, fmt.Sprintf("  in %5.1fh", a.ResetHours)))
 	}

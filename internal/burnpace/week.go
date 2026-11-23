@@ -95,6 +95,7 @@ func judgeRow(row Row, shift float64) rowVerdict {
 		stale: row.SweepCut,
 		account: Account{
 			ID:           row.ID,
+			Label:        row.Label,
 			Used:         week.UsedPercent / 100,
 			ElapsedHours: (weekSeconds - rs) / 3600,
 			ResetHours:   rs / 3600,

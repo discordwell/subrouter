@@ -50,12 +50,12 @@ type Model struct {
 	// copy, not one per account.
 	Folded int
 	// LeftOut are the named rows that are not in the numbers, one per account
-	// with the first reason seen, sorted by ID as strings.
+	// with the first reason seen, sorted by Name as strings.
 	LeftOut []LeftOut
 	// Stale counts merged accounts that some scope reported as sweep-cut.
 	Stale int
-	// Conflicts are the IDs of later copies that disagreed with the copy kept,
-	// in visit order, not de-duplicated.
+	// Conflicts name the account of each later copy that disagreed with the
+	// copy kept, by the kept copy's Name, in visit order, not de-duplicated.
 	Conflicts []string
 }
 
@@ -192,10 +192,16 @@ type Provider struct {
 // first copy seen, with a peer copy's reset already moved on by its age.
 type Account struct {
 	ID           string
+	Label        string  // the kept copy's label; "" when it had none
 	Used         float64 // share of the week's limit spent; not clamped
 	ElapsedHours float64 // of its 168 h window; negative when the reset is over a week out
 	ResetHours   float64 // until the window rolls; always > 0
 }
+
+// Name is what the page calls the account: its label, else its ID. A Codex
+// account enrolled with owner claims has an opaque "codex-owner-<hash>" ID and
+// its login email as its label.
+func (a Account) Name() string { return cmp.Or(a.Label, a.ID) }
 
 // Drawn is the sum of Used across the pool.
 func (p Provider) Drawn() float64 {
@@ -236,8 +242,12 @@ func (p Provider) CeilingAt(hours float64) (ceiling float64, ok bool) {
 type LeftOut struct {
 	Provider string
 	ID       string
+	Label    string // the first left-out copy's label; "" when it had none
 	Why      LeftOutReason
 }
+
+// Name is what the page calls the account, as Account.Name.
+func (l LeftOut) Name() string { return cmp.Or(l.Label, l.ID) }
 
 // LeftOutReason is a closed set. Its order is the order the kinds are counted
 // in on the page.
@@ -564,6 +574,7 @@ type accountKey struct{ provider, id string }
 func mergeScopes(m *Model, scopes []scope) {
 	type leftRow struct {
 		key    accountKey
+		label  string
 		why    LeftOutReason
 		source int
 	}
@@ -581,7 +592,7 @@ func mergeScopes(m *Model, scopes []scope) {
 			}
 			switch v.kind {
 			case rowLeftOut:
-				left = append(left, leftRow{key: key, why: v.why, source: sc.source})
+				left = append(left, leftRow{key: key, label: row.Label, why: v.why, source: sc.source})
 			case rowCounted:
 				m.Sources[sc.source].Measured++
 				first, seen := merged[key]
@@ -592,7 +603,7 @@ func mergeScopes(m *Model, scopes []scope) {
 				}
 				m.Folded++
 				if math.Abs(first.Used-v.account.Used) > conflictUsed || math.Abs(first.ResetHours-v.account.ResetHours) > conflictHours {
-					m.Conflicts = append(m.Conflicts, row.ID)
+					m.Conflicts = append(m.Conflicts, first.Name())
 				}
 			}
 		}
@@ -612,10 +623,10 @@ func mergeScopes(m *Model, scopes []scope) {
 		}
 		if !named[l.key] {
 			named[l.key] = true
-			m.LeftOut = append(m.LeftOut, LeftOut{Provider: l.key.provider, ID: l.key.id, Why: l.why})
+			m.LeftOut = append(m.LeftOut, LeftOut{Provider: l.key.provider, ID: l.key.id, Label: l.label, Why: l.why})
 		}
 	}
-	slices.SortStableFunc(m.LeftOut, func(a, b LeftOut) int { return strings.Compare(a.ID, b.ID) })
+	slices.SortStableFunc(m.LeftOut, func(a, b LeftOut) int { return strings.Compare(a.Name(), b.Name()) })
 
 	for key := range staleKeys {
 		if _, in := merged[key]; in {

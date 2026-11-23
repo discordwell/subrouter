@@ -153,6 +153,7 @@ func (p Peer) SameBoxAs(box string) Peer {
 type Row struct {
 	Provider    string // only providers in weekRules are counted or named
 	ID          string // "" is never counted and never named
+	Label       string // what the page calls the account; "" names it by its ID
 	AuthMode    string // "", "oauth", or anything else; gates only the naming of a left-out row
 	AuthChecked bool
 	AuthValid   bool

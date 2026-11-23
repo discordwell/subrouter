@@ -1,0 +1,80 @@
+{
+ "peers": [
+  {
+   "name": "box",
+   "url": "https://box.parity.test:31416",
+   "reachable": true,
+   "as_of": "2026-11-22T17:59:52Z",
+   "error": "",
+   "accounts": [
+    {
+     "id": "codex-owner-59bc28923c826d2f974e92268d4b05a71f76730ee8876fd160bce9075385571a",
+     "provider": "codex",
+     "label": "owner-b@example.com",
+     "auth_mode": "oauth",
+     "email": "codex-owner-59bc28923c826d2f974e92268d4b05a71f76730ee8876fd160bce9075385571a",
+     "auth_checked": true,
+     "auth_valid": true,
+     "windows": [
+      {
+       "Name": "primary",
+       "UsedPercent": 0,
+       "LimitWindowSeconds": 604800,
+       "ResetAfterSeconds": 66960
+      }
+     ]
+    },
+    {
+     "id": "codex-owner-43ce068d7daaf69aa76274c7b97e308af2e490a59314d34157b8ea85b2232880",
+     "provider": "codex",
+     "label": "owner-c@example.com",
+     "auth_mode": "oauth",
+     "email": "codex-owner-43ce068d7daaf69aa76274c7b97e308af2e490a59314d34157b8ea85b2232880",
+     "auth_checked": true,
+     "auth_valid": true,
+     "windows": [
+      {
+       "Name": "primary",
+       "UsedPercent": 20,
+       "LimitWindowSeconds": 604800,
+       "ResetAfterSeconds": 144000
+      }
+     ]
+    },
+    {
+     "id": "legacy@example.com",
+     "provider": "codex",
+     "label": "legacy@example.com",
+     "auth_mode": "oauth",
+     "email": "legacy@example.com",
+     "auth_checked": true,
+     "auth_valid": true,
+     "windows": [
+      {
+       "Name": "primary",
+       "UsedPercent": 50,
+       "LimitWindowSeconds": 604800,
+       "ResetAfterSeconds": 360000
+      }
+     ]
+    },
+    {
+     "id": "beta",
+     "provider": "claude",
+     "auth_mode": "oauth",
+     "email": "beta@example.com",
+     "auth_checked": true,
+     "auth_valid": true,
+     "windows": [
+      {
+       "Name": "7d",
+       "UsedPercent": 20,
+       "LimitWindowSeconds": 604800,
+       "ResetAfterSeconds": 432000
+      }
+     ]
+    }
+   ]
+  }
+ ]
+}
