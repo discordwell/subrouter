@@ -1007,12 +1007,16 @@ func TestPlotNamesAnAccountByItsLabel(t *testing.T) {
 		row.Label, row.Email = "owner-"+c+"@example.com", row.ID
 		return row
 	}
-	unmeasured := remoteServerUsageStatus{ID: owner("d"), Provider: accounts.ProviderCodex, Label: "owner-d@example.com",
-		AuthMode: accounts.AuthModeOAuth, SweepCut: true}
+	unmeasured := func(c, label string) remoteServerUsageStatus {
+		return remoteServerUsageStatus{ID: owner(c), Provider: accounts.ProviderCodex, Label: label,
+			AuthMode: accounts.AuthModeOAuth, SweepCut: true}
+	}
+	// The two unmeasured rows' IDs sort the other way round from their labels.
 	serveLocalPlotDaemon(t,
-		plotRowsBody(t, plotRow(accounts.ProviderClaude, "alpha", 40, 60), labelled("a", 30, 20), labelled("c", 10, 40), unmeasured),
-		plotPeersBody(t, wirePeer("box", []remoteServerUsageStatus{labelled("b", 0, 18.6), labelled("c", 20, 40)},
-			true, plotThursday.Add(-5*time.Second), "")))
+		plotRowsBody(t, plotRow(accounts.ProviderClaude, "alpha", 40, 60), labelled("a", 30, 20), labelled("c", 10, 40),
+			unmeasured("d", "owner-d@example.com")),
+		plotPeersBody(t, wirePeer("box", []remoteServerUsageStatus{labelled("b", 0, 18.6), labelled("c", 20, 40),
+			unmeasured("0", "owner-e@example.com")}, true, plotThursday.Add(-5*time.Second), "")))
 
 	out, errOut, err := runPlot(t)
 	if err != nil || errOut != "" {
@@ -1031,7 +1035,7 @@ func TestPlotNamesAnAccountByItsLabel(t *testing.T) {
 		t.Errorf("expiring names = %v, want %v: the peer's account, then this machine's, by label\n%s", names, want, out)
 	}
 	requirePlotSays(t, out,
-		"1 unmeasured — not in the numbers: owner-d@example.com",
+		"2 unmeasured — not in the numbers: owner-d@example.com, owner-e@example.com",
 		"same account disagrees across scopes: owner-c@example.com")
 	if strings.Contains(out, "codex-owner-") {
 		t.Errorf("the page prints an owner-keyed ID:\n%s", out)
