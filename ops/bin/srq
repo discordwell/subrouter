@@ -585,6 +585,13 @@ def weekly_window(row):
     return None
 
 
+def account_name(row):
+    """What a person calls the account: its label, else its id. A Codex
+    account enrolled with owner claims has an opaque codex-owner-<hash> id and
+    its login email as its label. Commands that take an account take the id."""
+    return str(row.get("label") or "").strip() or row.get("id")
+
+
 def summarize(row):
     """Normalized view of one account row.
 
@@ -601,6 +608,7 @@ def summarize(row):
         secs = norm.get("seconds_to_weekly_reset") or 0
         return {
             "id": row.get("id"),
+            "name": account_name(row),
             "provider": row.get("provider"),
             "used_percent": None if headroom is None else round((1 - headroom) * 100),
             "headroom_percent": None if headroom is None else round(headroom * 100),
@@ -623,6 +631,7 @@ def summarize(row):
     used = w.get("UsedPercent") if w else None
     return {
         "id": row.get("id"),
+        "name": account_name(row),
         "provider": row.get("provider"),
         "used_percent": used,          # None == unknown, NOT empty
         "headroom_percent": None if used is None else max(0, 100 - used),
@@ -820,7 +829,7 @@ def _render_sections(rows, where, peer=False):
                 flags += "  (no weekly window for this provider -- UNKNOWN, not empty)"
             # Two windows, each labelled. One combined "used" column is what
             # made a 5h reading get quoted as weekly consumption.
-            lines.append(f"  {r['id']:<34} 5h={short}%  7d={weekly}%{fable}  rolls {roll}{flags}")
+            lines.append(f"  {r['name']:<34} 5h={short}%  7d={weekly}%{fable}  rolls {roll}{flags}")
 
         print(f"=== {provider} @ {where} ({len(sub)} accounts): {head}")
         print("      (5h = short window, refills within hours; 7d = the WEEK, what actually runs out)")
@@ -1412,6 +1421,37 @@ def cmd_selftest(_argv):
     check("the local section ranks", "new=fallback (at_cap)" in local_part)
     check("the peer section refuses", "take a new session from a peer" in peer_part
           and "new=NO (at_cap)" in peer_part)
+
+    print("regression: an owner-keyed Codex account is named by its label, local and on a peer")
+    # The daemon publishes the opaque id, the same hash in email, and the
+    # login email as the label.
+    def owner_row(c):
+        key = "codex-owner-" + c * 64
+        return {"id": key, "email": key, "label": f"owner-{c}@example.com", "provider": "codex",
+                "auth_valid": True, "auth_checked": True,
+                "windows": [{"Name": "primary", "UsedPercent": 10, "ResetAfterSeconds": 86400}]}
+    mine, theirs = owner_row("a"), owner_row("b")
+    saved = globals()["_get"], globals()["remote_configs"], globals()["remote_rows"]
+    try:
+        globals()["_get"] = lambda path: [mine] if path == "/_subrouter/usage-status" else None
+        globals()["remote_configs"] = lambda env=None: [{"name": "box", "url": "https://box.example"}]
+        globals()["remote_rows"] = lambda cfg: [summarize(theirs)]
+        out, as_json = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out):
+            cmd_pool([])
+        with contextlib.redirect_stdout(as_json):
+            cmd_pool(["--json"])
+    finally:
+        globals()["_get"], globals()["remote_configs"], globals()["remote_rows"] = saved
+    local_part, _, peer_part = out.getvalue().partition("@ peer box")
+    check("this machine's account is named by its label", "  owner-a@example.com " in local_part)
+    check("the peer's account is named by its label", "  owner-b@example.com " in peer_part)
+    check("no codex-owner id is printed", "codex-owner-" not in out.getvalue())
+    pool = json.loads(as_json.getvalue())
+    check("--json keeps the id and adds the name",
+          pool["local"][0]["id"] == mine["id"] and pool["local"][0]["name"] == "owner-a@example.com"
+          and pool["remote"][0]["id"] == theirs["id"] and pool["remote"][0]["name"] == "owner-b@example.com")
+    check("a row with no label is named by its id", summarize(codex)["name"] == "five@x")
 
     print("regression: newest assignment wins, and only the asked-for session")
     rows = [
