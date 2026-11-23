@@ -256,7 +256,7 @@ func TestASubagentFableTurnHeldOnAFableSpentAccountIsForwardedThereAsOpus(t *tes
 		t.Fatalf("status %d served by %q, box turns %s; want sixteen, as Opus", status, servedBy, fablePinTurnsString(box.seen()))
 	}
 	turns := box.seen()
-	if len(turns) != 1 || turns[0].Target != "sixteen" || turns[0].Model != "claude-opus-5[1m]" || turns[0].Status != http.StatusOK {
+	if len(turns) != 1 || turns[0].Target != "sixteen" || turns[0].Model != "claude-opus-5-5[1m]" || turns[0].Status != http.StatusOK {
 		t.Fatalf("box turns %s; want exactly one, an Opus turn targeted at sixteen (the [1m] suffix kept)", fablePinTurnsString(turns))
 	}
 	if account, held := holdAccount(box.pool, fablePinSession); !held || account != "sixteen" {
@@ -307,7 +307,7 @@ func TestASubagentFableTurnRefusedForItsFablePoolIsResentAsOpusToTheSameAccount(
 		}
 		turns := box.seen()
 		if len(turns) != 2 || turns[0].Target != "sixteen" || turns[0].Model != "claude-fable-5" || turns[0].Status != http.StatusConflict ||
-			turns[1].Target != "sixteen" || turns[1].Model != "claude-opus-5" || turns[1].Status != http.StatusOK {
+			turns[1].Target != "sixteen" || turns[1].Model != "claude-opus-5-5" || turns[1].Status != http.StatusOK {
 			t.Fatalf("box turns %s; want sixteen refusing Fable, then sixteen serving the same turn as Opus", fablePinTurnsString(turns))
 		}
 		// claudeOpusBody keeps every other field's value byte for byte (the
@@ -366,7 +366,7 @@ func TestASubagentFableTurnRefusedForItsFablePoolIsResentAsOpusToTheSameAccount(
 			if tc.opusTried {
 				want = 2
 			}
-			if len(sixteen) != want || sixteen[0].Model != "claude-fable-5" || (tc.opusTried && sixteen[1].Model != "claude-opus-5") {
+			if len(sixteen) != want || sixteen[0].Model != "claude-fable-5" || (tc.opusTried && sixteen[1].Model != "claude-opus-5-5") {
 				t.Fatalf("box turns %s; want sixteen asked for Fable%s", fablePinTurnsString(box.seen()), map[bool]string{true: " and then once for Opus", false: " only"}[tc.opusTried])
 			}
 			if account, held := holdAccount(box.pool, fablePinSession); !held || account != "acct-p" {
@@ -481,8 +481,8 @@ func TestASubagentFableTurnPinnedToAFableSpentLocalAccountIsServedThereAsOpus(t 
 	t.Run("another local account has fable left", func(t *testing.T) {
 		server, served, logs := fablePinLocalLaptop(t, nil, true)
 		status, servedBy := postFablePinTurn(t, server.Handler(), fablePinSession, "claude-fable-5", fablePinAgentID)
-		if status != http.StatusOK || servedBy != "one" || len(*served) != 1 || (*served)[0] != "one:claude-opus-5" {
-			t.Fatalf("status %d served by %q (upstream saw %v); want one serving claude-opus-5", status, servedBy, *served)
+		if status != http.StatusOK || servedBy != "one" || len(*served) != 1 || (*served)[0] != "one:claude-opus-5-5" {
+			t.Fatalf("status %d served by %q (upstream saw %v); want one serving claude-opus-5-5", status, servedBy, *served)
 		}
 		if pinned, _ := server.Sessions.Get("claude", fablePinSession); pinned.AccountID != "one" {
 			t.Fatalf("pin moved to %q; want it kept on one", pinned.AccountID)
@@ -494,8 +494,8 @@ func TestASubagentFableTurnPinnedToAFableSpentLocalAccountIsServedThereAsOpus(t 
 		box.pool.AdminGet(context.Background(), remotePoolUsagePath)
 		server, served, logs := fablePinLocalLaptop(t, box.pool, false)
 		status, servedBy := postFablePinTurn(t, server.Handler(), fablePinSession, "claude-fable-5", fablePinAgentID)
-		if status != http.StatusOK || servedBy != "one" || len(*served) != 1 || (*served)[0] != "one:claude-opus-5" {
-			t.Fatalf("status %d served by %q (upstream saw %v, box %s); want one serving claude-opus-5", status, servedBy, *served, fablePinTurnsString(box.seen()))
+		if status != http.StatusOK || servedBy != "one" || len(*served) != 1 || (*served)[0] != "one:claude-opus-5-5" {
+			t.Fatalf("status %d served by %q (upstream saw %v, box %s); want one serving claude-opus-5-5", status, servedBy, *served, fablePinTurnsString(box.seen()))
 		}
 		if turns := box.seen(); len(turns) != 0 {
 			t.Fatalf("box turns %s; the turn must not leave the pinned account", fablePinTurnsString(turns))
