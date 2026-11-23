@@ -67,4 +67,4 @@ To run the whole Go suite on this Mac, isolated from the live pool, logins, and 
 
 ## Not here
 
-The §63 and §64 code never reached `main` and is not in this repo.
+The §63 code never reached `main` and is not in this repo. The §64 code reached `main` on 2026-11-22, after its section was written.
