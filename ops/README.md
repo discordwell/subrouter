@@ -58,6 +58,7 @@ python3 ops/bin/srq selftest
 python3 ops/bin/sr-plot --selftest
 python3 ops/skills/revive-workflow-agents/test_wf_revive.py
 node --test ops/skills/revive-workflow-agents/test_wf_prefix.mjs
+node --test internal/proxy/pool_ui_page_test.mjs   # the pool board page; Docker: the Node image, as the file says
 ops/bin/sr-local-ci --selftest
 ```
 
@@ -67,4 +68,4 @@ To run the whole Go suite on this Mac, isolated from the live pool, logins, and 
 
 ## Not here
 
-The §63 code never reached `main` and is not in this repo. The §64 code reached `main` on 2026-11-22, after its section was written.
+The §63 code never reached `main` and is not in this repo. The §64 code reached `main` only with the change that ported it on 2026-11-22, after its section was written.
