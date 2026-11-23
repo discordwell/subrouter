@@ -521,9 +521,18 @@ func TestSupervisorTakesTheClaudeSocketAgainWhenItsFolderIsReplaced(t *testing.T
 func TestSupervisorStatusSaysItWaitsForTheClaudeSocketLock(t *testing.T) {
 	rawStatus := func(t *testing.T, config supervisorConfig) map[string]any {
 		t.Helper()
-		response, err := unixHTTPClient(config.ControlSocket).Get("http://supervisor/_subrouter/supervisor-status")
-		if err != nil {
-			t.Fatal(err)
+		// The client gives one answer a second, and a loaded machine can
+		// take longer, so ask again until the suite's own patience ends.
+		var response *http.Response
+		for deadline := time.Now().Add(keeperTestPatience); ; time.Sleep(20 * time.Millisecond) {
+			var err error
+			response, err = unixHTTPClient(config.ControlSocket).Get("http://supervisor/_subrouter/supervisor-status")
+			if err == nil {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatal(err)
+			}
 		}
 		defer response.Body.Close()
 		var status map[string]any

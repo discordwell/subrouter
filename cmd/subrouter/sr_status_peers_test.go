@@ -129,11 +129,8 @@ func addTailnetServer(t *testing.T, store accounts.CodexStore) {
 // failed server section whose red line is the same on every run.
 func addRefusingServer(t *testing.T, store accounts.CodexStore) {
 	t.Helper()
-	box := httptest.NewServer(http.NotFoundHandler())
-	boxURL := box.URL
-	box.Close()
 	var scratch bytes.Buffer
-	addBoxServer(t, store, &scratch, boxURL)
+	addBoxServer(t, store, &scratch, refusingPortURL(t))
 }
 
 // tailscaleRefusal is the servers.json section the transport policy refused.
