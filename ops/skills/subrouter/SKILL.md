@@ -73,6 +73,7 @@ Loopback callers need no token. Routes are hyphenated, and a guessed route such 
 | `/_subrouter/sessions` | Each `session_id` with its `account_id` and `served_by`, plus `served_peer` and `served_account` for a session that a peer serves (§49). |
 | `/_subrouter/pool.json` | The router's own ranking, as `rank` and `reason`. |
 | `/_subrouter/peers/usage-status` | Each peer's usage-status as this daemon's peer link last read it, with `reachable` and `as_of`. Loopback only (§32). |
+| `/_subrouter/burn.json` | The pool's burn per meter, over this daemon's and every peer's accounts (§92.2). |
 | `/_subrouter/accounts` | The account registry. |
 | `/_subrouter/health`, `/_subrouter/ready` | Liveness, and readiness to serve. |
 
@@ -83,6 +84,7 @@ srq serving     # which account serves this session (reads CLAUDE_CODE_SESSION_I
 srq pool        # per-provider status and each account's new-session verdict
 srq resets      # every saved reset in the pool, soonest expiry first
 srq selftest    # regression fixtures; needs no daemon
+srq burn        # how fast the pool spends each weekly meter, with its trend
 ```
 
 To query a daemon over the tailnet, set `SUBROUTER_ADDR`, and `SUBROUTER_ADMIN_TOKEN` or `SUBROUTER_ADMIN_TOKEN_FILE`. Never derive the session id from transcript filenames. `CLAUDE_CODE_SESSION_ID` is in the environment, and a glob of `~/.claude/projects/*/*.jsonl` returns whichever session wrote last.
@@ -147,6 +149,16 @@ To see every reset an account holds, read the `resets` list on its `usage-status
 - Name the account by its exact profile name or email. A near miss gets `did you mean ...? nothing was sent`.
 - The command asks y/N only when the week has more than 10% left, rolls within a day, or is unread. Without a terminal it refuses, and `--yes` answers. Pass `--yes` only after the operator answers yes to that question.
 - The command prints one line. If it says `may have landed`, check the `1x reset` column in `sr status` before any retry.
+
+## Read the pool's burn (§92.2)
+
+`srq burn` gives, per meter (Claude week, Claude Fable, Codex week), the pool's burn over the last hour, 6 hours and 24 hours, the trend against the 6 and 24 hours before, and the share of account-time at the limit. `srq pool` ends with the 24-hour figures on one line.
+
+- 1.00 spends the week's budget exactly as fast as it lasts, 2.00 twice as fast, 0 not at all. Each account weighs the same.
+- A low burn with a high share at the limit means spent accounts, not an idle pool: an account at its limit burns 0.
+- `not enough history yet` is not 0. A figure needs readings over half its window (12 hours for 24 hours), and the 24-hour trend needs 36 hours.
+- A peer named `not counted` publishes no burn (a build from before §92, or its history off) or has not answered for 15 minutes. Its accounts are left out, not read as 0.
+- Each daemon reads only its own accounts' history, `usage-history.jsonl` in its state directory. A daemon that was down leaves a gap. Nothing ranks or routes on the figures. `SUBROUTER_USAGE_HISTORY=0` turns them off.
 
 ## Add an account
 

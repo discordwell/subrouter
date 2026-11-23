@@ -6,7 +6,7 @@ Tools and docs for running this fork on your own Mac and, optionally, your own L
 |---|---|
 | `GETTING-STARTED.md` | The tutorial: from a fresh Mac to a working pool, and adding a box. |
 | `OPERATING.md` | Day-to-day operation: status and meters, dangerous commands, deploys, peers, held turns, saved resets, troubleshooting. |
-| `bin/srq` | Answers questions about the local daemon without its traps: `srq serving`, `srq pool`, `srq resets`, `srq selftest`. |
+| `bin/srq` | Answers questions about the local daemon without its traps: `srq serving`, `srq pool`, `srq resets`, `srq burn`, `srq selftest`. |
 | `bin/sr-plot` | Shows each account's 7-day burn pace in the terminal. `sr plot` runs it. |
 | `bin/srdash` | Shows every pool this machine can reach on one page. |
 | `bin/srprobe` | Sends a request shaped like Claude Code's through a daemon. |
