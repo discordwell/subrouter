@@ -247,6 +247,28 @@ func readCodexResetExpiryEnabled() (bool, error) {
 	return false, fmt.Errorf("SUBROUTER_READ_CODEX_RESET_EXPIRY=%q: want 1 (the default) or 0", raw)
 }
 
+// usageHistoryEnabled reads SUBROUTER_USAGE_HISTORY, the switch of §92.1's
+// series of meter readings and claim records: on unless set to 0, and any
+// value it cannot read stops serve.
+func usageHistoryEnabled() (bool, error) {
+	raw := os.Getenv("SUBROUTER_USAGE_HISTORY")
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "", "1", "true", "yes", "on":
+		return true, nil
+	case "0", "false", "no", "off":
+		return false, nil
+	}
+	return false, fmt.Errorf("SUBROUTER_USAGE_HISTORY=%q: want 1 (the default) or 0", raw)
+}
+
+// serveUsageHistory is §92.1's history in stateDir, nil when it is off.
+func serveUsageHistory(on bool, stateDir string, logger *slog.Logger) *proxy.UsageHistory {
+	if !on {
+		return nil
+	}
+	return proxy.NewUsageHistory(filepath.Join(stateDir, proxy.UsageHistoryFile), logger)
+}
+
 // pacedAllowanceEnabled reads SUBROUTER_PACED_ALLOWANCE (PATCHES §72). 0 keeps
 // a burndown account at the taper of at most four sessions and gives every
 // account four refugees. It does not reopen a closed admission queue: that is
@@ -1109,6 +1131,16 @@ func serve(args []string) error {
 		slog.Info("codex reset credit expiry reads disabled by SUBROUTER_READ_CODEX_RESET_EXPIRY; usage-status shows each Codex credit with its expiry not read",
 			"reenable", "unset SUBROUTER_READ_CODEX_RESET_EXPIRY and restart")
 	}
+	// PATCHES §92.1, read with the other switches so a value it cannot read
+	// stops serve before anything starts.
+	usageHistoryOn, err := usageHistoryEnabled()
+	if err != nil {
+		return err
+	}
+	if !usageHistoryOn {
+		slog.Info("usage history disabled by SUBROUTER_USAGE_HISTORY; no meter reading or reset claim is recorded",
+			"reenable", "unset SUBROUTER_USAGE_HISTORY and restart")
+	}
 	pacedAllowance, err := pacedAllowanceEnabled()
 	if err != nil {
 		return err
@@ -1496,6 +1528,14 @@ func serve(args []string) error {
 	tokenUsageCtx, stopTokenUsage := context.WithCancel(context.Background())
 	defer stopTokenUsage()
 	tokenUsage.RunFlushLoop(tokenUsageCtx)
+	// Same lifetime as token usage, beside it in the state directory: only
+	// this daemon's own accounts feed it (PATCHES §92.1).
+	var usageHistory *proxy.UsageHistory
+	if accountRef != nil {
+		usageHistory = serveUsageHistory(usageHistoryOn, filepath.Dir(*sessionPath), slog.Default())
+		accountRef.SetUsageHistory(usageHistory)
+		usageHistory.RunFlushLoop(tokenUsageCtx)
+	}
 	// Same lifetime as token usage: a retiring worker still records the
 	// failures of the streams it finishes.
 	errorEvents := proxy.NewErrorEventLog(filepath.Join(filepath.Dir(*sessionPath), "error-events.jsonl"), slog.Default())
@@ -1932,6 +1972,8 @@ func serve(args []string) error {
 	if err := tokenUsage.Flush(); err != nil {
 		slog.Warn("token usage flush at shutdown failed", "error", err)
 	}
+	// A failure here was already logged once by the history itself.
+	_ = usageHistory.Close()
 	// Transcript events are buffered; write them out once the server has
 	// drained so a graceful stop loses nothing.
 	if err := errors.Join(server.Transcripts.Close(), multiTenantHandler.CloseTranscripts()); err != nil {
