@@ -1636,7 +1636,8 @@ def render_burn(report):
     if any(_need_line(m) for m in report.get("meters") or []):
         lines.extend(textwrap.wrap("(resets needed: pressure is the burn of the accounts not at their limit. Yes at a"
                                    " 24-hour pressure of 1.0 or more, or when the 6-hour pressure plus its rise on the"
-                                   " 6 hours before reaches 1.1. Nothing claims on it yet.)", 100, subsequent_indent=" "))
+                                   " 6 hours before reaches 1.1. Outside a reset's expiry window and its last chance,"
+                                   " an automatic reset is claimed only when this says yes.)", 100, subsequent_indent=" "))
     return "\n".join(lines) + "\n"
 
 
@@ -2786,7 +2787,8 @@ def cmd_selftest(_argv):
           " under 1.0\n" in need_text)
     check("the legend says what pressure is and when resets are needed",
           "(resets needed: pressure is the burn of the accounts not at their limit. Yes at a 24-hour pressure of 1.0 or"
-          " more, or when the 6-hour pressure plus its rise on the 6 hours before reaches 1.1. Nothing claims on it yet.)"
+          " more, or when the 6-hour pressure plus its rise on the 6 hours before reaches 1.1. Outside a reset's expiry"
+          " window and its last chance, an automatic reset is claimed only when this says yes.)"
           in " ".join(need_text.split()))
     odd_need = json.loads(json.dumps(needs))
     odd_need["meters"][0]["need"] = {"answer": "maybe", "why": "?"}
