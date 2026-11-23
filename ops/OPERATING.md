@@ -72,6 +72,14 @@ To see it:
 
 `SUBROUTER_START_UNSTARTED_WEEK=0` turns the priority and the marks off. The daemon still reads and publishes the fact, and a peer ranks on it by its own switch.
 
+The daemon also starts such a week itself (§90). Within seconds of a reading that says one of its own Codex accounts has not started its week, it sends one tiny turn on that account: one word asked of `gpt-6.2-sol`, at low effort. It marks the account as a new session would, so the next new session is not also pulled there, and a new session that got there first leaves it nothing to send. It never sends for a peer's account, for an account whose credential is dead or that the router would not serve, or for one under a capacity or rate-limit mark. The turn leaves no session, no transcript, and no answer in the log. If a newer reading still says unstarted once the mark has expired, it sends again: 10 minutes after the first send, then 20, 40 and so on, at most 6 hours apart. A failed send counts too.
+
+- Each send logs `weekly window not started; the daemon sent one request to start its clock`, or at Warn `weekly window not started; the daemon's request to start its clock failed`, with `account`, `status`, `sends` and `next_send_after`.
+- After three sends without the week starting, `weekly window still not started after the daemon's requests` is logged once at Warn.
+- `weekly window started after the daemon's request` says a reading saw the clock run.
+
+`SUBROUTER_SELF_START_WEEK=0` turns the daemon's own turn off, independently of the priority. `SUBROUTER_SELF_START_MODEL` names another model for it.
+
 ## Avoid the dangerous commands
 
 These commands change state that every running client depends on, or spend something that does not come back. Run them only when you mean to.
@@ -156,7 +164,7 @@ The daemon logs to `~/Library/Logs/subrouter.err.log`. The daemon caps the file 
 grep -h 'proxy request' ~/Library/Logs/subrouter.err.log* | tail -20
 ```
 
-Each `proxy request` line names the `agent`, `session`, `account`, `path`, and `upstream`. A `remote pool decision` line says why a turn went to a peer, with `target_peer`, `target_account`, and `session_state`. A `weekly window not started; this new session starts its clock` line names each account a new session was sent to so that its week starts (§86). A turn kept on its account logs that line at Debug. To see those, set `SUBROUTER_LOG_LEVEL=debug` in the daemon's environment.
+Each `proxy request` line names the `agent`, `session`, `account`, `path`, and `upstream`. A `remote pool decision` line says why a turn went to a peer, with `target_peer`, `target_account`, and `session_state`. A `weekly window not started; this new session starts its clock` line names each account a new session was sent to so that its week starts (§86), and a `weekly window not started; the daemon sent one request to start its clock` line each account the daemon sent its own turn to (§90). A turn kept on its account logs that line at Debug. To see those, set `SUBROUTER_LOG_LEVEL=debug` in the daemon's environment.
 
 ## Point clients at the pool
 
@@ -544,9 +552,11 @@ The daemon reads these from its environment when it starts.
 | `SUBROUTER_RESET_HOLD_PRIORITY` | on | `0` stops ranking reset holders at 2x (§56). A value it does not recognize stops the daemon. |
 | `SUBROUTER_FABLE_RESERVATION` | off | `1` holds back weekly budget for Fable (§57). A value it does not recognize stops the daemon. |
 | `SUBROUTER_START_UNSTARTED_WEEK` | on | `0` stops giving the next new session first to an account whose weekly window has not started (§86). A value it does not recognize stops the daemon. |
+| `SUBROUTER_SELF_START_WEEK` | on | `0` stops the daemon from sending one tiny turn itself on its own account whose weekly window has not started (§90). A value it does not recognize stops the daemon. |
+| `SUBROUTER_SELF_START_MODEL` | `gpt-6.2-sol` | The model of that turn (§90). |
 | `SUBROUTER_CODEX_AUTO_RATE_LIMIT_RESET` | off | `1` lets failover spend a Codex reset credit. |
 | `SUBROUTER_PUBLIC_ADMIN` | off | On a box, `1` serves admin routes on the public listener to named admin tokens. |
 
-Most of these log an unreadable value and start with the default. Three do not. `SUBROUTER_RESET_HOLD_PRIORITY`, `SUBROUTER_FABLE_RESERVATION` and `SUBROUTER_START_UNSTARTED_WEEK` accept only `1` or `0`, or `true` or `false`, `yes` or `no`, `on` or `off`. Any other value stops `serve` from starting, and on a plain job launchd then restarts it forever. The other on/off settings read any value but `1`, `true`, `yes`, or `on` as off, and log nothing.
+Most of these log an unreadable value and start with the default. Four do not. `SUBROUTER_RESET_HOLD_PRIORITY`, `SUBROUTER_FABLE_RESERVATION`, `SUBROUTER_START_UNSTARTED_WEEK` and `SUBROUTER_SELF_START_WEEK` accept only `1` or `0`, or `true` or `false`, `yes` or `no`, `on` or `off`. Any other value stops `serve` from starting, and on a plain job launchd then restarts it forever. The other on/off settings read any value but `1`, `true`, `yes`, or `on` as off, and log nothing.
 
 The deploy scripts read `SUBROUTER_LABEL`, `SUBROUTER_PLIST`, `SUBROUTER_ADDR` (as `host:port`), and `SUBROUTER_CONTROL_SOCKET` to find the job, and default to the LaunchAgent above.
