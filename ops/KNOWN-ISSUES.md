@@ -374,3 +374,11 @@ A pre-§59 daemon (with §58) holds a turn whose lookup fails and retries the sa
 - **Two daemons can still read need differently near the bar.** Each daemon holds its own answer, so a daemon that read 1.02 holds `yes` at 0.98 while one that has read nothing above 0.98 since it started says `no`. The hold steadies each daemon's answer over time, not the pool's at one moment, and each daemon decides only for its own accounts.
 - **A Claude choice keeps its old order only until 30 minutes after its gap began.** After that its order follows the value of a claim at its wall again, as every standing choice's does.
 - **Need's memory is lost at a restart and at a worker swap.** The new process answers from the figures alone. An unsettled claim is not lost: its record is on disk (§93.2), and the choice reads it.
+
+## Residual gaps §102 leaves open
+
+- **The record of a claim and its follow-up live in memory.** A restart or a worker swap forgets them. The next reading then speaks, and until it does the restored snapshot shows what it shows, without `resets_from_claim`.
+- **A Codex usage-status sweep reads every Codex account live, whatever a hold-off.** After a redeem whose read was refused, a status read inside the hold-off reads the account again, as before §102. The follow-up's own reads keep to the deadline.
+- **A 429 that names no deadline holds the account off for the daemon's own five minutes.** The follow-up waits it out, as every read of the account does.
+- **The follow-up waits for the saved resets, not for every meter.** A meter whose usage answer never carries it, on an account that takes no turn, stays named in `not_read_since_claim` until a probe or a reply measures it.
+- **Not measured:** how long Anthropic's usage endpoint holds a login off after a claim, what `Retry-After` it sends then, and whether a read at that deadline is answered.

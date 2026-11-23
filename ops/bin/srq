@@ -950,7 +950,7 @@ def _render_sections(rows, where, peer=False):
         show_hold = any(r["held_reset_expires_in_hours"] is not None for r in sub)
         # Likewise a column only where an account holds a saved reset: each
         # kind with its count and soonest expiry (§91.2). It holds §64's Fn.
-        reset_marks = {id(r): _reset_marks(r["resets"], r["resets_partial"]) for r in sub}
+        reset_marks = {id(r): _reset_marks(r["resets"], r["resets_partial"], r["resets_from_claim"]) for r in sub}
         reset_width = max(map(len, reset_marks.values()), default=0)
         # Likewise a column only where an account's week has not started (§86),
         # and beside it one only where its daemon sent a request to start it (§90).
@@ -1048,6 +1048,8 @@ def _render_sections(rows, where, peer=False):
             if any(mark in text for text in reset_marks.values() for mark in ("?", "*", "~")):
                 extra.append("? = its expiry not read yet; * = from the last good read of the credit list;"
                              " ~ = its daemon publishes no full list (before §91): what complimentary_reset says")
+            if any(r["resets_from_claim"] for r in sub):
+                extra.append(RESETS_FROM_CLAIM_LEGEND)
         if show_unstarted:
             # The fact is published whatever the owner's switch says; the
             # daemon that places the session ranks on it with its own switch.
@@ -1314,6 +1316,10 @@ RESET_KINDS = {
 UNKNOWN_RESET_KIND = ("U", "reset of an unknown kind", "resets of an unknown kind")
 # The provider's order of use for the Claude kinds remaining_by_kind names.
 CLAUDE_RESET_ORDER = {"week": 1, "fable": 2}
+# What "^" after an account's resets means (§102): its daemon knows them from
+# the claim the provider says it used, and no reading has replaced them yet.
+RESETS_FROM_CLAIM_LEGEND = ("^ = known from the claim just made, not read since: the last block read with the reset it used"
+                            " counted as used; no automatic claim goes by it until a reading")
 PEERS_USAGE_PATH = "/_subrouter/peers/usage-status"
 
 
@@ -1322,11 +1328,17 @@ def _held_resets(row):
     per kind and expiry, and `resets_partial`, true when the row's daemon
     publishes no list (before §91, or a block restored from its persisted
     snapshot) and the entries are what complimentary_reset says.
+    `resets_from_claim` is true when they are known from the account's last
+    claim, not from a reading, and `not_read_since_claim` names each meter
+    that claim gave back with no figure since (§102); false and [] from a
+    daemon before §102.
     """
+    claim = {"resets_from_claim": row.get("resets_from_claim") is True,
+             "not_read_since_claim": [n for n in row.get("not_read_since_claim") or [] if isinstance(n, str)]}
     listed = row.get("resets")
     if not isinstance(listed, list):
         derived = _resets_from_complimentary(row)
-        return {"resets": derived, "resets_partial": bool(derived)}
+        return {"resets": derived, "resets_partial": bool(derived), **claim}
     entries = []
     for e in listed:
         # bool is an int in Python; a true here is not a count.
@@ -1338,7 +1350,7 @@ def _held_resets(row):
                         "expires_at": e.get("expires_at"), "expiry": e.get("expiry"),
                         "expiry_age_seconds": e.get("expiry_age_seconds"),
                         "expiry_window": _expiry_window(e.get("expiry_window"))})
-    return {"resets": entries, "resets_partial": False}
+    return {"resets": entries, "resets_partial": False, **claim}
 
 
 def _expiry_window(window):
@@ -1402,12 +1414,14 @@ def _month_day(when):
     return f"{local.month}/{local.day}"
 
 
-def _reset_marks(entries, partial):
+def _reset_marks(entries, partial, from_claim=False):
     """One mark per kind the row holds, in the provider's order: its letter,
     its count and its soonest expiry in this machine's time, as the board
     draws it. "W1 12/10 F2 3/9", "R3 ?" (expiry not read), "R3 12/14*" (from
-    the last good read), "U1" (a kind the daemon does not know), and "~" after
-    them when the row's daemon publishes no full list. "" for none.
+    the last good read), "U1" (a kind the daemon does not know), "~" after
+    them when the row's daemon publishes no full list, and "^" when they are
+    known from the account's last claim, not a reading ("0^" when that claim
+    used its last reset). "" for none.
     """
     kinds = {}
     for e in entries:
@@ -1425,7 +1439,8 @@ def _reset_marks(entries, partial):
         elif k["unread"]:
             mark += " ?"
         marks.append(mark)
-    return " ".join(marks) + ("~" if partial and marks else "")
+    text = " ".join(marks) + ("~" if partial and marks else "")
+    return (text or "0") + "^" if from_claim else text
 
 
 def pool_resets(sources):
@@ -1449,7 +1464,8 @@ def pool_resets(sources):
         s = held["summary"]
         for e in s["resets"]:
             items.append({**e, "account": s["name"], "id": s["id"], "provider": s["provider"], "on": held["on"],
-                          "partial": s["resets_partial"], "week_used_percent": s["weekly_used_percent"],
+                          "partial": s["resets_partial"], "from_claim": s["resets_from_claim"],
+                          "week_used_percent": s["weekly_used_percent"],
                           "fable_used_percent": s["fable_used_percent"] if s["has_fable_window"] else None,
                           "has_fable_window": s["has_fable_window"],
                           "week_rolls_in_hours": s["weekly_reset_hours"]})
@@ -1532,7 +1548,8 @@ def _render_resets(items, notes, now):
         fable = "-" if not item["has_fable_window"] else ("??" if item["fable_used_percent"] is None else f"{item['fable_used_percent']}%")
         rolls = "-" if item["week_rolls_in_hours"] is None else f"{item['week_rolls_in_hours']:.0f}h"
         window = (_window_words(item.get("expiry_window"), now),) if windows else ()
-        rows.append((expires, *window, kind, str(item["count"]), str(item["account"]), ", ".join(item["on"]),
+        count = str(item["count"]) + ("^" if item.get("from_claim") else "")
+        rows.append((expires, *window, kind, count, str(item["account"]), ", ".join(item["on"]),
                      week, fable, rolls, "; ".join(notes_here)))
     print(f"=== every saved reset in the pool, soonest expiry first ({len(items)} entries)")
     for line in notes:
@@ -1540,6 +1557,8 @@ def _render_resets(items, notes, now):
     if windows:
         print("(window = when the expiry burndown of that kind and date opens (§94.1, §95): from then every holder is"
               " chosen and loaded in real mode, and a claim needs only demand at the limit; - = none published)")
+    if any(item.get("from_claim") for item in items):
+        print(f"({RESETS_FROM_CLAIM_LEGEND})")
     if rows:
         head = ("expires", *(("window",) if windows else ()), "kind", "n", "account", "on", "week", "fable", "rolls", "")
         right = {i for i, name in enumerate(head) if name in ("n", "week", "fable", "rolls")}
@@ -2713,6 +2732,27 @@ def cmd_selftest(_argv):
     check("a block from before §64 names no kinds: one entry of an unknown kind, never a guess",
           [(e["kind"], e["count"], e["expires_at"]) for e in summarize(before_64)["resets"]] == [("unknown", 2, fable_ends)])
 
+    print("saved resets known from a claim, not a reading, are marked ^ (PATCHES §102)")
+    # Right after a claim the provider says it used, a row carries the last
+    # block read with that reset counted as used, until a reading replaces it.
+    from_claim = listing(holder_row(3, True, "eligible"), [held("fable", 1, fable_ends)], resets_from_claim=True,
+                         not_read_since_claim=["7d", 7])
+    text = rendered([summarize(r) for r in pool_rows + [from_claim]])
+    claim_line = next((ln for ln in text.splitlines() if ln.startswith("  acct3")), "")
+    check("srq pool: resets known from a claim read ^ after their marks, the columns still aligned",
+          f"  F1 {md[fable_ends]}^" in claim_line
+          and len({ln.index("new=") for ln in text.splitlines() if ln.startswith("  acct")}) == 1)
+    check("srq pool: the legend explains ^ where it is drawn, and only there",
+          "\n       " + RESETS_FROM_CLAIM_LEGEND in text
+          and RESETS_FROM_CLAIM_LEGEND not in rendered([summarize(r) for r in pool_rows]))
+    used_last = summarize(listing(holder_row(4, True, "eligible"), [], resets_from_claim=True))
+    check("srq pool: a claim that used the account's last reset reads 0^",
+          _reset_marks(used_last["resets"], used_last["resets_partial"], used_last["resets_from_claim"]) == "0^")
+    check("srq pool --json carries the mark and the meters not read since the claim; a daemon before §102 neither",
+          summarize(from_claim)["resets_from_claim"] is True and summarize(from_claim)["not_read_since_claim"] == ["7d"]
+          and summarize(pool_rows[0])["resets_from_claim"] is False and summarize(pool_rows[0])["not_read_since_claim"] == []
+          and summarize(old_claude)["resets_from_claim"] is False)
+
     def resets_output(usage, peers, argv=()):
         def fake_get(path):
             if path == PEERS_USAGE_PATH:
@@ -2793,6 +2833,14 @@ def cmd_selftest(_argv):
           len(as_json["resets"]) == 9 and as_json["resets"][0]["account"] == "alpha@example.com"
           and as_json["resets"][0]["on"] == ["local"] and as_json["totals"][:1] == [{
               "count": 3, "kind": "week", "expires_on": md[week_ends], "expiry": None}])
+    claimed = [listing(dict(holder_row(0, True, "eligible"), label="alpha@example.com"), [held("fable", 1, fable_ends)],
+                       resets_from_claim=True)]
+    text = resets_output(claimed, {"peers": []})
+    check("srq resets: a count known from a claim reads ^, and one legend line says what it means",
+          any("alpha@" in ln and " 1^ " in ln for ln in text.splitlines())
+          and text.count(RESETS_FROM_CLAIM_LEGEND) == 1 and f"({RESETS_FROM_CLAIM_LEGEND})" in text)
+    check("srq resets: no ^ and no legend line where nothing is from a claim",
+          RESETS_FROM_CLAIM_LEGEND not in resets_output(local, peers) and "^" not in resets_output(local, peers))
     check("in how long, from a fixed now",
           _in_how_long(_instant(week_ends), _instant("2026-11-23T18:00:00Z")) == "in 17d 4h"
           and _in_how_long(_instant("2026-11-23T19:30:00Z"), _instant("2026-11-23T18:00:00Z")) == "in 1h 30m"
