@@ -445,7 +445,7 @@ While the daemon serves its socket, the stand-in asks it for `policy_limits` as 
 
 A saved reset clears an account's meters once. Anthropic has granted Claude accounts saved resets of two kinds, and Codex accounts hold rate-limit reset credits. A week reset clears the general week and discards what is left of it. A Fable reset clears only the Fable limit and gives back the part of the week that Fable spent, so it loses nothing left in the week (§64). Each claim spends one for good. Never claim one unless the account owner asked for that claim.
 
-- `sr status` shows a `1x reset` column on Claude and Codex tables (§46). A Claude cell names Fable resets: `2 Fable 3/9`, or `1 +1F 12/10` for a week reset with a Fable reset behind it (§64). A Codex cell shows the soonest expiry the daemon read beside the count, `3 left 12/14`, on a row read from a daemon (§91). A row `sr` reads itself shows the count alone.
+- `sr status` shows a `1x reset` column on Claude and Codex tables (§46). A Claude cell names Fable resets: `2 Fable 3/9`, or `1 +1F 12/10` for a week reset with a Fable reset behind it (§64). A Codex cell shows the soonest expiry the daemon read beside the count, `3 left 12/14` (§91). On a row that `sr` reads itself, the date comes from this machine's daemon, and only when the daemon counted the same credits.
 - `sr claude reset <name|email>` claims one Claude account's next reset, of either kind, through the daemon that holds it, and says which kind it claimed and what it cleared. It asks first only when more than 10% of the week is left or the week rolls within a day.
 - `sr codex reset <name|email>` redeems one Codex credit at any time.
 - `sr reset [email]` redeems a Codex credit only for an account that is out of quota.
