@@ -27,19 +27,33 @@ import (
 
 var resetUseBy = time.Date(2026, 10, 22, 16, 0, 0, 0, time.UTC)
 
-const testResetOrganization = "0b1c2d3e-4f50-6172-8394-a5b6c7d8e9f0"
-
 // The local-daemon fill-in for `sr status` rows is off for the whole package:
-// otherwise any test that lists Claude rows whose read carried no block would
-// ask whatever answers at 127.0.0.1:31415 -- on a developer machine, the real
-// daemon. Tests that want it turn it on against their own fake.
+// otherwise any test that lists Claude rows whose read carried no block, or
+// Codex rows holding credits, would ask whatever answers at 127.0.0.1:31415
+// -- on a developer machine, the real daemon. Tests that want it turn it on
+// against their own fake.
 func init() {
 	fetchLocalDaemonResets = noLocalDaemonResets
 }
 
-func noLocalDaemonResets(srRunner, context.Context) map[string]*accounts.ComplimentaryResetInfo {
+func noLocalDaemonResets(srRunner, context.Context) []remoteServerUsageStatus {
 	return nil
 }
+
+// serveLocalDaemonResets stands in for the fill-in's read of this machine's
+// daemon and counts the reads.
+func serveLocalDaemonResets(t *testing.T, statuses []remoteServerUsageStatus) *int {
+	t.Helper()
+	calls := new(int)
+	fetchLocalDaemonResets = func(srRunner, context.Context) []remoteServerUsageStatus {
+		*calls++
+		return statuses
+	}
+	t.Cleanup(func() { fetchLocalDaemonResets = noLocalDaemonResets })
+	return calls
+}
+
+const testResetOrganization = "0b1c2d3e-4f50-6172-8394-a5b6c7d8e9f0"
 
 func heldResetInfo() *accounts.ComplimentaryResetInfo {
 	one, zero, eligible := 1, 0, true
@@ -1190,33 +1204,36 @@ func TestClaudeResetColumnNeverPushesOutPaidUsage(t *testing.T) {
 // machine's daemon publishes for the same profile -- one loopback read, only
 // when a row needs it.
 func TestLocalRowsTakeTheDaemonsResetWhenTheirReadHasNone(t *testing.T) {
-	calls := 0
-	fetchLocalDaemonResets = func(srRunner, context.Context) map[string]*accounts.ComplimentaryResetInfo {
-		calls++
-		return map[string]*accounts.ComplimentaryResetInfo{"missing": heldResetInfo(), "known": heldResetInfo()}
+	daemonRow := func(id string) remoteServerUsageStatus {
+		return remoteServerUsageStatus{ID: id, Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, ComplimentaryReset: heldResetInfo()}
 	}
-	t.Cleanup(func() { fetchLocalDaemonResets = noLocalDaemonResets })
+	calls := serveLocalDaemonResets(t, []remoteServerUsageStatus{daemonRow("missing"), daemonRow("known")})
 	own := &accounts.ComplimentaryResetInfo{Known: true, Source: agentclaude.ResetProgram}
 	rows := []srUsageRow{
 		{email: "missing", provider: accounts.ProviderClaude, authMode: accounts.AuthModeOAuth},
 		{email: "known", provider: accounts.ProviderClaude, authMode: accounts.AuthModeOAuth, complimentaryReset: own},
 		{email: "failed", provider: accounts.ProviderClaude, authMode: accounts.AuthModeOAuth, err: errors.New("x")},
 	}
-	fillClaudeResetsFromLocalDaemon(context.Background(), srRunner{}, rows)
-	if calls != 1 || rows[0].complimentaryReset == nil || rows[1].complimentaryReset != own || rows[2].complimentaryReset != nil {
-		t.Fatalf("calls %d, rows %+v %+v %+v", calls, rows[0].complimentaryReset, rows[1].complimentaryReset, rows[2].complimentaryReset)
+	fillResetsFromLocalDaemon(context.Background(), srRunner{}, rows)
+	if *calls != 1 || rows[0].complimentaryReset == nil || rows[1].complimentaryReset != own || rows[2].complimentaryReset != nil {
+		t.Fatalf("calls %d, rows %+v %+v %+v", *calls, rows[0].complimentaryReset, rows[1].complimentaryReset, rows[2].complimentaryReset)
 	}
-	fillClaudeResetsFromLocalDaemon(context.Background(), srRunner{}, rows[1:2])
-	if calls != 1 {
+	fillResetsFromLocalDaemon(context.Background(), srRunner{}, rows[1:2])
+	if *calls != 1 {
 		t.Fatal("the daemon was asked although every row had its reset")
 	}
 
-	// Against a fake daemon: the real read picks the Claude rows' resets.
+	// Against a fake daemon: the real read gives the Claude rows its resets.
 	daemon := &resetDaemonFake{t: t, statuses: claudeResetStatuses()}
 	resetMachine(t, daemon)
-	got := srRunner{}.localDaemonClaudeResets(context.Background())
-	if got["held"] == nil || got["held"].Remaining == nil || *got["held"].Remaining != 1 || got["unread"] != nil {
-		t.Fatalf("daemon resets = %+v", got)
+	fetchLocalDaemonResets = srRunner.localDaemonResetRows
+	rows = []srUsageRow{
+		{email: "held", provider: accounts.ProviderClaude, authMode: accounts.AuthModeOAuth},
+		{email: "unread", provider: accounts.ProviderClaude, authMode: accounts.AuthModeOAuth},
+	}
+	fillResetsFromLocalDaemon(context.Background(), srRunner{}, rows)
+	if held := rows[0].complimentaryReset; held == nil || held.Remaining == nil || *held.Remaining != 1 || rows[1].complimentaryReset != nil {
+		t.Fatalf("daemon resets = %+v, %+v", rows[0].complimentaryReset, rows[1].complimentaryReset)
 	}
 }
 

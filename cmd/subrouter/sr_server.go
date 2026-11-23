@@ -1756,20 +1756,28 @@ func (r srRunner) fetchServerAccountStatuses(ctx context.Context, server srServe
 }
 
 func (r srRunner) fetchServerUsageStatuses(ctx context.Context, server srServerConfig) ([]remoteServerUsageStatus, bool, error) {
-	out, available, _, err := r.fetchServerUsageStatusesAt(ctx, server, false)
+	out, available, _, err := r.fetchServerUsageStatusesAt(ctx, server, usageStatusRoute, false)
 	return out, available, err
 }
 
 // fetchServerUsageStatusesVia is fetchServerUsageStatuses for a caller that
 // says in its own output which of the server's paths answered (PATCHES §43.2).
 func (r srRunner) fetchServerUsageStatusesVia(ctx context.Context, server srServerConfig) ([]remoteServerUsageStatus, bool, serverAdminVia, error) {
-	return r.fetchServerUsageStatusesAt(ctx, server, true)
+	return r.fetchServerUsageStatusesAt(ctx, server, usageStatusRoute, true)
 }
 
-func (r srRunner) fetchServerUsageStatusesAt(ctx context.Context, server srServerConfig, quiet bool) ([]remoteServerUsageStatus, bool, serverAdminVia, error) {
+// usageStatusRoute is a server's usage-status, which sweeps its accounts when
+// its last sweep is over 30 s old; usageStatusSnapshotRoute is the last sweep
+// as it stands, which asks no provider anything.
+const (
+	usageStatusRoute         = "/_subrouter/usage-status"
+	usageStatusSnapshotRoute = usageStatusRoute + "?snapshot=1"
+)
+
+func (r srRunner) fetchServerUsageStatusesAt(ctx context.Context, server srServerConfig, route string, quiet bool) ([]remoteServerUsageStatus, bool, serverAdminVia, error) {
 	res, via, err := r.doServerAdmin(ctx, server, serverAdminCall{
 		method:  http.MethodGet,
-		path:    "/_subrouter/usage-status",
+		path:    route,
 		timeout: 15 * time.Second,
 		quiet:   quiet,
 		// A move's check that the server can use the account (PATCHES §51).

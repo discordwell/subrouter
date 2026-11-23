@@ -36,6 +36,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -1146,61 +1147,87 @@ func codexWeeklyPercent(windows []accounts.UsageWindow) (float64, bool) {
 	return 0, false
 }
 
-// localDaemonResetBudget bounds the one loopback read that fills in Claude
-// rows whose own usage read carried no saved-reset block.
+// localDaemonResetBudget bounds the one loopback read that fills in what
+// rows' own reads cannot give: a Claude row's saved-reset block when its
+// usage read carried none, and a Codex row's resets list, which only the
+// daemon reads.
 const localDaemonResetBudget = 3 * time.Second
 
 // fetchLocalDaemonResets is that read. A variable only so this package's
 // tests keep every `sr status` test off the machine's real daemon.
-var fetchLocalDaemonResets = srRunner.localDaemonClaudeResets
+var fetchLocalDaemonResets = srRunner.localDaemonResetRows
 
-// localDaemonClaudeResets is this machine's daemon's saved reset per Claude
-// account id, from its usage-status (loopback only, no credential). The
-// daemon reads the block with Claude Code's own query when its usage read
-// lacks it (EnableClaudeResetFallback), so this is the CLI's fallback too,
-// at no extra request to Anthropic.
-func (r srRunner) localDaemonClaudeResets(ctx context.Context) map[string]*accounts.ComplimentaryResetInfo {
+// localDaemonResetRows is this machine's daemon's usage-status as its last
+// sweep left it (loopback only, no credential, and no sweep started for it).
+// The daemon reads the Claude block with Claude Code's own query when its
+// usage read lacks it (EnableClaudeResetFallback), and each Codex account's
+// credit list (PATCHES §91.1), so this is the CLI's source for both, at no
+// request to a provider.
+func (r srRunner) localDaemonResetRows(ctx context.Context) []remoteServerUsageStatus {
 	local := localResetServer()
 	if !loopbackEndpoint(local.URL) {
 		return nil
 	}
-	ctx, cancel := context.WithTimeout(ctx, localDaemonResetBudget)
-	defer cancel()
-	statuses, available, err := r.fetchServerUsageStatuses(ctx, local)
+	statuses, available, _, err := r.fetchServerUsageStatusesAt(ctx, local, usageStatusSnapshotRoute, false)
 	if err != nil || !available {
 		return nil
 	}
-	out := map[string]*accounts.ComplimentaryResetInfo{}
-	for _, status := range statuses {
-		if status.Provider == accounts.ProviderClaude && status.ComplimentaryReset != nil &&
-			status.ComplimentaryReset.Source == agentclaude.ResetProgram && strings.TrimSpace(status.ID) != "" {
-			out[status.ID] = status.ComplimentaryReset
-		}
-	}
-	return out
+	return statuses
 }
 
-// fillClaudeResetsFromLocalDaemon gives each Claude row whose usage read
-// carried no saved-reset block (PATCHES §46) the reset this machine's daemon
-// publishes for the same profile. Nothing is asked when every row has one.
-func fillClaudeResetsFromLocalDaemon(ctx context.Context, r srRunner, rows []srUsageRow) {
-	missing := false
-	for _, row := range rows {
-		if row.provider == accounts.ProviderClaude && row.err == nil && row.complimentaryReset == nil {
-			missing = true
-			break
-		}
-	}
-	if !missing {
+// fillResetsFromLocalDaemon gives rows that this process read itself what
+// this machine's daemon publishes for the same account: a Claude row whose
+// usage read carried no saved-reset block (PATCHES §46) takes the daemon's
+// block, and a Codex row holding credits takes the daemon's resets list
+// (§91.2), so its cell shows the soonest expiry. The list is taken only when
+// the daemon counted as many credits as the row's own read, so it never
+// dates credits the row does not hold. Nothing is asked when no row needs it.
+func fillResetsFromLocalDaemon(ctx context.Context, r srRunner, rows []srUsageRow) {
+	if !slices.ContainsFunc(rows, needsLocalDaemonResets) {
 		return
 	}
-	resets := fetchLocalDaemonResets(r, ctx)
+	readCtx, cancel := context.WithTimeout(ctx, localDaemonResetBudget)
+	defer cancel()
+	statuses := fetchLocalDaemonResets(r, readCtx)
 	for i := range rows {
-		if rows[i].provider != accounts.ProviderClaude || rows[i].err != nil || rows[i].complimentaryReset != nil {
+		if !needsLocalDaemonResets(rows[i]) {
 			continue
 		}
-		if info := resets[rows[i].email]; info != nil {
-			rows[i].complimentaryReset = info
+		for _, status := range statuses {
+			if status.Provider != rows[i].provider || strings.TrimSpace(status.ID) == "" || status.ID != rows[i].email {
+				continue
+			}
+			reset := status.ComplimentaryReset
+			if rows[i].provider == accounts.ProviderClaude && reset != nil && reset.Source == agentclaude.ResetProgram {
+				rows[i].complimentaryReset = reset
+			}
+			if rows[i].provider == accounts.ProviderCodex && codexCreditCount(reset) == codexCreditCount(rows[i].complimentaryReset) {
+				rows[i].resets = status.Resets
+			}
 		}
 	}
+}
+
+// needsLocalDaemonResets is a row the daemon can complete: a Claude row whose
+// own read carried no block, or a Codex OAuth row that holds credits and has
+// no resets list.
+func needsLocalDaemonResets(row srUsageRow) bool {
+	if row.err != nil {
+		return false
+	}
+	switch row.provider {
+	case accounts.ProviderClaude:
+		return row.complimentaryReset == nil
+	case accounts.ProviderCodex:
+		return row.authMode == accounts.AuthModeOAuth && row.resets == nil && codexCreditCount(row.complimentaryReset) > 0
+	}
+	return false
+}
+
+// codexCreditCount is the credit count a Codex reading carries, -1 for none.
+func codexCreditCount(reset *accounts.ComplimentaryResetInfo) int {
+	if reset == nil || !reset.Known || reset.Remaining == nil {
+		return -1
+	}
+	return *reset.Remaining
 }
