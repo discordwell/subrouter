@@ -611,6 +611,9 @@ func TestAFailedCreditListReadKeepsTheLastGoodDates(t *testing.T) {
 				t.Fatalf("calibration: the session went to %s, want %s", served, creditAccount)
 			}
 			d.pass(base)
+			if d.server.SchedulerRef.HasRankMarks() {
+				t.Fatal("calibration: a rank mark is live before the failed read")
+			}
 			if tc.timeout > 0 {
 				d.memory().timeout = tc.timeout
 			}
@@ -633,6 +636,9 @@ func TestAFailedCreditListReadKeepsTheLastGoodDates(t *testing.T) {
 			}
 			if d.server.SchedulerRef.Get().Exhausted(accounts.ProviderCodex, creditAccount) {
 				t.Fatal("a failed list read marked the account exhausted")
+			}
+			if d.server.SchedulerRef.HasRankMarks() {
+				t.Fatal("a failed list read left a rate-limit or capacity mark, which ranks the account lower for new sessions")
 			}
 			if failure, dead := d.server.AccountRef.terminalCredFailure(account); dead {
 				t.Fatalf("a failed list read marked the credential dead: %s", failure)
