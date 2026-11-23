@@ -120,6 +120,27 @@ func burnNear(got *float64, want, within float64) bool {
 	return got != nil && math.Abs(*got-want) <= within
 }
 
+// figureText prints a published figure, or "none".
+func figureText(v *float64) string {
+	if v == nil {
+		return "none"
+	}
+	return fmt.Sprintf("%.3f", *v)
+}
+
+func (f UsageBurnFigure) String() string {
+	return fmt.Sprintf("burn %s, %.3f covered, %.3f at the limit", figureText(f.Burn), f.Covered, f.AtLimit)
+}
+
+func (w UsagePoolWindow) String() string {
+	return fmt.Sprintf("burn %s over %d accounts, %d without enough history, %s at the limit",
+		figureText(w.Burn), w.Accounts, w.NotEnoughHistory, figureText(w.AtLimit))
+}
+
+func (t UsagePoolTrend) String() string {
+	return fmt.Sprintf("change %s over %d accounts", figureText(t.Change), t.Accounts)
+}
+
 // Behaviour 1. Burn is the rise inside the window over the window's share of
 // the week: 1/7 of the week in 24 hours is 1.0, twice that 2.0, flat 0. A
 // fall at a roll or a claim and a jump at a roll add nothing; a window the
@@ -221,20 +242,20 @@ func TestUsageStatusPublishesEachAccountsBurn(t *testing.T) {
 	rows := usageStatusBurn(t, d.server)
 	steady := rows["steady@example.com"]
 	if len(steady) != 1 || len(steady[usageMeterWeek]) != len(usageBurnWindows) {
-		t.Fatalf("the steady account's burn = %+v, want the week over %d windows", steady, len(usageBurnWindows))
+		t.Fatalf("the steady account's burn = %v, want the week over %d windows", steady, len(usageBurnWindows))
 	}
 	for _, window := range usageBurnWindows {
 		figure := steady[usageMeterWeek][window.name]
 		if !burnNear(figure.Burn, 1, 0.001) || figure.Covered != 1 {
-			t.Errorf("the steady account's %s = %+v (burn %s), want burn 1 over all of it", window.name, figure, burnText(figure))
+			t.Errorf("the steady account's %s: %v; want burn 1 over all of it", window.name, figure)
 		}
 	}
 	short := rows["short@example.com"][usageMeterWeek]
 	if hour := short["1h"]; hour.Burn != nil || math.Abs(hour.Covered-20.0/60) > 0.01 {
-		t.Errorf("a series 20 minutes long publishes %+v over 1h, want no burn and a third covered", hour)
+		t.Errorf("a series 20 minutes long publishes %v over 1h, want no burn and a third covered", hour)
 	}
 	if day := short["24h"]; day.Burn != nil || day.Covered > 0.02 {
-		t.Errorf("a series 20 minutes long publishes %+v over 24h, want no burn", day)
+		t.Errorf("a series 20 minutes long publishes %v over 24h, want no burn", day)
 	}
 
 	off := newUnstartedCodexDaemon(t, readings)
@@ -353,17 +374,17 @@ func TestTheBurnRouteCountsLocalAndPeerAccounts(t *testing.T) {
 	}{{"1h", 1.5, 4, 0}, {"6h", 1.5, 4, 0}, {"24h", 2, 3, 1}} {
 		got := week.Windows[c.window]
 		if !burnNear(got.Burn, c.burn, 0.002) || got.Accounts != c.counted || got.NotEnoughHistory != c.few || !burnNear(got.AtLimit, 0, 0) {
-			t.Errorf("Codex week over %s: %+v (burn %v); want %.1f over %d accounts, %d without enough history, none at the limit",
-				c.window, got, got.Burn, c.burn, c.counted, c.few)
+			t.Errorf("Codex week over %s: %v; want %.1f over %d accounts, %d without enough history, none at the limit",
+				c.window, got, c.burn, c.counted, c.few)
 		}
 	}
 	// The box's account doubled its pace a day ago; nothing else changed.
 	// The newer series has no day before, so it is not in the 24-hour trend.
 	if trend := week.Trend["24h"]; !burnNear(trend.Change, 0.5, 0.002) || trend.Accounts != 2 {
-		t.Errorf("Codex week 24h trend = %+v, want +0.5 over the 2 accounts with both days", trend)
+		t.Errorf("Codex week 24h trend = %v, want +0.5 over the 2 accounts with both days", trend)
 	}
 	if trend := week.Trend["6h"]; !burnNear(trend.Change, 0, 0.002) || trend.Accounts != 4 {
-		t.Errorf("Codex week 6h trend = %+v, want 0 over 4 accounts", trend)
+		t.Errorf("Codex week 6h trend = %v, want 0 over 4 accounts", trend)
 	}
 	var held []string
 	for _, account := range week.Accounts {
@@ -378,10 +399,10 @@ func TestTheBurnRouteCountsLocalAndPeerAccounts(t *testing.T) {
 
 	claudeWeekMeter, fable := poolMeter(t, report, "claude", usageMeterWeek), poolMeter(t, report, "claude", usageMeterFable)
 	if got := claudeWeekMeter.Windows["24h"]; !burnNear(got.Burn, 0.5, 0.002) || got.Accounts != 1 || claudeWeekMeter.Label != "Claude week" {
-		t.Errorf("%s over 24h = %+v, want the peer's 0.5 over 1 account", claudeWeekMeter.Label, got)
+		t.Errorf("%s over 24h = %v, want the peer's 0.5 over 1 account", claudeWeekMeter.Label, got)
 	}
 	if got := fable.Windows["24h"]; !burnNear(got.Burn, 1.5, 0.002) || got.Accounts != 1 || fable.Label != "Claude Fable" {
-		t.Errorf("%s over 24h = %+v, want the peer's 1.5 over 1 account", fable.Label, got)
+		t.Errorf("%s over 24h = %v, want the peer's 1.5 over 1 account", fable.Label, got)
 	}
 	if got := fable.Accounts; len(got) != 1 || got[0].Label != "Opus seat" || got[0].Pool != "claude-box" {
 		t.Errorf("the Fable accounts = %+v, want the peer's labelled account", got)
@@ -416,7 +437,8 @@ func TestTheBurnRouteCountsLocalAndPeerAccounts(t *testing.T) {
 		}
 	}
 	if fable := poolMeter(t, gone, "claude", usageMeterFable); len(fable.Accounts) != 0 || fable.Windows["24h"].Burn != nil {
-		t.Errorf("with the Claude peer's body 20 minutes old the Fable meter = %+v, want no accounts and no figure", fable)
+		t.Errorf("with the Claude peer's body 20 minutes old the Fable meter has %d accounts and %v over 24h, want none",
+			len(fable.Accounts), fable.Windows["24h"])
 	}
 }
 
@@ -446,8 +468,8 @@ func TestASpentPoolReadsAtTheLimitNotUnderPace(t *testing.T) {
 		figure := accountWindows(t, spent, "spent@example.com")[window]
 		pool := spent.Windows[window]
 		if !burnNear(figure.Burn, 0, 0) || figure.AtLimit != 1 || !burnNear(pool.Burn, 0, 0) || !burnNear(pool.AtLimit, 1, 0) || pool.Accounts != 1 {
-			t.Errorf("a spent pool over %s: the account %+v (burn %s), the pool %+v; want burn 0 with all of it at the limit",
-				window, figure, burnText(figure), pool)
+			t.Errorf("a spent pool over %s: the account burns %s with %.3f at the limit, the pool %v; want burn 0 with all of it at the limit",
+				window, burnText(figure), figure.AtLimit, pool)
 		}
 	}
 
@@ -463,10 +485,10 @@ func TestASpentPoolReadsAtTheLimitNotUnderPace(t *testing.T) {
 	midway := accountWindows(t, both, "midway@example.com")["24h"]
 	atLimit := (12*time.Hour + 50*time.Minute).Hours() / 24
 	if !burnNear(midway.Burn, 0.5, 0.002) || math.Abs(midway.AtLimit-atLimit) > 0.002 {
-		t.Errorf("an account spent 12 hours ago reads %+v (burn %s) over 24h, want 0.5 with %.3f of it at the limit", midway, burnText(midway), atLimit)
+		t.Errorf("an account spent 12 hours ago burns %s with %.3f at the limit over 24h, want 0.5 with %.3f", burnText(midway), midway.AtLimit, atLimit)
 	}
 	if pool := both.Windows["24h"]; !burnNear(pool.Burn, 0.25, 0.002) || !burnNear(pool.AtLimit, (1+atLimit)/2, 0.002) || pool.Accounts != 2 {
-		t.Errorf("the pool over 24h = %+v, want burn 0.25 over 2 accounts with %.3f of its account-time at the limit", pool, (1+atLimit)/2)
+		t.Errorf("the pool over 24h: %v; want burn 0.25 over 2 accounts with %.3f of its account-time at the limit", pool, (1+atLimit)/2)
 	}
 }
 
@@ -542,6 +564,7 @@ func TestSelectionIsTheSameWithBurnPublished(t *testing.T) {
 		return out
 	}
 	on, off := run(true), run(false)
+	t.Logf("with the figures published: ranks %v, %s, served %v", on.ranks, on.spill, on.served)
 	if len(on.ranks) != 4 || len(on.served) != 3 || on.served[0] == "" {
 		t.Fatalf("calibration: with the figures published the laptop ranks %v and served %v", on.ranks, on.served)
 	}
