@@ -1060,6 +1060,9 @@ type AccountRef struct {
 	// usageHistory is §92.1's series and claim records (SetUsageHistory),
 	// nil when SUBROUTER_USAGE_HISTORY=0.
 	usageHistory *UsageHistory
+	// autoResetMemory is §93's decision memory (sharedAutoResets): the wall,
+	// the reading pass and the views read one.
+	autoResetMemory atomic.Pointer[autoResets]
 }
 
 // sharedAdmission returns the ref's admission gate, creating it on first use.
@@ -10405,6 +10408,16 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 			reportLeaseFailure(http.StatusTooManyRequests)
 		}
 	}
+	// A quota event on this relay is a wall (PATCHES §93.1); turn is what the
+	// relay does with the turn.
+	autoResetWallOnRelay := func(body []byte, turn string) {
+		if provider != accounts.ProviderCodex || !autoResetOn() {
+			return
+		}
+		if meter, ok := codexAutoResetWallMeter(body, time.Now()); ok {
+			s.autoResetAtTheWall(autoResetWall{account: accounts.Account{ID: accountID, Provider: provider}, meter: meter}, turn)
+		}
+	}
 	codexQuotaEvent := func(body []byte) bool {
 		return !codexChatGPTModelUnsupportedJSON(body) &&
 			(usageLimitJSON(body) || codexTurnFailureClass(body) == codexFailureQuota)
@@ -10511,6 +10524,7 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 					// reconnect picks another account (or, with nothing left,
 					// reaches the handler's fallbacks).
 					noteCodexQuota(body)
+					autoResetWallOnRelay(body, autoResetTurnReconnect)
 					if s.Logger != nil {
 						s.Logger.Warn("codex websocket turn hit a usage limit; rerouting session to another account",
 							"agent", agentType, "session", sessionID, "account", accountID, "pool", poolModel)
@@ -10559,6 +10573,7 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 				if reportLeaseFailure != nil {
 					reportLeaseFailure(http.StatusTooManyRequests)
 				}
+				autoResetWallOnRelay(body, autoResetTurnRefusalDelivered)
 			case credentialUnauthorizedJSON(body):
 				if reportLeaseFailure != nil {
 					reportLeaseFailure(http.StatusUnauthorized)
@@ -10630,6 +10645,7 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 				// -- and let the next turn pick another account. Before any
 				// visible output the rotate-and-1013 below is unchanged.
 				noteCodexQuota(body)
+				autoResetWallOnRelay(body, autoResetTurnRefusalDelivered)
 				if s.Logger != nil {
 					s.Logger.Warn("codex websocket turn failed after output was forwarded; passing the failure through",
 						"agent", agentType, "session", sessionID, "account", accountID, "class", int(codexFailureQuota))
@@ -10675,11 +10691,13 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 					}
 					// No usable alternate: deliver the actual upstream error, and
 					// tell the observer not to swallow it behind a 1012.
+					autoResetWallOnRelay(body, autoResetTurnRefusalDelivered)
 					filterHandledQuota = true
 					return nil
 				}
 				next = revived
 			}
+			autoResetWallOnRelay(body, autoResetTurnReconnect)
 			// The quota event is a spent window, a FORCED switch (P8), and
 			// where the session goes is the one ranking across every pool
 			// (D7). It cannot run here -- mid-socket there is no turn to
@@ -12003,6 +12021,13 @@ func (s Server) captureResponseBodyForRequest(response *http.Response, clientCtx
 		if !claudeControlPlane && claudeAccountExhaustedByResponseForPool(response.StatusCode, response.Header, poolModel) {
 			s.markAccountExhaustedFromResponseForAccount(account, poolModel, response.StatusCode, response.Header)
 		}
+		// A wall the retry transport did not see: a pin, a turn a peer
+		// targeted here, a request that cannot be replayed (PATCHES §93.1).
+		if !claudeControlPlane && autoResetOn() && !autoResetWallsSeen(response) {
+			if wall, ok := autoResetWallOf(account, response, time.Now()); ok {
+				s.autoResetAtTheWall(wall, fmt.Sprintf("answered %d", response.StatusCode))
+			}
+		}
 		// Surface the genuine upstream rate-limit signal (headers now, body
 		// prefix below). Anthropic conveys subscription exhaustion only via the
 		// status plus these headers and an opaque JSON body, none of which were
@@ -12095,6 +12120,11 @@ func (s Server) captureResponseBodyForRequest(response *http.Response, clientCtx
 				// default TTL. A Codex body that names its own reset or a
 				// workspace-level reason decides the hold-out instead.
 				s.markAccountExhaustedFromResponseBodyForAccount(account, poolModel, response.StatusCode, response.Header, body)
+				if accountProviderOrCodex(account) == accounts.ProviderCodex && autoResetOn() && !autoResetWallsSeen(response) {
+					if meter, ok := codexAutoResetWallMeter(body, time.Now()); ok {
+						s.autoResetAtTheWall(autoResetWall{account: account, meter: meter}, fmt.Sprintf("answered %d", response.StatusCode))
+					}
+				}
 			}
 			if inspectModelCompatibility && codexChatGPTModelUnsupportedJSON(body) {
 				if err := s.rerouteModelIncompatibilityForReconnect(responseCtx, provider, agentType, sessionID, "", accountID, compatibilityModel); err != nil && s.Logger != nil {
@@ -15286,7 +15316,22 @@ func claudeRateLimitHeaderFields(header http.Header) []any {
 	return fields
 }
 
+// RoundTrip is roundTrip, and then, for each wall a refusal on the way met
+// (PATCHES §93.1), a claim considered with what the turn got, which no mode
+// changes.
 func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	var walls []autoResetWall
+	response, err := t.roundTrip(req, &walls)
+	if len(walls) > 0 && t.server != nil {
+		for _, wall := range walls {
+			t.server.autoResetAtTheWall(wall, autoResetTurnAfterFailover(wall.account.ID, response, err))
+		}
+		response = markAutoResetWallsSeen(response)
+	}
+	return response, err
+}
+
+func (t usageLimitRetryTransport) roundTrip(req *http.Request, walls *[]autoResetWall) (*http.Response, error) {
 	maxAttempts := t.maxAttempts
 	if maxAttempts < 1 {
 		maxAttempts = 1
@@ -15995,6 +16040,11 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 		// committed and the switch is ranked across every pool.
 		poolRejected := t.provider == accounts.ProviderClaude && !exhausted &&
 			claudeResponseRejected(response.Header) && claudeRejectionIsModelPoolScoped(response.Header)
+		if (exhausted || poolRejected) && !credentialFailure && !modelUnsupported && t.server != nil && autoResetOn() {
+			if wall, ok := autoResetWallOf(accounts.Account{ID: accountID, Provider: t.provider}, response, t.clock()); ok {
+				*walls = append(*walls, wall)
+			}
+		}
 		leaveEvidence := accountSwitchEvidence{UsageLimited: usageLimited, Exhausted: exhausted, CredentialFailure: credentialFailure,
 			PoolRejected: poolRejected, ModelUnsupported: modelUnsupported}
 		// A spent credit balance walks the pool on the quota budget like a
