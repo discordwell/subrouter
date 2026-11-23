@@ -85,8 +85,8 @@ func timesWithin(a, b time.Time, within time.Duration) bool {
 }
 
 // Behaviour 1. Over the daemon's own usage read against a fake whose readings
-// change: one point per changed reading, at the reading's own time, with a
-// roll time that the same cached reading served again does not move.
+// change: one point per changed reading, at the reading's own time, with the
+// roll time the reading gives.
 func TestTheSeriesHoldsOnePointPerChangedReadingAtTheReadingsOwnTime(t *testing.T) {
 	d := newUnstartedCodexDaemon(t, map[string][2]float64{midweekAccount: {20, 300000}})
 	h, _, _ := testUsageHistory(t)
@@ -121,7 +121,8 @@ func TestTheSeriesHoldsOnePointPerChangedReadingAtTheReadingsOwnTime(t *testing.
 		t.Fatalf("the point rolls at %v, want the reading's time plus its 300000 s, %v", roll, first.Add(300000*time.Second))
 	}
 
-	// The 2-minute window cache serves the same reading to the next sweep.
+	// The next sweep reads the account live again and is told the same. A
+	// cached reading never reaches the series: only live reads feed it.
 	d.server.AccountRef.InvalidateUsageStatusCache()
 	d.server.updateSchedulerFromUsageStatusesContext(ctx, d.server.AccountRef.UsageStatuses(ctx))
 	if again := week(); !reflect.DeepEqual(again, points) {
@@ -646,6 +647,48 @@ func TestAnUnwritableStateDirectoryWarnsOnceAndACorruptLineIsSkipped(t *testing.
 	loaded := newUsageHistory(path, slog.New(slog.NewJSONHandler(io.Discard, nil)))
 	if points := historyPoints(loaded, "claude", "held", usageMeterWeek); len(points) != 2 || points[0].Used != 0.1 || points[1].Used != 0.2 {
 		t.Fatalf("loaded %+v, want the two good points", points)
+	}
+}
+
+// Behaviour 7. A damaged line far longer than any the history writes is
+// skipped like any other: the good lines around it load, the file is
+// compacted back under its bound, and nothing warns.
+func TestAnOverlongLineIsSkippedAndTheFileStillCompacts(t *testing.T) {
+	now := time.Now()
+	clock := withUsageHistoryClock(func() time.Time { return now })
+	const bound = 64 << 10
+	path := filepath.Join(t.TempDir(), UsageHistoryFile)
+	good := func(used float64, after time.Duration) string {
+		raw, _ := json.Marshal(usageHistoryLine{Provider: "claude", Account: "held",
+			usageMeterReading: usageMeterReading{Meter: usageMeterWeek, At: now.Add(-time.Hour + after).UnixMicro(), Used: used}})
+		return string(raw)
+	}
+	content := good(0.1, 0) + "\n" + strings.Repeat("x", 2<<20) + "\n" + good(0.2, time.Minute) + "\n"
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	logs := &syncBuffer{}
+	h := newUsageHistory(path, slog.New(slog.NewJSONHandler(logs, nil)), clock, withUsageHistoryMaxBytes(bound))
+	if points := historyPoints(h, "claude", "held", usageMeterWeek); len(points) != 2 || points[0].Used != 0.1 || points[1].Used != 0.2 {
+		t.Fatalf("loaded %+v past a 2 MiB line, want the two good points", points)
+	}
+	h.observe(accounts.Account{ID: "held", Provider: accounts.ProviderClaude}, claudeWeek(30, now.Add(time.Hour)), now)
+	if err := h.Flush(); err != nil {
+		t.Fatalf("a flush after a 2 MiB line: %v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() > bound {
+		t.Fatalf("the file is %d bytes, want it compacted under its bound of %d", info.Size(), bound)
+	}
+	if warns := jsonLogLines(logs, "usage history could not be written; the daemon keeps it in memory and serves as before"); len(warns) != 0 {
+		t.Fatalf("a skipped line logged %d write warnings:\n%s", len(warns), logs.String())
+	}
+	restarted := newUsageHistory(path, slog.New(slog.NewJSONHandler(io.Discard, nil)), clock)
+	if points := historyPoints(restarted, "claude", "held", usageMeterWeek); len(points) != 3 || points[2].Used != 0.30 {
+		t.Fatalf("a restart loaded %+v, want the two good points and the new one", points)
 	}
 }
 
