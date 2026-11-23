@@ -269,6 +269,38 @@ func serveUsageHistory(on bool, stateDir string, logger *slog.Logger) *proxy.Usa
 	return proxy.NewUsageHistory(filepath.Join(stateDir, proxy.UsageHistoryFile), logger)
 }
 
+// autoResetMode reads SUBROUTER_AUTO_RESET (PATCHES §93): 0 is off, shadow
+// (and unset) decides and logs what a claim would be and claims nothing, 1
+// claims. Anything else is an error, so a typo never picks a side.
+func autoResetMode() (proxy.AutoResetMode, error) {
+	raw := os.Getenv("SUBROUTER_AUTO_RESET")
+	switch strings.TrimSpace(raw) {
+	case "", "shadow":
+		return proxy.AutoResetShadow, nil
+	case "0":
+		return proxy.AutoResetOff, nil
+	case "1":
+		return proxy.AutoResetReal, nil
+	}
+	return proxy.AutoResetOff, fmt.Errorf("SUBROUTER_AUTO_RESET=%q: want shadow (the default), 0 or 1", raw)
+}
+
+// autoResetNearEmptyEnabled reads SUBROUTER_AUTO_RESET_NEAR_EMPTY.
+// Ruling 2026-11-23: an automatic claim waits until the account has under 1%
+// left on the meter its reset gives back; the owner keeps this condition on
+// until they turn it off. Unset or 1 is on, 0 is off, anything else is an
+// error.
+func autoResetNearEmptyEnabled() (bool, error) {
+	raw := os.Getenv("SUBROUTER_AUTO_RESET_NEAR_EMPTY")
+	switch strings.TrimSpace(raw) {
+	case "", "1":
+		return true, nil
+	case "0":
+		return false, nil
+	}
+	return false, fmt.Errorf("SUBROUTER_AUTO_RESET_NEAR_EMPTY=%q: want 1 (the default) or 0", raw)
+}
+
 // pacedAllowanceEnabled reads SUBROUTER_PACED_ALLOWANCE (PATCHES §72). 0 keeps
 // a burndown account at the taper of at most four sessions and gives every
 // account four refugees. It does not reopen a closed admission queue: that is
@@ -327,6 +359,10 @@ const selfStartScanInterval = 10 * time.Second
 // account whose reset credit list is due a read (PATCHES §91.1). The pass
 // reads the last sweep's counts, so a changed count is read within seconds.
 const codexResetExpiryScanInterval = 10 * time.Second
+
+// autoResetScanInterval is how often the daemon looks at its newest usage
+// readings for the reading moment of an automatic claim (PATCHES §93.1).
+const autoResetScanInterval = 10 * time.Second
 
 const maxSecretFileBytes = 64 << 10
 
@@ -1141,6 +1177,27 @@ func serve(args []string) error {
 		slog.Info("usage history disabled by SUBROUTER_USAGE_HISTORY; no meter reading or reset claim is recorded",
 			"reenable", "unset SUBROUTER_USAGE_HISTORY and restart")
 	}
+	// PATCHES §93.1, refused like §86's switch on a value it cannot read.
+	autoReset, err := autoResetMode()
+	if err != nil {
+		return err
+	}
+	autoResetNearEmpty, err := autoResetNearEmptyEnabled()
+	if err != nil {
+		return err
+	}
+	proxy.SetAutoReset(autoReset, autoResetNearEmpty)
+	switch {
+	case autoReset == proxy.AutoResetOff:
+		slog.Info("automatic resets disabled by SUBROUTER_AUTO_RESET=0; nothing decides or logs a claim",
+			"reenable", "unset SUBROUTER_AUTO_RESET and restart")
+	case autoReset == proxy.AutoResetReal:
+		slog.Warn("SUBROUTER_AUTO_RESET=1: this build makes no automatic claim yet; it decides and logs as shadow mode does")
+	}
+	if !autoResetNearEmpty {
+		slog.Warn("the under-1-percent condition on automatic claims is off (SUBROUTER_AUTO_RESET_NEAR_EMPTY=0)",
+			"reenable", "unset SUBROUTER_AUTO_RESET_NEAR_EMPTY and restart")
+	}
 	pacedAllowance, err := pacedAllowanceEnabled()
 	if err != nil {
 		return err
@@ -1796,6 +1853,9 @@ func serve(args []string) error {
 	// only reads the credit list; SUBROUTER_READ_CODEX_RESET_EXPIRY=0 keeps
 	// every pass empty.
 	go server.RunCodexResetExpiryReader(activeGenerationCtx, codexResetExpiryScanInterval)
+	// PATCHES §93.1: the reading moment. Each pass reads the rows the usage
+	// reads already published; SUBROUTER_AUTO_RESET=0 keeps every pass empty.
+	go server.RunAutoReset(activeGenerationCtx, autoResetScanInterval)
 
 	// No upstream idle score refresher (RunUsageScoreRefresher, #378): PATCHES
 	// 44.3 took #378's hand-off only. The auto-switch sweep and the usage-status
