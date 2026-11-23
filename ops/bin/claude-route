@@ -1435,7 +1435,7 @@ cmd_check() {
     out=$(cd "$cwd" && perl -e 'alarm shift; exec @ARGV' 240 env "${CLEAN[@]}" PATH="$FRONT_PATH" \
         "$FRONT" -p "Reply with exactly one word, in lowercase: ready" --model haiku --session-id "$sid" 2>&1)
     route=$($GREP -F "sid=$sid" "$ROUTE_HOME/launch.log" 2>/dev/null | tail -1 | sed -n 's/.* route=\([a-z-]*\).*/\1/p')
-    acct=$("$SRQ" serving "$sid" 2>/dev/null)
+    acct=$("$SRQ" serving "$sid" 2>/dev/null) || acct=""   # srq prints a line for an unassigned session too
     echo "mode=$(mode_now)  route=${route:-?}  answer=${out:0:80}  pool account=${acct:-none (not through the pool)}"
     [[ "$out" == *ready* ]] || return 1
     [ "$(mode_now)" = off ] || [ -n "$acct" ]
@@ -1455,7 +1455,7 @@ cmd_check_codex() {
         "$FRONT" exec --skip-git-repo-check -o "$cwd/.codex-check-last.txt" "Reply with exactly one word, in lowercase: ready" </dev/null 2>&1)
     sid=$(printf '%s\n' "$out" | sed -n 's/^session id: //p' | head -1)
     last=$(cat "$cwd/.codex-check-last.txt" 2>/dev/null); rm -f "$cwd/.codex-check-last.txt"
-    acct=$([ -n "$sid" ] && "$SRQ" serving "$sid" 2>/dev/null)
+    acct=$([ -n "$sid" ] && "$SRQ" serving "$sid" 2>/dev/null) || acct=""
     echo "codex: CODEX_HOME=${CODEX_HOME:-$HOME/.codex}  session=${sid:-?}  answer=${last:0:80}  pool account=${acct:-none (not through the pool)}"
     if [[ "$last" == *ready* ]] && [ -n "$acct" ]; then res=PASS; else res=FAIL; printf '%s\n' "$out" | tail -5 >&2; fi
     echo "$res $(date +%Y-%m-%d) $(date +%H:%M:%S) (${acct:-no pool account}; via $FRONT; CODEX_HOME=${CODEX_HOME:-$HOME/.codex})" > "$LAST_CODEX_CHECK"
