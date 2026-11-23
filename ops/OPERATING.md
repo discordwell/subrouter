@@ -485,7 +485,7 @@ To see every saved reset in the pool, run `srq resets`. It prints one line per a
 
 pool.json carries each row's list in `resets` (`kind`, `count`, `expires_at`, `expiry`), with `resets_partial: true` for a daemon from before §91.
 
-Each daemon records every claim it makes, by hand or by the Codex failover and background spender, in `usage-history.jsonl` in its state directory, with each meter's used fraction and roll time from the last reading before the claim and the first reading after it (§92.1). It logs the same as `reset claim recorded` at Info: `before` and `after` hold one group per meter. A claim that did not reset the account is marked `failed` and has no `after`. The same file holds the daemon's own meter readings for 35 days, at most 32 MiB. `SUBROUTER_USAGE_HISTORY=0` turns it off.
+Each daemon records every claim it makes, by hand or by the Codex failover and background spender, in `usage-history.jsonl` in its state directory, with each meter's used fraction and roll time from the last reading before the claim and the first reading after it (§92.1). It logs the same as `reset claim recorded` at Info: `before` and `after` hold one group per meter. A claim that did not reset the account is marked `failed` and has no `after`. A redeem `sr reset` makes from the CLI itself (`--local`, `SUBROUTER_CODEX_SERVER=local`, or a machine with no server configured) reaches no daemon and is not recorded. The same file holds the daemon's own meter readings for 35 days, at most 32 MiB. `SUBROUTER_USAGE_HISTORY=0` turns it off.
 
 ## Troubleshoot
 
