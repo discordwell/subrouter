@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"fmt"
+	"math"
 	"net/http"
 	"strings"
 	"sync"
@@ -238,7 +239,47 @@ type AutoResetDecision struct {
 	Reason string `json:"reason"`
 	// Turn is what the request at the wall got from the daemon, as today.
 	Turn string `json:"turn,omitempty"`
+	// Rule is what §94.2's rule used, absent when it did not decide: the
+	// rule off, or a check of §93.1 stopped the claim first.
+	Rule *AutoResetRule `json:"rule,omitempty"`
 }
+
+// AutoResetRule is what §94.2's rule read for one decision (PATCHES §94.3).
+type AutoResetRule struct {
+	// DecidedBy is the step of the rule the decision stopped at.
+	DecidedBy AutoResetRuleStep `json:"decided_by"`
+	// Need is the pool's need on the meter the reset is claimed on.
+	Need ResetNeed `json:"need"`
+	// Pressure is the pool's pressure over Window, the window that decided
+	// need; null when need is unknown. Trend is the 6-hour pressure trend.
+	Pressure Pressure `json:"pressure"`
+	Window   string   `json:"window,omitempty"`
+	Trend    *float64 `json:"trend"`
+	// Value is the share of a week a claim now adds; null when it is not
+	// known. HoursToRoll is null when the account's roll was not read.
+	Value       *float64 `json:"value"`
+	HoursToRoll *float64 `json:"hours_to_roll"`
+}
+
+// AutoResetRuleStep is where §94.2's rule decided, in its order.
+type AutoResetRuleStep string
+
+const (
+	// AutoResetByUnknownClock is a kind whose restarts_clock is unknown:
+	// never claimed.
+	AutoResetByUnknownClock AutoResetRuleStep = "unknown_clock"
+	// AutoResetByExpiryWindow and AutoResetByLastChance claim at any value.
+	AutoResetByExpiryWindow AutoResetRuleStep = "expiry_window"
+	AutoResetByLastChance   AutoResetRuleStep = "last_chance"
+	// AutoResetByNeed is the pool's need: held back when it is no, no claim
+	// when it is unknown.
+	AutoResetByNeed AutoResetRuleStep = "need"
+	// AutoResetByRollUnread is no claim: what a claim adds is not known.
+	AutoResetByRollUnread AutoResetRuleStep = "roll_unread"
+	// AutoResetByValue is what a claim adds: held back under the floor,
+	// claimed at or above it.
+	AutoResetByValue AutoResetRuleStep = "value"
+)
 
 // autoResetNext is the provider's next reset: the one a claim would spend.
 type autoResetNext struct {
@@ -348,7 +389,7 @@ func decideAutoReset(f autoResetFacts) AutoResetDecision {
 	d.Verdict = AutoResetWouldClaim
 	d.Reason = moment + "; " + next
 	if f.worth != nil {
-		d.Verdict, d.Reason = decideWorth(*f.worth, f.now, d.Reason)
+		d.Verdict, d.Reason, d.Rule = decideWorth(*f.worth, f.now, d.Reason)
 	}
 	return d
 }
@@ -357,38 +398,54 @@ func decideAutoReset(f autoResetFacts) AutoResetDecision {
 // whose clock nobody knows is never claimed. Inside its expiry window, or in
 // its last chance, it is claimed at any value. Otherwise it is claimed only
 // when the pool needs its saved resets on the meter and a claim adds at least
-// resetValueFloor of a week before the roll.
-func decideWorth(w autoResetWorth, now time.Time, reason string) (AutoResetVerdict, string) {
+// resetValueFloor of a week before the roll. It returns the verdict, its
+// reason, and what the rule used (§94.3).
+func decideWorth(w autoResetWorth, now time.Time, reason string) (AutoResetVerdict, string, *AutoResetRule) {
 	pool, _ := longestPressure(w.need.Pressure)
 	rate := claimRateOf(w.own, pool)
 	value := claimValueOf(w.restarts, w.roll.Sub(now), rate)
+	used := AutoResetRule{Need: w.need.Answer, Window: w.need.Window, Pressure: w.need.Pressure[w.need.Window], Trend: w.need.Trend}
+	if !w.roll.IsZero() {
+		hours := math.Round(max(w.roll.Sub(now), 0).Hours()*10) / 10
+		used.HoursToRoll = &hours
+		if value.known {
+			used.Value = &value.value
+		}
+	}
+	by := func(step AutoResetRuleStep) *AutoResetRule {
+		rule := used
+		rule.DecidedBy = step
+		return &rule
+	}
 	if _, known := w.restarts.Restarts(); !known {
-		return AutoResetNoClaim, reason + "; " + value.why + "; such a reset is never claimed automatically"
+		return AutoResetNoClaim, reason + "; " + value.why + "; such a reset is never claimed automatically", by(AutoResetByUnknownClock)
 	}
 	if w.window != nil && !now.Before(w.window.OpensAt) {
 		return AutoResetWouldClaim, fmt.Sprintf("%s; inside its expiry window, open since %s, %s before the reset expires: any demand at the limit is enough",
-			reason, w.window.OpensAt.UTC().Format(time.RFC3339), shortDuration(time.Duration(w.window.LeadSeconds)*time.Second))
+			reason, w.window.OpensAt.UTC().Format(time.RFC3339), shortDuration(time.Duration(w.window.LeadSeconds)*time.Second)), by(AutoResetByExpiryWindow)
 	}
 	if !w.roll.IsZero() && lastChance(w.expires, w.roll, rate) {
 		return AutoResetWouldClaim, fmt.Sprintf("%s; its last chance: it expires at %s, before the account could meet its next wall after the roll at %s at the rate %s",
-			reason, w.expires.UTC().Format(time.RFC3339), w.roll.UTC().Format(time.RFC3339), rate)
+			reason, w.expires.UTC().Format(time.RFC3339), w.roll.UTC().Format(time.RFC3339), rate), by(AutoResetByLastChance)
 	}
 	if w.need.Answer == ResetNeedNo {
 		return AutoResetHeldBack, fmt.Sprintf("%s; held back: the pool does not need its saved resets on the %s (%s), so the rest of the pool can carry the work",
-			reason, w.label, w.need.Why)
+			reason, w.label, w.need.Why), by(AutoResetByNeed)
 	}
 	if w.need.Answer != ResetNeedYes {
-		return AutoResetNoClaim, fmt.Sprintf("%s; the pool's burn on the %s is not known yet (%s), so nothing is claimed", reason, w.label, w.need.Why)
+		return AutoResetNoClaim, fmt.Sprintf("%s; the pool's burn on the %s is not known yet (%s), so nothing is claimed", reason, w.label, w.need.Why),
+			by(AutoResetByNeed)
 	}
 	if w.roll.IsZero() {
-		return AutoResetNoClaim, fmt.Sprintf("%s; the account's roll on the %s is not read, so what a claim would add is not known", reason, w.label)
+		return AutoResetNoClaim, fmt.Sprintf("%s; the account's roll on the %s is not read, so what a claim would add is not known", reason, w.label),
+			by(AutoResetByRollUnread)
 	}
 	if value.value < resetValueFloor {
 		return AutoResetHeldBack, fmt.Sprintf("%s; held back: the roll is %s away, and a claim would add %.2f of a week, under the floor of %.2f (%s)",
-			reason, shortDuration(max(w.roll.Sub(now), 0)), value.value, resetValueFloor, value.why)
+			reason, shortDuration(max(w.roll.Sub(now), 0)), value.value, resetValueFloor, value.why), by(AutoResetByValue)
 	}
 	return AutoResetWouldClaim, fmt.Sprintf("%s; the pool needs its saved resets on the %s (%s), and a claim adds %.2f of a week (%s)",
-		reason, w.label, w.need.Why, value.value, value.why)
+		reason, w.label, w.need.Why, value.value, value.why), by(AutoResetByValue)
 }
 
 // autoResetMeterLeft is how much meter has left: nothing, when the wall's

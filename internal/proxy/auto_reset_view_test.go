@@ -161,9 +161,9 @@ func TestHealthNamesTheAutoResetModeAndTheCondition(t *testing.T) {
 		nearEmpty bool
 		want      string
 	}{
-		{AutoResetShadow, true, `{"mode":"shadow","near_empty":true}`},
-		{AutoResetOff, true, `{"mode":"off","near_empty":true}`},
-		{AutoResetReal, false, `{"mode":"real","near_empty":false}`},
+		{AutoResetShadow, true, `{"mode":"shadow","near_empty":true,"worth":false}`},
+		{AutoResetOff, true, `{"mode":"off","near_empty":true,"worth":false}`},
+		{AutoResetReal, false, `{"mode":"real","near_empty":false,"worth":false}`},
 	} {
 		setAutoResetForTest(t, c.mode, c.nearEmpty)
 		recorder := httptest.NewRecorder()

@@ -588,8 +588,11 @@ def _self_start(norm):
     return sent_at, sends
 
 
-AUTO_RESET_VERDICTS = ("would_claim", "refused_by_condition", "no_claim", "claimed", "failed", "may_have_landed")
+AUTO_RESET_VERDICTS = ("would_claim", "refused_by_condition", "held_back", "no_claim", "claimed", "failed",
+                       "may_have_landed")
 AUTO_RESET_KINDS = {"week": "week", "fable": "Fable", "codex_credit": "credit"}
+# The steps of §94.2's rule a decision can stop at (PATCHES §94.3).
+AUTO_RESET_RULE_STEPS = ("unknown_clock", "expiry_window", "last_chance", "need", "roll_unread", "value")
 
 
 def _auto_reset(row):
@@ -602,14 +605,17 @@ def _auto_reset(row):
     Absent is an account its daemon cannot decide for, or a daemon from
     before §93. A malformed field reads as absent.
     """
-    out = {"auto_reset_mode": None, "auto_reset_near_empty": None, "auto_reset_claiming": False,
-           "auto_reset_verdict": None, "auto_reset_kind": None, "auto_reset_at": None,
-           "auto_reset_left": None, "auto_reset_reason": None}
+    out = {"auto_reset_mode": None, "auto_reset_near_empty": None, "auto_reset_worth": None,
+           "auto_reset_claiming": False, "auto_reset_verdict": None, "auto_reset_kind": None,
+           "auto_reset_at": None, "auto_reset_left": None, "auto_reset_reason": None,
+           **_auto_reset_rule(None)}
     auto = row.get("auto_reset")
     if not isinstance(auto, dict) or auto.get("mode") not in ("off", "shadow", "real"):
         return out
     out["auto_reset_mode"] = auto["mode"]
     out["auto_reset_near_empty"] = auto.get("near_empty") is True
+    # Absent from a daemon before §94, which has no rule to name.
+    out["auto_reset_worth"] = auto["worth"] if isinstance(auto.get("worth"), bool) else None
     out["auto_reset_claiming"] = auto.get("claiming") is True
     last = auto.get("last")
     if isinstance(last, dict) and last.get("verdict") in AUTO_RESET_VERDICTS and _instant(last.get("at")) is not None:
@@ -618,6 +624,30 @@ def _auto_reset(row):
         for key in ("kind", "left", "reason"):
             value = last.get(key)
             out[f"auto_reset_{key}"] = value if isinstance(value, str) and value else None
+        out.update(_auto_reset_rule(last.get("rule")))
+    return out
+
+
+def _auto_reset_rule(rule):
+    """What §94.2's rule used for a decision, flattened: the step it stopped
+    at, the pool's need and pressure, what a claim adds as a share of a week,
+    and the hours to the roll. All None for a decision the rule did not make,
+    a daemon before §94, or a malformed rule (PATCHES §94.3)."""
+    out = {"auto_reset_decided_by": None, "auto_reset_need": None, "auto_reset_pressure": None,
+           "auto_reset_value": None, "auto_reset_hours_to_roll": None}
+    if (not isinstance(rule, dict) or rule.get("decided_by") not in AUTO_RESET_RULE_STEPS
+            or rule.get("need") not in ("yes", "no", "unknown")):
+        return out
+
+    def number(value):
+        # bool is an int in Python; a true here is not a figure.
+        return value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+    pressure = rule.get("pressure")
+    out.update({"auto_reset_decided_by": rule["decided_by"], "auto_reset_need": rule["need"],
+                "auto_reset_pressure": pressure if pressure == "all_at_limit" else number(pressure),
+                "auto_reset_value": number(rule.get("value")),
+                "auto_reset_hours_to_roll": number(rule.get("hours_to_roll"))})
     return out
 
 
@@ -1008,7 +1038,10 @@ def _render_sections(rows, where, peer=False):
                          if peer else
                          "auto = the last automatic reset decision (§93), at that time: would claim (shadow: real mode"
                          " would claim it now), claiming, claimed, CLAIM FAILED, MAY HAVE LANDED (only a reading settles"
-                         " it), refused <1% (the owner's condition stopped it), no claim; usage-status has the reason")
+                         " it), refused <1% (the owner's condition stopped it), held back (§94: the pool does not need"
+                         " it, or a claim adds under a quarter of a week, wk, before the roll), no claim; (expiry window)"
+                         " or (last chance) = claimed at any value because the reset expires soon; usage-status has the"
+                         " reason")
         end = ";" if extra else ")"
         if peer:
             print(f"      ({fable_legend}new = would this peer take a NEW session placed from here{end}")
@@ -1025,17 +1058,23 @@ def _render_sections(rows, where, peer=False):
 def _auto_reset_mode_line(rows, where):
     """The daemon's automatic reset mode, once for all its rows, else None
     (no row it can decide for, or a daemon from before §93)."""
-    modes = sorted({(r["auto_reset_mode"], r["auto_reset_near_empty"]) for r in rows if r["auto_reset_mode"]})
+    modes = sorted({(r["auto_reset_mode"], r["auto_reset_near_empty"], r["auto_reset_worth"])
+                    for r in rows if r["auto_reset_mode"]}, key=str)
     if not modes:
         return None
     words = {"off": "off, nothing is decided or claimed",
              "shadow": "shadow, it logs what it would claim and claims nothing",
              "real": "REAL, it claims saved resets by itself"}
     parts = []
-    for mode, near_empty in modes:
+    for mode, near_empty, worth in modes:
         text = words[mode]
         if mode != "off":
             text += "; the owner's under-1% condition is " + ("on" if near_empty else "OFF")
+            # A daemon before §94 says nothing of the rule.
+            if worth is True:
+                text += "; §94's rule decides whether a claim is worth it"
+            elif worth is False:
+                text += "; §94's rule is OFF, §93's alone decides"
         parts.append(text)
     return f"--- automatic resets @ {where} (§93): " + " | ".join(parts)
 
@@ -1049,18 +1088,42 @@ def _auto_reset_label(r):
     kind = AUTO_RESET_KINDS.get(r["auto_reset_kind"], r["auto_reset_kind"] or "")
     at = _instant(r["auto_reset_at"]).astimezone().strftime("%H:%M")
     left = r["auto_reset_left"]
+    by = r["auto_reset_decided_by"]
+    # A claim the expiry window or last chance decided is made at any value.
+    urgent = {"expiry_window": "(expiry window)", "last_chance": "(last chance)"}.get(by, "")
     if r["auto_reset_claiming"]:
-        words = ["claiming", kind, "since", at]
+        words = ["claiming", kind, urgent, "since", at]
     elif verdict == "refused_by_condition":
         shown = f"({left} left)" if left and left[0].isdigit() else ""
         words = ["refused <1%", kind, shown, at]
+    elif verdict == "held_back":
+        words = ["held back", kind, _held_back_why(r), at]
     elif verdict == "no_claim":
-        never = "(never twice)" if (r["auto_reset_reason"] or "").startswith("never twice") else ""
-        words = ["no claim", never, at]
+        why = "(never twice)" if (r["auto_reset_reason"] or "").startswith("never twice") else ""
+        if not why and by == "need" and r["auto_reset_need"] == "unknown":
+            why = "(burn not known)"
+        words = ["no claim", why, at]
     else:
         words = [{"would_claim": "would claim", "claimed": "claimed", "failed": "CLAIM FAILED",
-                  "may_have_landed": "MAY HAVE LANDED"}[verdict], kind, at]
+                  "may_have_landed": "MAY HAVE LANDED"}[verdict], kind, urgent, at]
     return "auto=" + " ".join(w for w in words if w)
+
+
+def _held_back_why(r):
+    """Why §94.2's rule held a claim back, in a few words: the pool does not
+    need the reset, with its pressure; or a claim adds too little before the
+    roll, with what it adds and the hours to the roll. "" when not published."""
+    by = r["auto_reset_decided_by"]
+    if by == "need":
+        pressure = r["auto_reset_pressure"]
+        if isinstance(pressure, (int, float)):
+            return f"(not needed, pressure {pressure:.2f})"
+        return "(not needed)"
+    if by == "value" and r["auto_reset_value"] is not None and r["auto_reset_hours_to_roll"] is not None:
+        hours = r["auto_reset_hours_to_roll"]
+        roll = f"{hours:.0f}h" if hours >= 1 else f"{hours * 60:.0f}m"
+        return f"(adds {r['auto_reset_value']:.2f} wk, rolls in {roll})"
+    return ""
 
 
 def _start_sent(r):
@@ -2393,6 +2456,72 @@ def cmd_selftest(_argv):
     older = rendered([summarize(claude_row(0, True, "eligible"))])
     check("a daemon from before §93 prints no mode line and no label",
           "automatic resets" not in older and "auto=" not in older and "auto =" not in older)
+
+    print("automatic resets: whether §94's rule decides, a held-back decision and a claim the expiry decided (PATCHES §94.3)")
+
+    def rule(decided_by, need, pressure, value, hours):
+        return {"decided_by": decided_by, "need": need, "pressure": pressure, "window": "24h", "trend": 0.0,
+                "value": value, "hours_to_roll": hours}
+
+    def worth_row(i, worth=True, mode="shadow", **last):
+        row = auto_row(i, mode=mode, **last)
+        row["auto_reset"]["worth"] = worth
+        return row
+
+    for verdict, kind, used, want in (
+            ("held_back", "week", rule("need", "no", 0.7, 0.25, 60.0), f"auto=held back week (not needed, pressure 0.70) {at}"),
+            ("held_back", "week", rule("value", "yes", 1.2, 0.071, 10.0), f"auto=held back week (adds 0.07 wk, rolls in 10h) {at}"),
+            ("held_back", "codex_credit", rule("value", "yes", 1.3, 0.179, 30.0),
+             f"auto=held back credit (adds 0.18 wk, rolls in 30h) {at}"),
+            ("held_back", "fable", rule("value", "yes", 1.2, 0.004, 0.2), f"auto=held back Fable (adds 0.00 wk, rolls in 12m) {at}"),
+            ("would_claim", "week", rule("expiry_window", "no", 0.5, 0.179, 60.0), f"auto=would claim week (expiry window) {at}"),
+            ("claimed", "week", rule("last_chance", "no", 0.7, 0.25, 60.0), f"auto=claimed week (last chance) {at}"),
+            ("would_claim", "week", rule("value", "yes", 1.2, 0.429, 60.0), f"auto=would claim week {at}"),
+            ("no_claim", None, rule("need", "unknown", None, 0.357, 60.0), f"auto=no claim (burn not known) {at}"),
+            ("no_claim", None, rule("roll_unread", "yes", 1.2, None, None), f"auto=no claim {at}"),
+            ("held_back", "week", None, f"auto=held back week {at}")):
+        last = {"verdict": verdict, **({"kind": kind} if kind else {}), **({"rule": used} if used else {})}
+        row = summarize(worth_row(0, **last))
+        check(f"{verdict} by {(used or {}).get('decided_by')} reads {want!r}", _auto_reset_label(row) == want)
+    claiming = rendered([summarize(worth_row(0, mode="real", claiming=True, verdict="would_claim", kind="week",
+                                             rule=rule("expiry_window", "no", 0.5, 0.179, 60.0)))])
+    check("a claim in flight that the expiry window decided says so", f"  auto=claiming week (expiry window) since {at}\n" in claiming)
+    held = [worth_row(0, verdict="held_back", kind="week", rule=rule("need", "no", 0.7, 0.25, 60.0),
+                      reason="...; held back: the pool does not need its saved resets on the Claude week (...)"),
+            worth_row(1)]
+    text = rendered([summarize(r) for r in held])
+    check("the rule on is named in the mode line",
+          "--- automatic resets @ local (§93): shadow, it logs what it would claim and claims nothing; the owner's under-1%"
+          " condition is on; §94's rule decides whether a claim is worth it\n" in text)
+    check("the rule off is loud in the mode line",
+          "; §94's rule is OFF, §93's alone decides\n" in rendered([summarize(worth_row(0, worth=False))]))
+    check("mode off says nothing of the rule",
+          "--- automatic resets @ local (§93): off, nothing is decided or claimed\n"
+          in rendered([summarize(worth_row(0, mode="off"))]))
+    check("a held-back decision reads beside its account, and the legend explains it",
+          f"  auto=held back week (not needed, pressure 0.70) {at}\n" in text
+          and "held back (§94: the pool does not need it, or a claim adds under a quarter of a week, wk, before the roll)"
+              in text
+          and "(expiry window) or (last chance) = claimed at any value because the reset expires soon" in text)
+    check("peer: the peer's own held-back decision",
+          f"  auto=held back week (not needed, pressure 0.70) {at}\n" in rendered([summarize(r) for r in held], peer=True))
+    s = summarize(held[0])
+    check("--json carries what the rule used",
+          s["auto_reset_worth"] is True and s["auto_reset_verdict"] == "held_back" and s["auto_reset_decided_by"] == "need"
+          and s["auto_reset_need"] == "no" and s["auto_reset_pressure"] == 0.7 and s["auto_reset_value"] == 0.25
+          and s["auto_reset_hours_to_roll"] == 60.0 and summarize(held[1])["auto_reset_decided_by"] is None
+          and summarize(auto_row(0))["auto_reset_worth"] is None
+          and summarize(worth_row(0, verdict="would_claim", kind="week",
+                                  rule=rule("need", "yes", "all_at_limit", 1, 60.0)))["auto_reset_pressure"] == "all_at_limit")
+    check("a malformed rule reads as none",
+          not any(summarize(worth_row(0, verdict="held_back", kind="week", rule=v))["auto_reset_decided_by"]
+                  for v in ("need", [], {"decided_by": "guess", "need": "no"}, {"decided_by": "need", "need": "maybe"},
+                            {"need": "no"}))
+          and summarize(worth_row(0, verdict="held_back", kind="week",
+                                  rule={**rule("value", "yes", True, "0.07", False)}))["auto_reset_pressure"] is None
+          and summarize(worth_row(0, verdict="held_back", kind="week",
+                                  rule={**rule("value", "yes", True, "0.07", False)}))["auto_reset_value"] is None
+          and summarize({**claude_row(0, True, "eligible"), "auto_reset": {"mode": "shadow", "worth": "yes"}})["auto_reset_worth"] is None)
 
     print("reauth: the dir comes from the DAEMON, never from `sr claude env`")
     rows = [{"id": "main", "source": "/x/_p1787439913450"},

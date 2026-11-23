@@ -82,3 +82,45 @@ func TestDocsSayHowAutomaticResetsDecideAndWhoSpends(t *testing.T) {
 		}
 	}
 }
+
+// What a reader of the operator doc and the agent skill must find about the
+// views of PATCHES §94.3: that the owner's condition still comes first, why
+// the rule reads pressure and not burn, how `srq pool` shows a held-back
+// decision and a claim the expiry decided, and the rule's fields on a
+// decision and on the health route.
+var worthViewNames = []string{"comes first", "Pressure, not burn", "auto=held back", "(not needed, pressure", "(adds 0.07 wk",
+	"(expiry window)", "(last chance)", "decided_by", "hours_to_roll", "`worth`"}
+
+// What no doc but ops/PATCHES.md may still say since §94.2: that nothing
+// claims on the pool's need, the expiry window or the resets list it is
+// built from.
+var staleNothingClaimsOnIt = regexp.MustCompile(`\bNothing claims on it yet\b|§93's rule still decides|(?i:nothing claims or ranks on)`)
+
+func TestDocsSayHowToReadWhatTheRuleUsed(t *testing.T) {
+	root := repoRoot(t)
+	for _, rel := range []string{"ops/OPERATING.md", "ops/skills/subrouter/SKILL.md"} {
+		data, err := os.ReadFile(filepath.Join(root, rel))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, name := range worthViewNames {
+			if !strings.Contains(string(data), name) {
+				t.Errorf("%s does not name %q, which a reader needs to read what the rule decided", rel, name)
+			}
+		}
+	}
+	for _, rel := range trackedFiles(t, root) {
+		if !strings.HasSuffix(rel, ".md") || rel == "ops/PATCHES.md" {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(root, rel))
+		if err != nil {
+			continue
+		}
+		for n, line := range strings.Split(string(data), "\n") {
+			if match := staleNothingClaimsOnIt.FindString(line); match != "" {
+				t.Errorf("%s:%d still says %q; since §94.2 automatic resets claim on the pool's need and the expiry window", rel, n+1, match)
+			}
+		}
+	}
+}
