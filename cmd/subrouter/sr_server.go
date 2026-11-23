@@ -1653,6 +1653,10 @@ type remoteServerUsageStatus struct {
 	// AutoReset is the daemon's automatic resets for the account (PATCHES
 	// §93.3), decoded for the same wire test; no table reads it yet.
 	AutoReset *proxy.AutoResetStatus `json:"auto_reset,omitempty"`
+	// WouldChoose is the choice a daemon in shadow mode would publish for
+	// the account (PATCHES §95.1), decoded for the same wire test; no table
+	// reads it yet.
+	WouldChoose *proxy.ResetChoice `json:"would_choose,omitempty"`
 	// Normalized is the scheduler's own provider-independent view of this
 	// account. Raw Windows carry provider vocabulary that is easy to misread
 	// across providers, so consumers deciding capacity should prefer this.
