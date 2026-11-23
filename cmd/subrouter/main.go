@@ -1528,8 +1528,8 @@ func serve(args []string) error {
 	tokenUsageCtx, stopTokenUsage := context.WithCancel(context.Background())
 	defer stopTokenUsage()
 	tokenUsage.RunFlushLoop(tokenUsageCtx)
-	// Same lifetime as token usage, beside it in the state directory: only
-	// this daemon's own accounts feed it (PATCHES §92.1).
+	// Same lifetime as token usage, and beside it in the folder of
+	// --sessions: only this daemon's own accounts feed it (PATCHES §92.1).
 	var usageHistory *proxy.UsageHistory
 	if accountRef != nil {
 		usageHistory = serveUsageHistory(usageHistoryOn, filepath.Dir(*sessionPath), slog.Default())
@@ -1972,7 +1972,8 @@ func serve(args []string) error {
 	if err := tokenUsage.Flush(); err != nil {
 		slog.Warn("token usage flush at shutdown failed", "error", err)
 	}
-	// A failure here was already logged once by the history itself.
+	// The history's one last write, after the drain; its flush loop writes
+	// nothing when it stops. A failure was already logged by the history.
 	_ = usageHistory.Close()
 	// Transcript events are buffered; write them out once the server has
 	// drained so a graceful stop loses nothing.

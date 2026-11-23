@@ -206,9 +206,9 @@ func TestTheSeriesSurvivesARestartAndAPointWrittenTwiceIsStoredOnce(t *testing.T
 	}
 }
 
-// Behaviour 2. When the daemon stops (the flush loop's context ends), what
-// waits is written: the last points, and a claim still waiting for a reading
-// after it, without one.
+// Behaviour 2. When the daemon stops (its flush loop's context ends and it
+// calls Close), what waits is written: the last points, and a claim still
+// waiting for a reading after it, without one.
 func TestStoppingTheDaemonWritesWhatWaits(t *testing.T) {
 	h, logs, path := testUsageHistory(t)
 	ctx, stop := context.WithCancel(context.Background())
@@ -218,29 +218,25 @@ func TestStoppingTheDaemonWritesWhatWaits(t *testing.T) {
 	h.observe(held, claudeWeek(99, at.Add(48*time.Hour)), at)
 	h.finishClaim(h.startClaim(held, "week", time.Now()), "reset", true)
 	stop()
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		var points, claims []usageHistoryLine
-		for _, line := range historyFileLines(t, path) {
-			if line.Claim != nil {
-				claims = append(claims, line)
-			} else {
-				points = append(points, line)
-			}
+	if err := h.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var points, claims []usageHistoryLine
+	for _, line := range historyFileLines(t, path) {
+		if line.Claim != nil {
+			claims = append(claims, line)
+		} else {
+			points = append(points, line)
 		}
-		if len(points) == 1 && len(claims) == 1 {
-			if claim := claims[0].Claim; claim.Failed || len(claim.After) != 0 || len(claim.Before) != 1 || claim.Before[0].Used != 0.99 {
-				t.Fatalf("the claim written at stop: %+v, want the landed claim with its reading before and none after", claim)
-			}
-			if lines := jsonLogLines(logs, "reset claim recorded"); len(lines) != 1 {
-				t.Fatalf("logged %d claim lines at stop, want 1", len(lines))
-			}
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("10 s after the stop the file holds %d points and %d claims, want 1 and 1", len(points), len(claims))
-		}
-		time.Sleep(20 * time.Millisecond)
+	}
+	if len(points) != 1 || len(claims) != 1 {
+		t.Fatalf("after the stop the file holds %d points and %d claims, want 1 and 1", len(points), len(claims))
+	}
+	if claim := claims[0].Claim; claim.Failed || len(claim.After) != 0 || len(claim.Before) != 1 || claim.Before[0].Used != 0.99 {
+		t.Fatalf("the claim written at stop: %+v, want the landed claim with its reading before and none after", claim)
+	}
+	if lines := jsonLogLines(logs, "reset claim recorded"); len(lines) != 1 {
+		t.Fatalf("logged %d claim lines at stop, want 1", len(lines))
 	}
 }
 

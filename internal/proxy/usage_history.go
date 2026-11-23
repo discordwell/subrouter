@@ -408,7 +408,8 @@ func usageClaimLogArgs(claim usageClaim) []any {
 }
 
 // RunFlushLoop writes the history every usageHistoryFlushInterval until ctx
-// ends, then once more with every claim still waiting.
+// ends. It writes nothing when ctx ends: the daemon's stop calls Close once,
+// after its drain, so the last write happens before the process exits.
 func (h *UsageHistory) RunFlushLoop(ctx context.Context) {
 	if h == nil || h.path == "" {
 		return
@@ -420,7 +421,6 @@ func (h *UsageHistory) RunFlushLoop(ctx context.Context) {
 			for {
 				select {
 				case <-ctx.Done():
-					_ = h.Close()
 					return
 				case <-ticker.C:
 					_ = h.Flush()
