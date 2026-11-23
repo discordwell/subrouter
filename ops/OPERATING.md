@@ -211,6 +211,7 @@ Each `proxy request` line names the `agent`, `session`, `account`, `path`, and `
 | `claude-route status` | The mode, the shims, the socket (`STAND-IN` when a stand-in holds it, PATCHES §84), the identity account, and the last test. |
 | `claude-route pool`, `claude-route off` | New Claude Code launches use the pool over the socket, or your own login. |
 | `claude-route codex pool`, `claude-route codex off` | The same switch for new Codex launches. |
+| `claude-route advisor on`, `claude-route advisor off` | Claude Code's experimental advisor tool in new pool launches. It is off until you turn it on. `claude local` never gets it from the shim (§97). |
 | `claude-route test` | The wet test. `pool` refuses without a pass today. Without the Paradev app, the checks of its wrapper print `SKIP` and count as neither a pass nor a failure. |
 | `claude-route check`, `claude-route check codex` | One real launch, made as a new session makes it. It goes through Paradev's wrapper when this Mac has one, and through the shim otherwise. `codex pool` refuses without a passing `check codex` today. |
 | `claude-route socket-on`, `claude-route socket-off` | Start or stop the daemon's Claude socket through `deploy-laptop.sh`. A supervised job also needs `--restart-supervisor`. |
@@ -227,6 +228,8 @@ Route words are one-launch exceptions, typed first:
 A pool launch whose socket does not answer falls back to the daemon's TCP port, then to your own login. A Claude Code session that started in socket mode does not fall back if the socket dies later. It retries for minutes. Watch `claude_socket` in `/_subrouter/health`. A running daemon binds a deleted or dead socket path again within about 2 seconds (§77.1), so the session hangs only while the daemon itself is down.
 
 A credential command (`claude auth`, `claude login`, `claude logout`, `claude setup-token`) bypasses the route, so a login lands in the store its environment names (§73). `claude-route status` warns when the shim's login-free store holds a login (`pool store:`).
+
+Your own login sends Claude Code's advisor tool with each request, because an Anthropic-side flag turns it on for a signed-in login. A pool session gets no such flag, so it has no advisor tool. To add it, run `claude-route advisor on`. New pool and pool-tcp launches then set `CLAUDE_CODE_ENABLE_EXPERIMENTAL_ADVISOR_TOOL=1` and pass `--settings '{"advisorModel":"opus"}'`. Both are needed: with the variable alone, a socket session picks no advisor model. Each request is then about 1,360 tokens larger, and each `advisor()` call has a second model read the conversation on the pool account. A launch with its own `--settings` keeps that file, so it gets no advisor model unless its settings name one. `claude-route advisor off` turns it off. `claude-route status` shows the state on its `advisor:` line (§97).
 
 ### Fix 401s after `sr setup`
 

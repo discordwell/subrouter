@@ -50,6 +50,8 @@
 #   claude-route pool [--force]   cut over NEW launches to the pool (refuses without a passing test today)
 #   claude-route off              roll back NEW launches to your own login (instant)
 #   claude-route codex pool [--force] | codex off   the same switch for NEW Codex launches (ships off)
+#   claude-route advisor on | advisor off   Claude Code's experimental advisor tool in NEW pool launches
+#                                 (ships off; claude local is never changed)
 #   claude-route uninstall        remove the shims and the PATH lines (the socket stays: socket-off)
 #   claude-route socket-off [--force] [--restart-supervisor]
 #                                 stop serving the socket (refuses while pool sessions use it)
@@ -67,6 +69,7 @@ SHIM="$SHIM_DIR/claude"
 CODEX_SHIM="$SHIM_DIR/codex"
 MODE_FILE="$ROUTE_HOME/mode"
 CODEX_MODE_FILE="$ROUTE_HOME/codex-mode"
+ADVISOR_FILE="$ROUTE_HOME/advisor"   # on|off; the shim reads it at launch (PATCHES §97)
 LAST_TEST="$ROUTE_HOME/last-test"
 LAST_CODEX_TEST="$ROUTE_HOME/last-codex-test"
 LAST_CODEX_CHECK="$ROUTE_HOME/last-codex-check"
@@ -115,6 +118,8 @@ plist_identity() { plist_get EnvironmentVariables:SUBROUTER_IDENTITY_ACCOUNT 2>/
 read_mode() { local m=""; [ -f "$1" ] && [ -r "$1" ] && read -r m < "$1"; m="${m%$'\r'}"; case "$m" in pool|off) echo "$m" ;; *) echo off ;; esac; }
 mode_now() { read_mode "$MODE_FILE"; }
 codex_mode_now() { read_mode "$CODEX_MODE_FILE"; }
+# 2026-11-23 owner: the advisor is an option, off by default.
+advisor_now() { local a=""; [ -f "$ADVISOR_FILE" ] && [ -r "$ADVISOR_FILE" ] && read -r a < "$ADVISOR_FILE"; [ "${a%$'\r'}" = on ] && echo on || echo off; }
 write_mode() { mkdir -p "$ROUTE_HOME" && printf '%s\n' "$2" > "$1.tmp.$$" && mv -f "$1.tmp.$$" "$1"; }
 set_mode() { write_mode "$MODE_FILE" "$1"; }
 set_codex_mode() { write_mode "$CODEX_MODE_FILE" "$1"; }
@@ -710,6 +715,18 @@ fi
 set_keys=""
 put() { export "$1=$2"; set_keys="$set_keys $1"; }
 keep() { [ -n "${!1+x}" ] || put "$1" "$2"; }   # only when absent: the user's own value wins
+# 2026-11-23 owner: the advisor is an option, off by default.
+# `claude-route advisor on` writes on to $route_home/advisor; a pool launch then gets Claude Code's
+# experimental advisor tool, which a plain login gets from an Anthropic-side flag (PATCHES §97). The
+# variable opens Claude Code's gate; with no model named, a socket session picks none. A Claude Code
+# command ($1 reserved) gets no --settings; a --settings of the caller's own, later, wins.
+advisor_settings=""
+add_advisor() { # $1 = the first argument
+    local a=""; [ -f "$route_home/advisor" ] && [ -r "$route_home/advisor" ] && read -r a < "$route_home/advisor"
+    [ "${a%$'\r'}" = on ] || return 0
+    keep CLAUDE_CODE_ENABLE_EXPERIMENTAL_ADVISOR_TOOL 1
+    [[ "$reserved" == *" $1 "* ]] || advisor_settings='{"advisorModel":"opus"}'
+}
 scrub() { # every alternate route, and ambient proxies (the base URL is plain http)
     unset ANTHROPIC_AUTH_TOKEN ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_UNIX_SOCKET \
           CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY \
@@ -769,6 +786,7 @@ case "$route" in
         put ENABLE_CLAUDEAI_MCP_SERVERS 0
         if [ -n "$pin" ]; then put ANTHROPIC_CUSTOM_HEADERS "$(pin_headers)"; else keep ANTHROPIC_CUSTOM_HEADERS "X-Subrouter-Agent: claude"; fi
         keep CLAUDE_CODE_PROMPT_CACHE_TTL 1h
+        add_advisor "${1:-}"
         export CLAUDE_ROUTE_SET="${set_keys# }"
         ;;
     pool-tcp)
@@ -779,6 +797,7 @@ case "$route" in
         keep ENABLE_TOOL_SEARCH true
         keep CLAUDE_CODE_PROMPT_CACHE_TTL 1h
         keep CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY 1
+        add_advisor "${1:-}"
         export CLAUDE_ROUTE_SET="${set_keys# }"
         ;;
     off|credentials)
@@ -786,6 +805,7 @@ case "$route" in
         ;;
 esac
 export CLAUDE_ROUTE_ACTIVE="$route"
+[ -n "$advisor_settings" ] && set -- --settings "$advisor_settings" "$@"
 
 if [ -n "${CLAUDE_ROUTE_DRYRUN:-}" ]; then
     echo "route=$route"
@@ -794,7 +814,7 @@ if [ -n "${CLAUDE_ROUTE_DRYRUN:-}" ]; then
     echo "word=${word:-<none>}"
     echo "pin=${pin:-<none>}${pin_at:+ at=$pin_at}${pin_flags:+ flags=$pin_flags}"
     printf 'args='; [ $# -gt 0 ] && printf '[%s]' "$@"; echo
-    for k in ANTHROPIC_BASE_URL ANTHROPIC_UNIX_SOCKET CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_AUTH_TOKEN ANTHROPIC_API_KEY CLAUDE_CODE_USE_BEDROCK ANTHROPIC_CUSTOM_HEADERS ENABLE_TOOL_SEARCH CLAUDE_CODE_PROMPT_CACHE_TTL CLAUDE_CONFIG_DIR CLAUDE_SECURESTORAGE_CONFIG_DIR CLAUDE_CODE_OAUTH_SCOPES ENABLE_CLAUDEAI_MCP_SERVERS CLAUDE_ROUTE_SET; do
+    for k in ANTHROPIC_BASE_URL ANTHROPIC_UNIX_SOCKET CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_AUTH_TOKEN ANTHROPIC_API_KEY CLAUDE_CODE_USE_BEDROCK ANTHROPIC_CUSTOM_HEADERS ENABLE_TOOL_SEARCH CLAUDE_CODE_PROMPT_CACHE_TTL CLAUDE_CONFIG_DIR CLAUDE_SECURESTORAGE_CONFIG_DIR CLAUDE_CODE_OAUTH_SCOPES ENABLE_CLAUDEAI_MCP_SERVERS CLAUDE_CODE_ENABLE_EXPERIMENTAL_ADVISOR_TOOL CLAUDE_ROUTE_SET; do
         v="${!k-<unset>}"
         case "$k:$v" in *TOKEN:ssh-placeholder|*TOKEN:subrouter|*:"<unset>") ;; *TOKEN:*|*API_KEY:*) v="<set>" ;; esac
         echo "$k=${v//$nl/\\n}"
@@ -1151,7 +1171,7 @@ cmd_uninstall() {
         rc_has_block "$f" || continue
         rc_remove_block "$f" && echo "PATH line: removed from $f"
     done
-    rm -rf "$SHIM_DIR" "$MODE_FILE" "$CODEX_MODE_FILE" "$ACCOUNTS"
+    rm -rf "$SHIM_DIR" "$MODE_FILE" "$CODEX_MODE_FILE" "$ADVISOR_FILE" "$ACCOUNTS"
     echo "shims removed. New launches use the real claude and codex; shells opened earlier still list the (now empty) dir, which PATH lookup skips."
     echo "Kept: $ALIASES (yours). The daemon still serves the socket; 'claude-route socket-off' stops that."
 }
@@ -1310,6 +1330,7 @@ cmd_status() {
     fi
     [ -x "$SHIM" ] && echo "decision:    $(env -u ANTHROPIC_BASE_URL -u ANTHROPIC_UNIX_SOCKET -u CLAUDE_CODE_OAUTH_TOKEN -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_API_KEY -u CLAUDE_ROUTE CLAUDE_ROUTE_DRYRUN=1 "$SHIM" | head -1) (a fresh launch now)"
     echo "last test:   $(cat "$LAST_TEST" 2>/dev/null || echo never)"
+    echo "advisor:     $(advisor_now)   (new pool launches: $([ "$(advisor_now)" = on ] && echo "Claude Code's experimental advisor tool, advisor model opus" || echo "no advisor tool; claude-route advisor on adds it"))"
     echo "-- route words (claude local | claude <account>; codex local | codex <account>) --"
     local hb; hb=$(probe "$TCP/_subrouter/health")
     echo "identity:    $(plist_identity || echo 'none set') (on this build a laptop Claude pin must name it)"
@@ -1378,6 +1399,16 @@ cmd_codex() {
             set_codex_mode pool
             echo "codex mode: pool. NEW Codex launches (Paradev or terminal) route through subrouter. Roll back: claude-route codex off" ;;
         *) die "usage: claude-route codex pool [--force] | codex off" ;;
+    esac
+}
+
+cmd_advisor() {
+    case "${1:-}" in
+        on) write_mode "$ADVISOR_FILE" on
+            echo "advisor: on. NEW pool launches get Claude Code's experimental advisor tool (advisor model opus). claude local is unchanged. Running sessions keep what they started with. Turn it off: claude-route advisor off" ;;
+        off) write_mode "$ADVISOR_FILE" off
+            echo "advisor: off. NEW pool launches run without the advisor tool. Running sessions keep what they started with." ;;
+        *) die "usage: claude-route advisor on | advisor off" ;;
     esac
 }
 
@@ -1993,6 +2024,7 @@ case "${1:-status}" in
     pool) cmd_pool "${2:-}" ;;
     off) cmd_off ;;
     codex) cmd_codex "${2:-}" "${3:-}" ;;
+    advisor) cmd_advisor "${2:-}" ;;
     help|-h|--help) awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0" ;;
     *) die "unknown command '$1' (try: claude-route help)" ;;
 esac

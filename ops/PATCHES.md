@@ -4163,3 +4163,34 @@ Residuals. Need's memory is per daemon: two daemons can still read need differen
 - Tests: `internal/proxy/reset_steady_test.go`, `ops/docscheck/steady_choice_docs_test.go`, `srq selftest`
 - Docs: `ops/OPERATING.md` (Read the pool's burn, Automatic resets, Accounts chosen for a reset, the settings table), `ops/skills/subrouter/SKILL.md`, `ops/KNOWN-ISSUES.md`
 - Related: holds §94.1's need for §94.2's decision and §95.1's choice; keeps §95.1's choice and Codex hold through a gap in need; reads §93.2's latch as a decision does; corrects what §94.2's switch undoes in the documents. §95.2's ranking is unchanged.
+
+## 97. claude-route can give pool launches Claude Code's advisor tool, off by default
+
+A plain login (`claude local`, route `off`) sends Claude Code's experimental advisor server tool, `advisor`, with each main request, with the advisor model `claude-opus-5-5`. A socket-mode pool session never sent it. Claude Code 2.1.330 decides this on the client, in two steps. A gate opens through an Anthropic-side flag for a signed-in login, or through `CLAUDE_CODE_ENABLE_EXPERIMENTAL_ADVISOR_TOOL`. Then a model comes from `--advisor`, from the `advisorModel` setting, or, with neither, from a standby choice that needs Claude Code to know that the org serves the model. A socket session's token carries no plan, so that choice finds nothing.
+
+Measured on a laptop pool session (route `pool`, Sonnet, one turn, "Reply with one word: ok"), each read from the session's `api-request-shape` row:
+- The variable alone: 12 tools sent, no `advisor`, no `advisorModel` on the reply. Prompt 35,017 tokens.
+- The variable and `--settings '{"advisorModel":"opus"}'`: 13 tools, `advisor` on `claude-opus-5-5`, the model a plain login gets. Prompt 36,377 tokens, 1,360 more.
+
+The owner, 2026-11-23: "I'm fine giving the option to turn it on but leaving it off by default if we can."
+
+§97.1 `claude-route advisor on` and `claude-route advisor off` write `on` or `off` to `~/.claude-route/advisor`, as `codex pool` and `codex off` write `codex-mode`. A missing file, or anything but `on`, is off. `install` writes nothing there, and `uninstall` removes the file. `claude-route status` prints an `advisor:` line, and the usage text names the command.
+
+§97.2 The shim reads that file at each launch. When it says `on`, a launch on route `pool` or `pool-tcp`, pinned or not, gets `CLAUDE_CODE_ENABLE_EXPERIMENTAL_ADVISOR_TOOL=1`, unless the caller already set the variable, and `--settings '{"advisorModel":"opus"}'` ahead of its own arguments. The variable joins `CLAUDE_ROUTE_SET`, so a `claude local`, a `CLAUDE_ROUTE=off` launch or a credential command started inside such a session drops it. A Claude Code command (`$1` in the shim's reserved list, such as `mcp` or `doctor`) gets the variable and no `--settings`. Routes `off`, `credentials` and `inherited` set nothing. The dry run prints the variable, and its `args=` line shows the `--settings`.
+
+Readings of the design, each with its reason.
+- The model goes in as `--settings`, not as the hidden `--advisor` flag. `--settings` and `advisorModel` are public. Claude Code skips a model it will not accept as an advisor request by request, while `--advisor` fails the launch, and a Claude Code that dropped the hidden flag would fail every pool launch.
+- `opus` is an alias, so the advisor follows the newest Opus, as a plain login's does.
+- A launch with its own `--settings` keeps it. Claude Code takes the last `--settings`, so the caller's wins, and that launch gets no advisor model unless its settings name one.
+
+Residuals.
+- With the variable set, Claude Code skips its own check that the advisor is at least as capable as the main model, so a Fable session gets an Opus advisor. Whether the API accepts that is not tested. Claude Code retries a 400 that says a model "cannot be used as an advisor" without the tool.
+- `pool-tcp` gets both, as the owner asked. A real `pool-tcp` launch with them is not tested.
+- Each request is about 1,360 tokens larger, and each `advisor()` call has a second model read the conversation, all on the pool account.
+- Running sessions keep what they started with.
+
+Not changed: `claude local`, launches on the `off` route, and the daemon.
+
+- Code: `ops/bin/claude-route` (`ADVISOR_FILE`, `advisor_now`, `cmd_advisor`, `cmd_status`, `cmd_uninstall`, the shim's `add_advisor`)
+- Tests: `ops/deploy/tests/deploy-scripts-test.sh` (`route-advisor-is-off-on-a-fresh-install`, `route-advisor-on-sets-it-for-pool-and-pool-tcp`, `route-advisor-off-removes-it`, `route-advisor-leaves-claude-local-alone`), `ops/deploy/tests/deploy_scripts_test.go`. With `origin/main`'s `claude-route`, all four fail. Each of five one-change mutants, run in a scratch copy, fails the case named: the file ignored, so always on (fresh install, off); no advisor on `pool-tcp` (on); the variable exported, not kept, so it is missing from `CLAUDE_ROUTE_SET` and overrides the caller's own value (on); `advisor off` writing `on` (off); the advisor added on route `off` (local).
+- Docs: `ops/OPERATING.md` (Use claude-route), `ops/GETTING-STARTED.md`

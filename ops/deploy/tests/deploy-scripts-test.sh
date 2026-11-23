@@ -4807,6 +4807,90 @@ if begin route-plain-pool-launch-keeps-the-pool-store; then
   finish
 fi
 
+# 2026-11-23 owner: the advisor is an option, off by default (PATCHES §97).
+# `claude-route advisor on` gives pool and pool-tcp launches Claude Code's
+# experimental advisor tool: the variable that opens its gate, and the model as
+# --settings. Off, and on every other route, the shim sets neither.
+ADVISOR_VAR=CLAUDE_CODE_ENABLE_EXPERIMENTAL_ADVISOR_TOOL
+ADVISOR_ARGS='args=[--settings][{"advisorModel":"opus"}][-p][hi]'
+if begin route-advisor-is-off-on-a-fresh-install; then
+  route_shim_setup; route_shim_pool
+  [ -e "$H/.claude-route/advisor" ] && bad "a fresh install has an advisor file" || ok
+  run_shim CLAUDE_ROUTE_DRYRUN=1 -- -p hi
+  expect_rc 0; expect_line "route=pool"; expect_line "$ADVISOR_VAR=<unset>"; expect_line "args=[-p][hi]"
+  run_shim CLAUDE_ROUTE_DRYRUN=1 CLAUDE_ROUTE_SOCKET=/nonexistent/claude.sock -- -p hi
+  expect_rc 0; expect_line "route=pool-tcp"; expect_line "$ADVISOR_VAR=<unset>"; expect_line "args=[-p][hi]"
+  run_shim -- -p hi
+  expect_rc 0; expect_line "CLAUDE_ROUTE_ACTIVE=pool"; expect_no_out "$ADVISOR_VAR"
+  run_route_stub_deploy status
+  expect_out "advisor:     off   (new pool launches: no advisor tool"
+  finish
+fi
+
+if begin route-advisor-on-sets-it-for-pool-and-pool-tcp; then
+  route_shim_setup; route_shim_pool
+  run_route_stub_deploy advisor on
+  expect_rc 0; expect_out "advisor: on."
+  [ "$(cat "$H/.claude-route/advisor" 2>/dev/null)" = on ] && ok || bad "the advisor file holds '$(cat "$H/.claude-route/advisor" 2>/dev/null)', want on"
+  run_shim CLAUDE_ROUTE_DRYRUN=1 -- -p hi
+  expect_rc 0; expect_line "route=pool"; expect_line "$ADVISOR_VAR=1"; expect_line "$ADVISOR_ARGS"
+  run_shim CLAUDE_ROUTE_DRYRUN=1 CLAUDE_ROUTE_SOCKET=/nonexistent/claude.sock -- -p hi
+  expect_rc 0; expect_line "route=pool-tcp"; expect_line "$ADVISOR_VAR=1"; expect_line "$ADVISOR_ARGS"
+  run_shim CLAUDE_ROUTE_DRYRUN=1 CLAUDE_ROUTE=pool -- -p hi
+  expect_line "route=pool"; expect_line "$ADVISOR_ARGS"
+  # A Claude Code command gets no --settings; the caller's own variable wins.
+  run_shim CLAUDE_ROUTE_DRYRUN=1 -- mcp list
+  expect_rc 0; expect_line "args=[mcp][list]"
+  run_shim CLAUDE_ROUTE_DRYRUN=1 "$ADVISOR_VAR=0" -- -p hi
+  expect_line "$ADVISOR_VAR=0"
+  # Listed in CLAUDE_ROUTE_SET, so a child launch on another route drops it.
+  run_shim -- -p hi
+  expect_rc 0; expect_line "$ADVISOR_VAR=1"; grep -Eq "^CLAUDE_ROUTE_SET=.* $ADVISOR_VAR( |$)" "$C/out" && ok || bad "CLAUDE_ROUTE_SET lacks $ADVISOR_VAR"
+  run_route_stub_deploy status
+  expect_out "advisor:     on   (new pool launches: Claude Code's experimental advisor tool"
+  finish
+fi
+
+if begin route-advisor-off-removes-it; then
+  route_shim_setup; route_shim_pool
+  run_route_stub_deploy advisor on
+  run_route_stub_deploy advisor off
+  expect_rc 0; expect_out "advisor: off."
+  [ "$(cat "$H/.claude-route/advisor" 2>/dev/null)" = off ] && ok || bad "the advisor file holds '$(cat "$H/.claude-route/advisor" 2>/dev/null)', want off"
+  for sock in "$H/.subrouter/claude.sock" /nonexistent/claude.sock; do
+    run_shim CLAUDE_ROUTE_DRYRUN=1 CLAUDE_ROUTE_SOCKET="$sock" -- -p hi
+    expect_rc 0; expect_line "$ADVISOR_VAR=<unset>"; expect_line "args=[-p][hi]"
+  done
+  run_shim -- -p hi
+  expect_rc 0; expect_no_out "$ADVISOR_VAR"
+  # Only "on" turns it on.
+  echo yes > "$H/.claude-route/advisor"
+  run_shim CLAUDE_ROUTE_DRYRUN=1 -- -p hi
+  expect_line "$ADVISOR_VAR=<unset>"
+  run_route_stub_deploy status
+  expect_out "advisor:     off"
+  run_route_stub_deploy advisor
+  expect_rc 1; expect_out "usage: claude-route advisor on | advisor off"
+  finish
+fi
+
+if begin route-advisor-leaves-claude-local-alone; then
+  route_shim_setup; route_shim_pool
+  rm -f "$H/.claude/settings.json"   # it names a route, and a route word refuses then
+  run_route_stub_deploy advisor on
+  run_shim CLAUDE_ROUTE_DRYRUN=1 -- local -p hi
+  expect_rc 0; expect_line "route=off"; expect_line "$ADVISOR_VAR=<unset>"; expect_line "args=[-p][hi]"
+  run_shim CLAUDE_ROUTE_DRYRUN=1 CLAUDE_ROUTE=off -- -p hi
+  expect_rc 0; expect_line "route=off"; expect_line "$ADVISOR_VAR=<unset>"; expect_line "args=[-p][hi]"
+  # From inside a pool session that has the advisor: what its shim set goes.
+  run_shim CLAUDE_ROUTE_ACTIVE=pool "CLAUDE_ROUTE_SET=CLAUDE_CODE_PROMPT_CACHE_TTL $ADVISOR_VAR" "$ADVISOR_VAR=1" CLAUDE_CODE_PROMPT_CACHE_TTL=1h -- local -p hi
+  expect_rc 0; expect_line "CLAUDE_ROUTE_ACTIVE=off"; expect_no_out "$ADVISOR_VAR"
+  # The owner's own value is theirs: local leaves it as it is.
+  run_shim "$ADVISOR_VAR=1" -- local -p hi
+  expect_rc 0; expect_line "CLAUDE_ROUTE_ACTIVE=off"; expect_line "$ADVISOR_VAR=1"
+  finish
+fi
+
 # check, check codex and test, on a Mac with no Paradev app unless
 # route_paradev adds its wrappers. Both shims as install writes them, the
 # socket serving, pool mode. The Claude Code and Codex answer the word their
