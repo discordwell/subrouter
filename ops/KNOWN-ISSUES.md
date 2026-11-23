@@ -32,7 +32,7 @@ On those builds, the provider-first fold turned `sr claude login main` into `sr 
 
 ## Gotcha: `opus-weekly` reads 0% because it is synthesized, not measured (pre-§24 builds)
 
-On a daemon older than §24, `/_subrouter/usage-status` shows `opus-weekly` and `sonnet-weekly` on every Claude account whose usage fetch succeeded. When Anthropic's response has no opus bucket (normal, since Opus has no limit of its own), that build appends a 0%-used placeholder, so 0% means "no data", not "unspent". Opus use lands in the general `7d` bucket. The only independent meter is Fable's (`seven_day_oauth_apps`, upstream header `anthropic-ratelimit-unified-7d_oi-utilization`).
+On a daemon older than §24, `/_subrouter/usage-status` shows `opus-weekly` and `sonnet-weekly` on every Claude account whose usage fetch succeeded. When Anthropic's response has no opus bucket (normal, since Opus has no limit of its own), that build appends a 0%-used placeholder, so 0% means "no data", not "unspent". Opus use lands in the general `7d` bucket. The only independent meter is Fable's (the usage answer's `limits[]` Fable row since §64, else `seven_day_oauth_apps`; upstream header `anthropic-ratelimit-unified-7d_oi-utilization`).
 
 The placeholder existed only on the usage-endpoint path. So a one-year setup token, or an OAuth account whose usage fetch failed while the probe answered, had no Opus/Sonnet pool, and `ForModel` zero-filled it out of Opus and Sonnet routing. §24 removes the placeholder and routes a model with no separate limit on the account's `5h`/`7d`. Delete once no machine runs a pre-§24 build.
 

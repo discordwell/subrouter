@@ -40,7 +40,7 @@ The reasons are `eligible`, `burndown`, `exhausted`, `holdout`, `at_cap`, `short
 |---|---|---|
 | Claude | `5h` | The short window. Since about 2026-10-31 Anthropic sends none for Claude Max accounts. A Claude account with no `5h` reading is not floored on it (§62). |
 | Claude | `7d` | The week. This is the budget that runs out. |
-| Claude | `oauth-apps-weekly` (header `7d_oi`) | The Fable meter. It is independent of `7d`, and it can read over 100%. |
+| Claude | `oauth-apps-weekly` (header `7d_oi`) | The Fable meter, read from the usage answer's `limits[]` Fable row, else from `seven_day_oauth_apps` (§64). It is independent of `7d`, and it can read over 100%. |
 | Claude | `opus-weekly`, `sonnet-weekly` | Present only when Anthropic reports them. Opus and Sonnet spend `5h` and `7d` (§24). |
 | Codex | `primary`, `<model>/primary` | The week. Codex has no short window. |
 | Codex | `reached` | The limit is reached. |

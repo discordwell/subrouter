@@ -105,7 +105,7 @@ Window names differ by provider. No single window name means the week for every 
 
 | Provider | Windows |
 |---|---|
-| Claude | `5h`, `7d`, and `oauth-apps-weekly` (the Fable meter). `opus-weekly` and `sonnet-weekly` appear only when Anthropic reports those buckets (§24). |
+| Claude | `5h`, `7d`, and `oauth-apps-weekly` (the Fable meter, from the usage answer's Fable row, else `seven_day_oauth_apps`; §64). `opus-weekly` and `sonnet-weekly` appear only when Anthropic reports those buckets (§24). |
 | Codex | `primary`, `<model>/primary`, and `reached`. No 5h window. |
 | Codex, usage-based seat (`rate_limit: null`) | `spend` and `spend/reached`, the monthly workspace spend cap (§42). |
 

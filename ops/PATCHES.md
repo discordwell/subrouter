@@ -6,7 +6,7 @@ The fork point is upstream `93bef02` (`v0.1.54`, 2026-08-03). Two upstream merge
 
 Sections are in numeric order, but past §17 the numbers are not chronological. Three sections came from branches outside the main line:
 
-- §63 and §64 were never merged, and their code is not in this repo.
+- §63 was never merged, and its code is not in this repo. §64's code reached `main` on 2026-11-22, after its text.
 - §68 was once numbered §62, where it collided with the other §62.
 - §14 is left out on purpose.
 
@@ -84,6 +84,7 @@ Amendments. §41: the taper step is 0.0625 on the budget above the owner's reser
 Fable has its own weekly bucket (`seven_day_oauth_apps`), and a spent Fable quota often leaves 5h and 7d headroom that only other models can use. The fallback chain (pool, Bedrock, API key) had nowhere to go without the last two, so requests died with quota unspent. Opus is now the last stage: the literal `fable` run is spliced (`claude-fable-5[1m]` → `claude-opus-5[1m]`), which keeps 1M context and survives a generation bump, and selection reruns on the Opus pool. Capacity is not predicted, because a guessing gate would bring back stale-score false 503s. `oauthRetryAccount` decides, and its decline means no capacity. Only a clean 2xx replaces the original response; anything else surfaces the original error unchanged. The pick is debited (`NoteRouted`) because debit keys are account-wide.
 
 - Code: `oauthRetryAccount`, `NoteRouted`
+- Related: §64 replaces the splice: every Fable model falls to `claude-opus-5-5`, the bracketed suffix kept. Since §64 the Fable meter is the usage answer's `limits[]` Fable row, else `seven_day_oauth_apps`.
 
 ## 12. Remote admin fails closed, and macOS can bind a tailnet
 
@@ -1538,6 +1539,12 @@ so every laptop row ranked at 4x (erasing the local 2x), and `thirteen-beta` (7d
 came from `seven_day_oauth_apps`, which Claude Code never reads. Spent Fable fell to
 `claude-opus-5`, the May 2026 Opus.
 
+This text was first written on 2026-11-09, for code on a branch that was never merged. The
+code reached `main` on 2026-11-22, and only then: until that change, a daemon built from
+`main` held every account on any grant (§56's rule), read the Fable meter from
+`seven_day_oauth_apps` alone and fell to `claude-opus-5`. The text below was corrected to the
+ported code where the two differ.
+
 Measured on `eight-alpha` (2026-11-09, 19:22Z): a claim took the week from 100 % to 42 %
 used and the Fable meter from 116 % to 0 %. So the Fable limit is half the week, and a reset
 only refunds the Fable usage off it. A claim loses nothing left in the week, so §56's reason
@@ -1561,22 +1568,54 @@ the board's box rows, `srq`) takes the week key, else the legacy key
 held an account on any grant, and it ranks as it did before, at 2x. Changed in the
 2026-11-22 port: the first version read only the new key, so a pre-§64 body ranked 1x.
 
-The Fable meter (`FableLimit`) is the usage answer's `limits[]` `weekly_scoped` row whose
-display name starts with "fable" (case-insensitive; of several, the most used), else
-`seven_day_oauth_apps`. Rows decode one by one, so drift never fails the usage read. A gap
-of more than one point between the two logs a WARN at most once an hour per account.
+The Fable meter (`UsageResponse.FableLimit`) is the usage answer's `limits[]` row of kind
+`weekly_scoped` whose model display name starts with "fable" in any case, and of several
+such rows the most used one. A `weekly_all` or `session` row scoped to Fable is not it. With
+no such row the meter is `seven_day_oauth_apps`, as before. Both usage reads build the
+`oauth-apps-weekly` window from it, the daemon's and `sr`'s own (`claudeUsageWindows` in
+`internal/proxy/proxy.go` and `cmd/subrouter/sr.go`), so the `claudefable` verdict, the
+scheduler's Fable pool and §65's `fable_week_spent` follow the row. The window takes the
+row's `percent` and `resets_at`. With a row in hand no Messages probe is sent; the probe
+still runs when neither is there. Rows decode one by one: a row that does not decode is
+dropped, and a `limits` value that is not a list reads as none, so drift never fails the
+usage read. When the row and `seven_day_oauth_apps` differ by more than one point, the
+daemon logs `claude fable meter: the limits[] Fable row and seven_day_oauth_apps disagree;
+the Fable window uses the row` at WARN, with both percents and both `resets_at`, at most
+once an hour per account (`fableMeterWarner`). An answer without a usable
+`seven_day_oauth_apps` logs nothing, and `sr` never logs it.
+
 `ResetGrant` also decodes `type` (`session`, `weekly`, `full`), `gives_back_weekly` (false
 when absent or not a boolean) and `unavailable_reason` (`cooldown`, `blocked_five_hour`,
 `blocked_seven_day`, `blocked_opus`, `blocked_sonnet`, `blocked_other`, `cannot_clear`,
 `needs_limit`, `unavailable`), as Claude Code 2.1.321 does: a value it does not know reads as
 absent, and the grant is kept. Nothing routes on them; a claim's answer carries them in its
-`grant`. Every Fable model now falls to `claude-opus-5-5`
-with the client's bracketed suffix kept, because Opus and Fable versions do not release in
-lockstep. The latent Bedrock path maps `claude-fable-5-2` to `us.anthropic.claude-fable-5-2`
-and prices Fable 5.2 per MTok at input 8, output 40, cache write 10 (5 m) and 16 (1 h),
-cache read 0.2, and Fable 5.1's cache read at 0.25. The `fable` alias or no model keeps
-`us.anthropic.claude-fable-5`. Its quota bump still keys every Fable id to Fable 5's code
-(`bedrockTPMQuotaByModel`, `L-9B258944`).
+`grant`.
+
+Every Fable model falls to `claude-opus-5-5` (`claudeSubstituteOpusModel`) where it fell to
+`claude-opus-5`, whichever Fable version and case the client sent, with its bracketed suffix
+kept: `claude-fable-5-2[1m]` becomes `claude-opus-5-5[1m]`, and the `fable` alias becomes
+`claude-opus-5-5`. Opus and Fable versions do not release in lockstep, so matching the
+version number lands on an older Opus or on an id Anthropic rejects. The one function serves
+§11's stage at selection and in flight, §50's undo and §71's rewrite of a subagent's turn
+(`claudeOpusBody`); nothing else in them changed.
+
+The latent Bedrock Fable fallback (`claudeFableBedrockResponse`, behind
+`SUBROUTER_FABLE_BEDROCK_PRIMARY` and the fallback chain) serves the Fable version the client
+asked for (`bedrockFableModelIDFor`). `claude-fable-5-2[1m]` goes to
+`us.anthropic.claude-fable-5-2`, the `[1m]` marker dropped. An id that already holds
+`anthropic.` passes through. The `fable` alias, no model, or any other value keeps
+`us.anthropic.claude-fable-5`. The same id names the throttle log line, the quota-bump hook
+and the cost record, which prices it at its own rates (`bedrockPriceFor`, per MTok): Fable
+5.2 input 8, output 40, cache write 10 (5 m) and 16 (1 h), cache read 0.2; Fable 5.1 as
+Fable 5 (10, 50, 12.5, 20) but cache read 0.25; Fable 5 unchanged. The `/bedrock/*`
+gateway's cost log prices from the same table. The quota bump still keys every Fable id to
+Fable 5's code (`bedrockTPMQuotaByModel`, `L-9B258944`), and the team route's auto-mode
+classifier rewrite still sends Fable 5. `sr claude-aws --model` maps any `claude-*` id its
+table does not name to `us.anthropic.<id>` (`bedrockModelID`), so `claude-fable-5-2` no
+longer reaches Bedrock bare. Where Bedrock is not configured nothing changes, and no deploy
+script configures it (§50). Not tested against Bedrock: if Bedrock does not offer the
+requested version, its error goes to the API-key stage, or to the client when there is no
+key, where before the turn was served as Fable 5.
 
 The views name the kind. `complimentary_reset.remaining_by_kind` splits `remaining` by kind
 (`{"week":1,"fable":1}`; absent from a pre-§64 daemon). `sr status`'s `1x reset` cell reads
@@ -1597,20 +1636,24 @@ y/N asks about the general week (when it has more than 10 % left), so read `Fabl
 pre-§64 box still drains its Fable holders under 25 % of their week through its `burndown`
 verdict, which a laptop honours (§31), and a §64 laptop ranks them at 2x off its legacy key
 until the box is deployed. A pre-§64 laptop keeps its own Fable holders at 4x and burns them
-down early until it is deployed. Nothing is misrouted in either. Whether the `limits[]` row
-and `seven_day_oauth_apps` are one bucket is unmeasured.
+down early until it is deployed. Nothing is misrouted in either. The meter, the Opus target
+and the Bedrock ids need no order: each daemon reads its own accounts' usage, and a peer
+takes the windows a daemon publishes. Whether the `limits[]` row and
+`seven_day_oauth_apps` are one bucket is unmeasured; the WARN line is how a deployed daemon
+will show it.
 
-- Knobs: `SUBROUTER_RESET_HOLD_PRIORITY` (still switches the week hold; `0` on a pre-§64 box stops its early drain)
-- Code: `internal/agents/claude/reset.go` (`ResetGrant.Kind`, `ResetInfo`, `weekHeldUntil`), `internal/proxy/claude_reset.go` (`resetHeldUntil`, `heldWeekResetSeconds`), `internal/proxy/claude_fable_meter.go`, `internal/proxy/claude_opus_substitute.go` (`claudeOpusModel`)
-- Tests (the reset half; each run in Docker, red with its change taken out and green with it): `internal/agents/claude/reset_test.go` (`TestResetGrantKindIsWhatItsClaimGivesBack`, `TestResetInfoCountsWhatIsLeftByKind`, `TestResetInfoHoldsTheWeekOnlyOnGrantsThatClearIt`, `TestParseResetGrantKeepsTypeGivesBackWeeklyAndUnavailableReason`); `internal/proxy/reset_hold_test.go` (`TestAFableOnlyResetRanksAsNoReset`, `TestAWeekResetHoldsTheAccountUntilItsEnd`, `TestTheWeekHoldEndsWithTheSoonerWeekReset`, `TestTheWeekHoldTravelsApartFromFableResets`, and §56's tests with Fable-only, mixed and legacy-key rows); `internal/proxy/claude_reset_test.go` (`TestClaudeResetClaimsTheNextGrantOfEitherKind`); `cmd/subrouter/sr_provider_reset_test.go` (`TestClaudeResetCellNamesAFableResetAsOne`, `TestClaudeResetSaysWhichKindItClaimedAndWhatItGaveBack`); `srq selftest` (the §64 block)
-- Related: amends §11 (the Opus target and the Fable meter), §46 (which grant is current) and §56 (which grants hold an account).
+- Knobs: `SUBROUTER_RESET_HOLD_PRIORITY` (still switches the week hold; `0` on a pre-§64 box stops its early drain). The meter, the Opus target and the Bedrock ids have no switch; going back is a rebuild.
+- Code: `internal/agents/claude/reset.go` (`ResetGrant.Kind`, `ResetInfo`, `weekHeldUntil`), `internal/proxy/claude_reset.go` (`resetHeldUntil`, `heldWeekResetSeconds`), `internal/agents/claude/store.go` (`UsageResponse.FableLimit`, `UsageLimits`), `claudeUsageWindows` in `internal/proxy/proxy.go` and `cmd/subrouter/sr.go`, `internal/proxy/claude_fable_meter.go` (`fableMeterWarner`), `internal/proxy/claude_opus_substitute.go` (`claudeSubstituteOpusModel`, `claudeOpusModel`), `internal/proxy/bedrock.go` (`bedrockFableModelIDFor`), `internal/proxy/bedrock_cost.go` (`bedrockPriceFor`), `cmd/subrouter/sr_claude.go` (`bedrockModelID`)
+- Tests (each run in Docker, red with its change taken out and green with it). The reset half: `internal/agents/claude/reset_test.go` (`TestResetGrantKindIsWhatItsClaimGivesBack`, `TestResetInfoCountsWhatIsLeftByKind`, `TestResetInfoHoldsTheWeekOnlyOnGrantsThatClearIt`, `TestParseResetGrantKeepsTypeGivesBackWeeklyAndUnavailableReason`); `internal/proxy/reset_hold_test.go` (`TestAFableOnlyResetRanksAsNoReset`, `TestAWeekResetHoldsTheAccountUntilItsEnd`, `TestTheWeekHoldEndsWithTheSoonerWeekReset`, `TestTheWeekHoldTravelsApartFromFableResets`, and §56's tests with Fable-only, mixed and legacy-key rows); `internal/proxy/claude_reset_test.go` (`TestClaudeResetClaimsTheNextGrantOfEitherKind`); `cmd/subrouter/sr_provider_reset_test.go` (`TestClaudeResetCellNamesAFableResetAsOne`, `TestClaudeResetSaysWhichKindItClaimedAndWhatItGaveBack`); `srq selftest` (the §64 block). The meter: `internal/proxy/claude_fable_meter_test.go` (`TestTheFableMeterIsTheLimitsFableRowWhenTheAnswerHasOne`, `TestClaudeFableMeterDisagreementWarnsOncePerAccountPerHour`, `TestClaudeFableMeterIsQuietWithoutSevenDayOAuthApps`); `internal/proxy/claude_ratelimit_routing_test.go` (`TestClaudeFableWindowComesFromTheLimitsRow`, `TestClaudeFableWindowIsAWeeklyScopedRowNamedFableInAnyCase`); `internal/agents/claude/store_test.go` (`TestUsageReadSurvivesDriftedLimitsRows`, `TestFableLimitIsTheMostUsedFableRow`); `cmd/subrouter/sr_test.go` (`TestLocalClaudeUsageReadTakesTheFableWindowFromTheLimitsRow`, `TestLocalClaudeUsageReadTakesAWeeklyScopedRowNamedFableInAnyCase`). The Opus target: `internal/proxy/claude_opus_substitute_test.go` (`TestClaudeOpusModelIsTheNewestOpusWithTheClientSuffix`, `TestClaudeFableHandlerSubstitutesOpusWhenFablePoolExhausted` and the rest of the file), `internal/proxy/claude_opus_substitute_commit_test.go`, and §71's `internal/proxy/subagent_fable_pin_test.go`. Bedrock: `internal/proxy/claude_fable_test.go` (`TestServeClaudeFableFallbackServesTheRequestedFableModel`, `TestAStreamedBedrockFableFallbackIsServedAndPricedAsTheRequestedModel`, `TestABedrockThrottleOnFable52NamesItAndBumpsFable5sQuota`); `internal/proxy/bedrock_cost_test.go` (`TestBedrockUsageCost`); `cmd/subrouter/sr_claude_aws_test.go` (`TestBedrockModelID`)
+- Related: amends §11 (the Opus target and the Fable meter), §46 (which grant is current), §56 (which grants hold an account), §65 (the meter its `fable_week_spent` reads) and §71 (the Opus its rewrite names).
 
 ## 65. An Opus or Sonnet turn ranks an account whose Fable meter is spent at up to 2x
 
 Owner decision, 2026-11-12: "when we do opus turns we should preferentially be using those"
 (accounts whose Fable meter is spent), in "the clean, proper version": a ranking term that
 leaves slot and reserve numbers alone, unlike §57. Each account has a general week every model
-spends and a separate Fable meter (`seven_day_oauth_apps`, published as `oauth-apps-weekly`).
+spends and a separate Fable meter (`seven_day_oauth_apps`, since §64 the usage answer's
+`limits[]` Fable row when it has one, published as `oauth-apps-weekly`).
 Opus ranked on the general week alone and burned general budget that Fable also needs on
 accounts with Fable left.
 
@@ -2017,7 +2060,7 @@ A session is held on one account, and its subagents share its session id, so one
 
 - Log: `claude subagent fable served as opus on pinned account` (`path` = `pre_send`, `after_refusal` or `local_pin`), `claude subagent fable as opus not served on pinned account`, and an INFO line when a served turn leaves a hold another turn moved.
 - Code: `internal/proxy/claude_subagent_fable.go`, `serveHeldTurn` and `serveHeldAttempt` (`remote_pool_decide.go`), the guarded hold clear and set in `forwardToPeer` (`remote_pool.go`), the handler's local-pin call (`proxy.go`). Tests: `internal/proxy/subagent_fable_pin_test.go`.
-- Related: pairs with turning off §65's Fable-spent preference on the laptop, which steered Opus sessions onto Fable-spent accounts and so made §71's case the usual one.
+- Related: §65's Fable-spent preference, on by default, steers Opus sessions onto Fable-spent accounts and so makes §71's case the usual one. Since §64 the Opus a subagent's turn is served as is `claude-opus-5-5`.
 
 ## 72. A burndown account behind pace takes more sessions, each account caps its refugees by its week, and a full queue takes no new session
 
