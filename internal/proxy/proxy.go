@@ -344,6 +344,10 @@ type Server struct {
 	// CodexCapacityEventsPath is the JSONL file of Codex capacity events
 	// (codex_capacity_events.go). Empty keeps them in memory only.
 	CodexCapacityEventsPath string
+	// AutoResetStateDir is the state directory where each account's last
+	// automatic claim is kept for the next worker generation (§93.2). Empty
+	// keeps it in memory only.
+	AutoResetStateDir string
 	// CodexFaultInjection honors X-Subrouter-Test-Fault from loopback
 	// (codex_regions.go). Off in production except for a live test.
 	CodexFaultInjection   bool
@@ -6672,6 +6676,9 @@ type rateLimitResetCandidate struct {
 	before        []accounts.UsageWindow
 	wait          int64
 	creditExpires time.Time
+	// credit is the exact credit about to be consumed, set only for a
+	// resetApproval (§93.2 reads its reset_type).
+	credit accounts.RateLimitResetCredit
 }
 
 // resetCreditExpiringSoon is how close to expiry a credit must be for the
@@ -6960,7 +6967,7 @@ func (s Server) redeemAccountChecked(ctx context.Context, account accounts.Accou
 	var draft *usageClaimDraft
 	check := func(credit accounts.RateLimitResetCredit) error {
 		if approve != nil {
-			live := rateLimitResetCandidate{account: account, before: before.Windows, wait: weeklyResetWait(before.Windows)}
+			live := rateLimitResetCandidate{account: account, before: before.Windows, wait: weeklyResetWait(before.Windows), credit: credit}
 			live.creditExpires, _ = time.Parse(time.RFC3339, credit.ExpiresAt)
 			if err := approve(live, time.Now()); err != nil {
 				return err
@@ -9052,6 +9059,7 @@ func (s Server) proxyHandler() http.Handler {
 					commitFirstSuccess: pendingSessionCommit,
 					expectedAccount:    pendingSessionExpectedAccount,
 					pendingMoveReason:  pendingSessionMoveReason,
+					peerForwarded:      remotePoolInboundHop(r) > 0,
 				}
 				usageFailoverInstalled = true
 			}
@@ -14511,6 +14519,10 @@ type usageLimitRetryTransport struct {
 	// newer forced/admin move while a response body is still streaming.
 	expectedAccount   string
 	pendingMoveReason accountMoveReason
+	// peerForwarded: a peer daemon forwarded this turn (nonzero X-Pool-Hop).
+	// It never waits for an automatic claim (§93.2): the forwarder gives up
+	// on headers after remotePoolResponseHeaderTimeout.
+	peerForwarded bool
 	// sleep waits for the backoff duration or until the context is cancelled.
 	// Injectable for tests; nil means a real timer wait.
 	sleep func(context.Context, time.Duration) error
@@ -15317,14 +15329,16 @@ func claudeRateLimitHeaderFields(header http.Header) []any {
 }
 
 // RoundTrip is roundTrip, and then, for each wall a refusal on the way met
-// (PATCHES §93.1), a claim considered with what the turn got, which no mode
-// changes.
+// (PATCHES §93.1) that the turn did not wait on (§93.2), a claim considered
+// with what the turn got.
 func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	var walls []autoResetWall
 	response, err := t.roundTrip(req, &walls)
 	if len(walls) > 0 && t.server != nil {
 		for _, wall := range walls {
-			t.server.autoResetAtTheWall(wall, autoResetTurnAfterFailover(wall.account.ID, response, err))
+			if !wall.decided {
+				t.server.autoResetAtTheWall(wall, autoResetTurnAfterFailover(wall.account.ID, response, err))
+			}
 		}
 		response = markAutoResetWallsSeen(response)
 	}
@@ -15514,6 +15528,11 @@ func (t usageLimitRetryTransport) roundTrip(req *http.Request, walls *[]autoRese
 	// resort. Whatever it answers is returned.
 	probeSent := false
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		// A turn for an account whose automatic claim is running waits for it
+		// first, in place (PATCHES §93.2).
+		if t.autoResetWaitsInPlace(req) {
+			t.server.autoResetWaitBeforeSend(req.Context(), t.provider, accountID)
+		}
 		// A denial can arrive while another request still holds the sticky
 		// assignment. Re-check the controller immediately before every physical
 		// attempt so queued concurrent callers move to a different credential
@@ -16042,6 +16061,31 @@ func (t usageLimitRetryTransport) roundTrip(req *http.Request, walls *[]autoRese
 			claudeResponseRejected(response.Header) && claudeRejectionIsModelPoolScoped(response.Header)
 		if (exhausted || poolRejected) && !credentialFailure && !modelUnsupported && t.server != nil && autoResetOn() {
 			if wall, ok := autoResetWallOf(accounts.Account{ID: accountID, Provider: t.provider}, response, t.clock()); ok {
+				// Real mode (§93.2): the turn waits here, before the marks and
+				// the failover, for the claim; when the reading after it shows
+				// the meter back, it is sent again on the same account (once:
+				// at a second wall the claim's latch forbids another).
+				// Otherwise it goes on below exactly as it would have.
+				if t.autoResetWaitsInPlace(req) && a.replayable() {
+					wall.decided = true
+					considerCtx, cancel := context.WithTimeout(context.WithoutCancel(req.Context()), autoResetConsiderTimeout)
+					claim := t.server.autoResetDecideAtTheWall(considerCtx, wall, autoResetTurnWaits)
+					cancel()
+					if result, answered := claim.waitFor(req.Context(), t.server.Lifecycle); answered && result.back {
+						if current, own := t.server.autoResetOwnAccount(t.provider, accountID); own {
+							if nextReq, replayErr := a.replay(replayReq, &current); replayErr == nil {
+								if response.Body != nil {
+									_ = response.Body.Close()
+								}
+								accountCredential = current.CredentialIdentity()
+								attemptReq = nextReq
+								// Not a failover: it spends no attempt and no budget.
+								attempt--
+								continue
+							}
+						}
+					}
+				}
 				*walls = append(*walls, wall)
 			}
 		}
