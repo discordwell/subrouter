@@ -8618,6 +8618,17 @@ func (s Server) proxyHandler() http.Handler {
 						"error", err)
 				}
 				w.Header().Set(subrouterReasonHeader, reason)
+				// The caller pinned an account inside its owner's holdout. The
+				// holdout ends with the account's week, not between two tries,
+				// and a client that waits hours for a daemon that is gone would
+				// ask again for as long: answer once, finally (PATCHES section
+				// 89, pinned_account_held_out.go). forcedAccountID, as above.
+				var heldOut pinnedAccountHeldOutError
+				if forcedAccountID != "" && errors.As(err, &heldOut) {
+					score, _ := s.scheduler().LookupScore(schedulerAccountProvider(requestProvider), forcedAccountID)
+					writePinnedAccountHeldOut(w, requestProvider, forcedAccountID, score.WeeklyResetAt)
+					return
+				}
 				// Local cannot serve and no peer could be asked: a peer that
 				// comes back can serve it, so the hold (PATCHES §58) waits, as
 				// for a stranded chat (PATCHES §67), and gives up an hour
@@ -12514,7 +12525,7 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 		// strict selector has no such check; this one is the fork's (PATCHES
 		// section 20).
 		if s.scheduler().WithReserves(s.AccountReserves).InHoldout(schedulerAccountProvider(account.Provider), account.ID) {
-			return accounts.Account{}, sessionID, userEmail, routingCapacity{}, fmt.Errorf("requested account %q is inside its owner's holdout", forcedAccountID)
+			return accounts.Account{}, sessionID, userEmail, routingCapacity{}, pinnedAccountHeldOutError{accountID: forcedAccountID}
 		}
 		// An identity-only account serves the control plane and nothing else,
 		// however it is asked for (control_plane.go).

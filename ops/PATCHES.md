@@ -3407,3 +3407,18 @@ A Codex OAuth login is keyed by `accounts.CodexOAuthIdentifier`: `codex-owner-` 
 - Code: `ops/bin/claude-route` (`launch_front`, `build_launch_env`, `cmd_check`, `cmd_check_codex`, `cmd_test`)
 - Tests: `ops/deploy/tests/deploy-scripts-test.sh` (`route-check-without-paradev-launches-through-the-shim`, `route-test-without-paradev-skips-only-the-paradev-cases`, `route-check-and-test-with-paradev-go-through-its-wrapper`, `route-check-finds-paradev-build-and-superset-wrappers`, `route-failed-check-without-paradev-blocks-the-gate`), `ops/deploy/tests/deploy_scripts_test.go`
 - Docs: `ops/GETTING-STARTED.md`, `ops/OPERATING.md`
+
+## 89. A pin on an account inside its owner's holdout is answered once, finally
+
+A request with the caller's own pin (`X-Subrouter-Account-ID`) on an account inside its owner's holdout is refused by selection (§20), and a pin is never moved to another account. The refusal left as the ordinary no-account 503, which clients retry. Claude Code stopped after ten tries, inside a minute, and that was all that made a pinned launch on such an account fail fast. A client that waits hours for a daemon that is gone (`CLAUDE_CODE_RETRY_WATCHDOG=1` with no retry limit, set on the owner's laptop on 2026-11-22) asks again for as long: `claude-route test` measured 13 identical refusals in 4 minutes on Claude Code 2.1.330, and its check "pinned (spent) fails fast" failed at 241 s against 45 s.
+
+The holdout ends when the account's week rolls, or in its last day (§60), not between two tries. The daemon now answers such a pin once, with `X-Should-Retry: false`, as §28 answers a pin whose credential is dead. The message names the account, says it is inside its owner's holdout, gives the time its week rolls when that is known, and says how to pick another account or launch pooled.
+
+- Claude: 429 `rate_limit_error` in Anthropic's shape. Measured on Claude Code 2.1.330 with the long wait on, against a test server: with the header the client stops after one request and prints the message; the same 429 without the header, and the old 503, are retried until the launch is killed.
+- Every other provider: §28's 403, with code `account_held_out`.
+- The gate is §28's: only the caller's own selector. A session lease, or a placement another daemon made, keeps the retryable 503 and recovers by asking again.
+
+Not changed: a pin on an account that is not found, that cannot serve ChatGPT backend paths, or that is identity-only still gets the 503. A pin on an account above its holdout that the provider then limits still gets the provider's own answer.
+
+- Code: `internal/proxy/pinned_account_held_out.go`, `internal/proxy/proxy.go` (`pinnedAccountHeldOutError`, the handler's no-account branch)
+- Tests: `internal/proxy/pinned_account_held_out_test.go`. `TestPinnedClaudeAccountInsideItsHoldoutIsAnsweredOnceAndFinally` and `TestPinnedCodexAccountInsideItsHoldoutIsAnsweredOnceAndFinally` fail with the final answer taken out (status 503). `TestLeasedRequestOnAHeldOutAccountStaysRetryable` fails with the gate on the caller's own selector taken out (status 429).
