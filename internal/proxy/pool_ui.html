@@ -294,7 +294,7 @@ function meter(remaining, state, fuse){
 function visibleRows(){
   if(!BOARD) return [];
   const f = FILTER.trim().toLowerCase();
-  return BOARD.rows.filter(r => !f || r.id.toLowerCase().includes(f) || (r.email||"").toLowerCase().includes(f) || r.state.includes(f));
+  return BOARD.rows.filter(r => !f || r.id.toLowerCase().includes(f) || (r.label||"").toLowerCase().includes(f) || (r.email||"").toLowerCase().includes(f) || r.state.includes(f));
 }
 
 function renderHeader(){
@@ -391,7 +391,7 @@ function renderBoard(){
       const poolTag = '<span class="pool'+(both?" both":"")+'">'+(both?"L·B":(r.pools[0]==="local"?"L":"B"))+'</span>';
       html += '<tr class="row '+r.provider+sel+(r.state==="unknown"?" unmeasured":"")+'" data-i="'+idx+'">'
         + '<td><span class="st '+r.state+act+'">'+glyph+'</span></td>'
-        + '<td><span class="acct" title="'+esc(r.email||r.id)+'">'+esc(r.id)+'</span></td>'
+        + '<td><span class="acct" title="'+esc(r.email||r.id)+'">'+esc(nameOf(r))+'</span></td>'
         + '<td>'+poolTag+'</td>'
         + (r.provider==="claude" ? claudeCells(r) : codexCells(r))
         + '<td class="num">'+(r.live_known?r.live:"·")+'</td>'
@@ -467,7 +467,7 @@ async function post(path, body){
 function openSwitch(){
   if(VIEW!=="pool") return;
   const r = window._flat[CUR]; if(!r) return;
-  const target = r.id;
+  const target = nameOf(r);
   const liveSessions = (BOARD.sessions||[]).filter(x=>x.live && providerOf(x.agent_type)===r.provider);
   const onOther = liveSessions.filter(x=>x.account_id!==r.id);
 
@@ -478,7 +478,7 @@ function openSwitch(){
       + '<div class="sub">'+esc(r.pools.join(" + ").toUpperCase())+' &middot; '+esc(r.provider)+'</div>'
       + '<div class="blocked"><b>PIN REFUSED.</b> '+esc(r.pin_refusal)+'</div>'
       + '<section><h4>Accounts in the local pool that can hold a pin</h4>'
-      + (alts.length ? alts.map(a=>'<div class="opt"><span class="mark"></span><span class="acct">'+esc(a.id)+'</span>'
+      + (alts.length ? alts.map(a=>'<div class="opt"><span class="mark"></span><span class="acct">'+esc(nameOf(a))+'</span>'
           + '<span class="reason">'+esc(a.state)+' &middot; '+(a.weekly_left!==undefined?pct(a.weekly_left)+"% week":"")+'</span></div>').join("")
          : '<div class="reason">none — every local '+esc(r.provider)+' account is exhausted or unmeasured.</div>')
       + '</section><div class="actions"><kbd>esc</kbd> close</div>', {});
@@ -512,12 +512,14 @@ function openSwitch(){
       try{
         const res = await post("/_subrouter/pool/pin",{account_id:r.id,
           sessions:onOther.map(x=>({agent_type:x.agent_type,session_id:x.session_id}))});
-        flash("pinned "+res.ok+" session"+(res.ok===1?"":"s")+" to "+r.id);
+        flash("pinned "+res.ok+" session"+(res.ok===1?"":"s")+" to "+target);
       }catch(e){ flash(String(e.message||e), true); }
       closeModal(); refresh();
     }});
 }
 
+// An owner-keyed Codex account's id is an opaque hash; its label is its login email.
+function nameOf(r){ return r.label || r.id; }
 function providerOf(agent){ return agent==="claude" ? "claude" : "codex"; }
 
 async function openPrune(){
