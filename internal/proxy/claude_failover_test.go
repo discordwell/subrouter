@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -41,13 +42,18 @@ func TestRetryableUpstreamPostRequestClaudeMessages(t *testing.T) {
 	}
 }
 
+// stubRoundTripper answers every request with responses(req). Read calls once
+// the requests have returned; concurrent callers may share one stub.
 type stubRoundTripper struct {
+	mu        sync.Mutex
 	calls     int
 	responses func(req *http.Request) *http.Response
 }
 
 func (s *stubRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	s.mu.Lock()
 	s.calls++
+	s.mu.Unlock()
 	return s.responses(req), nil
 }
 
