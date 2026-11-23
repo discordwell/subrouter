@@ -428,6 +428,12 @@ var requiredCases = []string{
 	"route-every-credential-command-routes-credentials",
 	"route-logout-of-a-pool-profile-is-refused",
 	"route-plain-pool-launch-keeps-the-pool-store",
+	// The advisor is an option, off by default; it never reaches claude
+	// local (PATCHES §97).
+	"route-advisor-is-off-on-a-fresh-install",
+	"route-advisor-on-sets-it-for-pool-and-pool-tcp",
+	"route-advisor-off-removes-it",
+	"route-advisor-leaves-claude-local-alone",
 	// check, check codex and test without the Paradev app launch as a new
 	// terminal does, skip only the cases about its wrapper, and still gate.
 	"route-check-without-paradev-launches-through-the-shim",
