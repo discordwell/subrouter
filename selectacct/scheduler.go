@@ -113,7 +113,10 @@ type Score struct {
 	// missing or unread window is not unstarted.
 	WeeklyUnstarted bool
 	// ResetHeldUntil is when the account's unclaimed saved usage-limit reset
-	// (cedar_ember, PATCHES §46) expires: while it is in the future the
+	// (cedar_ember, PATCHES §46) that clears the general week expires. A
+	// grant that clears only the Fable limit sets nothing here: its claim
+	// gives back only the week that Fable usage spent, so nothing left in the
+	// week is lost at the claim (PATCHES §64). While it is in the future the
 	// account ranks at ResetHoldPreferenceRatio and drains early below
 	// ResetBurndownWeeklyRemaining of its week, so it is spent down and the
 	// reset can be claimed for a fresh week before the grant lapses (PATCHES
@@ -758,10 +761,11 @@ func inheritAccountFacts(modelScore, accountScore Score) Score {
 	// Without it the Fable pool's drain cap would still read the per-request
 	// debit.
 	modelScore.Provider = accountScore.Provider
-	// The saved reset restores the whole account, and the proxy sets the hold
-	// on the account score only. Without it every model pool would rank a
-	// holder at 1x and never drain it early -- on the Fable pool, which every
-	// Fable request narrows to.
+	// The hold is set only for a saved reset that clears the general week,
+	// which every model pool draws on, and the proxy sets it on the account
+	// score only. Without it every model pool would rank a holder at 1x and
+	// never drain it early -- on the Fable pool, which every Fable request
+	// narrows to.
 	modelScore.ResetHeldUntil = accountScore.ResetHeldUntil
 	return modelScore
 }

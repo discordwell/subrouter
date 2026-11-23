@@ -43,6 +43,7 @@ import (
 	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
+	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
 	"github.com/manaflow-ai/subrouter/selectacct"
 	"github.com/manaflow-ai/subrouter/session"
 )
@@ -261,10 +262,15 @@ type poolRow struct {
 	Fuse         *poolFuse `json:"fuse,omitempty"`
 	Spark        *poolFuse `json:"spark,omitempty"`
 	// ResetHold marks an account the router ranks at
-	// selectacct.ResetHoldPreferenceRatio for an unclaimed saved reset
-	// (Score.HoldsReset, PATCHES §56). Pace is the raw weekly pace, so without
-	// this a holder ranked above a faster account reads as a mistake.
-	ResetHold bool `json:"reset_hold,omitempty"`
+	// selectacct.ResetHoldPreferenceRatio for an unclaimed saved reset that
+	// clears the week (Score.HoldsReset, PATCHES §56, §64), until
+	// ResetHoldS from now. Pace is the raw weekly pace, so without this a
+	// holder ranked above a faster account reads as a mistake.
+	ResetHold  bool   `json:"reset_hold,omitempty"`
+	ResetHoldS *int64 `json:"reset_hold_s,omitempty"`
+	// FableResets counts the account's unclaimed resets that clear only the
+	// Fable limit (PATCHES §64). They hold nothing: no 2x, no early burndown.
+	FableResets int `json:"fable_resets,omitempty"`
 	// WeeklyUnstarted is Score.WeeklyUnstarted, the fact ranking reads: the
 	// weekly window has not started, so the next new session goes here first
 	// (PATCHES §86). The fuse, the state and the state note read it too.
@@ -833,6 +839,9 @@ func (s Server) poolBoard(ctx context.Context, boardModel, machineID string) poo
 func applyPoolReadings(row *poolRow, status AccountUsageStatus, scheduler selectacct.Scheduler, measurable bool, now time.Time) {
 	row.Windows = projectWindows(status.Windows)
 	row.BindingWindow = bindingWindowName(status.Windows)
+	if reset := status.ComplimentaryReset; reset != nil && reset.Source == agentclaude.ResetProgram && reset.Available {
+		row.FableResets = reset.RemainingByKind[string(agentclaude.ResetKindFable)]
+	}
 
 	score, known := scheduler.LookupScore(status.Provider, status.ID)
 	row.Measured = known && measurable
@@ -893,6 +902,10 @@ func applyPoolReadings(row *poolRow, status AccountUsageStatus, scheduler select
 		row.Pace = &pace
 	}
 	row.ResetHold = score.HoldsReset(now)
+	if row.ResetHold {
+		held := int64(score.ResetHeldUntil.Sub(now) / time.Second)
+		row.ResetHoldS = &held
+	}
 
 	if factor := score.FableSpentFactor(); factor > 1 {
 		row.FableSpentFactor = factor
@@ -974,11 +987,11 @@ func classifyPoolState(
 	case selectacct.BurndownCauseRoll:
 		return poolStateDrain, "inside the 24h roll window; whatever is left here expires whether or not it is spent"
 	case selectacct.BurndownCauseReset:
-		return poolStateDrain, "early burndown: holds an unclaimed saved reset (expires " + resetHoldExpiry(score) +
+		return poolStateDrain, "early burndown: holds an unclaimed week reset (expires " + resetHoldExpiry(score) +
 			") and under 25% of its week is left; drained first so the reset can be claimed"
 	}
 	if score.HoldsReset(now) {
-		return poolStateOK, "eligible for new sessions; ranks at 2x its weekly pace while it holds an unclaimed saved reset (expires " +
+		return poolStateOK, "eligible for new sessions; ranks at 2x its weekly pace while it holds an unclaimed week reset (expires " +
 			resetHoldExpiry(score) + ")"
 	}
 	if factor := score.FableSpentFactor(); factor > 1 {
@@ -1150,10 +1163,12 @@ func bindingWindowName(windows []accounts.UsageWindow) string {
 // assumed: a peer that has just restarted publishes optimistic entries, and
 // believing them would paint an unmeasured pool as fully healthy.
 //
-// So is the reset hold (PATCHES §56), counted from bodyAt, when the peer
-// measured the body: with it and the measured week the windows carry, a box
-// row reads early burndown and the 2x the same way a local row does. The
-// windows cannot say whether a reset is held.
+// So is the week reset hold (PATCHES §56), counted from bodyAt, when the
+// peer measured the body: with it and the measured week the windows carry, a
+// box row reads early burndown and the 2x the same way a local row does. The
+// windows cannot say whether a reset is held. The keys are read as the peer
+// path reads them (heldWeekResetSeconds), so a box row ranks here as the
+// laptop ranks it.
 func schedulerFromStatuses(statuses []AccountUsageStatus, bodyAt time.Time) selectacct.Scheduler {
 	if bodyAt.IsZero() {
 		bodyAt = time.Now()
@@ -1165,9 +1180,10 @@ func schedulerFromStatuses(statuses []AccountUsageStatus, bodyAt time.Time) sele
 		}
 		score := scoreFromUsageWindows(status.Provider, status.ID, status.Windows)
 		score.Fresh = status.Normalized != nil && status.Normalized.Fresh
-		if status.Normalized != nil && status.Normalized.SecondsToHeldResetExpiry != nil {
-			seconds := *status.Normalized.SecondsToHeldResetExpiry
-			score.ResetHeldUntil = bodyAt.Add(time.Duration(seconds * float64(time.Second)))
+		if status.Normalized != nil {
+			if seconds := heldWeekResetSeconds(status.Normalized.SecondsToHeldWeekResetExpiry, status.Normalized.SecondsToHeldResetExpiry); seconds != nil {
+				score.ResetHeldUntil = bodyAt.Add(time.Duration(*seconds * float64(time.Second)))
+			}
 		}
 		scores = append(scores, score)
 	}

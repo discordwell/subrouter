@@ -772,10 +772,12 @@ func inheritPeerAccountFacts(pool, account remotePoolNormalized) remotePoolNorma
 	// reading. A peer before PATCHES §52 published every measured pool
 	// fresh:false under a fresh account, so the pool's own field is not read.
 	pool.Fresh = account.Fresh
-	// So is the reset hold: the claim restores the whole account, and the
-	// owner publishes the hold at the top level only (PATCHES §56). A pool
-	// entry's own field is never read, so a pool can neither gain a hold its
-	// account lacks nor lose one its account has.
+	// So is the reset hold: it is held only on a grant that clears the
+	// general week, which every pool draws on, and the owner publishes it at
+	// the top level only (PATCHES §56, §64). A pool entry's own fields are
+	// never read, so a pool can neither gain a hold its account lacks nor
+	// lose one its account has.
+	pool.SecondsToHeldWeekResetExpiry = account.SecondsToHeldWeekResetExpiry
 	pool.SecondsToHeldResetExpiry = account.SecondsToHeldResetExpiry
 	return pool
 }

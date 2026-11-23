@@ -997,9 +997,15 @@ func (r *AccountRef) usageReadReset(account accounts.Account, startFallback bool
 // a score built from a fresh usage read, given the saved reset that read
 // stands for (info) and the score it replaces (seed).
 //
-// A Known cedar_ember reading decides. An Available reset whose expiry parses
-// and lies ahead holds the account until then; anything else it says --
-// consumed, expired, ineligible, an expiry that does not parse -- is no hold.
+// A Known cedar_ember reading decides. An Available reading holds the account
+// until its WeekHeldUntil, the soonest expiry among the live grants that
+// clear the general week, when that parses and lies ahead; anything else it
+// says -- consumed, expired, ineligible, an expiry that does not parse, or
+// only grants that clear the Fable limit -- is no hold. A Fable claim zeroes
+// the Fable meter and gives back the week Fable usage spent; it does not
+// refill the week, so nothing left in the week is lost at the claim and
+// there is nothing to spend down first.
+//
 // A reading that knows nothing carries the seed's hold: nil (no block, the
 // fallback not back yet or failed) and Known false (Anthropic's
 // "unavailable", a setup token). Zeroing there took a holder out of early
@@ -1022,9 +1028,21 @@ func resetHeldUntil(info *accounts.ComplimentaryResetInfo, seed selectacct.Score
 	if !info.Available {
 		return time.Time{}
 	}
-	expires, ok := agentclaude.ParseResetTime(info.ExpiresAt)
+	expires, ok := agentclaude.ParseResetTime(info.WeekHeldUntil)
 	if !ok || !expires.After(now) {
 		return time.Time{}
 	}
 	return expires
+}
+
+// heldWeekResetSeconds is the hold a peer's usage-status body states for an
+// account, from its two keys (NormalizedUsage). A peer since PATCHES §64
+// publishes both for a week hold and neither otherwise, so the week key
+// decides. The legacy key alone is a peer from before §64: it held an account
+// on any grant, a Fable-only one too, and its body ranks as it did then.
+func heldWeekResetSeconds(week, legacy *float64) *float64 {
+	if week != nil {
+		return week
+	}
+	return legacy
 }
