@@ -14,7 +14,7 @@ The daemon decides where a session goes, and it publishes that decision. Read it
 
 `sr status` is a view for the human at the terminal. Its columns explain your own direct login and the CLI's switch recommendation. They do not show the router's ranking.
 
-A Codex account enrolled with owner claims has the ID `codex-owner-<hash>`, and its `usage-status` row carries the hash in `email` as well. Its login email is in `label`. `sr status` shows such an account by its login email. `sr plot`, `srq pool`, `srdash` and the pool board name every account by its `label`, or by its ID when it has none, and `srq pool --json` gives both, as `id` and `name`. A command that takes an account, such as `srq dir`, takes the ID.
+A Codex account enrolled with owner claims has the ID `codex-owner-<hash>`, and its `usage-status` row carries the hash in `email` as well. Its `label` normally holds its login email. `sr status` shows such an account by its login email. `sr plot`, `srq pool`, `srdash` and the pool board name every account by its `label`, or by its ID when it has none, and `srq pool --json` gives both, as `id` and `name`. A command that takes an account, such as `srq dir`, takes the ID.
 
 ### The CLI's "protected" is not the router's gate
 
