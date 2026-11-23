@@ -1650,6 +1650,9 @@ type remoteServerUsageStatus struct {
 	WeeklyCookedWindow string                      `json:"weekly_cooked_window,omitempty"`
 	ResetAdvice        *proxy.ResetCreditAdvice    `json:"reset_advice,omitempty"`
 	CapacityMarks      []proxy.AccountCapacityMark `json:"capacity_marks,omitempty"`
+	// AutoReset is the daemon's automatic resets for the account (PATCHES
+	// §93.3), decoded for the same wire test; no table reads it yet.
+	AutoReset *proxy.AutoResetStatus `json:"auto_reset,omitempty"`
 	// Normalized is the scheduler's own provider-independent view of this
 	// account. Raw Windows carry provider vocabulary that is easy to misread
 	// across providers, so consumers deciding capacity should prefer this.

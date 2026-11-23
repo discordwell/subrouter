@@ -2087,6 +2087,10 @@ type AccountUsageStatus struct {
 	// mode, would redeem a credit on this account now (see
 	// --reset-credit-autospend).
 	ResetAdvice *ResetCreditAdvice `json:"reset_advice,omitempty"`
+	// AutoReset is this daemon's automatic resets for one of its own
+	// accounts (PATCHES §93.3): the mode, the owner's condition, a claim in
+	// flight and the last decision.
+	AutoReset *AutoResetStatus `json:"auto_reset,omitempty"`
 	// UsageFresh is an internal signal used to decide whether a live fetch
 	// succeeded. UsageFetchedAt is the time represented by Windows and is
 	// exposed so clients can distinguish a last-known-good fallback from a
@@ -4750,6 +4754,8 @@ func (s Server) handleHealth(w http.ResponseWriter, request *http.Request) {
 		payload[ShadowHealthProofField] = proof
 	}
 	payload["codex_provider_selection"] = true
+	// Automatic resets (PATCHES §93.3): the mode and the owner's condition.
+	payload["auto_reset"] = autoResetHealth()
 	if s.ClaudeSocketStatus != nil {
 		payload["claude_socket"] = s.ClaudeSocketStatus()
 	}
@@ -5116,7 +5122,7 @@ func (s Server) handleUsageStatus(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "usage sweep in progress", http.StatusServiceUnavailable)
 			return
 		}
-		statuses = s.withHeldResets(s.withNewSessionVerdicts(s.withNormalizedUsage(s.withCodexCapacityMarks(s.withClaudeCostTiers(s.AccountRef.withResetAdvice(withWeeklyCooked(s.withSessionActivity(s.withSessionCounts(s.withRequestTimeExhaustionWindows(s.withClaudeWebBalances(statuses)))))))))))
+		statuses = s.withAutoResets(s.withHeldResets(s.withNewSessionVerdicts(s.withNormalizedUsage(s.withCodexCapacityMarks(s.withClaudeCostTiers(s.AccountRef.withResetAdvice(withWeeklyCooked(s.withSessionActivity(s.withSessionCounts(s.withRequestTimeExhaustionWindows(s.withClaudeWebBalances(statuses))))))))))))
 		writeJSON(w, s.AccountRef.withUsageBurn(statuses))
 		return
 	}

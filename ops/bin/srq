@@ -588,6 +588,39 @@ def _self_start(norm):
     return sent_at, sends
 
 
+AUTO_RESET_VERDICTS = ("would_claim", "refused_by_condition", "no_claim", "claimed", "failed", "may_have_landed")
+AUTO_RESET_KINDS = {"week": "week", "fable": "Fable", "codex_credit": "credit"}
+
+
+def _auto_reset(row):
+    """auto_reset as published on a usage-status row, flattened for summarize().
+
+    PATCHES §93.3: the row's own daemon publishes its mode (off, shadow or
+    real), whether the owner's under-1-percent condition is on, whether an
+    automatic claim is running on the account, and its last decision about
+    claiming the account's next saved reset. A peer's row carries the peer's.
+    Absent is an account its daemon cannot decide for, or a daemon from
+    before §93. A malformed field reads as absent.
+    """
+    out = {"auto_reset_mode": None, "auto_reset_near_empty": None, "auto_reset_claiming": False,
+           "auto_reset_verdict": None, "auto_reset_kind": None, "auto_reset_at": None,
+           "auto_reset_left": None, "auto_reset_reason": None}
+    auto = row.get("auto_reset")
+    if not isinstance(auto, dict) or auto.get("mode") not in ("off", "shadow", "real"):
+        return out
+    out["auto_reset_mode"] = auto["mode"]
+    out["auto_reset_near_empty"] = auto.get("near_empty") is True
+    out["auto_reset_claiming"] = auto.get("claiming") is True
+    last = auto.get("last")
+    if isinstance(last, dict) and last.get("verdict") in AUTO_RESET_VERDICTS and _instant(last.get("at")) is not None:
+        out["auto_reset_verdict"] = last["verdict"]
+        out["auto_reset_at"] = last["at"]
+        for key in ("kind", "left", "reason"):
+            value = last.get(key)
+            out[f"auto_reset_{key}"] = value if isinstance(value, str) and value else None
+    return out
+
+
 def _fable_week_spent_percent(norm):
     """The account's Fable meter, percent used, as its daemon publishes it, else None.
 
@@ -690,6 +723,7 @@ def summarize(row):
             **_verdicts(norm),
             "fable_resets": _fable_resets(row),
             **_held_resets(row),
+            **_auto_reset(row),
         }
 
     w = weekly_window(row)
@@ -713,6 +747,7 @@ def summarize(row):
         **_verdicts(norm),
         "fable_resets": _fable_resets(row),
         **_held_resets(row),
+        **_auto_reset(row),
     }
 
 
@@ -818,6 +853,9 @@ def _render_sections(rows, where, peer=False):
     usage-status: its verdict is then exactly what this daemon acts on. For
     this daemon's own rows the same verdict only ranks (local_fallback).
     """
+    mode_line = _auto_reset_mode_line(rows, where)
+    if mode_line:
+        print(mode_line + "\n")
     for provider in sorted({r["provider"] for r in rows if r["provider"]}):
         sub = [r for r in rows if r["provider"] == provider]
         ready, judged, basis = pool_counts(sub)
@@ -904,6 +942,9 @@ def _render_sections(rows, where, peer=False):
             flags += _auth_flag(r)
             if not r["known"]:
                 flags += "  (no weekly window for this provider -- UNKNOWN, not empty)"
+            auto = _auto_reset_label(r)
+            if auto:
+                flags += f"  {auto}"
             # Two windows, each labelled. One combined "used" column is what
             # made a 5h reading get quoted as weekly consumption.
             lines.append(f"  {r['name']:<34} 5h={short}%  7d={weekly}%{fable}  rolls {roll}{flags}")
@@ -959,6 +1000,15 @@ def _render_sections(rows, where, peer=False):
                          if peer else
                          "start sent = this daemon sent one tiny request itself at that time to start the week's clock"
                          " (§90); xN = N sent in a row, the week still unstarted")
+        if any(r["auto_reset_verdict"] for r in sub):
+            # The decision is the account's own daemon's: a peer's is shown,
+            # and this daemon decides nothing for a peer's account.
+            extra.append("auto = the peer's own last automatic reset decision (§93) for its own account, at that time"
+                         " here; nothing here ranks on it"
+                         if peer else
+                         "auto = the last automatic reset decision (§93), at that time: would claim (shadow: real mode"
+                         " would claim it now), claiming, claimed, CLAIM FAILED, MAY HAVE LANDED (only a reading settles"
+                         " it), refused <1% (the owner's condition stopped it), no claim; usage-status has the reason")
         end = ";" if extra else ")"
         if peer:
             print(f"      ({fable_legend}new = would this peer take a NEW session placed from here{end}")
@@ -970,6 +1020,47 @@ def _render_sections(rows, where, peer=False):
         for line in lines:
             print(line)
         print()
+
+
+def _auto_reset_mode_line(rows, where):
+    """The daemon's automatic reset mode, once for all its rows, else None
+    (no row it can decide for, or a daemon from before §93)."""
+    modes = sorted({(r["auto_reset_mode"], r["auto_reset_near_empty"]) for r in rows if r["auto_reset_mode"]})
+    if not modes:
+        return None
+    words = {"off": "off, nothing is decided or claimed",
+             "shadow": "shadow, it logs what it would claim and claims nothing",
+             "real": "REAL, it claims saved resets by itself"}
+    parts = []
+    for mode, near_empty in modes:
+        text = words[mode]
+        if mode != "off":
+            text += "; the owner's under-1% condition is " + ("on" if near_empty else "OFF")
+        parts.append(text)
+    return f"--- automatic resets @ {where} (§93): " + " | ".join(parts)
+
+
+def _auto_reset_label(r):
+    """The last automatic reset decision in a few words, as `auto=claimed week
+    14:05` in this machine's time, else ""."""
+    verdict = r["auto_reset_verdict"]
+    if verdict is None:
+        return ""
+    kind = AUTO_RESET_KINDS.get(r["auto_reset_kind"], r["auto_reset_kind"] or "")
+    at = _instant(r["auto_reset_at"]).astimezone().strftime("%H:%M")
+    left = r["auto_reset_left"]
+    if r["auto_reset_claiming"]:
+        words = ["claiming", kind, "since", at]
+    elif verdict == "refused_by_condition":
+        shown = f"({left} left)" if left and left[0].isdigit() else ""
+        words = ["refused <1%", kind, shown, at]
+    elif verdict == "no_claim":
+        never = "(never twice)" if (r["auto_reset_reason"] or "").startswith("never twice") else ""
+        words = ["no claim", never, at]
+    else:
+        words = [{"would_claim": "would claim", "claimed": "claimed", "failed": "CLAIM FAILED",
+                  "may_have_landed": "MAY HAVE LANDED"}[verdict], kind, at]
+    return "auto=" + " ".join(w for w in words if w)
 
 
 def _start_sent(r):
@@ -2212,6 +2303,77 @@ def cmd_selftest(_argv):
     unstarted_only = rendered([summarize(codex_row(0, 0, 604800, weekly_unstarted=True)), summarize(codex_row(1, 20, 300000))])
     check("a daemon from before §90 (no field) prints no start sent column and no legend",
           "start sent" not in unstarted_only and "rolls   168h  unstarted  new=yes\n" in unstarted_only)
+
+    print("automatic resets: the mode once per daemon, the last decision beside its account (PATCHES §93)")
+    decided_at = "2026-11-23T14:05:00Z"
+    at = _instant(decided_at).astimezone().strftime("%H:%M")
+
+    def auto_row(i, mode="shadow", near_empty=True, claiming=False, **last):
+        row = claude_row(i, True, "eligible")
+        auto = {"mode": mode, "near_empty": near_empty}
+        if claiming:
+            auto["claiming"] = True
+        if last:
+            auto["last"] = {"at": decided_at, **last}
+        row["auto_reset"] = auto
+        return row
+
+    shadow = [auto_row(0, verdict="would_claim", kind="week", left="0.0%",
+                       reason="a request met the limit of the week; the next reset is a week reset"),
+              auto_row(1)]
+    text = rendered([summarize(r) for r in shadow])
+    lines = [ln for ln in text.splitlines() if ln.startswith("  acct")]
+    mode_line = ("--- automatic resets @ local (§93): shadow, it logs what it would claim and claims nothing;"
+                 " the owner's under-1% condition is on\n")
+    check("the mode is printed once, before the sections",
+          text.count(mode_line) == 1 and text.index(mode_line) < text.index("=== claude"))
+    check("a would-claim reads beside its account, in few words", lines[0].endswith(f"  auto=would claim week {at}"))
+    check("an account with no decision has no label", len(lines) == 2 and "auto=" not in lines[1])
+    check("the legend explains auto",
+          "auto = the last automatic reset decision (§93), at that time: would claim (shadow: real mode would claim"
+          " it now), claiming, claimed, CLAIM FAILED, MAY HAVE LANDED" in text)
+    for verdict, kind, extra, want in (
+            ("claimed", "week", {}, f"auto=claimed week {at}"),
+            ("failed", "fable", {}, f"auto=CLAIM FAILED Fable {at}"),
+            ("may_have_landed", "codex_credit", {}, f"auto=MAY HAVE LANDED credit {at}"),
+            ("refused_by_condition", "week", {"left": "2.0%"}, f"auto=refused <1% week (2.0% left) {at}"),
+            ("refused_by_condition", "fable", {"left": "the Fable meter is unread"}, f"auto=refused <1% Fable {at}"),
+            ("no_claim", None, {"reason": "never twice: an automatic claim on this account started at ..."},
+             f"auto=no claim (never twice) {at}"),
+            ("no_claim", None, {"reason": "no demand: no request met the wall"}, f"auto=no claim {at}")):
+        row = summarize(auto_row(0, mode="real", verdict=verdict, **({"kind": kind} if kind else {}), **extra))
+        check(f"{verdict} {kind or ''} reads {want!r}", _auto_reset_label(row) == want)
+    claiming = rendered([summarize(auto_row(0, mode="real", claiming=True, verdict="would_claim", kind="week",
+                                            reason="...; claiming it now"))])
+    check("real mode, and a claim in flight reads claiming",
+          "--- automatic resets @ local (§93): REAL, it claims saved resets by itself; the owner's under-1% condition"
+          " is on\n" in claiming and f"  auto=claiming week since {at}\n" in claiming)
+    check("the condition turned off is loud",
+          "the owner's under-1% condition is OFF\n" in rendered([summarize(auto_row(0, near_empty=False))]))
+    check("mode off says nothing is decided",
+          "--- automatic resets @ local (§93): off, nothing is decided or claimed\n"
+          in rendered([summarize(auto_row(0, mode="off"))]))
+    remote = rendered([summarize(r) for r in shadow], peer=True)
+    check("peer: the peer's own mode and decision, which rank nothing here",
+          "--- automatic resets @ peer box (§93): shadow, it logs what it would claim" in remote
+          and f"  auto=would claim week {at}\n" in remote
+          and "auto = the peer's own last automatic reset decision (§93) for its own account, at that time here;"
+              " nothing here ranks on it" in remote)
+    s = summarize(shadow[0])
+    check("--json carries the published decision",
+          s["auto_reset_mode"] == "shadow" and s["auto_reset_near_empty"] is True and s["auto_reset_claiming"] is False
+          and s["auto_reset_verdict"] == "would_claim" and s["auto_reset_kind"] == "week"
+          and s["auto_reset_at"] == decided_at and s["auto_reset_left"] == "0.0%"
+          and summarize(shadow[1])["auto_reset_verdict"] is None)
+    check("a malformed auto_reset reads as none",
+          not any(summarize({**claude_row(0, True, "eligible"), "auto_reset": v})["auto_reset_mode"]
+                  for v in ("shadow", {"mode": "1"}, {"mode": True}, [], {"near_empty": True}))
+          and not any(summarize({**claude_row(0, True, "eligible"), "auto_reset": {"mode": "real", "last": v}})["auto_reset_verdict"]
+                      for v in ({"verdict": "guess", "at": decided_at}, {"verdict": "claimed", "at": "14:05"},
+                                {"verdict": "claimed"}, "claimed")))
+    older = rendered([summarize(claude_row(0, True, "eligible"))])
+    check("a daemon from before §93 prints no mode line and no label",
+          "automatic resets" not in older and "auto=" not in older and "auto =" not in older)
 
     print("reauth: the dir comes from the DAEMON, never from `sr claude env`")
     rows = [{"id": "main", "source": "/x/_p1787439913450"},
