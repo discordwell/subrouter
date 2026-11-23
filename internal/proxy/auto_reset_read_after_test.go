@@ -230,14 +230,17 @@ func TestEveryReadingThatCouldNotBeTakenServesInPlace(t *testing.T) {
 }
 
 // 2. Turns that arrive while that claim runs, two sessions' and a new
-// session's, are served on the same account too, after one claim.
+// session's, are served on the same account too, after one claim. A spare
+// with room is in the pool, so a turn moved off the account would land there
+// (§102.1, §99's independent check); the new session is placed on held as
+// its first turn arrives, since selection would place it on the spare.
 func TestTurnsThatArriveWhileTheClaimRunsAreServedInPlaceWhenTheReadingAfterIsRefused(t *testing.T) {
 	setAutoResetForTest(t, AutoResetReal, true)
-	f := newClaudeClaimFake(t, map[string]*claudeClaimProfile{"held": {week: 95, grants: []bool{false}}})
+	f := newClaudeClaimFake(t, map[string]*claudeClaimProfile{"held": {week: 95, grants: []bool{false}}, "spare": {week: 40}})
 	f.hold = make(chan struct{})
 	d := f.daemon(t, "")
 	answerReadsAfterClaim(d, f, "held", readAfterRefused)
-	for _, session := range []string{"one", "two", "three"} {
+	for _, session := range []string{"one", "two", "three", "new"} {
 		d.pinSession(session, "held")
 	}
 	f.set("held", func(p *claudeClaimProfile) { p.week = 100 })

@@ -331,6 +331,7 @@ func (s Server) readClaudeResetStatus(work, caller context.Context, account acco
 		if err == nil {
 			windows := displayClaudeWindows(claudeUsageWindows(usage))
 			ref.noteClaudeResetStatus(account.ID, account.Token, status, windows, started)
+			ref.noteResetBlockRead(accounts.ProviderClaude, account.ID, agentclaude.ResetInfo(status, started), started)
 			ref.history().observe(account, windows, started)
 			return claudeResetState{status: status, windows: windows, source: "live", at: started}, nil
 		}
@@ -585,6 +586,15 @@ func (s Server) claudeReset(work, caller context.Context, request ClaudeResetReq
 	// (noteClaudeResetClaimSent): the next call reads live.
 	landed := claim.Result == agentclaude.ResetResultReset || (claim.MayHaveLanded() && len(claim.Cleared) > 0)
 	ref.history().finishClaim(draft, string(claim.Result), landed)
+	if claim.Result == agentclaude.ResetResultReset {
+		// Anthropic says it used the reset: the daemon knows what that did to
+		// the block it went by and to the meters the claim gave back, before
+		// any reading (§102.1).
+		s.noteResetClaimed(account, resetClaimed{
+			kind: string(grant.Kind()), block: claudeBlockAfterClaim(state.status, grant.ID, time.Now()),
+			before: state.windows, beforeAt: state.at, meters: claudeGivenBack(claim.Cleared, grant.Clears),
+		})
+	}
 	if landed {
 		response.WindowsAfter, response.readAfter = s.afterClaudeReset(work, account)
 	}
@@ -625,7 +635,7 @@ func (s Server) afterClaudeReset(ctx context.Context, account accounts.Account) 
 	ref.forgetClaudeResetStatus(account.ID)
 	ref.InvalidateUsageStatusCache()
 	var windows []accounts.UsageWindow
-	windows, _, read.measuredAt, read.servedOver, read.err = ref.fetchUsageWindowsCachedReason(ctx, ref.client, account)
+	windows, _, read.measuredAt, read.servedOver, read.err = ref.fetchUsageWindowsCachedReason(withReadAfterClaim(ctx), ref.client, account)
 	if read.err != nil {
 		if s.Logger != nil {
 			s.Logger.Warn("claude reset re-read failed", "account", account.ID, "error", read.err)
@@ -995,6 +1005,9 @@ func (r *AccountRef) claudeResetFromFallback(account accounts.Account, start boo
 			started := time.Now()
 			usage, status, err := agentclaude.FetchResetStatus(ctx, client, token)
 			r.finishClaudeResetFallback(id, token, started, usage, status, err)
+			if err == nil {
+				r.noteResetBlockRead(accounts.ProviderClaude, id, agentclaude.ResetInfo(status, started), started)
+			}
 		}()
 	}
 	if entry.info == nil || entry.at.IsZero() || now.Sub(entry.at) >= 2*every {

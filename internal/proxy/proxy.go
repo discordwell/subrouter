@@ -1073,6 +1073,9 @@ type AccountRef struct {
 	// resetNeedMemory is §96's memory of each meter's need
 	// (sharedResetNeeds): burn.json, §94's decision and §95's choice read one.
 	resetNeedMemory atomic.Pointer[resetNeeds]
+	// claimedResetMemory is §102.1's memory of each account's last landed
+	// claim (sharedClaimedResets) until readings replace what it told.
+	claimedResetMemory atomic.Pointer[claimedResets]
 }
 
 // sharedAdmission returns the ref's admission gate, creating it on first use.
@@ -1647,6 +1650,7 @@ func (r *AccountRef) fetchUsageWindowsShared(ctx context.Context, client *http.C
 				}
 				var persistedFailure *usageWindowsFailure
 				var clearPersistedFailure bool
+				var blockRead *accounts.ComplimentaryResetInfo
 				r.usageWindowsMu.Lock()
 				now := time.Now()
 				// Expire old account failures whenever a live fetch completes.
@@ -1673,6 +1677,7 @@ func (r *AccountRef) fetchUsageWindowsShared(ctx context.Context, client *http.C
 							entry.resetStatus = flight.resetStatus
 							entry.resetLogin = claudeResetLoginMark(account.Token)
 							entry.resetAt = flight.started
+							blockRead = entry.reset
 						}
 						r.usageWindows[cacheKey] = entry
 						delete(r.usageWindowsFailures, failureKey)
@@ -1706,6 +1711,9 @@ func (r *AccountRef) fetchUsageWindowsShared(ctx context.Context, client *http.C
 				} else if clearPersistedFailure {
 					r.clearUsageThrottleState(cacheKey)
 				}
+				// Before the waiters wake: the row they build from this read
+				// carries its block, not the one a claim left (§102.1).
+				r.noteResetBlockRead(account.Provider, account.ID, blockRead, flight.started)
 				close(flight.done)
 			}()
 			flight.windows, flight.resetStatus, flight.supplementalFresh, flight.err = r.fetchAccountUsageLive(fetchCtx, client, account)
@@ -1845,6 +1853,11 @@ func (r *AccountRef) fetchClaudeOAuthUsageLive(ctx context.Context, client *http
 		// Save it so a later ordinary response that omits the bucket does not
 		// resurrect older supplemental evidence.
 		r.rememberClaudeSupplemental(account, windows)
+		return windows, reset, nil
+	}
+	if err == nil && r.readAfterClaimMissing(ctx, account, windows) {
+		// The claim path's own read after a landed claim, whose answer left
+		// out a meter the claim gave back (§102.1).
 		return windows, reset, nil
 	}
 
@@ -2124,6 +2137,14 @@ type AccountUsageStatus struct {
 	// expiry (withHeldResets, PATCHES §91.1). [] is a reading that holds
 	// none; absent is no reading, as complimentary_reset's absence is.
 	Resets []accounts.HeldReset `json:"resets,omitzero"`
+	// ResetsFromClaim marks complimentary_reset and resets as the block the
+	// account's last landed claim left, the reset it used counted as used,
+	// and not a reading (PATCHES §102.1). Absent once a reading replaced it.
+	ResetsFromClaim bool `json:"resets_from_claim,omitempty"`
+	// NotReadSinceClaim names each meter (its window's name) the account's
+	// last landed claim gave back that no figure measured after the claim
+	// shows yet (PATCHES §102.1).
+	NotReadSinceClaim []string `json:"not_read_since_claim,omitempty"`
 	// Burn is how fast this daemon's own account spends each meter, from its
 	// usage history (PATCHES §92.2). Outside normalized: a peer shows it and
 	// ranks on nothing in it. Absent with the history off or no series.
@@ -3733,6 +3754,7 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 			next.Windows = details.Windows
 			next.Credits = details.Credits
 			next.ComplimentaryReset = details.ComplimentaryReset
+			r.noteResetBlockRead(accounts.ProviderCodex, account.ID, details.ComplimentaryReset, measuredAt)
 			next.UsageFresh = true
 			next.UsageMeasuredAt = measuredAt
 			// The reading's time is when its fetch started (PATCHES §29).
@@ -5421,6 +5443,11 @@ func (s Server) updateSchedulerFromUsageStatusesAtScoreRevision(
 			continue
 		}
 		statusProvider := schedulerAccountProvider(status.Provider)
+		if s.AccountRef.claimedBefore(accounts.Account{ID: status.ID, Provider: accountProviderFor(status.Provider)}, status.UsageMeasuredAt) {
+			// Read before the account's last landed claim: its hold and the
+			// meters the claim gave back are what the claim left (§102.1).
+			continue
+		}
 		if idx, ok := scoreByID[selectacct.ScoreKey(statusProvider, status.ID)]; ok {
 			next := scoreFromUsageWindows(statusProvider, status.ID, status.Windows)
 			next.Fresh = true
@@ -7024,6 +7051,15 @@ func (s Server) redeemAccountChecked(ctx context.Context, account accounts.Accou
 	history.finishClaim(draft, "redeemed", true)
 	result.Credit = &credit
 	result.Reset = true
+	// The consume came back as a redeem: the credit is spent, whatever the
+	// read after it gets (§102.1).
+	kind := strings.TrimSpace(credit.ResetType)
+	if kind == "" {
+		kind = codexRateLimitsResetType
+	}
+	s.AccountRef.sharedHeldResets().forgetCredit(account.ID, credit.ID)
+	s.noteResetClaimed(account, resetClaimed{kind: kind, block: codexBlockAfterRedeem(before.ComplimentaryReset),
+		before: before.Windows, beforeAt: beforeAt, meters: codexGivenBack(before.Windows)})
 	// The 429 that cooked the account also paused its admission gate; every
 	// redeem path comes through here, so the reset ends the pause here.
 	s.admissionGate().clearAccount(schedulerAccountProvider(accounts.ProviderCodex), account.ID)

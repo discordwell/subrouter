@@ -33,6 +33,11 @@ func (r *AccountRef) observeClaudeQuotaHeaders(routed accounts.Account, header h
 	if requestStarted.IsZero() {
 		requestStarted = now
 	}
+	if r.claimedBefore(current, requestStarted) {
+		// Sent before the account's last landed claim: its figures were
+		// measured before it (§102.1).
+		return nil, false, 0, time.Time{}
+	}
 	windows := make([]accounts.UsageWindow, 0, len(observed))
 	for _, window := range observed {
 		if window.Feature != "" {
