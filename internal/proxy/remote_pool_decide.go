@@ -779,6 +779,9 @@ func inheritPeerAccountFacts(pool, account remotePoolNormalized) remotePoolNorma
 	// lose one its account has.
 	pool.SecondsToHeldWeekResetExpiry = account.SecondsToHeldWeekResetExpiry
 	pool.SecondsToHeldResetExpiry = account.SecondsToHeldResetExpiry
+	// A reset choice is the account's too (PATCHES §95.2); its meter says
+	// which pools load it.
+	pool.ResetChoice = account.ResetChoice
 	return pool
 }
 

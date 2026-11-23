@@ -8,6 +8,7 @@ import (
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
+	"github.com/manaflow-ai/subrouter/selectacct"
 )
 
 // PATCHES §95.1 on facts: which of a daemon's accounts are chosen to run to
@@ -74,7 +75,7 @@ func (a choiceAccount) row(now time.Time) AccountUsageStatus {
 
 // choiceResult is one pass's choice, by account ID.
 type choiceResult struct {
-	chosen map[string]ResetChoice
+	chosen map[string]selectacct.ResetChoice
 	why    map[string]string
 	hold   resetCodexHold
 }
@@ -101,7 +102,7 @@ func choose(now time.Time, hold resetCodexHold, list ...choiceAccount) choiceRes
 		weighed = append(weighed, pool.weigh(c))
 	}
 	choosing := chooseResets(weighed, hold, now)
-	out := choiceResult{chosen: map[string]ResetChoice{}, why: map[string]string{}, hold: choosing.codex}
+	out := choiceResult{chosen: map[string]selectacct.ResetChoice{}, why: map[string]string{}, hold: choosing.codex}
 	for key, choice := range choosing.choices {
 		out.chosen[ids[key]] = choice
 	}
@@ -113,7 +114,7 @@ func choose(now time.Time, hold resetCodexHold, list ...choiceAccount) choiceRes
 
 // wantChosen requires exactly the accounts named, each on meter in the order
 // listed, and that each reason says what words name.
-func wantChosen(t *testing.T, what string, got choiceResult, meter ResetChoiceMeter, order ...string) {
+func wantChosen(t *testing.T, what string, got choiceResult, meter selectacct.ResetChoiceMeter, order ...string) {
 	t.Helper()
 	count := 0
 	for _, choice := range got.chosen {
@@ -163,16 +164,16 @@ func TestAWeekHolderIsChosenWhenThePoolNeedsItsResets(t *testing.T) {
 		return append([]choiceAccount{h}, spares(rate, 3)...)
 	}
 	got := choose(choiceNow, resetCodexHold{}, at(1.2)...)
-	wantChosen(t, "need yes", got, ResetChoiceWeek, "held")
+	wantChosen(t, "need yes", got, selectacct.ResetChoiceWeek, "held")
 	wantWords(t, "need yes", got.chosen["held"].Why, "the pool needs its saved resets on the Claude week (the 24-hour pressure is 1.20",
 		"it reaches its limit in 10h30m", "a claim there adds 0.64 of a week")
 
 	got = choose(choiceNow, resetCodexHold{}, at(0.7)...)
-	wantChosen(t, "need no", got, ResetChoiceWeek)
+	wantChosen(t, "need no", got, selectacct.ResetChoiceWeek)
 	wantWords(t, "need no", got.why["held"], "the pool does not need its saved resets on the Claude week", "the 24-hour pressure is 0.70, under 1.0")
 
 	got = choose(choiceNow, resetCodexHold{}, at(0)...)
-	wantChosen(t, "need unknown", got, ResetChoiceWeek)
+	wantChosen(t, "need unknown", got, selectacct.ResetChoiceWeek)
 	wantWords(t, "need unknown", got.why["held"], "the pool's burn on the Claude week is not known yet")
 }
 
@@ -188,7 +189,7 @@ func TestWeekHoldersAreOrderedByTheValueAtTheirWall(t *testing.T) {
 			toRoll: time.Duration(hours) * time.Hour, expires: 17 * burnDay, weekBurn: 1.5})
 	}
 	got := choose(choiceNow, resetCodexHold{}, append(list, spares(1.5, 2)...)...)
-	wantChosen(t, "three holders", got, ResetChoiceWeek, "h150", "h90", "h40")
+	wantChosen(t, "three holders", got, selectacct.ResetChoiceWeek, "h150", "h90", "h40")
 	wantWords(t, "under the floor", got.why["h20"], "a claim there adds 0.16 of a week, under the floor of 0.25")
 }
 
@@ -207,14 +208,14 @@ func TestAFableHolderIsChosenForTheFableMeterAndAWeekHolderNeverIs(t *testing.T)
 		}
 	}
 	got := choose(choiceNow, resetCodexHold{}, pair(0.5)...)
-	wantChosen(t, "the week's need no", got, ResetChoiceFable, "fabled")
-	wantChosen(t, "the week's need no", got, ResetChoiceWeek)
+	wantChosen(t, "the week's need no", got, selectacct.ResetChoiceFable, "fabled")
+	wantChosen(t, "the week's need no", got, selectacct.ResetChoiceWeek)
 	wantWords(t, "the Fable holder", got.chosen["fabled"].Why, "the pool needs its saved resets on the Claude Fable")
 	wantWords(t, "the week holder", got.why["weekly"], "the pool does not need its saved resets on the Claude week")
 
 	got = choose(choiceNow, resetCodexHold{}, pair(1.5)...)
-	wantChosen(t, "the week's need yes", got, ResetChoiceFable, "fabled")
-	wantChosen(t, "the week's need yes", got, ResetChoiceWeek, "weekly")
+	wantChosen(t, "the week's need yes", got, selectacct.ResetChoiceFable, "fabled")
+	wantChosen(t, "the week's need yes", got, selectacct.ResetChoiceWeek, "weekly")
 }
 
 // codexHolders are three Codex accounts holding a credit, half their week
@@ -240,7 +241,7 @@ func codexHolders(change func(*choiceAccount)) []choiceAccount {
 // that it gives way to the one worth more.
 func TestOneCodexAccountIsChosenAtATime(t *testing.T) {
 	first := choose(choiceNow, resetCodexHold{}, codexHolders(nil)...)
-	wantChosen(t, "three holders", first, ResetChoiceCodexWeek, "c150")
+	wantChosen(t, "three holders", first, selectacct.ResetChoiceCodexWeek, "c150")
 	wantWords(t, "the chosen one", first.chosen["c150"].Why, "a claim there adds 0.77 of a week", "Codex accounts are loaded one at a time")
 	wantWords(t, "the next one", first.why["c100"], "Codex accounts are loaded one at a time, and another one is loaded now")
 	wantWords(t, "the third", first.why["c60"], "under the floor of 0.25")
@@ -250,7 +251,7 @@ func TestOneCodexAccountIsChosenAtATime(t *testing.T) {
 			a.kind = ""
 		}
 	})...)
-	wantChosen(t, "the first one's credit spent", spent, ResetChoiceCodexWeek, "c100")
+	wantChosen(t, "the first one's credit spent", spent, selectacct.ResetChoiceCodexWeek, "c100")
 	wantWords(t, "the spent one", spent.why["c150"], "it holds no saved reset")
 
 	passed := func(a *choiceAccount) {
@@ -259,14 +260,14 @@ func TestOneCodexAccountIsChosenAtATime(t *testing.T) {
 		}
 	}
 	held := choose(choiceNow.Add(29*time.Minute), first.hold, codexHolders(passed)...)
-	wantChosen(t, "another passes it within 30 minutes", held, ResetChoiceCodexWeek, "c150")
+	wantChosen(t, "another passes it within 30 minutes", held, selectacct.ResetChoiceCodexWeek, "c150")
 	moved := choose(choiceNow.Add(31*time.Minute), held.hold, codexHolders(passed)...)
-	wantChosen(t, "another passes it after 30 minutes", moved, ResetChoiceCodexWeek, "c100")
+	wantChosen(t, "another passes it after 30 minutes", moved, selectacct.ResetChoiceCodexWeek, "c100")
 	if moved.hold.key == first.hold.key || !moved.hold.since.Equal(choiceNow.Add(31*time.Minute)) {
 		t.Fatalf("the hold after the move is %+v, want c100 since the pass", moved.hold)
 	}
 	stays := choose(choiceNow.Add(31*time.Minute), held.hold, codexHolders(nil)...)
-	wantChosen(t, "none worth more after 30 minutes", stays, ResetChoiceCodexWeek, "c150")
+	wantChosen(t, "none worth more after 30 minutes", stays, selectacct.ResetChoiceCodexWeek, "c150")
 }
 
 // 5. Inside a kind's expiry window every holder of it is chosen whatever the
@@ -285,7 +286,7 @@ func TestInsideTheExpiryWindowEveryHolderIsChosen(t *testing.T) {
 		codex("x20b", 1.0, 160*time.Hour, 20*time.Hour),
 		codex("x10", 0.05, 100*time.Hour, 10*time.Hour),
 		codex("x20c", 0.1, 150*time.Hour, 20*time.Hour))
-	wantChosen(t, "Codex holders in their windows", got, ResetChoiceCodexWeek, "x10", "x20c", "x20a", "x20b")
+	wantChosen(t, "Codex holders in their windows", got, selectacct.ResetChoiceCodexWeek, "x10", "x20c", "x20a", "x20b")
 	wantWords(t, "a holder in its window", got.chosen["x10"].Why, "is inside its expiry window", "every holder of it is loaded")
 	wantWords(t, "the last", got.chosen["x20b"].Why, "is likely to expire unused", "after the reset expires at")
 	for _, id := range []string{"x10", "x20a", "x20c"} {
@@ -298,10 +299,10 @@ func TestInsideTheExpiryWindowEveryHolderIsChosen(t *testing.T) {
 		return choiceAccount{id: id, kind: accounts.ResetKindClaudeWeek, week: 0.02, fable: 0.5, toRoll: toRoll, expires: 20 * time.Hour, weekBurn: 0.5}
 	}
 	got = choose(choiceNow, resetCodexHold{}, week("b", 60*time.Hour), week("a", 120*time.Hour))
-	wantChosen(t, "Claude holders in their window", got, ResetChoiceWeek, "a", "b")
+	wantChosen(t, "Claude holders in their window", got, selectacct.ResetChoiceWeek, "a", "b")
 
 	outside := choose(choiceNow, resetCodexHold{}, codex("x9d", 0.1, 100*time.Hour, 9*burnDay), codex("y9d", 0.1, 150*time.Hour, 9*burnDay))
-	wantChosen(t, "calibration: the same pool with its expiry far away", outside, ResetChoiceCodexWeek)
+	wantChosen(t, "calibration: the same pool with its expiry far away", outside, selectacct.ResetChoiceCodexWeek)
 }
 
 // 6, on facts. An account whose next reset is of a kind this daemon does not
@@ -311,7 +312,7 @@ func TestANextResetOfAnUnknownKindIsNeverChosen(t *testing.T) {
 		return append([]choiceAccount{{id: "held", kind: kind, week: 0.3, fable: 0.5, toRoll: 100 * time.Hour, expires: 17 * burnDay, weekBurn: 1.2}},
 			spares(1.2, 3)...)
 	}
-	wantChosen(t, "calibration: a week reset", choose(choiceNow, resetCodexHold{}, account(accounts.ResetKindClaudeWeek)...), ResetChoiceWeek, "held")
+	wantChosen(t, "calibration: a week reset", choose(choiceNow, resetCodexHold{}, account(accounts.ResetKindClaudeWeek)...), selectacct.ResetChoiceWeek, "held")
 	got := choose(choiceNow, resetCodexHold{}, account("five_hour_grant")...)
 	if len(got.chosen) != 0 {
 		t.Fatalf("an unknown kind: %+v chosen", got.chosen)

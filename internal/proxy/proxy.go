@@ -2094,7 +2094,7 @@ type AccountUsageStatus struct {
 	// WouldChoose is the choice this daemon would publish for one of its own
 	// accounts in real mode, published in shadow mode (PATCHES §95.1). Outside
 	// normalized, so nothing ranks on it.
-	WouldChoose *ResetChoice `json:"would_choose,omitempty"`
+	WouldChoose *selectacct.ResetChoice `json:"would_choose,omitempty"`
 	// UsageFresh is an internal signal used to decide whether a live fetch
 	// succeeded. UsageFetchedAt is the time represented by Windows and is
 	// exposed so clients can distinguish a last-known-good fallback from a
@@ -2225,10 +2225,10 @@ type NormalizedUsage struct {
 	// ResetChoice is the holder's choice to run this account to its limit
 	// for its next saved reset (PATCHES §95.1), published by the daemon that
 	// holds the account in real mode only, for every daemon that ranks the
-	// account to honour (§95.2; until then nothing ranks on it). Absent is
-	// not chosen, or a daemon from before §95. Top level only: the choice is
-	// the account's, and its meter says which pools it covers.
-	ResetChoice *ResetChoice `json:"reset_choice,omitempty"`
+	// account to honour (§95.2). Absent is not chosen, or a daemon from
+	// before §95. Top level only: the choice is the account's, and its meter
+	// says which pools it covers.
+	ResetChoice *selectacct.ResetChoice `json:"reset_choice,omitempty"`
 	// Fresh distinguishes a score computed from a current usage fetch from one
 	// carried forward as a seed after a failed fetch. A stale reading is still
 	// the scheduler's working belief, but it is not evidence.
@@ -13027,7 +13027,10 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 		// billing 400 the client cannot fall back on (upstream #569/#598).
 		return accounts.Account{}, sessionID, userEmail, routingCapacity{}, s.poolExhaustedError(provider, availableAccounts, poolModel)
 	}
-	if account.AuthMode == accounts.AuthModeOAuth && !scheduler.UsableForNewSession(schedulerAccountProvider(account.Provider), account.ID) && s.Logger != nil {
+	// An account chosen for a reset takes new sessions below the floor on
+	// purpose (PATCHES §95.2), so it is not reported.
+	if account.AuthMode == accounts.AuthModeOAuth && !scheduler.UsableForNewSession(schedulerAccountProvider(account.Provider), account.ID) &&
+		!scheduler.LoadsForReset(schedulerAccountProvider(account.Provider), account.ID) && s.Logger != nil {
 		// Never refuse here based on the scheduler's view. Usage scores can be
 		// stale: the per-request re-score reads usage through a cache that falls
 		// back to stale "last good" data when the upstream usage endpoint
@@ -18020,7 +18023,8 @@ func (s Server) selectionSchedulerFrom(base selectacct.Scheduler, poolModel, mac
 	return scheduler.
 		WithReserves(s.AccountReserves).
 		WithMachine(machineID, s.MachinePolicy).
-		WithClosedAccounts(s.admissionGate().closedAccounts())
+		WithClosedAccounts(s.admissionGate().closedAccounts()).
+		WithResetChoices(s.rankedResetChoices())
 }
 
 // selectionScheduler is selectionSchedulerFrom against the current base.

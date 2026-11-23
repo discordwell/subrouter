@@ -20,20 +20,23 @@ import (
 // daemon that holds an account chooses the ones this pool should run to their
 // limit, so that their next saved reset is claimed there (§93, §94). This file
 // decides which accounts are chosen and in what order, logs each change and
-// publishes the choice; it changes no ranking. Ruling 2026-11-22: "with resets
-// in hand the aim is to load, not to balance", and for Codex "pick one
-// account, burn it to the ground, use its reset, then pick a new account".
+// publishes the choice; ranking honours a choice published in real mode
+// (§95.2, selectacct/reset_choice.go). Ruling 2026-11-22: "with resets in hand
+// the aim is to load, not to balance", and for Codex "pick one account, burn
+// it to the ground, use its reset, then pick a new account".
 
 // resetLoadingOn is SUBROUTER_RESET_LOADING: on, the daemon chooses accounts
-// (in shadow or real mode); off, it chooses none. Never set, it is off, so a
-// Server that serve did not set up chooses nothing; serve sets it on unless
-// the switch says 0.
+// (in shadow or real mode) and ranks on the choices published in real mode,
+// its own and its peers'; off, it chooses none and ranks on none. Never set,
+// it is off, so a Server that serve did not set up chooses nothing; serve
+// sets it on unless the switch says 0.
 var resetLoadingOn atomic.Bool
 
 // SetResetLoading turns the choosing of accounts on or off for the process.
 func SetResetLoading(on bool) { resetLoadingOn.Store(on) }
 
-// ResetLoading reports whether this daemon chooses accounts to load.
+// ResetLoading reports whether this daemon chooses accounts to load and
+// honours a published choice.
 func ResetLoading() bool { return resetLoadingOn.Load() }
 
 const (
@@ -47,43 +50,15 @@ const (
 	resetPeerRefreshAge = 5 * time.Minute
 )
 
-// ResetChoiceMeter is the meter a chosen account is run to its limit on.
-type ResetChoiceMeter string
-
-const (
-	// ResetChoiceWeek is a Claude account chosen for its week: it ranks first
-	// on every model pool of the account.
-	ResetChoiceWeek ResetChoiceMeter = "week"
-	// ResetChoiceFable is a Claude account whose next reset is a Fable reset,
-	// chosen for its Fable meter: it ranks first on the Fable pool only.
-	ResetChoiceFable ResetChoiceMeter = "fable"
-	// ResetChoiceCodexWeek is a Codex account chosen for its week.
-	ResetChoiceCodexWeek ResetChoiceMeter = "codex_week"
-)
-
-// ResetChoice is an account this daemon chose to run to its limit, as its
-// usage-status row publishes it: inside normalized in real mode, where every
-// daemon that ranks the account reads it, and as would_choose beside it in
-// shadow mode, where nothing ranks on it.
-type ResetChoice struct {
-	Meter ResetChoiceMeter `json:"meter"`
-	// Order is the account's place among this daemon's accounts chosen for
-	// the same meter, 1 first: the next takes new sessions only when the
-	// ones before it are at their allowance.
-	Order int `json:"order"`
-	// Why says, in one sentence, why the account is chosen.
-	Why string `json:"why"`
-}
-
 // resetChoiceMeterOf names the choice for provider's meter.
-func resetChoiceMeterOf(provider string, meter accounts.ResetMeter) ResetChoiceMeter {
+func resetChoiceMeterOf(provider string, meter accounts.ResetMeter) selectacct.ResetChoiceMeter {
 	switch {
 	case provider == string(accounts.ProviderCodex):
-		return ResetChoiceCodexWeek
+		return selectacct.ResetChoiceCodexWeek
 	case meter == accounts.ResetMeterFable:
-		return ResetChoiceFable
+		return selectacct.ResetChoiceFable
 	}
-	return ResetChoiceWeek
+	return selectacct.ResetChoiceWeek
 }
 
 // resetKindWords names a known kind for a person.
@@ -120,7 +95,7 @@ type resetCandidate struct {
 // resetWeighing is what the pool says of one candidate.
 type resetWeighing struct {
 	candidate resetCandidate
-	meter     ResetChoiceMeter
+	meter     selectacct.ResetChoiceMeter
 	// qualifies is a candidate the pool should load; why says why, or why
 	// not.
 	qualifies bool
@@ -253,7 +228,7 @@ type resetCodexHold struct {
 // resetChoosing is one pass's choice: each account chosen, by key, and why
 // each weighed account that is not chosen is not.
 type resetChoosing struct {
-	choices   map[string]ResetChoice
+	choices   map[string]selectacct.ResetChoice
 	notChosen map[string]string
 	codex     resetCodexHold
 }
@@ -268,14 +243,14 @@ type resetChoosing struct {
 // soonest expiry first, then the rest by the value of a claim at their wall,
 // highest first, and last the holders whose reset is likely to expire unused.
 func chooseResets(weighed []resetWeighing, hold resetCodexHold, now time.Time) resetChoosing {
-	out := resetChoosing{choices: map[string]ResetChoice{}, notChosen: map[string]string{}}
-	byMeter := map[ResetChoiceMeter][]resetWeighing{}
+	out := resetChoosing{choices: map[string]selectacct.ResetChoice{}, notChosen: map[string]string{}}
+	byMeter := map[selectacct.ResetChoiceMeter][]resetWeighing{}
 	var codex []resetWeighing
 	for _, w := range weighed {
 		switch {
 		case !w.qualifies:
 			out.notChosen[w.candidate.key] = w.why
-		case w.meter == ResetChoiceCodexWeek:
+		case w.meter == selectacct.ResetChoiceCodexWeek:
 			codex = append(codex, w)
 		default:
 			byMeter[w.meter] = append(byMeter[w.meter], w)
@@ -291,7 +266,7 @@ func chooseResets(weighed []resetWeighing, hold resetCodexHold, now time.Time) r
 			w.why += fmt.Sprintf("; Codex accounts are loaded one at a time, and this one is loaded since %s", since.UTC().Format(time.RFC3339))
 			fallthrough
 		case w.window:
-			byMeter[ResetChoiceCodexWeek] = append(byMeter[ResetChoiceCodexWeek], w)
+			byMeter[selectacct.ResetChoiceCodexWeek] = append(byMeter[selectacct.ResetChoiceCodexWeek], w)
 		default:
 			out.notChosen[w.candidate.key] = "Codex accounts are loaded one at a time, and another one is loaded now"
 		}
@@ -299,7 +274,7 @@ func chooseResets(weighed []resetWeighing, hold resetCodexHold, now time.Time) r
 	for meter, list := range byMeter {
 		slices.SortFunc(list, compareChosen)
 		for i, w := range list {
-			out.choices[w.candidate.key] = ResetChoice{Meter: meter, Order: i + 1, Why: w.why}
+			out.choices[w.candidate.key] = selectacct.ResetChoice{Meter: meter, Order: i + 1, Why: w.why}
 		}
 	}
 	return out
@@ -374,7 +349,7 @@ func compareValue(a, b resetWeighing) int {
 // resetChosen is a choice as the daemon keeps it: with the account's label
 // and provider, for its log lines.
 type resetChosen struct {
-	choice          ResetChoice
+	choice          selectacct.ResetChoice
 	label, provider string
 }
 
@@ -586,6 +561,30 @@ func (s Server) withResetChoices(statuses []AccountUsageStatus) []AccountUsageSt
 		normalized := *out[i].Normalized
 		normalized.ResetChoice = &choice
 		out[i].Normalized = &normalized
+	}
+	return out
+}
+
+// rankedResetChoices is the choices selection ranks this daemon's own
+// accounts on (PATCHES §95.2), keyed by ScoreKey: the ones it publishes inside
+// normalized, so in real mode only. A choice in shadow mode is would_choose,
+// and nothing ranks on it; with SUBROUTER_RESET_LOADING=0 the pass chooses
+// none. A peer's choice rides on its score instead (remotePoolNormalized.score).
+func (s Server) rankedResetChoices() map[string]selectacct.ResetChoice {
+	if mode, _ := AutoReset(); mode != AutoResetReal || s.AccountRef == nil || s.CredentialBroker != nil {
+		return nil
+	}
+	memory := s.AccountRef.sharedAutoResets()
+	memory.mu.Lock()
+	// Replaced whole at each pass, never written in place.
+	chosen := memory.choices
+	memory.mu.Unlock()
+	if len(chosen) == 0 {
+		return nil
+	}
+	out := make(map[string]selectacct.ResetChoice, len(chosen))
+	for key, held := range chosen {
+		out[key] = held.choice
 	}
 	return out
 }

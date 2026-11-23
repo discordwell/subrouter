@@ -157,8 +157,16 @@ type Score struct {
 	// measuredScore from the pace table SchedulerRef.Get attaches. Zero is
 	// unmeasured, and so is every Remote score: a peer's allowance is read
 	// from its verdict.
-	Pace        Pace
+	Pace Pace
+	// ResetChoice is the holder's choice to run this account to its limit
+	// for its next saved reset (PATCHES §95.2): a local account's from the
+	// table WithResetChoices attached, a peer's as its holder published it.
+	// Zero is none.
+	ResetChoice ResetChoice
 	queueClosed bool
+	// loading is set by the scheduler that reads the score: its ResetChoice
+	// is for a meter the request spends (Scheduler.loads).
+	loading bool
 
 	// weeklyDebit and shortDebit are what ApplyLiveDebit took off
 	// WeeklyHeadroom and ShortHeadroom (after its 0.01 floor); zero when
@@ -260,8 +268,14 @@ type Scheduler struct {
 	// Haiku call, and it must not pin a session that will run Fable to an
 	// account whose Fable is spent.
 	nonFableClaudeTurn bool
-	paces              map[string]Pace
-	closedAccounts     map[string]bool
+	// fablePool marks a scheduler ForModel scoped to the Fable pool, the only
+	// one an account chosen for its Fable meter is loaded on (PATCHES §95.2).
+	fablePool bool
+	// resetChoices is this daemon's choices for its own accounts, keyed by
+	// ScoreKey (WithResetChoices).
+	resetChoices   map[string]ResetChoice
+	paces          map[string]Pace
+	closedAccounts map[string]bool
 	// startSent is when each account's start mark expires (PATCHES §86),
 	// keyed by ScoreKey. SchedulerRef.Get attaches it.
 	startSent map[string]time.Time
@@ -436,7 +450,9 @@ func (s Score) FableSpentFactor() float64 {
 // Fable-spent factor, which stacks on either. Each is a factor on one score's
 // own pace, so the comparator stays a strict weak ordering.
 func (s Scheduler) rankingPace(score Score, pace float64, now time.Time) float64 {
-	if s.nonFableClaudeTurn {
+	// An account chosen for its Fable meter is not ranked up for the Opus or
+	// Sonnet work that would eat the week under its reset (PATCHES §95.2).
+	if s.nonFableClaudeTurn && score.ResetChoice.Meter != ResetChoiceFable {
 		pace *= score.FableSpentFactor()
 	}
 	switch {
@@ -677,6 +693,7 @@ func (s Scheduler) ForModel(model string) Scheduler {
 	// own (absentPoolInheritsAccountScore), so that return is the usual Opus
 	// path.
 	s.nonFableClaudeTurn = claudeFamilyPoolKeys[key] && key != claudeFablePoolKey
+	s.fablePool = key == claudeFablePoolKey
 	if key == "" || !s.hasModelScore(key) {
 		return s
 	}
@@ -1146,9 +1163,13 @@ func (s Scheduler) measuredScore(provider account.Provider, accountID string) Sc
 		// daemon's -- published in its verdict and carried on the score -- and
 		// this daemon's tables are keyed by its own accounts, so decorating it
 		// here would overwrite the peer's live count with a zero and erase the
-		// very concurrency the 2026-09-27 incident could not see.
+		// very concurrency the 2026-09-27 incident could not see. So is its
+		// reset choice.
+		score.loading = s.loads(score.ResetChoice)
 		return score
 	}
+	score.ResetChoice = s.resetChoices[key]
+	score.loading = s.loads(score.ResetChoice)
 	if s.sessionCounts != nil {
 		score.Sessions = countFor(s.sessionCounts, key, accountID)
 	}
@@ -1348,7 +1369,7 @@ func (s Score) routableForNewSession(now time.Time, allowEndgame bool) bool {
 	if s.queueClosed {
 		return false
 	}
-	return s.usableForNewSession() || (allowEndgame && s.endgameDrainEligible(now))
+	return s.usableForNewSession() || (allowEndgame && (s.endgameDrainEligible(now) || s.loadEligible(now)))
 }
 
 // weeklyPace is spendable weekly budget per second until the roll — the
@@ -1488,9 +1509,11 @@ func (s Score) holdsReset(now time.Time) bool {
 //
 // Local only: WeeklyRemaining is not published, and a peer's early burndown is
 // its owner's call, read from its verdict like any other burndown. Zero
-// WeeklyRemaining is unmeasured, never "spent", and stays out.
+// WeeklyRemaining is unmeasured, never "spent", and stays out. An account
+// chosen for a reset is loaded in its holder's order instead (PATCHES §95.2),
+// which the drain's soonest-roll-first order would turn round.
 func (s Score) inResetBurndown(now time.Time) bool {
-	return !s.Remote && s.holdsReset(now) &&
+	return !s.Remote && !s.loading && s.holdsReset(now) &&
 		s.WeeklyRemaining > 0 && s.WeeklyRemaining < ResetBurndownWeeklyRemaining &&
 		s.weeklyResetSecondsLeft(now) > 0 &&
 		!s.exhausted()

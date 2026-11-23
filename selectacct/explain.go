@@ -241,20 +241,37 @@ func (s Scheduler) compare(left, right account.Account, now time.Time, allowEndg
 			if leftCapped != rightCapped {
 				return rightCapped, "the other is draining but already at its concurrency cap"
 			}
+			// An account chosen for a saved reset (PATCHES §95.2) takes the
+			// next new session before every steady account, below the drain:
+			// the holder's order decides among chosen accounts, and at its
+			// allowance a chosen account ranks below every routable one.
+			leftLoads, rightLoads := leftScore.loadEligible(now), rightScore.loadEligible(now)
+			if leftLoads != rightLoads {
+				return leftLoads, reasonChosen
+			}
+			if leftLoads {
+				return compareChosen(left, right, leftScore, rightScore, now)
+			}
+			if leftFull, rightFull := leftScore.loadAtCap(now), rightScore.loadAtCap(now); leftFull != rightFull {
+				return rightFull, reasonChosenAtCap
+			}
 		} else {
 			// Steady mode: rank endgame accounts LAST, the mirror of the
 			// drain-first ordering above. PickSteady chooses the account an
 			// interactive session will sit on for hours, and parking it on one
 			// that rolls tonight is how that session goes dry -- or on a reset
 			// holder the router is running into its wall days early.
-			leftDraining := leftScore.inBurndownWindow(now)
-			rightDraining := rightScore.inBurndownWindow(now)
+			leftDraining := leftScore.inBurndownWindow(now) || leftScore.loading
+			rightDraining := rightScore.inBurndownWindow(now) || rightScore.loading
 			if leftDraining != rightDraining {
 				drainer := rightScore
 				if leftDraining {
 					drainer = leftScore
 				}
-				if drainer.BurndownCause(now) == BurndownCauseReset {
+				switch {
+				case !drainer.inBurndownWindow(now):
+					return rightDraining, reasonSteadyChosen
+				case drainer.BurndownCause(now) == BurndownCauseReset:
 					return rightDraining, "the other is in early burndown on a saved reset; not a place to park a session"
 				}
 				return rightDraining, "the other rolls within a day; not a place to park a session"
