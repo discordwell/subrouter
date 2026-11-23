@@ -59,6 +59,16 @@
      ]
     },
     {
+     "id": "codex-owner-08d2255bdf8cedd6c57344416e47f2a0a0651ad1139bef8495b5fbc500fdf63c",
+     "provider": "codex",
+     "label": "owner-e@example.com",
+     "auth_mode": "oauth",
+     "email": "codex-owner-08d2255bdf8cedd6c57344416e47f2a0a0651ad1139bef8495b5fbc500fdf63c",
+     "auth_checked": false,
+     "auth_valid": false,
+     "sweep_cut": true
+    },
+    {
      "id": "beta",
      "provider": "claude",
      "auth_mode": "oauth",

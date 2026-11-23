@@ -972,17 +972,20 @@ def _selftest(argv):
     theirs = codex(owner("b"), 0, 18.6, label="owner-b@example.com", email=owner("b"))
     both_here = codex(owner("c"), 10, 40, label="owner-c@example.com")
     both_there = codex(owner("c"), 20, 40, label="owner-c@example.com")
-    unread = dict(id=owner("d"), label="owner-d@example.com", provider="codex", auth_mode="oauth",
-                  auth_checked=False, auth_valid=False, sweep_cut=True, windows=[])
-    routes = {U: body(LOCAL_ROWS[:2] + [mine, both_here, unread]),
-              P: body({"peers": [peer("box", [theirs, both_there])]})}
+    def unread(c, label):
+        return dict(id=owner(c), label=label, provider="codex", auth_mode="oauth",
+                    auth_checked=False, auth_valid=False, sweep_cut=True, windows=[])
+    # the two unmeasured rows' ids sort the other way round from their labels
+    routes = {U: body(LOCAL_ROWS[:2] + [mine, both_here, unread("d", "owner-d@example.com")]),
+              P: body({"peers": [peer("box", [theirs, both_there, unread("0", "owner-e@example.com")])]})}
     text, lines, rc, _ = run(routes, boxes=())
     soon = " ".join(expiring(lines))
     check_all("a Codex account keyed by its owner is named by its label, never its id", [
         ("the peer's account is named in the expiring list", "owner-b@example.com" in soon),
         ("this machine's account is named in the expiring list", "owner-a@example.com" in soon),
         ("a copy that disagrees is named", "disagrees across scopes: owner-c@example.com" in text),
-        ("an unmeasured row is named", "not in the numbers: owner-d@example.com" in text),
+        ("the unmeasured rows are named, in order of name",
+         "not in the numbers: owner-d@example.com, owner-e@example.com" in " ".join(text.split())),
         ("no codex-owner id is printed", "codex-owner-" not in text),
     ], text)
 
