@@ -4820,7 +4820,8 @@ route_launch_setup() {
     "$LAPTOP_BASH" -c 'source "$1"; write_shim "$HOME/.claude-route/bin/claude" && write_codex_shim "$HOME/.claude-route/bin/codex"' _ "$C/route-lib.sh"
   route_shim_pool
   printf '\n# >>> claude-route >>>\nexport PATH="$HOME/.claude-route/bin:$PATH"\n# <<< claude-route <<<\n' > "$H/.zshrc"
-  printf 'codex\tcx-box\tcx-box\t\tbox\tyes\tno\n' > "$H/.claude-route/accounts.tsv"   # a Codex account, so codex pool routes
+  # A box Codex account, so codex pool routes, and a laptop one, so test pins it.
+  printf 'codex\tcx-box\tcx-box\t\tbox\tyes\tno\ncodex\tcx-lap\tcx-lap\t\tlocal\tyes\tno\n' > "$H/.claude-route/accounts.tsv"
   mkdir -p "$H/.local/bin"
   cat > "$H/.local/bin/claude" <<'SH'
 #!/bin/bash
@@ -4834,15 +4835,16 @@ done
 echo "$word"
 SH
   chmod 755 "$H/.local/bin/claude"
-  stub codex 'out=""; word=""; pool=""; prev=""
+  stub codex 'out=""; word=""; pool=""; pin=""; prev=""
 for a; do
   case "$prev" in -o) out="$a" ;; esac
-  case "$a" in --version) echo "codex-cli 9.9.9"; exit 0 ;; "Reply with exactly one word, in lowercase: "*) word="${a##*: }" ;; model_provider=\"subrouter\") pool=1 ;; esac
+  case "$a" in --version) echo "codex-cli 9.9.9"; exit 0 ;; "Reply with exactly one word, in lowercase: "*) word="${a##*: }" ;; model_provider=\"subrouter\") pool=1 ;;
+    *X-Subrouter-Account-ID*) pin="${a##*X-Subrouter-Account-ID\"=\"}"; pin="${pin%%\"*}" ;; esac
   prev="$a"
 done
 [ -n "$word" ] || exit 0
 sid="cx-$$-$RANDOM"; echo "session id: $sid"
-[ -n "$pool" ] && echo "$sid cx-pool" >> "$HOME/served"
+[ -n "$pool" ] && echo "$sid ${pin:-cx-pool}" >> "$HOME/served"
 [ -n "$out" ] && echo "$word" > "$out"
 exit 0'
   stub uuidgen 'printf "%08x-%04x-4%03x-8%03x-%012x\n" "$$" "$RANDOM" "$((RANDOM % 4096))" "$((RANDOM % 4096))" "$RANDOM$RANDOM"'
@@ -4921,9 +4923,11 @@ if begin route-test-without-paradev-skips-only-the-paradev-cases; then
     expect_line "  SKIP  $name   (no Paradev wrapper)"
   done
   [ "$(grep -c '^  SKIP  ' "$C/out")" = "${#ROUTE_PARADEV_CASES[@]}" ] && ok || bad "$(grep -c '^  SKIP  ' "$C/out") SKIP lines, want ${#ROUTE_PARADEV_CASES[@]}"
-  # A launch that is not about the wrapper went through it; now through the shim.
+  # Launches that are not about the wrapper went through it; now through the shim.
   expect_line "  PASS  'claude local' answers on your own login"
   expect_line "  PASS    ...logged route=off word=local, and the daemon never saw it"
+  expect_line "  PASS  codex pinned through the shim answers"
+  expect_line "  PASS    ...on exactly that account"
   expect_test_counts
   finish
 fi
@@ -4942,6 +4946,8 @@ if begin route-check-and-test-with-paradev-go-through-its-wrapper; then
   expect_no_out "  SKIP  "
   expect_line "  PASS  'claude local' answers on your own login"
   expect_log "^paradev wrapper claude local -p Reply with exactly one word, in lowercase: juliet"
+  expect_line "  PASS  codex pinned through Paradev's wrapper answers"
+  expect_log "^paradev wrapper codex cx-lap exec --skip-git-repo-check Reply with exactly one word, in lowercase: foxtrot"
   expect_test_counts
   finish
 fi
