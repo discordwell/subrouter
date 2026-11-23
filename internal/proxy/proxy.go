@@ -1051,6 +1051,9 @@ type AccountRef struct {
 	// concurrency limit and 429 pause must hold across both.
 	admission      atomic.Pointer[admissionControl]
 	activeSessions atomic.Pointer[ActiveSessions]
+	// selfStartMemory is §90's sender memory (sharedSelfStarts): the
+	// sender's loop writes it, and usage-status and the pool board read it.
+	selfStartMemory atomic.Pointer[selfStarts]
 }
 
 // sharedAdmission returns the ref's admission gate, creating it on first use.
@@ -2164,6 +2167,14 @@ type NormalizedUsage struct {
 	// Absent is false -- a running week, no weekly window, or a daemon from
 	// before §86. A pool entry carries its own pool's week.
 	WeeklyUnstarted bool `json:"weekly_unstarted,omitempty"`
+	// SelfStart is this daemon's own turns on the account while its week
+	// still reads unstarted (PATCHES §90.2): when it sent the last one, and
+	// how many it has sent in a row. Absent is none since the week last read
+	// as running, a week that runs, or a daemon from before §90. A peer shows
+	// it on its board and ranks on nothing in it: the deciding daemon keeps
+	// its own start marks (§86.2). Top level only: the turn starts the
+	// account's binding week, not a quota pool's.
+	SelfStart *SelfStartSent `json:"self_start,omitempty"`
 	// Fresh distinguishes a score computed from a current usage fetch from one
 	// carried forward as a seed after a failed fetch. A stale reading is still
 	// the scheduler's working belief, but it is not evidence.
@@ -2221,6 +2232,7 @@ func normalizedFromScore(score selectacct.Score, now time.Time) NormalizedUsage 
 // The input slice may be owned by AccountRef, so the result is a copy.
 func (s Server) withNormalizedUsage(statuses []AccountUsageStatus) []AccountUsageStatus {
 	scheduler := s.scheduler()
+	selfStarts := s.AccountRef.sharedSelfStarts()
 	now := time.Now()
 	out := append([]AccountUsageStatus(nil), statuses...)
 	for i := range out {
@@ -2232,6 +2244,9 @@ func (s Server) withNormalizedUsage(statuses []AccountUsageStatus) []AccountUsag
 			continue
 		}
 		normalized := normalizedFromScore(score, now)
+		if normalized.WeeklyUnstarted {
+			normalized.SelfStart = selfStarts.sent(selectacct.ScoreKey(schedulerAccountProvider(out[i].Provider), out[i].ID))
+		}
 		// One level of nesting only. A pool's own ModelScores is empty by
 		// construction (scoreFromLimitWindows builds each from a single filtered
 		// window set), but building them through the same helper means a future

@@ -39,6 +39,7 @@ import (
 	"math"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -91,9 +92,10 @@ const (
 	poolStateDrain = "drain"
 	// poolStatePristine is an account whose weekly window has not started
 	// (Score.WeeklyUnstarted): its tumbling fuse has never been lit, so
-	// nothing is at risk yet, and the router gives it the next new session to
-	// start its clock (PATCHES §86). This is the single most important thing
-	// this board can say about a Codex account and no other tool shows it.
+	// nothing is at risk yet. Its daemon sends one tiny request itself to
+	// start its clock (PATCHES §90), and the router gives it the next new
+	// session (§86). This is the single most important thing this board can
+	// say about a Codex account.
 	poolStatePristine = "pristine"
 	poolStateOK       = "ok"
 )
@@ -275,6 +277,10 @@ type poolRow struct {
 	// weekly window has not started, so the next new session goes here first
 	// (PATCHES §86). The fuse, the state and the state note read it too.
 	WeeklyUnstarted bool `json:"weekly_unstarted,omitempty"`
+	// SelfStart is the row's daemon's own turns on an account whose week
+	// still reads unstarted, as its usage-status publishes them (PATCHES
+	// §90.2). It is shown, never ranked on.
+	SelfStart *SelfStartSent `json:"self_start,omitempty"`
 
 	// FableSpentFactor is the factor an Opus or Sonnet turn ranks this
 	// account's weekly pace by because its Fable meter is spent
@@ -913,29 +919,66 @@ func applyPoolReadings(row *poolRow, status AccountUsageStatus, scheduler select
 	row.State, row.StateNote = classifyPoolState(status.Provider, status.ID, score, scheduler, now)
 }
 
-// noteUnstartedRow says, on a row whose week has not started, what this
-// daemon's ranking does with it (PATCHES §86): this daemon may have sent it a
-// new session already, which takes the priority off until its start mark
+// noteUnstartedRow says, on a row whose week has not started, what its daemon
+// did to start it and what this daemon's ranking does with it. The row's
+// daemon may have sent its own turn (PATCHES §90.2). This daemon may have sent
+// it a new session already, which takes the priority off until its start mark
 // expires, and a peer from before §86 does not publish the fact, so ranking
-// here never reads it. classifyPoolState's note assumes neither.
+// here never reads it (§86.2). classifyPoolState's note assumes none of these.
 func (s Server) noteUnstartedRow(row *poolRow, status AccountUsageStatus, pool string, now time.Time) {
-	if row.State != poolStatePristine || !selectacct.StartUnstartedWeek() {
+	if row.WeeklyUnstarted && status.Normalized != nil {
+		row.SelfStart = status.Normalized.SelfStart
+	}
+	if row.State != poolStatePristine {
 		return
+	}
+	notes := []string{"weekly window not started"}
+	if sent := row.SelfStart; sent != nil {
+		who := "this daemon"
+		if pool != poolNameLocal {
+			who = "its daemon"
+		}
+		note := who + " sent one request to start its clock at " + sent.SentAt.UTC().Format("15:04 MST")
+		if sent.Sends > 1 {
+			note += " (" + strconv.Itoa(sent.Sends) + " sent in a row)"
+		}
+		notes = append(notes, note)
+	}
+	ranking := s.unstartedRanking(status, pool, now, pool == poolNameLocal && row.SelfStart != nil)
+	if ranking == "" {
+		if row.SelfStart == nil {
+			return
+		}
+		ranking = "until a reading shows its clock running, the next new session goes here first"
+	}
+	row.StateNote = strings.Join(append(notes, ranking), "; ")
+}
+
+// unstartedRanking is what this daemon's ranking does with an unstarted row,
+// "" when the next new session goes there first. sentHere says this daemon's
+// own turn set the mark, or a session did after it.
+func (s Server) unstartedRanking(status AccountUsageStatus, pool string, now time.Time, sentHere bool) string {
+	if !selectacct.StartUnstartedWeek() {
+		return "SUBROUTER_START_UNSTARTED_WEEK=0 here, so it ranks on its pace"
 	}
 	provider, id := schedulerAccountProvider(status.Provider), status.ID
 	if pool != poolNameLocal {
 		if status.Normalized == nil || !status.Normalized.WeeklyUnstarted {
-			row.StateNote = "weekly window not started; its daemon does not publish weekly_unstarted (before PATCHES §86), so this daemon ranks it on its pace"
-			return
+			return "its daemon does not publish weekly_unstarted (before PATCHES §86), so this daemon ranks it on its pace"
 		}
 		if box := s.firstPeer(); box != nil {
 			id = crossPoolCandidateID(box.name(), status.ID)
 		}
 	}
-	if until, marked := s.SchedulerRef.StartSentUntil(provider, id); marked && until.After(now) {
-		row.StateNote = "weekly window not started; a new session was sent here, so it ranks on its pace until " +
-			until.UTC().Format("15:04 MST") + ", while a usage reading catches up"
+	until, marked := s.SchedulerRef.StartSentUntil(provider, id)
+	if !marked || !until.After(now) {
+		return ""
 	}
+	off := "it ranks on its pace until " + until.UTC().Format("15:04 MST") + ", while a usage reading catches up"
+	if sentHere {
+		return off
+	}
+	return "a new session was sent here, so " + off
 }
 
 // classifyPoolState is the one place a row's colour is decided.
