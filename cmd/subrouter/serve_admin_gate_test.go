@@ -37,13 +37,15 @@ func TestBindAddrRequiresAdminToken(t *testing.T) {
 // gate and turn these tests vacuous.
 func clearControlSecretEnv(t *testing.T) {
 	t.Helper()
-	for _, name := range []string{
-		"SUBROUTER_ADMIN_TOKEN", "SUBROUTER_ADMIN_TOKEN_FILE",
-		"SUBROUTER_ACCOUNT_IMPORT_TOKEN", "SUBROUTER_ACCOUNT_IMPORT_TOKEN_FILE",
-		"SUBROUTER_PROXY_TOKEN", "SUBROUTER_PROXY_TOKEN_FILE",
-	} {
+	for _, name := range controlSecretEnvNames {
 		t.Setenv(name, "")
 	}
+}
+
+var controlSecretEnvNames = []string{
+	"SUBROUTER_ADMIN_TOKEN", "SUBROUTER_ADMIN_TOKEN_FILE",
+	"SUBROUTER_ACCOUNT_IMPORT_TOKEN", "SUBROUTER_ACCOUNT_IMPORT_TOKEN_FILE",
+	"SUBROUTER_PROXY_TOKEN", "SUBROUTER_PROXY_TOKEN_FILE",
 }
 
 // serveMustReturn runs serve and requires it to return: every caller expects

@@ -19,14 +19,16 @@ import (
 	"github.com/manaflow-ai/subrouter/selectacct"
 )
 
-// runServeChild is serve in a child of the test binary, for
-// TestServeStartsAnUnstartedCodexWeekByItself: args is serve's arguments as
-// JSON. It serves until the parent kills it.
+// runServeChild is serve in a child of the test binary: args is serve's
+// arguments as JSON. It serves until the parent stops it.
 func runServeChild(args string) {
 	var argv []string
 	if err := json.Unmarshal([]byte(args), &argv); err != nil {
 		fmt.Fprintln(os.Stderr, "serve child: bad args:", args, err)
 		os.Exit(97)
+	}
+	if fake := os.Getenv(serveChildChatGPTEnv); fake != "" {
+		http.DefaultTransport = fakeChatGPTTransport(fake)
 	}
 	if err := serve(argv); err != nil {
 		fmt.Fprintln(os.Stderr, "serve child:", err)

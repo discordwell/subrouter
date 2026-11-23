@@ -110,15 +110,15 @@ func TestServeAttachesTheUsageHistoryOnlyWithTheSwitchOn(t *testing.T) {
 			sandboxHostConfig(t)
 			clearControlSecretEnv(t)
 			t.Setenv("SUBROUTER_USAGE_HISTORY", c.env)
-			base, output := startServeChild(t, "--fetch-usage=false", "--sr-switch-interval=0", "--reset-credit-autospend", "off")
-			resp, err := http.Get(base + proxy.UsageBurnPath)
+			child := startServeChild(t, nil, "--fetch-usage=false", "--sr-switch-interval=0", "--reset-credit-autospend", "off")
+			resp, err := http.Get(child.base + proxy.UsageBurnPath)
 			if err != nil {
-				t.Fatalf("GET %s: %v\nserve's output:\n%s", proxy.UsageBurnPath, err, output.String())
+				t.Fatalf("GET %s: %v\nserve's output:\n%s", proxy.UsageBurnPath, err, child.output.String())
 			}
 			body, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
 			if resp.StatusCode != c.status {
-				t.Fatalf("%s = %d %q, want %d\nserve's output:\n%s", proxy.UsageBurnPath, resp.StatusCode, body, c.status, output.String())
+				t.Fatalf("%s = %d %q, want %d\nserve's output:\n%s", proxy.UsageBurnPath, resp.StatusCode, body, c.status, child.output.String())
 			}
 			if c.status == http.StatusNotFound {
 				if !strings.Contains(string(body), "SUBROUTER_USAGE_HISTORY=0") {
@@ -134,10 +134,19 @@ func TestServeAttachesTheUsageHistoryOnlyWithTheSwitchOn(t *testing.T) {
 	}
 }
 
+// serveChild is serve running in a child of the test binary.
+type serveChild struct {
+	base   string
+	output *lockedBuffer
+	cmd    *exec.Cmd
+	exited chan struct{}
+}
+
 // startServeChild runs serve with args on a free loopback port in a child of
-// the test binary, as runServeChild does, and returns its base URL once it
-// answers. Every address but loopback goes to a closed port.
-func startServeChild(t *testing.T, args ...string) (string, *lockedBuffer) {
+// the test binary, as runServeChild does, with env over this process's
+// environment, and returns once it answers. Every address but loopback goes
+// to a closed port.
+func startServeChild(t *testing.T, env []string, args ...string) *serveChild {
 	t.Helper()
 	binary, err := os.Executable()
 	if err != nil {
@@ -155,41 +164,52 @@ func startServeChild(t *testing.T, args ...string) (string, *lockedBuffer) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	output := &lockedBuffer{}
-	child := exec.Command(binary, "-test.run=^$")
-	child.Env = append(os.Environ(),
+	child := &serveChild{base: "http://" + addr, output: &lockedBuffer{}, exited: make(chan struct{})}
+	child.cmd = exec.Command(binary, "-test.run=^$")
+	child.cmd.Env = append(append(os.Environ(), env...),
 		"SUBROUTER_TEST_SERVE_CHILD="+string(argv),
 		"HTTPS_PROXY=http://127.0.0.1:1", "HTTP_PROXY=http://127.0.0.1:1", "NO_PROXY=",
 	)
-	child.Stdout, child.Stderr = output, output
-	if err := child.Start(); err != nil {
+	child.cmd.Stdout, child.cmd.Stderr = child.output, child.output
+	if err := child.cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
-	exited := make(chan struct{})
 	go func() {
-		_ = child.Wait()
-		close(exited)
+		_ = child.cmd.Wait()
+		close(child.exited)
 	}()
 	t.Cleanup(func() {
-		_ = child.Process.Kill()
-		<-exited
+		_ = child.cmd.Process.Kill()
+		<-child.exited
 	})
-	base := "http://" + addr
 	client := &http.Client{Timeout: 2 * time.Second}
 	deadline := time.Now().Add(90 * time.Second)
 	for {
 		select {
-		case <-exited:
-			t.Fatalf("serve exited before it answered; its output:\n%s", output.String())
+		case <-child.exited:
+			t.Fatalf("serve exited before it answered; its output:\n%s", child.output.String())
 		default:
 		}
-		if resp, err := client.Get(base + "/_subrouter/health"); err == nil {
+		if resp, err := client.Get(child.base + "/_subrouter/health"); err == nil {
 			resp.Body.Close()
-			return base, output
+			return child
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("serve did not answer on %s within 90s; its output:\n%s", addr, output.String())
+			t.Fatalf("serve did not answer on %s within 90s; its output:\n%s", addr, child.output.String())
 		}
 		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+// stop sends sig and waits up to within for serve to exit.
+func (c *serveChild) stop(t *testing.T, sig os.Signal, within time.Duration) {
+	t.Helper()
+	if err := c.cmd.Process.Signal(sig); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-c.exited:
+	case <-time.After(within):
+		t.Fatalf("serve did not exit within %v of %v; its output:\n%s", within, sig, c.output.String())
 	}
 }
