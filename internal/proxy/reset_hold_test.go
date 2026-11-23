@@ -601,9 +601,10 @@ func TestPoolBoardShowsResetBurndownAndTheHold(t *testing.T) {
 		}
 		seconds := ends.Sub(now).Seconds()
 		// box-old is an older box's holder, which may hold a Fable grant
-		// only: the legacy key alone, read as it was before §64.
+		// only: the legacy key alone, read as it was before §64. box-week
+		// carries the week key alone, so only a reader of that key holds it.
 		payload, err := json.Marshal([]AccountUsageStatus{status("box-holder", &seconds, &seconds), status("box-plain", nil, nil),
-			status("box-old", nil, &seconds)})
+			status("box-old", nil, &seconds), status("box-week", &seconds, nil)})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -624,6 +625,7 @@ func TestPoolBoardShowsResetBurndownAndTheHold(t *testing.T) {
 		expect(t, rows["box-plain"], poolStateOK, "eligible for new sessions", false)
 		expect(t, rows["box-holder"], poolStateDrain, "early burndown", true)
 		expect(t, rows["box-old"], poolStateDrain, "early burndown", true)
+		expect(t, rows["box-week"], poolStateDrain, "early burndown", true)
 	})
 }
 
