@@ -1656,9 +1656,8 @@ type remoteServerUsageStatus struct {
 	// Absent from servers older than the patch that publishes it, and absent
 	// means unknown — never treat a missing normalized view as "no headroom".
 	Normalized *proxy.NormalizedUsage `json:"normalized,omitempty"`
-	// Resets is every saved reset the account holds (PATCHES §91.1), decoded
-	// so this type takes every field the daemon publishes; no table reads it
-	// yet.
+	// Resets is every saved reset the account holds (PATCHES §91.1). The
+	// Codex 1x reset cell shows its soonest read expiry (§91.2).
 	Resets []accounts.HeldReset `json:"resets,omitzero"`
 }
 
@@ -1893,6 +1892,7 @@ func usageRowsFromServerUsageStatuses(statuses []remoteServerUsageStatus) []srUs
 			windows:               status.Windows,
 			credits:               status.Credits,
 			complimentaryReset:    status.ComplimentaryReset,
+			resets:                status.Resets,
 			extraUsage:            status.ExtraUsage,
 			costTier:              status.CostTier,
 			costTierRank:          status.CostTierRank,

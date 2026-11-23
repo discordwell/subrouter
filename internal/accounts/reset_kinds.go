@@ -210,6 +210,12 @@ type HeldReset struct {
 	ManualOnly bool `json:"manual_only,omitempty"`
 }
 
+// Expires is the entry's expiry as a time; false when it carries none, or one
+// that does not parse.
+func (h HeldReset) Expires() (time.Time, bool) {
+	return parseResetExpiry(h.ExpiresAt)
+}
+
 // HeldResets groups readings into a row's list: one entry per kind and
 // expiry, counts added, in the provider's order of use (the kind's UseOrder,
 // then the soonest expiry), with unknown kinds after every known one. Never
