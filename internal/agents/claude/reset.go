@@ -28,6 +28,7 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -144,6 +145,34 @@ func (g ResetGrant) ClearsExhausted(status *ResetStatus) bool {
 		}
 	}
 	return false
+}
+
+// ResetKind is what claiming a grant gives back, read from its clears list
+// (PATCHES §64).
+type ResetKind string
+
+const (
+	// ResetKindWeek refills the general weekly limit ("seven_day"). A grant
+	// with no clears list is one too: that is how a block from before
+	// Anthropic listed them reads, and October's grant cleared the week.
+	ResetKindWeek ResetKind = "week"
+	// ResetKindFable clears the Fable limit ("seven_day_overage_included")
+	// and not the week: the claim zeroes the Fable meter and gives back only
+	// the part of the week that Fable usage spent.
+	ResetKindFable ResetKind = "fable"
+	// ResetKindOther clears neither.
+	ResetKindOther ResetKind = "other"
+)
+
+// Kind is what claiming the grant gives back.
+func (g ResetGrant) Kind() ResetKind {
+	if len(g.Clears) == 0 || slices.Contains(g.Clears, "seven_day") {
+		return ResetKindWeek
+	}
+	if slices.Contains(g.Clears, "seven_day_overage_included") {
+		return ResetKindFable
+	}
+	return ResetKindOther
 }
 
 // Expired reports whether the grant's use-by time has passed. A grant with
@@ -736,8 +765,11 @@ func parseResetClaim(raw []byte) (ResetClaim, error) {
 // ResetInfo maps a decoded block onto the usage-status row's
 // complimentary_reset (Source "cedar_ember"). Remaining and Total count every
 // grant that has not expired; ExpiresAt and Clears are the grant with a reset
-// left that expires first. Nil in, nil out: a block that was not read is not
-// a block that says "none".
+// left that expires first. RemainingByKind splits Remaining by what each
+// grant's claim gives back. WeekHeldUntil is read over every grant, not the
+// one that expires first: which grant expires first says nothing about
+// whether another clears the week. Nil in, nil out: a block that was not
+// read is not a block that says "none".
 func ResetInfo(status *ResetStatus, now time.Time) *accounts.ComplimentaryResetInfo {
 	if status == nil {
 		return nil
@@ -758,6 +790,7 @@ func ResetInfo(status *ResetStatus, now time.Time) *accounts.ComplimentaryResetI
 		IneligibleReason: status.IneligibleReason,
 	}
 	remaining, total, expiredLeft := 0, 0, 0
+	byKind := map[string]int{}
 	var soonest time.Time
 	var chosen *ResetGrant
 	for i := range status.Grants {
@@ -775,6 +808,7 @@ func ResetInfo(status *ResetStatus, now time.Time) *accounts.ComplimentaryResetI
 		if grant.ResetsLeft <= 0 {
 			continue
 		}
+		byKind[string(grant.Kind())] += grant.ResetsLeft
 		ends, ok := parseResetTime(grant.EndsAt)
 		if chosen == nil || (ok && (soonest.IsZero() || ends.Before(soonest))) {
 			chosen = &status.Grants[i]
@@ -792,6 +826,9 @@ func ResetInfo(status *ResetStatus, now time.Time) *accounts.ComplimentaryResetI
 		info.Total = &total
 		info.Used = &used
 		info.Consumed = total > 0 && remaining == 0
+		if len(byKind) > 0 {
+			info.RemainingByKind = byKind
+		}
 	}
 	info.Available = eligible && remaining > 0
 	if remaining == 0 && expiredLeft > 0 {
@@ -802,7 +839,27 @@ func ResetInfo(status *ResetStatus, now time.Time) *accounts.ComplimentaryResetI
 		info.ExpiresAt = chosen.EndsAt
 		info.Clears = append([]string(nil), chosen.Clears...)
 	}
+	if eligible {
+		info.WeekHeldUntil = weekHeldUntil(status.Grants, now)
+	}
 	return info
+}
+
+// weekHeldUntil is the soonest ends_at, verbatim, among the grants that clear
+// the week and can still be claimed: a reset left, not expired, not paused.
+// An ends_at that does not parse holds nothing: there is no expiry to hold to.
+func weekHeldUntil(grants []ResetGrant, now time.Time) string {
+	held, heldEnds := "", time.Time{}
+	for _, grant := range grants {
+		if grant.ResetsLeft <= 0 || grant.Expired(now) || grant.Paused || grant.Kind() != ResetKindWeek {
+			continue
+		}
+		ends, ok := parseResetTime(grant.EndsAt)
+		if ok && (held == "" || ends.Before(heldEnds)) {
+			held, heldEnds = grant.EndsAt, ends
+		}
+	}
+	return held
 }
 
 // ResetStatusUnread reports a block that is Anthropic's "could not read it

@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -570,6 +571,45 @@ func TestClaudeResetClaimsOnlyTheNextGrantAndNeverGuesses(t *testing.T) {
 		if code != http.StatusOK || response.Result != "reset" || !response.EarlyUse || fake.claimCount() != 1 {
 			t.Fatalf("%s claim: %d %+v, %d claims", name, code, response, fake.claimCount())
 		}
+	}
+}
+
+// PATCHES §64: a manual claim still takes the grant Anthropic names next,
+// whatever it gives back: the week reset when that is next, a Fable reset
+// when that is. The answer carries the claimed grant as decoded, with what
+// it clears and gives_back_weekly, so the CLI can say which kind it spent.
+func TestClaudeResetClaimsTheNextGrantOfEitherKind(t *testing.T) {
+	ends := time.Now().Add(18 * 24 * time.Hour).UTC().Format(time.RFC3339)
+	fableEnds := time.Now().Add(100 * 24 * time.Hour).UTC().Format(time.RFC3339)
+	week := `{"id":"week_reset","resets_total":1,"resets_left":1,"usable_now":true,"clears":["seven_day","seven_day_overage_included"],"ends_at":"` + ends + `"}`
+	fable := `{"id":"fable_5_2_launch","resets_total":2,"resets_left":2,"usable_now":true,"gives_back_weekly":true,` +
+		`"clears":["seven_day_overage_included"],"ends_at":"` + fableEnds + `"}`
+	for _, tc := range []struct {
+		name, block, grant string
+		kind               agentclaude.ResetKind
+		givesBackWeekly    bool
+	}{
+		{"the week reset named next",
+			`{"eligible":true,"at_limit":true,"exhausted":["seven_day"],"next_grant_id":"week_reset","grants":[` + week + `,` + fable + `]}`,
+			"week_reset", agentclaude.ResetKindWeek, false},
+		{"a Fable reset named next",
+			`{"eligible":true,"at_limit":true,"exhausted":["seven_day_overage_included"],"next_grant_id":"fable_5_2_launch","grants":[` + fable + `]}`,
+			"fable_5_2_launch", agentclaude.ResetKindFable, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := &anthropicFake{t: t, block: tc.block, claimBody: `{"result":"reset","cleared":["seven_day_overage_included"]}`}
+			server, _ := resetDaemon(t, fake)
+			code, response := postClaudeReset(t, server.Handler(), claimJSON(""))
+			if code != http.StatusOK || response.Result != "reset" || fake.claimCount() != 1 || fake.claims[0]["grant_id"] != tc.grant {
+				t.Fatalf("claim: %d %+v, claims %v; want %q claimed", code, response, fake.claims, tc.grant)
+			}
+			if grant := response.Grant; grant == nil || grant.ID != tc.grant || grant.Kind() != tc.kind || grant.GivesBackWeekly != tc.givesBackWeekly {
+				t.Fatalf("answer's grant %+v; want %q of kind %q, gives_back_weekly %v", grant, tc.grant, tc.kind, tc.givesBackWeekly)
+			}
+			if !slices.Equal(response.Cleared, []string{"seven_day_overage_included"}) {
+				t.Fatalf("answer's cleared %v; want Anthropic's", response.Cleared)
+			}
+		})
 	}
 }
 

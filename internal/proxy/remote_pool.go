@@ -670,12 +670,18 @@ type remotePoolNormalized struct {
 	// holds as WeeklyResetAt.
 	WeeklyHeadroom      *float64 `json:"weekly_headroom"`
 	SecondsToWeeklyRoll *float64 `json:"seconds_to_weekly_reset"`
-	// SecondsToHeldResetExpiry is the peer's own statement that the account
-	// holds an unclaimed saved reset until then (PATCHES §56), which ranks it
-	// at selectacct.ResetHoldPreferenceRatio here. Absent -- no hold, or a
-	// peer too old to publish one -- ranks it at 1x. The peer publishes it at
-	// the top level only; a pool entry takes its account's.
-	SecondsToHeldResetExpiry *float64 `json:"seconds_to_held_reset_expiry"`
+	// SecondsToHeldWeekResetExpiry is the peer's own statement that the
+	// account holds an unclaimed saved reset that clears the general week
+	// until then (PATCHES §56, §64), which ranks it at
+	// selectacct.ResetHoldPreferenceRatio here. A peer since §64 publishes
+	// SecondsToHeldResetExpiry beside it with the same value, and neither key
+	// for a grant that clears only the Fable limit. A body with the legacy
+	// key alone is from a peer before §64, which holds an account on any
+	// grant, and ranks as it did before (heldWeekResetSeconds). The peer
+	// publishes the hold at the top level only; a pool entry takes its
+	// account's.
+	SecondsToHeldWeekResetExpiry *float64 `json:"seconds_to_held_week_reset_expiry"`
+	SecondsToHeldResetExpiry     *float64 `json:"seconds_to_held_reset_expiry"`
 	// The short pair. ShortWindowSeconds is absent on a peer running an
 	// older binary -- the live box does not publish it today -- which
 	// means the burn gate cannot be evaluated for that account from here.
@@ -855,8 +861,8 @@ func (n remotePoolNormalized) score(id string, now time.Time) (selectacct.Score,
 	// Anchored where the weekly roll is, so a body's hold ends when the
 	// peer's does. It feeds the 2x only: early burndown is the owner's call,
 	// carried in its verdict.
-	if n.SecondsToHeldResetExpiry != nil && *n.SecondsToHeldResetExpiry > 0 {
-		score.ResetHeldUntil = now.Add(time.Duration(*n.SecondsToHeldResetExpiry * float64(time.Second)))
+	if seconds := heldWeekResetSeconds(n.SecondsToHeldWeekResetExpiry, n.SecondsToHeldResetExpiry); seconds != nil && *seconds > 0 {
+		score.ResetHeldUntil = now.Add(time.Duration(*seconds * float64(time.Second)))
 	}
 	if n.NewSession != nil {
 		verdict := *n.NewSession

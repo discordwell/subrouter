@@ -2113,16 +2113,22 @@ type NormalizedUsage struct {
 	// than definition.
 	WeeklyHeadroom       float64 `json:"weekly_headroom,omitempty"`
 	SecondsToWeeklyReset int64   `json:"seconds_to_weekly_reset,omitempty"`
-	// SecondsToHeldResetExpiry is how long the account's unclaimed saved reset
-	// (cedar_ember) has left, published while this daemon ranks the account
-	// on it (Score.HoldsReset, PATCHES §56): a peer ranks it at
-	// selectacct.ResetHoldPreferenceRatio until then. Counted from now like
-	// the weekly roll, so the two daemons' clocks need not agree. Absent is no
-	// hold -- none held, none read, the switch off here, or a daemon from
-	// before §56 -- and the peer ranks the account at 1x. Its early burndown is
-	// not derived from this: that arrives in new_session. Top level only: the
-	// hold is the account's, and a peer reads a pool entry with its account's
-	// (inheritPeerAccountFacts).
+	// SecondsToHeldWeekResetExpiry is how long the account's unclaimed saved
+	// reset that clears the general week (cedar_ember) has left, published
+	// while this daemon ranks the account on it (Score.HoldsReset, PATCHES
+	// §56, §64): a peer ranks it at selectacct.ResetHoldPreferenceRatio until
+	// then. A grant that clears only the Fable limit holds nothing and
+	// publishes nothing. Counted from now like the weekly roll, so the two
+	// daemons' clocks need not agree. Absent is no hold -- none held, none
+	// read, the switch off here -- and the peer ranks the account at 1x. Its
+	// early burndown is not derived from this: that arrives in
+	// new_session. Top level only: the hold is the account's, and a peer reads
+	// a pool entry with its account's (inheritPeerAccountFacts).
+	SecondsToHeldWeekResetExpiry *float64 `json:"seconds_to_held_week_reset_expiry,omitempty"`
+	// SecondsToHeldResetExpiry is the same value under the key daemons from
+	// before §64 read, so they keep the 2x for a week reset. A reader takes
+	// it only from a body without the week key (heldWeekResetSeconds): an
+	// owner from before §64 publishes it for a Fable-only grant too.
 	SecondsToHeldResetExpiry *float64 `json:"seconds_to_held_reset_expiry,omitempty"`
 	// Pools answers "can this account serve THIS traffic class" per quota pool
 	// (claudefable, plus claudeopus / claudesonnet only when Anthropic reports
@@ -2206,6 +2212,7 @@ func normalizedFromScore(score selectacct.Score, now time.Time) NormalizedUsage 
 	}
 	if score.HoldsReset(now) {
 		seconds := score.ResetHeldUntil.Sub(now).Seconds()
+		normalized.SecondsToHeldWeekResetExpiry = &seconds
 		normalized.SecondsToHeldResetExpiry = &seconds
 	}
 	return normalized

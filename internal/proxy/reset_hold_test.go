@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"maps"
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -79,6 +81,47 @@ func TestResetHoldCarryRule(t *testing.T) {
 	}
 }
 
+// cedarEmberBlock is an eligible cedar_ember block holding grants.
+func cedarEmberBlock(grants ...map[string]any) string {
+	raw, _ := json.Marshal(map[string]any{
+		"eligible": true, "ineligible_reason": nil, "at_limit": false, "exhausted": []string{},
+		"grants": grants, "next_grant_id": grants[0]["id"],
+	})
+	return string(raw)
+}
+
+// fableGrant is a grant as every pooled account held them on 2026-11-09: it
+// clears only the Fable limit, not the general week.
+func fableGrant(left int, ends time.Time) map[string]any {
+	return map[string]any{
+		"id": "fable_5_2_launch", "label": "New model launch: one Fable reset for Max, Team Premium and Enterprise Premium",
+		"resets_total": left, "resets_left": left, "ends_at": ends.UTC().Format(time.RFC3339),
+		"clears": []string{"seven_day_overage_included"}, "paused": false, "usable_now": false, "use_requires_limit": true,
+	}
+}
+
+// weekGrant is a grant shaped as October's: it clears the general week.
+func weekGrant(left int, ends time.Time) map[string]any {
+	return map[string]any{
+		"id": "opus_5_5_launch", "label": "Claude Opus 5.5 launch: one usage-limit reset for Pro and Max",
+		"resets_total": 1, "resets_left": left, "ends_at": ends.UTC().Format(time.RFC3339),
+		"clears": []string{"five_hour", "seven_day", "seven_day_overage_included"}, "paused": false, "usable_now": false,
+		"use_requires_limit": true,
+	}
+}
+
+// fableGrantEnds is the live Fable grant's use-by time, 2027-03-09T07:59Z,
+// while it is still more than a day ahead of now; after that the same 119
+// days out the pool saw it on 2026-11-09, so the grant stays live and a hold
+// read off it would still show.
+func fableGrantEnds(now time.Time) time.Time {
+	ends := time.Date(2027, 3, 9, 7, 59, 0, 0, time.UTC)
+	if ends.Before(now.Add(24 * time.Hour)) {
+		ends = now.Add(119 * 24 * time.Hour).UTC().Truncate(time.Second)
+	}
+	return ends
+}
+
 // resetHoldUsage is a box account's usage answer: 10% of its 5h used, pctUsed
 // of its week with three days to the roll, and block as its cedar_ember ("" for
 // none).
@@ -93,18 +136,25 @@ func resetHoldUsage(now time.Time, weekUsed float64, block string) string {
 // Both places a fresh local score is built -- the usage-status republish and
 // the scheduled refresh -- set the hold by the carry rule, on scores the real
 // sweep and the real refresh build from real usage answers. Every account is
-// seeded with a hold the read must either replace, keep or clear.
+// seeded with a hold the read must either replace, keep or clear. Only a
+// grant that clears the general week holds: an account holding only Fable
+// grants, with a fifth of its week left, comes out with no hold and so no
+// early burndown, and one whose Fable grant lapses before its week grant is
+// held to the week grant.
 func TestBothScoreBuildSitesHoldAnAccountOnItsSavedReset(t *testing.T) {
 	now := time.Now()
 	ends := now.Add(5 * 24 * time.Hour).UTC().Truncate(time.Second)
 	seedHold := now.Add(2 * 24 * time.Hour)
+	later := ends.Add(3 * 24 * time.Hour)
 	usage := map[string]string{
 		"holder":  resetHoldUsage(now, 50, resetBlock(true, false, false, false, 1, ends)),
 		"unread":  resetHoldUsage(now, 50, `{"eligible":false,"ineligible_reason":"unavailable","grants":[]}`),
 		"noblock": resetHoldUsage(now, 50, ""),
 		"claimed": resetHoldUsage(now, 50, resetBlock(true, false, false, false, 0, ends)),
+		"fable":   resetHoldUsage(now, 80, cedarEmberBlock(fableGrant(2, fableGrantEnds(now)))),
+		"mixed":   resetHoldUsage(now, 50, cedarEmberBlock(fableGrant(1, ends), weekGrant(1, later))),
 	}
-	want := map[string]time.Time{"holder": ends, "unread": seedHold, "noblock": seedHold, "claimed": {}}
+	want := map[string]time.Time{"holder": ends, "unread": seedHold, "noblock": seedHold, "claimed": {}, "fable": {}, "mixed": later}
 	seeded := func(t *testing.T) Server {
 		t.Helper()
 		box, _, _ := claudeUsageBox(t, usage, nil)
@@ -126,6 +176,13 @@ func TestBothScoreBuildSitesHoldAnAccountOnItsSavedReset(t *testing.T) {
 			if !score.ResetHeldUntil.Equal(wantHold) {
 				t.Errorf("%s: %s held until %v, want %v", site, id, score.ResetHeldUntil, wantHold)
 			}
+		}
+		fable, _ := held("fable")
+		if fable.WeeklyRemaining <= 0 || fable.WeeklyRemaining >= selectacct.ResetBurndownWeeklyRemaining {
+			t.Fatalf("calibration: %s read fable's week as %v remaining, want under a quarter", site, fable.WeeklyRemaining)
+		}
+		if cause := fable.BurndownCause(time.Now()); cause != "" {
+			t.Errorf("%s: fable, holding only Fable grants, is in burndown (%q)", site, cause)
 		}
 	}
 
@@ -268,10 +325,12 @@ func TestTheScheduledRefreshNeverStartsAFallbackRead(t *testing.T) {
 	})
 }
 
-// The owner publishes the hold at the top level only, and decides early
-// burndown itself: a holder with a fifth of its week left, three days from
-// its roll, goes out with its hold and a burndown verdict naming the reset,
-// and an identical account without the reset goes out with neither. Off, the
+// The owner publishes the week hold at the top level only, under the week
+// key and the legacy key alike, and decides early burndown itself: a holder
+// with a fifth of its week left, three days from its roll, goes out with its
+// hold and a burndown verdict naming the reset, and an identical account
+// without the reset goes out with neither. So does an identical account
+// holding only Fable grants: today's block, which clears no week. Off, the
 // box publishes no hold and no early burndown.
 func TestABoxPublishesItsHoldAtTheTopLevelAndItsEarlyBurndownInTheVerdict(t *testing.T) {
 	now := time.Now()
@@ -279,54 +338,102 @@ func TestABoxPublishesItsHoldAtTheTopLevelAndItsEarlyBurndownInTheVerdict(t *tes
 	box, _, _ := claudeUsageBox(t, map[string]string{
 		"holder": resetHoldUsage(now, 80, resetBlock(true, false, false, false, 1, ends)),
 		"plain":  resetHoldUsage(now, 80, ""),
+		"fable":  resetHoldUsage(now, 80, cedarEmberBlock(fableGrant(2, fableGrantEnds(now)))),
 	}, nil)
-	byID := func() map[string]remotePoolAccountUsage {
-		out := map[string]remotePoolAccountUsage{}
-		for _, row := range readUsageRows(t, box) {
-			out[row.ID] = row
+	// The wire as peers read it, keys spelled out.
+	type entry struct {
+		Week       *float64                      `json:"seconds_to_held_week_reset_expiry"`
+		Legacy     *float64                      `json:"seconds_to_held_reset_expiry"`
+		NewSession *selectacct.NewSessionVerdict `json:"new_session"`
+	}
+	type row struct {
+		ID                 string                           `json:"id"`
+		ComplimentaryReset *accounts.ComplimentaryResetInfo `json:"complimentary_reset"`
+		Normalized         struct {
+			entry
+			Pools map[string]entry `json:"pools"`
+		} `json:"normalized"`
+	}
+	byID := func() map[string]row {
+		req := httptest.NewRequest(http.MethodGet, remotePoolUsagePath, nil)
+		req.Header.Set("Authorization", "Bearer admin")
+		recorder := httptest.NewRecorder()
+		box.Handler().ServeHTTP(recorder, req)
+		var rows []row
+		if recorder.Code != http.StatusOK || json.Unmarshal(recorder.Body.Bytes(), &rows) != nil {
+			t.Fatalf("usage-status = %d: %s", recorder.Code, recorder.Body.String())
+		}
+		out := map[string]row{}
+		for _, r := range rows {
+			if r.Normalized.NewSession == nil || len(r.Normalized.Pools) == 0 {
+				t.Fatalf("calibration: %s published no verdict or pools: %+v", r.ID, r.Normalized)
+			}
+			out[r.ID] = r
 		}
 		return out
 	}
+	noHold := func(t *testing.T, r row) {
+		t.Helper()
+		scopes := map[string]entry{"account": r.Normalized.entry}
+		for key, pool := range r.Normalized.Pools {
+			scopes[key] = pool
+		}
+		for scope, e := range scopes {
+			if e.Week != nil || e.Legacy != nil {
+				t.Errorf("%s %s published a hold (week key set %v, legacy key set %v)", r.ID, scope, e.Week != nil, e.Legacy != nil)
+			}
+			if e.NewSession != nil && (e.NewSession.Burndown || e.NewSession.BurndownCause != "") {
+				t.Errorf("%s %s verdict %+v, want no burndown", r.ID, scope, e.NewSession)
+			}
+		}
+	}
 
 	rows := byID()
-	holder, plain := rows["holder"], rows["plain"]
-	if holder.Normalized.NewSession == nil || plain.Normalized.NewSession == nil || len(holder.Normalized.Pools) == 0 {
-		t.Fatalf("calibration: rows without verdicts or pools: %+v", rows)
+	holder := rows["holder"]
+	week, legacy := holder.Normalized.Week, holder.Normalized.Legacy
+	if week == nil || math.Abs(*week-ends.Sub(now).Seconds()) > 60 {
+		t.Fatalf("holder published seconds_to_held_week_reset_expiry %v, want about %.0f", week, ends.Sub(now).Seconds())
 	}
-	seconds := holder.Normalized.SecondsToHeldResetExpiry
-	if seconds == nil || math.Abs(*seconds-ends.Sub(now).Seconds()) > 60 {
-		t.Fatalf("holder published seconds_to_held_reset_expiry %v, want about %.0f", seconds, ends.Sub(now).Seconds())
+	if legacy == nil || *legacy != *week {
+		t.Fatalf("holder published seconds_to_held_reset_expiry %v, want the week hold's %v for older peers", legacy, *week)
 	}
 	for key, pool := range holder.Normalized.Pools {
-		if pool.SecondsToHeldResetExpiry != nil {
-			t.Errorf("pool %q published its own hold (%v); the hold is published at the top level only", key, *pool.SecondsToHeldResetExpiry)
+		if pool.Week != nil || pool.Legacy != nil {
+			t.Errorf("pool %q published its own hold; the hold is published at the top level only", key)
 		}
 	}
 	if verdict := holder.Normalized.NewSession; !verdict.Burndown || verdict.BurndownCause != selectacct.BurndownCauseReset || verdict.AllowedSessions < 1 {
 		t.Fatalf("holder verdict %+v, want burndown on the reset with an allowance", verdict)
 	}
-	if plain.Normalized.SecondsToHeldResetExpiry != nil || plain.Normalized.NewSession.Burndown || plain.Normalized.NewSession.BurndownCause != "" {
-		t.Fatalf("plain published a hold %v or a burndown %+v", plain.Normalized.SecondsToHeldResetExpiry, plain.Normalized.NewSession)
+	noHold(t, rows["plain"])
+	if reset := rows["fable"].ComplimentaryReset; reset == nil || !reset.Available || len(reset.Clears) != 1 {
+		t.Fatalf("calibration: fable's row reads its Fable grants as %+v", reset)
 	}
+	noHold(t, rows["fable"])
 
 	setResetHoldPriorityForTest(t, false)
-	holder = byID()["holder"]
-	if holder.Normalized.SecondsToHeldResetExpiry != nil || holder.Normalized.NewSession == nil ||
-		holder.Normalized.NewSession.Burndown || holder.Normalized.NewSession.BurndownCause != "" {
-		t.Fatalf("switch off: holder published hold %v and verdict %+v, want neither", holder.Normalized.SecondsToHeldResetExpiry, holder.Normalized.NewSession)
-	}
+	noHold(t, byID()["holder"])
 }
+
+// The keys a peer publishes its hold under: the week key, and the legacy key
+// that a peer since §64 publishes beside it and an older peer publishes for a
+// Fable-only grant too.
+const (
+	weekHoldKey   = "seconds_to_held_week_reset_expiry"
+	legacyHoldKey = "seconds_to_held_reset_expiry"
+)
 
 // peerHoldBody is a peer's usage-status: two accounts with identical published
 // numbers, each with a Fable pool entry. holds gives an account a top-level
-// hold, poolHolds a hold on its Fable entry only (no owner publishes that).
-func peerHoldBody(t *testing.T, holds, poolHolds map[string]float64) []byte {
+// hold under key, poolHolds a hold under key on its Fable entry only (no owner
+// publishes that).
+func peerHoldBody(t *testing.T, key string, holds, poolHolds map[string]float64) []byte {
 	t.Helper()
 	eligible := map[string]any{"eligible": true, "reason": selectacct.VerdictEligible}
 	row := func(id string) map[string]any {
 		pool := map[string]any{"headroom": 0.5, "short_headroom": 0.9, "fresh": true, "new_session": eligible}
 		if seconds, ok := poolHolds[id]; ok {
-			pool["seconds_to_held_reset_expiry"] = seconds
+			pool[key] = seconds
 		}
 		normalized := map[string]any{
 			"headroom": 0.5, "short_headroom": 0.9, "fresh": true,
@@ -335,7 +442,7 @@ func peerHoldBody(t *testing.T, holds, poolHolds map[string]float64) []byte {
 			"pools":       map[string]any{selectacct.ModelKey(agentclaude.FableFeature): pool},
 		}
 		if seconds, ok := holds[id]; ok {
-			normalized["seconds_to_held_reset_expiry"] = seconds
+			normalized[key] = seconds
 		}
 		return map[string]any{"id": id, "provider": "claude", "auth_mode": "oauth", "auth_checked": true, "auth_valid": true,
 			"normalized": normalized}
@@ -349,10 +456,11 @@ func peerHoldBody(t *testing.T, holds, poolHolds map[string]float64) []byte {
 	return body
 }
 
-// The laptop reads a peer's published hold into Score.ResetHeldUntil, counted
-// from when the body was measured, and ranks that account at 2x: at equal
-// published pace the holder beats the peer's other account. A pool entry
-// takes its account's hold, always.
+// The laptop reads a peer's published week hold into Score.ResetHeldUntil,
+// counted from when the body was measured, and ranks that account at 2x: at
+// equal published pace the holder beats the peer's other account. A pool
+// entry takes its account's hold, always. A body with only the legacy key is
+// an older peer's, and ranks as it did before §64: at 2x.
 func TestALaptopRanksAPeerHolderAtTwiceItsPublishedPace(t *testing.T) {
 	now := time.Now()
 	bodyAt := now.Add(-time.Minute)
@@ -383,7 +491,7 @@ func TestALaptopRanksAPeerHolderAtTwiceItsPublishedPace(t *testing.T) {
 	}
 
 	// Calibration: without a hold the two tie, and the id decides.
-	placement, _ := place(t, peerHoldBody(t, nil, nil), "")
+	placement, _ := place(t, peerHoldBody(t, weekHoldKey, nil, nil), "")
 	expect(t, placement, "a-plain", tied)
 
 	holds := map[string]float64{"b-holder": hold}
@@ -393,7 +501,7 @@ func TestALaptopRanksAPeerHolderAtTwiceItsPublishedPace(t *testing.T) {
 			name = selectacct.ModelKey(poolModel) + " pool"
 		}
 		t.Run(name, func(t *testing.T) {
-			placement, scores := place(t, peerHoldBody(t, holds, nil), poolModel)
+			placement, scores := place(t, peerHoldBody(t, weekHoldKey, holds, nil), poolModel)
 			if want := bodyAt.Add(time.Duration(hold) * time.Second); !scores["b-holder"].ResetHeldUntil.Equal(want) {
 				t.Fatalf("b-holder held until %v, want %v (the body's time plus the published seconds)", scores["b-holder"].ResetHeldUntil, want)
 			}
@@ -407,17 +515,29 @@ func TestALaptopRanksAPeerHolderAtTwiceItsPublishedPace(t *testing.T) {
 	// A hold on a pool entry alone is not the account's: no owner publishes
 	// one, and if it were read b-holder would win the Fable pool.
 	t.Run("a pool entry's own hold is not read", func(t *testing.T) {
-		placement, scores := place(t, peerHoldBody(t, nil, map[string]float64{"b-holder": hold}), agentclaude.FableFeature)
+		placement, scores := place(t, peerHoldBody(t, weekHoldKey, nil, map[string]float64{"b-holder": hold}), agentclaude.FableFeature)
 		if !scores["b-holder"].ResetHeldUntil.IsZero() {
 			t.Fatalf("b-holder held until %v off its pool entry alone", scores["b-holder"].ResetHeldUntil)
 		}
 		expect(t, placement, "a-plain", tied)
 	})
 
+	// An older peer cannot tell a Fable grant from a week grant; its body
+	// ranks as it did before §64 until it is deployed.
+	t.Run("an older peer's legacy key alone", func(t *testing.T) {
+		for _, poolModel := range []string{"", agentclaude.FableFeature} {
+			placement, scores := place(t, peerHoldBody(t, legacyHoldKey, holds, nil), poolModel)
+			if want := bodyAt.Add(time.Duration(hold) * time.Second); !scores["b-holder"].ResetHeldUntil.Equal(want) {
+				t.Fatalf("b-holder held until %v off the legacy key, want %v", scores["b-holder"].ResetHeldUntil, want)
+			}
+			expect(t, placement, "b-holder", boosted)
+		}
+	})
+
 	// Off here, a peer's published hold is ignored like a local one.
 	t.Run("switch off", func(t *testing.T) {
 		setResetHoldPriorityForTest(t, false)
-		placement, _ := place(t, peerHoldBody(t, holds, nil), "")
+		placement, _ := place(t, peerHoldBody(t, weekHoldKey, holds, nil), "")
 		expect(t, placement, "a-plain", tied)
 	})
 }
@@ -471,15 +591,19 @@ func TestPoolBoardShowsResetBurndownAndTheHold(t *testing.T) {
 	})
 
 	t.Run("box", func(t *testing.T) {
-		status := func(id string, held *float64) AccountUsageStatus {
+		status := func(id string, week, legacy *float64) AccountUsageStatus {
 			return AccountUsageStatus{
 				AccountStatus: AccountStatus{ID: id, Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, AuthValid: true},
 				Windows:       windows(80),
-				Normalized:    &NormalizedUsage{Headroom: 0.2, ShortHeadroom: 0.9, Fresh: true, SecondsToHeldResetExpiry: held},
+				Normalized: &NormalizedUsage{Headroom: 0.2, ShortHeadroom: 0.9, Fresh: true,
+					SecondsToHeldWeekResetExpiry: week, SecondsToHeldResetExpiry: legacy},
 			}
 		}
 		seconds := ends.Sub(now).Seconds()
-		payload, err := json.Marshal([]AccountUsageStatus{status("box-holder", &seconds), status("box-plain", nil)})
+		// box-old is an older box's holder, which may hold a Fable grant
+		// only: the legacy key alone, read as it was before §64.
+		payload, err := json.Marshal([]AccountUsageStatus{status("box-holder", &seconds, &seconds), status("box-plain", nil, nil),
+			status("box-old", nil, &seconds)})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -499,6 +623,7 @@ func TestPoolBoardShowsResetBurndownAndTheHold(t *testing.T) {
 		}
 		expect(t, rows["box-plain"], poolStateOK, "eligible for new sessions", false)
 		expect(t, rows["box-holder"], poolStateDrain, "early burndown", true)
+		expect(t, rows["box-old"], poolStateDrain, "early burndown", true)
 	})
 }
 
@@ -519,5 +644,248 @@ func TestRoutingCapacityEndgameCoversEarlyBurndown(t *testing.T) {
 	}
 	if !capacity(now.Add(5 * 24 * time.Hour)).Endgame {
 		t.Fatal("a holder in early burndown logged local_endgame=false")
+	}
+}
+
+// decemberWeekGrant is the week reset the pool read on 2026-11-22, one per
+// account: it clears the general week and the Fable limit.
+func decemberWeekGrant(left int, ends time.Time) map[string]any {
+	return map[string]any{
+		"id": "week_reset", "resets_total": 1, "resets_left": left, "ends_at": ends.UTC().Format(time.RFC3339),
+		"clears": []string{"seven_day", "seven_day_overage_included"}, "paused": false, "usable_now": false,
+		"use_requires_limit": true,
+	}
+}
+
+// republished is a box after one usage-status republish: each account's
+// score built from its usage answer and the saved reset read with it.
+func republished(t *testing.T, usage map[string]string) (Server, selectacct.Scheduler) {
+	t.Helper()
+	box, _, _ := claudeUsageBox(t, usage, nil)
+	box.SchedulerRef = selectacct.NewSchedulerRef(selectacct.NewScheduler(nil))
+	ctx := context.Background()
+	box.updateSchedulerFromUsageStatusesContext(ctx, box.AccountRef.UsageStatuses(ctx))
+	scheduler := box.SchedulerRef.Get()
+	for id := range usage {
+		if score, ok := scheduler.LookupScore(accounts.ProviderClaude, id); !ok || !score.Fresh {
+			t.Fatalf("calibration: no fresh score for %s (%+v)", id, score)
+		}
+	}
+	return box, scheduler
+}
+
+// explainClaude ranks the named Claude OAuth accounts account-wide (pool "")
+// or on one model pool, as a new session would be placed.
+func explainClaude(t *testing.T, scheduler selectacct.Scheduler, pool string, ids ...string) []selectacct.Explanation {
+	t.Helper()
+	if pool != "" {
+		scheduler = scheduler.ForModel(pool)
+	}
+	candidates := make([]accounts.Account, 0, len(ids))
+	for _, id := range ids {
+		candidates = append(candidates, accounts.Account{ID: id, Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth})
+	}
+	explained, err := scheduler.Explain(candidates)
+	if err != nil || len(explained) != len(ids) {
+		t.Fatalf("explain %v on %q: %v, %v", ids, pool, explained, err)
+	}
+	return explained
+}
+
+// resetRows is the usage-status rows' saved resets and published holds.
+type resetRow struct {
+	ID                 string                           `json:"id"`
+	ComplimentaryReset *accounts.ComplimentaryResetInfo `json:"complimentary_reset"`
+	Normalized         struct {
+		Week   *float64 `json:"seconds_to_held_week_reset_expiry"`
+		Legacy *float64 `json:"seconds_to_held_reset_expiry"`
+	} `json:"normalized"`
+}
+
+func resetRows(t *testing.T, box Server) ([]byte, map[string]resetRow) {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, remotePoolUsagePath, nil)
+	req.Header.Set("Authorization", "Bearer admin")
+	recorder := httptest.NewRecorder()
+	box.Handler().ServeHTTP(recorder, req)
+	var rows []resetRow
+	if recorder.Code != http.StatusOK || json.Unmarshal(recorder.Body.Bytes(), &rows) != nil {
+		t.Fatalf("usage-status = %d: %s", recorder.Code, recorder.Body.String())
+	}
+	out := map[string]resetRow{}
+	for _, row := range rows {
+		out[row.ID] = row
+	}
+	return recorder.Body.Bytes(), out
+}
+
+// PATCHES §64: an account whose only saved resets clear the Fable limit
+// ranks exactly as an account with none, account-wide and on the Fable pool,
+// with a fifth of its week left three days from its roll: no 2x, no early
+// burndown. Its row still shows the resets, as Fable resets.
+func TestAFableOnlyResetRanksAsNoReset(t *testing.T) {
+	now := time.Now()
+	fableEnds := fableGrantEnds(now)
+	box, scheduler := republished(t, map[string]string{
+		"a-plain": resetHoldUsage(now, 80, ""),
+		"b-fable": resetHoldUsage(now, 80, cedarEmberBlock(fableGrant(2, fableEnds))),
+	})
+	for _, pool := range []string{"", agentclaude.FableFeature} {
+		explained := explainClaude(t, scheduler, pool, "a-plain", "b-fable")
+		if explained[0].Account.ID != "a-plain" || explained[0].Reason != "tied; ordered by account id" {
+			t.Errorf("pool %q ranked %s first (%q); want the two tied, the id breaking it", pool, explained[0].Account.ID, explained[0].Reason)
+		}
+	}
+	fable, _ := scheduler.LookupScore(accounts.ProviderClaude, "b-fable")
+	if fable.WeeklyRemaining <= 0 || fable.WeeklyRemaining >= selectacct.ResetBurndownWeeklyRemaining {
+		t.Fatalf("calibration: b-fable's week read as %v remaining, want under a quarter", fable.WeeklyRemaining)
+	}
+	if fable.HoldsReset(now) || fable.BurndownCause(now) != "" {
+		t.Fatalf("b-fable holds %v, burndown %q; a Fable reset holds nothing", fable.ResetHeldUntil, fable.BurndownCause(now))
+	}
+
+	_, rows := resetRows(t, box)
+	reset := rows["b-fable"].ComplimentaryReset
+	if reset == nil || !reset.Known || !reset.Available || reset.Remaining == nil || *reset.Remaining != 2 ||
+		reset.ExpiresAt != fableEnds.Format(time.RFC3339) || !slices.Equal(reset.Clears, []string{"seven_day_overage_included"}) {
+		t.Fatalf("b-fable's row shows its resets as %+v; want both Fable resets, Available, ending %s", reset, fableEnds)
+	}
+	if reset.WeekHeldUntil != "" || !maps.Equal(reset.RemainingByKind, map[string]int{"fable": 2}) {
+		t.Fatalf("b-fable's row reads week_held_until %q, remaining_by_kind %v; want none held and 2 Fable",
+			reset.WeekHeldUntil, reset.RemainingByKind)
+	}
+}
+
+// PATCHES §64 keeps §56 for a reset that gives back the week: in December's
+// shape (seven_day and the Fable limit) its holder ranks at 2x above an
+// equal account with half its week left, and below a quarter left it drains
+// early, until the grant's end and not after it. The grant ends 36 hours
+// out, before the week's roll three days out and outside its 24 hours.
+func TestAWeekResetHoldsTheAccountUntilItsEnd(t *testing.T) {
+	now := time.Now()
+	ends := now.Add(36 * time.Hour).UTC().Truncate(time.Second)
+	_, scheduler := republished(t, map[string]string{
+		"a-plain":  resetHoldUsage(now, 50, ""),
+		"b-holder": resetHoldUsage(now, 50, cedarEmberBlock(decemberWeekGrant(1, ends))),
+		"c-plain":  resetHoldUsage(now, 80, ""),
+		"d-holder": resetHoldUsage(now, 80, cedarEmberBlock(decemberWeekGrant(1, ends))),
+	})
+	for _, pool := range []string{"", agentclaude.FableFeature} {
+		explained := explainClaude(t, scheduler, pool, "a-plain", "b-holder")
+		if explained[0].Account.ID != "b-holder" || explained[0].Reason != "higher weekly pace after the reset-hold 2x and the live-session discount" {
+			t.Errorf("pool %q ranked %s first (%q); want b-holder on the 2x", pool, explained[0].Account.ID, explained[0].Reason)
+		}
+		explained = explainClaude(t, scheduler, pool, "c-plain", "d-holder")
+		if explained[0].Account.ID != "d-holder" || !strings.HasPrefix(explained[0].Reason, "early burndown") {
+			t.Errorf("pool %q ranked %s first (%q); want d-holder in early burndown", pool, explained[0].Account.ID, explained[0].Reason)
+		}
+	}
+	holder, _ := scheduler.LookupScore(accounts.ProviderClaude, "d-holder")
+	if !holder.ResetHeldUntil.Equal(ends) {
+		t.Fatalf("d-holder held until %v, want the grant's end %v", holder.ResetHeldUntil, ends)
+	}
+	if !holder.HoldsReset(ends.Add(-time.Minute)) || holder.BurndownCause(ends.Add(-time.Minute)) != selectacct.BurndownCauseReset {
+		t.Fatalf("a minute before the grant's end: holds %v, burndown %q; want the hold and early burndown",
+			holder.HoldsReset(ends.Add(-time.Minute)), holder.BurndownCause(ends.Add(-time.Minute)))
+	}
+	if holder.HoldsReset(ends) || holder.BurndownCause(ends.Add(time.Minute)) != "" {
+		t.Fatalf("at the grant's end: holds %v, a minute on burndown %q; want neither", holder.HoldsReset(ends), holder.BurndownCause(ends.Add(time.Minute)))
+	}
+}
+
+// PATCHES §64: an account with a week reset and Fable resets is a week holder
+// until the week reset's end, whichever ends first, never the Fable reset's;
+// with two live week resets, until the sooner end.
+func TestTheWeekHoldEndsWithTheSoonerWeekReset(t *testing.T) {
+	now := time.Now()
+	weekEnds := now.Add(5 * 24 * time.Hour).UTC().Truncate(time.Second)
+	fableSooner := now.Add(2 * 24 * time.Hour).UTC().Truncate(time.Second)
+	secondWeek := decemberWeekGrant(1, weekEnds.Add(3*24*time.Hour))
+	secondWeek["id"] = "week_reset_b"
+	_, scheduler := republished(t, map[string]string{
+		"week-then-fable": resetHoldUsage(now, 50, cedarEmberBlock(decemberWeekGrant(1, weekEnds), fableGrant(2, fableGrantEnds(now)))),
+		"fable-then-week": resetHoldUsage(now, 50, cedarEmberBlock(fableGrant(1, fableSooner), decemberWeekGrant(1, weekEnds))),
+		"two-weeks":       resetHoldUsage(now, 50, cedarEmberBlock(secondWeek, decemberWeekGrant(1, weekEnds))),
+		"two-weeks-swap":  resetHoldUsage(now, 50, cedarEmberBlock(decemberWeekGrant(1, weekEnds), secondWeek)),
+	})
+	for _, id := range []string{"week-then-fable", "fable-then-week", "two-weeks", "two-weeks-swap"} {
+		score, _ := scheduler.LookupScore(accounts.ProviderClaude, id)
+		if !score.ResetHeldUntil.Equal(weekEnds) {
+			t.Errorf("%s held until %v, want the sooner week reset's end %v", id, score.ResetHeldUntil, weekEnds)
+		}
+	}
+}
+
+// PATCHES §64: the week hold travels apart from any Fable reset, in
+// usage-status (week_held_until, the hold keys), in pool.json (reset_hold_s,
+// fable_resets) and on the peer path, so a deciding daemon that reads this
+// box ranks each account by the same rule: the Fable-only account at 1x, the
+// week holders at 2x until their week reset's end.
+func TestTheWeekHoldTravelsApartFromFableResets(t *testing.T) {
+	now := time.Now()
+	weekEnds := now.Add(5 * 24 * time.Hour).UTC().Truncate(time.Second)
+	fableEnds := fableGrantEnds(now)
+	box, scheduler := republished(t, map[string]string{
+		"a-week":  resetHoldUsage(now, 50, cedarEmberBlock(decemberWeekGrant(1, weekEnds))),
+		"b-fable": resetHoldUsage(now, 50, cedarEmberBlock(fableGrant(2, fableEnds))),
+		"c-both":  resetHoldUsage(now, 50, cedarEmberBlock(decemberWeekGrant(1, weekEnds), fableGrant(1, fableEnds))),
+	})
+	toWeekEnd := weekEnds.Sub(now).Seconds()
+	near := func(got *float64, want float64) bool { return got != nil && math.Abs(*got-want) < 60 }
+
+	body, rows := resetRows(t, box)
+	for id, want := range map[string]struct {
+		held   string
+		byKind map[string]int
+	}{
+		"a-week":  {weekEnds.Format(time.RFC3339), map[string]int{"week": 1}},
+		"b-fable": {"", map[string]int{"fable": 2}},
+		"c-both":  {weekEnds.Format(time.RFC3339), map[string]int{"week": 1, "fable": 1}},
+	} {
+		row := rows[id]
+		if row.ComplimentaryReset == nil || row.ComplimentaryReset.WeekHeldUntil != want.held ||
+			!maps.Equal(row.ComplimentaryReset.RemainingByKind, want.byKind) {
+			t.Errorf("usage-status %s: complimentary_reset %+v; want week_held_until %q, remaining_by_kind %v",
+				id, row.ComplimentaryReset, want.held, want.byKind)
+		}
+		if held := want.held != ""; held != near(row.Normalized.Week, toWeekEnd) || held != near(row.Normalized.Legacy, toWeekEnd) {
+			t.Errorf("usage-status %s: week key %v, legacy key %v; want both %v about %.0f s out",
+				id, row.Normalized.Week, row.Normalized.Legacy, held, toWeekEnd)
+		}
+	}
+
+	statuses := box.AccountRef.UsageStatuses(context.Background())
+	for _, status := range statuses {
+		row := poolRow{Provider: "claude", ID: status.ID, Pools: []string{poolNameLocal}}
+		applyPoolReadings(&row, status, scheduler, true, now)
+		raw, err := json.Marshal(row)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var wire struct {
+			ResetHold   bool   `json:"reset_hold"`
+			ResetHoldS  *int64 `json:"reset_hold_s"`
+			FableResets int    `json:"fable_resets"`
+		}
+		_ = json.Unmarshal(raw, &wire)
+		wantHold, wantFable := status.ID != "b-fable", map[string]int{"a-week": 0, "b-fable": 2, "c-both": 1}[status.ID]
+		heldNear := wire.ResetHoldS != nil && math.Abs(float64(*wire.ResetHoldS)-toWeekEnd) < 60
+		if wire.ResetHold != wantHold || heldNear != wantHold || wire.FableResets != wantFable {
+			t.Errorf("pool.json %s: %s; want reset_hold %v (about %.0f s), fable_resets %d", status.ID, raw, wantHold, toWeekEnd, wantFable)
+		}
+	}
+
+	peer := NewRemotePool("http://peer.invalid", "", "")
+	for _, pool := range []string{"", agentclaude.FableFeature} {
+		candidates, _, ok := peer.decisionCandidates(AdminSnapshot{Body: body, At: now}, string(accounts.ProviderClaude), pool, nil, now)
+		if !ok || len(candidates) != 3 {
+			t.Fatalf("calibration: %d peer candidates (ok %v) on %q", len(candidates), ok, pool)
+		}
+		for _, candidate := range candidates {
+			held := candidate.Score.ResetHeldUntil
+			if wantHold := candidate.Account != "b-fable"; wantHold != (math.Abs(held.Sub(weekEnds).Seconds()) < 60) || held.IsZero() == wantHold {
+				t.Errorf("peer path %q: %s held until %v; want held %v, to about %v", pool, candidate.Account, held, wantHold, weekEnds)
+			}
+		}
 	}
 }

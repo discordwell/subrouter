@@ -186,6 +186,18 @@ type ComplimentaryResetInfo struct {
 	ExpiresAt string `json:"expires_at,omitempty"`
 	// Clears lists the limits that grant resets (grants[].clears).
 	Clears []string `json:"clears,omitempty"`
+	// RemainingByKind splits Remaining by what each grant's claim gives
+	// back (agentclaude.ResetKind: "week", "fable", "other"; PATCHES §64).
+	// A kind with nothing left is absent; the whole map is absent when no
+	// grant has a reset left, and on a row from a daemon before §64.
+	RemainingByKind map[string]int `json:"remaining_by_kind,omitempty"`
+	// WeekHeldUntil is the soonest ends_at, verbatim, among the live grants
+	// that clear the general week ("seven_day", or no clears list at all):
+	// the only kind of grant that refills a spent week, so the only one the
+	// §56 hold ranks and drains an account on. Live means the account is
+	// eligible and the grant has a reset left, has not expired and is not
+	// paused. "" when no such grant has a readable ends_at.
+	WeekHeldUntil string `json:"week_held_until,omitempty"`
 	// IneligibleReason is Anthropic's ineligible_reason, verbatim, or
 	// "no_profile_scope" for a token that cannot read the block at all.
 	IneligibleReason string `json:"ineligible_reason,omitempty"`

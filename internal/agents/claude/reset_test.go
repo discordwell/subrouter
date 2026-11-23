@@ -6,11 +6,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/manaflow-ai/subrouter/internal/accounts"
 )
 
 // The cedar_ember block as Anthropic answered it on 2026-09-29 (read-only,
@@ -161,6 +164,180 @@ func TestResetInfoMapsTheBlockOntoTheUsageRow(t *testing.T) {
 	unreadable := UnreadableResetInfo()
 	if unreadable.Known || unreadable.Status != "unreadable" || unreadable.IneligibleReason != ResetUnreadableReason {
 		t.Fatalf("unreadable = %+v", unreadable)
+	}
+}
+
+// The Fable 5.2 launch block's shape as the pool read it on 2026-11-09: every
+// grant clears only the Fable limit. Ids and resets_left are illustrative.
+const liveFableResetBlock = `{
+  "eligible": true,
+  "ineligible_reason": null,
+  "at_limit": false,
+  "exhausted": [],
+  "grants": [{
+    "id": "fable_5_2_launch",
+    "label": "New model launch: one Fable reset for Max, Team Premium and Enterprise Premium",
+    "resets_total": 2,
+    "resets_left": 2,
+    "ends_at": "2027-03-09T07:59:00Z",
+    "clears": ["seven_day_overage_included"],
+    "paused": false,
+    "usable_now": false,
+    "use_requires_limit": true
+  }, {
+    "id": "fable_5_2_launch_b",
+    "label": "New model launch: one Fable reset for Max, Team Premium and Enterprise Premium",
+    "resets_total": 1,
+    "resets_left": 1,
+    "ends_at": "2027-03-09T07:59:00Z",
+    "clears": ["seven_day_overage_included"],
+    "paused": false,
+    "usable_now": false,
+    "use_requires_limit": true
+  }],
+  "next_grant_id": "fable_5_2_launch"
+}`
+
+// Only a live grant that clears the general week holds the week, read over
+// every grant whatever their order and whichever one the row shows.
+func TestResetInfoHoldsTheWeekOnlyOnGrantsThatClearIt(t *testing.T) {
+	now := time.Date(2026, 11, 9, 20, 0, 0, 0, time.UTC)
+	read := func(t *testing.T, block string) *accounts.ComplimentaryResetInfo {
+		t.Helper()
+		status, err := ParseResetStatus(json.RawMessage(block))
+		if err != nil || status == nil {
+			t.Fatalf("calibration: %s decoded as %+v, %v", block, status, err)
+		}
+		return ResetInfo(status, now)
+	}
+	expect := func(t *testing.T, info *accounts.ComplimentaryResetInfo, week string) {
+		t.Helper()
+		if info.WeekHeldUntil != week {
+			t.Fatalf("week held until %q, want %q", info.WeekHeldUntil, week)
+		}
+	}
+
+	t.Run("the Fable 5.2 launch block", func(t *testing.T) {
+		info := read(t, liveFableResetBlock)
+		if !info.Known || !info.Available || info.Remaining == nil || *info.Remaining != 3 {
+			t.Fatalf("calibration: the Fable block read as %+v", info)
+		}
+		expect(t, info, "")
+	})
+
+	grant := func(id string, clears []string, left int, ends string, paused bool) map[string]any {
+		g := map[string]any{"id": id, "resets_total": 1, "resets_left": left, "ends_at": ends, "paused": paused}
+		if clears != nil {
+			g["clears"] = clears
+		}
+		return g
+	}
+	block := func(eligible bool, grants ...map[string]any) string {
+		raw, _ := json.Marshal(map[string]any{"eligible": eligible, "grants": grants})
+		return string(raw)
+	}
+	fable := []string{"seven_day_overage_included"}
+	week := []string{"five_hour", "seven_day", "seven_day_overage_included"}
+	fableSoon := grant("fable_soon", fable, 1, "2026-11-20T00:00:00Z", false)
+	weekLater := grant("week_later", week, 1, "2026-12-01T00:00:00Z", false)
+	// Each of these clears the week sooner than weekLater but cannot be
+	// claimed: spent, expired, paused.
+	spent := grant("week_spent", week, 0, "2026-11-12T00:00:00Z", false)
+	expired := grant("week_expired", week, 1, "2026-11-01T00:00:00Z", false)
+	paused := grant("week_paused", week, 1, "2026-11-13T00:00:00Z", true)
+
+	t.Run("a Fable grant first, a week grant later", func(t *testing.T) {
+		info := read(t, block(true, fableSoon, weekLater))
+		if info.ExpiresAt != "2026-11-20T00:00:00Z" {
+			t.Fatalf("calibration: the row shows the grant ending %q, want the Fable grant's", info.ExpiresAt)
+		}
+		expect(t, info, "2026-12-01T00:00:00Z")
+		expect(t, read(t, block(true, fableSoon, weekLater, spent, expired, paused)), "2026-12-01T00:00:00Z")
+		expect(t, read(t, block(true, paused, expired, spent, weekLater, fableSoon)), "2026-12-01T00:00:00Z")
+	})
+	t.Run("two live week grants hold to the sooner, in either order", func(t *testing.T) {
+		weekSoon := grant("week_soon", week, 1, "2026-11-25T00:00:00Z", false)
+		expect(t, read(t, block(true, weekLater, weekSoon)), "2026-11-25T00:00:00Z")
+		expect(t, read(t, block(true, weekSoon, weekLater)), "2026-11-25T00:00:00Z")
+	})
+	t.Run("the week grant claimed, a Fable grant left", func(t *testing.T) {
+		expect(t, read(t, block(true, fableSoon, grant("week_later", week, 0, "2026-12-01T00:00:00Z", false))), "")
+	})
+	t.Run("a grant with no clears list counts as a week grant", func(t *testing.T) {
+		expect(t, read(t, block(true, grant("unlisted", nil, 1, "2026-11-25T00:00:00Z", false))), "2026-11-25T00:00:00Z")
+	})
+	t.Run("ineligible holds nothing", func(t *testing.T) {
+		expect(t, read(t, block(false, fableSoon, weekLater)), "")
+	})
+}
+
+// A grant's kind is read from what it clears. The pool read two shapes on
+// 2026-11-22: one reset per account that clears seven_day and the Fable limit
+// (use by 2026-12-10), and Fable resets that clear the Fable limit alone (one
+// account's also cleared five_hour).
+func TestResetGrantKindIsWhatItsClaimGivesBack(t *testing.T) {
+	for _, tc := range []struct {
+		clears []string
+		want   ResetKind
+	}{
+		{[]string{"seven_day", "seven_day_overage_included"}, ResetKindWeek},
+		{[]string{"five_hour", "seven_day", "seven_day_overage_included"}, ResetKindWeek},
+		{nil, ResetKindWeek},
+		{[]string{"seven_day_overage_included"}, ResetKindFable},
+		{[]string{"five_hour", "seven_day_overage_included"}, ResetKindFable},
+		{[]string{"five_hour"}, ResetKindOther},
+		{[]string{"seven_day_opus"}, ResetKindOther},
+	} {
+		if got := (ResetGrant{Clears: tc.clears}).Kind(); got != tc.want {
+			t.Errorf("clears %v: kind %q, want %q", tc.clears, got, tc.want)
+		}
+	}
+}
+
+// The row splits what is left by kind, over the grants that count toward
+// Remaining with a reset left: the week reset with a Fable reset queued
+// behind it reads 1 and 1, not 2 of one kind.
+func TestResetInfoCountsWhatIsLeftByKind(t *testing.T) {
+	now := time.Date(2026, 11, 22, 20, 0, 0, 0, time.UTC)
+	grant := func(id string, clears []string, left int, ends string) map[string]any {
+		return map[string]any{"id": id, "resets_total": max(left, 1), "resets_left": left, "ends_at": ends, "clears": clears}
+	}
+	read := func(t *testing.T, grants ...map[string]any) *accounts.ComplimentaryResetInfo {
+		t.Helper()
+		raw, _ := json.Marshal(map[string]any{"eligible": true, "grants": grants})
+		status, err := ParseResetStatus(raw)
+		if err != nil || status == nil {
+			t.Fatalf("calibration: %s decoded as %+v, %v", raw, status, err)
+		}
+		return ResetInfo(status, now)
+	}
+	week := grant("week", []string{"seven_day", "seven_day_overage_included"}, 1, "2026-12-10T22:00:00Z")
+	fable := grant("fable", []string{"seven_day_overage_included"}, 2, "2027-03-09T07:59:00Z")
+	for _, tc := range []struct {
+		name   string
+		grants []map[string]any
+		want   map[string]int
+	}{
+		{"a week reset and Fable resets", []map[string]any{week, fable}, map[string]int{"week": 1, "fable": 2}},
+		{"Fable resets alone", []map[string]any{fable}, map[string]int{"fable": 2}},
+		{"the week reset claimed", []map[string]any{grant("week", []string{"seven_day"}, 0, "2026-12-10T22:00:00Z"), fable}, map[string]int{"fable": 2}},
+		{"an expired week reset", []map[string]any{grant("week", []string{"seven_day"}, 1, "2026-11-01T00:00:00Z"), fable}, map[string]int{"fable": 2}},
+		{"another kind", []map[string]any{grant("short", []string{"five_hour"}, 1, "2026-12-01T00:00:00Z")}, map[string]int{"other": 1}},
+		{"nothing left", []map[string]any{grant("week", []string{"seven_day"}, 0, "2026-12-10T22:00:00Z")}, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			info := read(t, tc.grants...)
+			if !maps.Equal(info.RemainingByKind, tc.want) {
+				t.Fatalf("remaining by kind %v, want %v", info.RemainingByKind, tc.want)
+			}
+			sum := 0
+			for _, left := range info.RemainingByKind {
+				sum += left
+			}
+			if info.Remaining == nil || *info.Remaining != sum {
+				t.Fatalf("remaining %v; the kinds add up to %d", info.Remaining, sum)
+			}
+		})
 	}
 }
 
