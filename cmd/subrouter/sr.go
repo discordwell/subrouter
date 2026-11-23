@@ -2902,7 +2902,7 @@ func claudeUsageWindows(usage *agentclaude.UsageResponse) []accounts.UsageWindow
 	)
 	add("5h", fiveHourSeconds, usage.FiveHour)
 	add("7d", sevenDaySeconds, usage.SevenDay)
-	add(agentclaude.FableWindowName, sevenDaySeconds, usage.SevenDayOAuthApps)
+	add(agentclaude.FableWindowName, sevenDaySeconds, usage.FableLimit())
 	add("opus-weekly", sevenDaySeconds, usage.SevenDayOpus)
 	add("sonnet-weekly", sevenDaySeconds, usage.SevenDaySonnet)
 	if usage.ExtraUsage != nil {

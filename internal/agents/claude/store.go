@@ -266,11 +266,100 @@ type UsageResponse struct {
 	SevenDayOAuthApps *RateLimit  `json:"seven_day_oauth_apps"`
 	ExtraUsage        *ExtraUsage `json:"extra_usage"`
 	Spend             *Spend      `json:"spend"`
+	// Limits is the server's own list of meters. Claude Code shows each
+	// weekly_scoped row as "Current week (<model>)"; the Fable limit is one.
+	Limits UsageLimits `json:"limits,omitempty"`
 	// CedarEmber is the saved usage-limit reset block, answered only when
 	// the read opts in with ?cedar_ember=1 (PATCHES §46). Kept raw and
 	// decoded on its own (ResetStatus), so a drifted block can never fail
 	// the usage read that routing depends on.
 	CedarEmber json.RawMessage `json:"cedar_ember,omitempty"`
+}
+
+// UsageLimit is one limits[] row, in Claude Code's shape: Percent is used
+// percent 0-100 like RateLimit.Utilization, ResetsAt an ISO 8601 time or
+// null.
+type UsageLimit struct {
+	Kind     string           `json:"kind"`
+	Group    string           `json:"group,omitempty"`
+	Percent  *float64         `json:"percent"`
+	ResetsAt string           `json:"resets_at,omitempty"`
+	Severity string           `json:"severity,omitempty"`
+	IsActive bool             `json:"is_active"`
+	Scope    *UsageLimitScope `json:"scope,omitempty"`
+}
+
+// UsageLimitScope names what a limits[] row meters.
+type UsageLimitScope struct {
+	Model   *UsageLimitScopeName `json:"model,omitempty"`
+	Surface *UsageLimitScopeName `json:"surface,omitempty"`
+}
+
+// UsageLimitScopeName is the server's label for a scope, e.g. "Fable".
+type UsageLimitScopeName struct {
+	DisplayName string `json:"display_name"`
+}
+
+// UsageLimits decodes row by row: a row that does not decode is dropped and
+// a list that is not a list reads as none, so drift in one meter can never
+// fail the usage read that routing depends on.
+type UsageLimits []UsageLimit
+
+func (l *UsageLimits) UnmarshalJSON(data []byte) error {
+	*l = nil
+	var rows []json.RawMessage
+	if err := json.Unmarshal(data, &rows); err != nil {
+		return nil
+	}
+	for _, raw := range rows {
+		var row UsageLimit
+		if err := json.Unmarshal(raw, &row); err == nil {
+			*l = append(*l, row)
+		}
+	}
+	return nil
+}
+
+// FableLimit is the Fable weekly meter: the limits[] Fable row when the
+// answer has one, else seven_day_oauth_apps. Claude Code never reads
+// seven_day_oauth_apps, and its reset vocabulary names it as a limit apart
+// from the Fable one (seven_day_overage_included).
+func (u *UsageResponse) FableLimit() *RateLimit {
+	if row := u.FableLimitRow(); row != nil {
+		return row
+	}
+	if u == nil {
+		return nil
+	}
+	return u.SevenDayOAuthApps
+}
+
+// FableLimitRow is the limits[] Fable row as a RateLimit, or nil: a
+// weekly_scoped row whose model is named Fable-something, as Claude Code
+// classifies rows by kind and model name. Of several, the most used one,
+// since every Fable model spends the one pool.
+func (u *UsageResponse) FableLimitRow() *RateLimit {
+	if u == nil {
+		return nil
+	}
+	var best *UsageLimit
+	for i := range u.Limits {
+		row := &u.Limits[i]
+		if row.Kind != "weekly_scoped" || row.Percent == nil || row.Scope == nil || row.Scope.Model == nil {
+			continue
+		}
+		if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(row.Scope.Model.DisplayName)), "fable") {
+			continue
+		}
+		if best == nil || *row.Percent > *best.Percent {
+			best = row
+		}
+	}
+	if best == nil {
+		return nil
+	}
+	percent := *best.Percent
+	return &RateLimit{Utilization: &percent, ResetsAt: best.ResetsAt}
 }
 
 // ExtraUsageInfoFromUsage maps the OAuth usage response onto the shared

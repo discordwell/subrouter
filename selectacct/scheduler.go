@@ -191,7 +191,7 @@ const (
 // declare MissingModelSupport (upstream #467, with this fork's table).
 //
 // Claude publishes a per-model bucket only where the model has a limit of its
-// own. Today that is Fable alone (seven_day_oauth_apps); Opus and Sonnet spend
+// own. Today that is Fable alone (the Fable limit); Opus and Sonnet spend
 // the general 5h/7d budget and their buckets come back null, and a setup token
 // cannot read the usage endpoint at all (PATCHES §24). Antigravity omits
 // disabled, unavailable, and sometimes merely unreported buckets. For both,
