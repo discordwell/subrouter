@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -949,17 +950,27 @@ func TestSlotRetirementDrainsPinnedStreamBeforeSupervisorExit(t *testing.T) {
 	}
 }
 
+// reserveSupervisorAddress returns a loopback address that nothing listens
+// on, for a supervisor that binds it later, after its first worker has
+// started. The port is below the ones the kernel gives to a socket that asks
+// for any port (32768 and up on Linux, 49152 and up on macOS), so a test of
+// another package, running at the same time, cannot be given it in between.
 func reserveSupervisorAddress(t *testing.T) string {
 	t.Helper()
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
+	const lowest, ports = 20000, 10000
+	for range 100 {
+		address := net.JoinHostPort("127.0.0.1", strconv.Itoa(lowest+rand.IntN(ports)))
+		listener, err := net.Listen("tcp", address)
+		if err != nil {
+			continue
+		}
+		if err := listener.Close(); err != nil {
+			t.Fatal(err)
+		}
+		return address
 	}
-	address := listener.Addr().String()
-	if err := listener.Close(); err != nil {
-		t.Fatal(err)
-	}
-	return address
+	t.Fatalf("found no free loopback port from %d to %d", lowest, lowest+ports-1)
+	return ""
 }
 
 func unixHTTPClient(socket string) *http.Client {
@@ -993,7 +1004,9 @@ type supervisorControlStatus struct {
 
 func waitForSupervisorStatus(t *testing.T, client *http.Client, runDone <-chan error) supervisorControlStatus {
 	t.Helper()
-	deadline := time.Now().Add(3 * time.Second)
+	// A supervisor that ended is reported at once, so the limit is only for
+	// one that is slow to start on a busy machine.
+	deadline := time.Now().Add(supervisorStatusReadLimit)
 	for time.Now().Before(deadline) {
 		select {
 		case err := <-runDone:
@@ -1006,7 +1019,7 @@ func waitForSupervisorStatus(t *testing.T, client *http.Client, runDone <-chan e
 		}
 		time.Sleep(time.Millisecond)
 	}
-	t.Fatal("supervisor control socket did not become ready")
+	t.Fatalf("supervisor control socket did not become ready in %s", supervisorStatusReadLimit)
 	return supervisorControlStatus{}
 }
 
