@@ -431,7 +431,8 @@ func TestTheBackgroundPassReadsAStalePeerAndNothingElseDoes(t *testing.T) {
 
 // 10. No ranking changes: the daemon's own Explain, Pick and PickSteady are
 // the same before and after a pass chooses, in every mode, and a peer that
-// reads a body carrying the choice ranks its accounts exactly as without it.
+// reads the rows published with the choice ranks the accounts exactly as it
+// does the same rows published without it.
 func TestAChoiceChangesNoRanking(t *testing.T) {
 	candidates := []accounts.Account{
 		{ID: "held", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth},
@@ -463,22 +464,23 @@ func TestAChoiceChangesNoRanking(t *testing.T) {
 		if mode != AutoResetReal {
 			continue
 		}
-		rec := httptest.NewRecorder()
-		d.server.handleUsageStatus(rec, loopbackRequest(http.MethodGet, remotePoolUsagePath, ""))
-		withChoice := rec.Body.Bytes()
 		if _, inside := published(t, usageRows(t, d.server)["held"]); inside == nil {
 			t.Fatal("calibration: real mode publishes no choice")
 		}
-		var rows []map[string]any
-		if err := json.Unmarshal(withChoice, &rows); err != nil {
+		// The same rows, published with the choice and without it.
+		SetResetLoading(false)
+		rec := httptest.NewRecorder()
+		d.server.handleUsageStatus(rec, loopbackRequest(http.MethodGet, remotePoolUsagePath, ""))
+		SetResetLoading(true)
+		var rows []AccountUsageStatus
+		if err := json.Unmarshal(rec.Body.Bytes(), &rows); err != nil {
 			t.Fatal(err)
 		}
-		for _, row := range rows {
-			if normalized, ok := row["normalized"].(map[string]any); ok {
-				delete(normalized, "reset_choice")
-			}
-		}
 		without, _ := json.Marshal(rows)
+		withChoice, _ := json.Marshal(d.server.withResetChoices(rows))
+		if !strings.Contains(string(withChoice), `"reset_choice"`) || strings.Contains(string(without), `"reset_choice"`) {
+			t.Fatalf("calibration: the bodies with and without the choice are\n%s\n%s", withChoice, without)
+		}
 		peer := NewRemotePool("http://peer.invalid", "", "")
 		now := time.Now()
 		ranked := func(body []byte) []crossPoolCandidate {

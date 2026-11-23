@@ -571,7 +571,8 @@ type resetPool struct {
 // carrying their burn and resets, and every peer counted on burn.json, each
 // from its last usage body. No peer is read here: a peer that reads this
 // daemon's usage-status would read it back, and a decision does not wait on
-// a peer.
+// a peer. The background pass reads a peer again when that body is more than
+// resetPeerRefreshAge old (§95.1).
 func (s Server) resetPoolOf(statuses []AccountUsageStatus, now time.Time) resetPool {
 	pool := resetPool{now: now, meters: map[string]UsagePoolMeter{}}
 	var rows []usageBurnAccount
