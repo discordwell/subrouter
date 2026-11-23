@@ -465,6 +465,8 @@ To see every saved reset in the pool, run `srq resets`. It prints one line per a
 
 pool.json carries each row's list in `resets` (`kind`, `count`, `expires_at`, `expiry`), with `resets_partial: true` for a daemon from before §91.
 
+Each daemon records every claim it makes, by hand or by the Codex failover and background spender, in `usage-history.jsonl` in its state directory, with each meter's used fraction and roll time from the last reading before the claim and the first reading after it (§92.1). It logs the same as `reset claim recorded` at Info: `before` and `after` hold one group per meter. A claim that did not reset the account is marked `failed` and has no `after`. The same file holds the daemon's own meter readings for 35 days, at most 32 MiB. `SUBROUTER_USAGE_HISTORY=0` turns it off.
+
 ## Troubleshoot
 
 **A client gets `503 no accounts available`.** The daemon holds no account for the provider it picked. This is not a quota problem. An exhausted pool answers `no non-exhausted <provider> accounts available` instead. Run `srq pool`. If it prints no section for the client's provider, add an account, or run `curl -fsS -X POST http://127.0.0.1:31415/_subrouter/reload-accounts` if you added one since the daemon last read the store. If that section is there, the daemon picked the other provider for the request. The daemon picks the provider from the agent type, and the default is Codex. A request is Claude when `X-Subrouter-Agent` says `claude`, or when the header is absent and the request has one of these:
@@ -570,7 +572,8 @@ The daemon reads these from its environment when it starts.
 | `SUBROUTER_READ_CODEX_RESET_EXPIRY` | on | `0` stops the daemon from reading its own Codex accounts' reset credit list for the credits' expiry dates (§91). A value it does not recognize stops the daemon. |
 | `SUBROUTER_CODEX_AUTO_RATE_LIMIT_RESET` | off | `1` lets failover spend a Codex reset credit. |
 | `SUBROUTER_PUBLIC_ADMIN` | off | On a box, `1` serves admin routes on the public listener to named admin tokens. |
+| `SUBROUTER_USAGE_HISTORY` | on | `0` stops recording this daemon's own meter readings and reset claims in `usage-history.jsonl` (§92.1). A value it does not recognize stops the daemon. |
 
-Most of these log an unreadable value and start with the default. Five do not. `SUBROUTER_RESET_HOLD_PRIORITY`, `SUBROUTER_FABLE_RESERVATION`, `SUBROUTER_START_UNSTARTED_WEEK`, `SUBROUTER_SELF_START_WEEK` and `SUBROUTER_READ_CODEX_RESET_EXPIRY` accept only `1` or `0`, or `true` or `false`, `yes` or `no`, `on` or `off`. Any other value stops `serve` from starting, and on a plain job launchd then restarts it forever. The other on/off settings read any value but `1`, `true`, `yes`, or `on` as off, and log nothing.
+Most of these log an unreadable value and start with the default. Six do not. `SUBROUTER_RESET_HOLD_PRIORITY`, `SUBROUTER_FABLE_RESERVATION`, `SUBROUTER_START_UNSTARTED_WEEK`, `SUBROUTER_SELF_START_WEEK`, `SUBROUTER_READ_CODEX_RESET_EXPIRY` and `SUBROUTER_USAGE_HISTORY` accept only `1` or `0`, or `true` or `false`, `yes` or `no`, `on` or `off`. Any other value stops `serve` from starting, and on a plain job launchd then restarts it forever. The other on/off settings read any value but `1`, `true`, `yes`, or `on` as off, and log nothing.
 
 The deploy scripts read `SUBROUTER_LABEL`, `SUBROUTER_PLIST`, `SUBROUTER_ADDR` (as `host:port`), and `SUBROUTER_CONTROL_SOCKET` to find the job, and default to the LaunchAgent above.
