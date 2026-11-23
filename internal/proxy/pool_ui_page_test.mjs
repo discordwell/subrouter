@@ -179,6 +179,41 @@ test('the board marks each kind of saved reset with its count and soonest expiry
     'the mark\'s title lists every entry')
 })
 
+// The rows carry choices as TestPoolJSONCarriesEachRowsResetChoice checks pool.json sends them:
+// reset_choice from a daemon in real mode, would_choose from one in shadow mode.
+test('the board marks an account chosen for a reset, with its meter, its order and why (PATCHES §95.3)', async () => {
+  const codexRow = (id, fields) => claudeRow(id, { provider: 'codex', pace: undefined, ...fields })
+  const why = 'the pool needs its saved resets on the Claude week (the 24-hour pressure is 1.20, at or above 1.0); a claim there adds 0.51 of a week'
+  const { board, flash } = await render(boardOf([
+    claudeRow('a-chosen', { reset_hold: true, reset_hold_s: WEEK_HOLD_S, resets: [{ kind: 'week', count: 1, expires_at: WEEK_ENDS, expiry: 'read' }],
+      reset_choice: { meter: 'week', order: 1, why } }),
+    claudeRow('b-would', { would_choose: { meter: 'week', order: 2, why: 'a <shadow> reason & more' } }),
+    claudeRow('c-fable', { reset_choice: { meter: 'fable', order: 1, why: 'its Fable reset' } }),
+    codexRow('d-codex', { resets: [{ kind: 'codex_rate_limits', count: 1, expires_at: CREDIT_A, expiry: 'read' }],
+      reset_choice: { meter: 'codex_week', order: 1, why: 'Codex accounts are loaded one at a time' } }),
+    claudeRow('e-none', {}),
+  ]))
+  assert.equal(flash, '', 'the page read pool.json')
+  const marks = (id) => [...rowHTML(board, id).matchAll(/<span class="(chosen|wouldchoose)" title="([^"]*)">([^<]*)<\/span>/g)]
+    .map((m) => ({ cls: m[1], title: m[2], text: m[3] }))
+  assert.deepEqual(marks('a-chosen'), [{ cls: 'chosen', title: why, text: 'chosen week #1' }], 'a chosen account, its reason in the title')
+  assert.match(paceCell(board, 'a-chosen'), /<span class="wreset"[^>]*>W1 [^<]*<\/span> <span class="chosen"/, 'the mark follows the reset marks')
+  assert.deepEqual(marks('b-would'), [{ cls: 'wouldchoose', title: 'shadow mode, nothing ranks on it: a &lt;shadow&gt; reason &amp; more',
+    text: 'would choose week #2' }], 'a would-be choice in shadow mode says so, escaped')
+  assert.deepEqual(marks('c-fable').map((m) => m.text), ['chosen Fable #1'], 'a choice for the Fable meter')
+  assert.deepEqual(marks('d-codex').map((m) => m.text), ['chosen week #1'], 'a Codex account chosen for its week')
+  assert.match(rowHTML(board, 'd-codex'), /<span class="creset"[^>]*>R1 [^<]*<\/span> <span class="chosen"/, 'on a Codex row, after its credits')
+  assert.deepEqual(marks('e-none'), [], 'an account no daemon chose is not marked')
+})
+
+test('the legend explains the reset choice marks (PATCHES §95.3)', () => {
+  const legend = PAGE.match(/<div class="legend" id="legend">([\s\S]*?)<\/div>/)
+  assert.ok(legend, 'the page has its legend')
+  const entry = (cls) => legend[1].split('\n').find((line) => line.includes('class="' + cls + '"'))
+  assert.match(entry('chosen') || '', /run to its limit.*new sessions go there first.*title says why/, 'chosen')
+  assert.match(entry('wouldchoose') || '', /shadow mode.*nothing ranks on it/, 'would choose')
+})
+
 test('the legend explains every reset mark (PATCHES §91.2)', () => {
   const legend = PAGE.match(/<div class="legend" id="legend">([\s\S]*?)<\/div>/)
   assert.ok(legend, 'the page has its legend')

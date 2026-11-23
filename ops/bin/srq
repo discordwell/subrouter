@@ -651,6 +651,29 @@ def _auto_reset_rule(rule):
     return out
 
 
+RESET_CHOICE_METERS = {"week": "week", "fable": "Fable", "codex_week": "week"}
+
+
+def _reset_choice(row):
+    """The account's holder's choice to run it to its limit for its next saved
+    reset (PATCHES §95), flattened for summarize(). Real mode publishes it
+    inside normalized as reset_choice, and every daemon that ranks the account
+    honours it; shadow mode publishes it beside normalized as would_choose,
+    and nothing ranks on it. reset_choice_mode is "real" or "shadow". All None
+    for no choice, a daemon before §95, or a choice srq cannot read: a meter
+    it does not know or an order under 1, which the daemons ignore too.
+    """
+    norm = row.get("normalized")
+    for mode, choice in (("real", norm.get("reset_choice") if isinstance(norm, dict) else None),
+                         ("shadow", row.get("would_choose"))):
+        if (isinstance(choice, dict) and choice.get("meter") in RESET_CHOICE_METERS
+                and type(choice.get("order")) is int and choice["order"] >= 1):
+            why = choice.get("why")
+            return {"reset_choice_mode": mode, "reset_choice_meter": choice["meter"],
+                    "reset_choice_order": choice["order"], "reset_choice_why": why if isinstance(why, str) else None}
+    return {"reset_choice_mode": None, "reset_choice_meter": None, "reset_choice_order": None, "reset_choice_why": None}
+
+
 def _fable_week_spent_percent(norm):
     """The account's Fable meter, percent used, as its daemon publishes it, else None.
 
@@ -754,6 +777,7 @@ def summarize(row):
             "fable_resets": _fable_resets(row),
             **_held_resets(row),
             **_auto_reset(row),
+            **_reset_choice(row),
         }
 
     w = weekly_window(row)
@@ -778,6 +802,7 @@ def summarize(row):
         "fable_resets": _fable_resets(row),
         **_held_resets(row),
         **_auto_reset(row),
+        **_reset_choice(row),
     }
 
 
@@ -834,14 +859,15 @@ def local_fallback(r):
     return r.get("new_session") is False and r.get("new_session_evicted") is False
 
 
-SLOT_REASONS = ("burndown", "at_cap")
+SLOT_REASONS = ("burndown", "at_cap", "chosen")
 
 
 def _slots(r, field="new_session"):
-    """The "live/allowed" of a draining (burndown) or full (at_cap) verdict, else None.
+    """The "live/allowed" of a draining (burndown), full (at_cap) or loaded
+    (chosen, PATCHES §95.2) verdict, else None.
 
-    Only those two reasons are about the endgame allowance; on any other row
-    the counts are left out, so it renders as before. None too when the daemon
+    Only those reasons are about an allowance; on any other row the counts
+    are left out, so it renders as before. None too when the daemon
     published no counts, or an allowance of 0 (its "outside the burndown
     window").
     """
@@ -972,6 +998,9 @@ def _render_sections(rows, where, peer=False):
             flags += _auth_flag(r)
             if not r["known"]:
                 flags += "  (no weekly window for this provider -- UNKNOWN, not empty)"
+            choice = _reset_choice_label(r)
+            if choice:
+                flags += f"  {choice}"
             auto = _auto_reset_label(r)
             if auto:
                 flags += f"  {auto}"
@@ -987,7 +1016,9 @@ def _render_sections(rows, where, peer=False):
         # as before.
         extra = []
         if any_slots:
-            extra.append("n/m = sessions in flight / sessions it will take while draining")
+            loaded = any(_slots(r) and (r["new_session_reason"] == "chosen" or r["reset_choice_mode"] == "real") for r in sub)
+            extra.append("n/m = sessions in flight / sessions it will take while draining"
+                         + (" or chosen for a saved reset" if loaded else ""))
         if show_spent:
             # Published whatever the owner's switch says; a peer's is ranked
             # on only by a daemon running §65 with its own switch on.
@@ -1030,6 +1061,18 @@ def _render_sections(rows, where, peer=False):
                          if peer else
                          "start sent = this daemon sent one tiny request itself at that time to start the week's clock"
                          " (§90); xN = N sent in a row, the week still unstarted")
+        if any(r["reset_choice_mode"] for r in sub):
+            # The choice is the account's own daemon's (§95.1). A peer's,
+            # published in its real mode, ranks here too unless this daemon's
+            # SUBROUTER_RESET_LOADING is 0, which srq cannot read.
+            extra.append("chosen week #1 = the peer chose it to run to its limit for its next saved reset (§95, its real"
+                         " mode): a new session from here goes there first, #1 first, unless SUBROUTER_RESET_LOADING=0"
+                         " here; would choose = the peer is in shadow mode, and nothing ranks on it"
+                         if peer else
+                         "chosen week #1 = this daemon runs it to its limit for its next saved reset (§95, real mode):"
+                         " new sessions go there first, #1 first per meter (week, Fable or a Codex week), up to the"
+                         " paced ceiling and below the 5% floor; would choose = what real mode would choose (shadow):"
+                         " nothing ranks on it")
         if any(r["auto_reset_verdict"] for r in sub):
             # The decision is the account's own daemon's: a peer's is shown,
             # and this daemon decides nothing for a peer's account.
@@ -1107,6 +1150,16 @@ def _auto_reset_label(r):
         words = [{"would_claim": "would claim", "claimed": "claimed", "failed": "CLAIM FAILED",
                   "may_have_landed": "MAY HAVE LANDED"}[verdict], kind, urgent, at]
     return "auto=" + " ".join(w for w in words if w)
+
+
+def _reset_choice_label(r):
+    """`chosen week #1`, or in shadow mode `would choose week #1`: the meter
+    the account is run to its limit on and its place in its holder's order
+    for that meter (PATCHES §95), else ""."""
+    if r["reset_choice_mode"] is None:
+        return ""
+    words = "chosen" if r["reset_choice_mode"] == "real" else "would choose"
+    return f"{words} {RESET_CHOICE_METERS[r['reset_choice_meter']]} #{r['reset_choice_order']}"
 
 
 def _held_back_why(r):
@@ -1276,8 +1329,23 @@ def _held_resets(row):
         entries.append({"kind": kind if isinstance(kind, str) and kind else "unknown",
                         "raw_type": e.get("raw_type"), "count": e["count"],
                         "expires_at": e.get("expires_at"), "expiry": e.get("expiry"),
-                        "expiry_age_seconds": e.get("expiry_age_seconds")})
+                        "expiry_age_seconds": e.get("expiry_age_seconds"),
+                        "expiry_window": _expiry_window(e.get("expiry_window"))})
     return {"resets": entries, "resets_partial": False}
+
+
+def _expiry_window(window):
+    """A reset's expiry window as the daemon that holds the account publishes
+    it (PATCHES §94.1): `opens_at`, `lead_seconds` and `why`. From the moment
+    it opens, every holder of that kind and date is chosen and loaded, the
+    expiry burndown (§95.1). None where none is published: a kind the daemon
+    does not know, no date, a date gone by, a daemon before §94, or a
+    malformed one."""
+    if not isinstance(window, dict) or _instant(window.get("opens_at")) is None:
+        return None
+    lead, why = window.get("lead_seconds"), window.get("why")
+    return {"opens_at": window["opens_at"], "lead_seconds": lead if type(lead) is int else None,
+            "why": why if isinstance(why, str) else None}
 
 
 def _resets_from_complimentary(row):
@@ -1295,7 +1363,8 @@ def _resets_from_complimentary(row):
 
     def entry(kind, count, expires_at, expiry=None):
         return {"kind": kind, "raw_type": None, "count": count, "expires_at": expires_at or None,
-                "expiry": expiry or ("read" if expires_at else "none_given"), "expiry_age_seconds": None}
+                "expiry": expiry or ("read" if expires_at else "none_given"), "expiry_age_seconds": None,
+                "expiry_window": None}
 
     if reset.get("source") != "cedar_ember":
         if (row.get("provider") or "").lower() != "codex":
@@ -1413,8 +1482,22 @@ def _span(secs):
     return f"{rest // 60}m"
 
 
+def _window_words(window, now):
+    """When a reset's expiry window opens, in this machine's time: `OPEN since
+    12/8 10:00` once it has, `opens 12/8 10:00 in 15d 2h` before, and `-` where
+    none is published."""
+    if not window:
+        return "-"
+    opens = _instant(window["opens_at"])
+    at = f"{_month_day(opens)} {opens.astimezone():%H:%M}"
+    return f"OPEN since {at}" if opens <= now else f"opens {at} {_in_how_long(opens, now)}"
+
+
 def _render_resets(items, notes, now):
     """srq resets as text: one line per reset, then the totals per kind and date."""
+    # A window column only where a daemon publishes one, so a pool of daemons
+    # from before §94 reads as before.
+    windows = any(item.get("expiry_window") for item in items)
     rows = []
     for item in items:
         when = _instant(item["expires_at"])
@@ -1441,15 +1524,19 @@ def _render_resets(items, notes, now):
         week = "??" if item["week_used_percent"] is None else f"{item['week_used_percent']}%"
         fable = "-" if not item["has_fable_window"] else ("??" if item["fable_used_percent"] is None else f"{item['fable_used_percent']}%")
         rolls = "-" if item["week_rolls_in_hours"] is None else f"{item['week_rolls_in_hours']:.0f}h"
-        rows.append((expires, kind, str(item["count"]), str(item["account"]), ", ".join(item["on"]),
+        window = (_window_words(item.get("expiry_window"), now),) if windows else ()
+        rows.append((expires, *window, kind, str(item["count"]), str(item["account"]), ", ".join(item["on"]),
                      week, fable, rolls, "; ".join(notes_here)))
     print(f"=== every saved reset in the pool, soonest expiry first ({len(items)} entries)")
     for line in notes:
         print(line)
+    if windows:
+        print("(window = when the expiry burndown of that kind and date opens (§94.1, §95): from then every holder is"
+              " chosen and loaded in real mode, and a claim needs only demand at the limit; - = none published)")
     if rows:
-        head = ("expires", "kind", "n", "account", "on", "week", "fable", "rolls", "")
+        head = ("expires", *(("window",) if windows else ()), "kind", "n", "account", "on", "week", "fable", "rolls", "")
+        right = {i for i, name in enumerate(head) if name in ("n", "week", "fable", "rolls")}
         widths = [max(len(r[i]) for r in rows + [head]) for i in range(len(head))]
-        right = {2, 5, 6, 7}
 
         def fmt(cells):
             out = [f"{c:>{w}}" if i in right else f"{c:<{w}}" for i, (c, w) in enumerate(zip(cells, widths))]
@@ -2690,6 +2777,98 @@ def cmd_selftest(_argv):
           _in_how_long(_instant(week_ends), _instant("2026-11-23T18:00:00Z")) == "in 17d 4h"
           and _in_how_long(_instant("2026-11-23T19:30:00Z"), _instant("2026-11-23T18:00:00Z")) == "in 1h 30m"
           and _in_how_long(_instant("2026-11-23T17:00:00Z"), _instant("2026-11-23T18:00:00Z")) == "ended 1h 0m ago")
+
+    print("an account chosen for a reset is marked with its meter and order; srq resets shows each expiry window (PATCHES §95.3)")
+    # Nothing showed which accounts a daemon runs to their limit for their next
+    # saved reset, nor when a kind's expiry burndown starts.
+    choice_why = "the pool needs its saved resets on the Claude week (...); a claim there adds 0.51 of a week (...)"
+
+    def chosen_row(row, meter="week", order=1, mode="real", label=None):
+        row = json.loads(json.dumps(row))
+        choice = {"meter": meter, "order": order, "why": choice_why}
+        if mode == "real":
+            row["normalized"]["reset_choice"] = choice
+        else:
+            row["would_choose"] = choice
+        return dict(row, label=label) if label else row
+
+    loaded = [chosen_row(holder_row(0, True, "chosen", live_sessions=3, allowed_sessions=20), label="alpha@example.com"),
+              chosen_row(holder_row(1, False, "at_cap", live_sessions=20, allowed_sessions=20), order=2),
+              chosen_row(holder_row(2, True, "eligible"), meter="fable"),
+              holder_row(3, True, "eligible")]
+    text = rendered([summarize(r) for r in loaded])
+    lines = [ln for ln in text.splitlines() if ln.startswith("  ")]
+    check("srq pool: a chosen account reads its meter and order, by its label",
+          any(ln.startswith("  alpha@example.com ") and ln.endswith("  new=yes (chosen 3/20)  chosen week #1") for ln in lines)
+          and "acct0" not in text)
+    check("srq pool: the next in the order, at its allowance, and one chosen for its Fable meter",
+          any(ln.startswith("  acct1 ") and ln.endswith("  new=fallback (at_cap 20/20)  chosen week #2") for ln in lines)
+          and any(ln.startswith("  acct2 ") and ln.endswith("  new=yes  chosen Fable #1") for ln in lines))
+    check("srq pool: an account no daemon chose is not marked",
+          any(ln.startswith("  acct3 ") and ln.endswith("  new=yes") for ln in lines))
+    check("srq pool: the legend explains the mark and n/m for a chosen account",
+          "chosen week #1 = this daemon runs it to its limit for its next saved reset (§95, real mode): new sessions go"
+          " there first, #1 first per meter" in text
+          and "n/m = sessions in flight / sessions it will take while draining or chosen for a saved reset;" in text)
+    shadow_rows = [chosen_row(holder_row(0, True, "eligible"), mode="shadow"),
+                   chosen_row(codex_row(1, 40, 300000), meter="codex_week", order=1, mode="shadow")]
+    text = rendered([summarize(r) for r in shadow_rows])
+    check("srq pool: in shadow mode a would-be choice reads in other words",
+          [ln.split("new=")[1] for ln in text.splitlines() if ln.startswith(("  acct", "  cx"))]
+          == ["yes  would choose week #1", "yes  would choose week #1"])
+    check("srq pool: the legend says nothing ranks on a would-be choice",
+          "would choose = what real mode would choose (shadow): nothing ranks on it" in text)
+    remote = rendered([summarize(r) for r in loaded], peer=True)
+    check("peer: the peer's choice, honoured from here unless this daemon's switch is 0",
+          "  chosen week #1\n" in remote
+          and "chosen week #1 = the peer chose it to run to its limit for its next saved reset (§95, its real mode):"
+              " a new session from here goes there first, #1 first, unless SUBROUTER_RESET_LOADING=0 here" in remote)
+    none = rendered([summarize(holder_row(0, True, "eligible")), summarize(codex_row(1, 40, 300000))])
+    check("srq pool: a pool with no choice has no mark and no legend line",
+          "chosen" not in none and "would choose" not in none)
+    s, w = summarize(loaded[0]), summarize(shadow_rows[1])
+    check("srq pool --json carries the choice",
+          (s["reset_choice_mode"], s["reset_choice_meter"], s["reset_choice_order"], s["reset_choice_why"]) == ("real", "week", 1, choice_why)
+          and (w["reset_choice_mode"], w["reset_choice_meter"], w["reset_choice_order"]) == ("shadow", "codex_week", 1)
+          and summarize(loaded[3])["reset_choice_mode"] is None)
+    check("a malformed choice, or one this srq cannot read, reads as none",
+          not any(summarize(chosen_row(holder_row(0, True, "eligible"), **bad))["reset_choice_mode"]
+                  for bad in ({"meter": "month"}, {"order": 0}, {"order": True}, {"order": "1"}))
+          and summarize(dict(holder_row(0, True, "eligible"), would_choose="week"))["reset_choice_mode"] is None)
+
+    import datetime
+    now = datetime.datetime.now(datetime.timezone.utc)
+    soon, later = now + datetime.timedelta(hours=20), now + datetime.timedelta(days=17)
+    opened, opens = now - datetime.timedelta(hours=4), now + datetime.timedelta(days=14, hours=3, minutes=30)
+    iso = lambda when: when.strftime("%Y-%m-%dT%H:%M:%SZ")
+    window = lambda when: {"opens_at": iso(when), "lead_seconds": 86400, "why": "3 holders have 1.4 weeks ..."}
+    windowed = [listing(dict(holder_row(0, True, "eligible"), label="alpha@example.com"),
+                        [held("week", 1, iso(later), expiry_window=window(opens))]),
+                listing(dict(codex_row(0, 20, 300000), label="dev@example.com"),
+                        [held("codex_rate_limits", 1, iso(soon), expiry_window=window(opened)),
+                         held("codex_rate_limits", 1, expiry="not_read")])]
+    text = resets_output(windowed, {"peers": []})
+    lines = text.splitlines()
+    rows = [ln for ln in lines if ln.startswith("  ") and not ln.startswith("  expires")]
+    at = lambda when: f"{_month_day(when)} {when.astimezone():%H:%M}"
+    check("srq resets: a window that has opened reads OPEN since when",
+          any("dev@" in ln and f"  OPEN since {at(opened)}  " in ln for ln in rows))
+    check("srq resets: a window ahead reads when it opens and in how long",
+          any("alpha@" in ln and f"  opens {at(opens)} in 14d 3h  " in ln for ln in rows))
+    check("srq resets: a reset with no window published reads -",
+          any(ln.startswith("  expiry not read") and "  -  " in ln.split("Codex")[0] for ln in rows))
+    check("srq resets: the window column has its head and a line that says what it is",
+          any(ln.startswith("  expires") and "  window  " in ln for ln in lines)
+          and "(window = when the expiry burndown of that kind and date opens (§94.1, §95): from then every holder is"
+              " chosen and loaded in real mode" in text)
+    check("srq resets --json carries each window",
+          [i["expiry_window"]["opens_at"] if i["expiry_window"] else None
+           for i in json.loads(resets_output(windowed, {"peers": []}, ["--json"]))["resets"]] == [iso(opened), iso(opens), None])
+    check("srq resets: a pool whose daemons publish no window has no window column",
+          not any("window" in ln for ln in resets_output(local, {"peers": []}).splitlines()))
+    check("a malformed window reads as none",
+          not any(summarize(listing(codex_row(0, 20, 300000), [held("codex_rate_limits", 1, iso(soon), expiry_window=bad)]))
+                  ["resets"][0]["expiry_window"] for bad in ("open", {"opens_at": "soon"}, {"lead_seconds": 86400}, [])))
 
     print("srq burn words the pool's burn, its trend and the share at the limit; srq pool has one line (PATCHES §92.2)")
     import contextlib, io
