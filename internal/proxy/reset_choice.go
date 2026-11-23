@@ -387,14 +387,14 @@ const (
 	resetWouldUnchooseMessage = "reset loading: would no longer choose an account"
 )
 
-// chooseResetAccounts is the choice of one background pass: it weighs each
-// of this daemon's own accounts against the pool, keeps what it chose, and
-// logs each account that becomes chosen or stops. Only the daemon that holds
-// an account chooses it; with the mode off or SUBROUTER_RESET_LOADING=0 it
-// chooses nothing.
+// chooseResetAccounts is the choice of one background pass (autoResetPass,
+// which runs nothing with the mode off): it weighs each of this daemon's own
+// accounts against the pool, keeps what it chose, and logs each account that
+// becomes chosen or stops. Only the daemon that holds an account chooses it;
+// with SUBROUTER_RESET_LOADING=0 it chooses nothing.
 func (s Server) chooseResetAccounts() {
 	mode, _ := AutoReset()
-	if mode == AutoResetOff || !ResetLoading() || s.AccountRef == nil || s.CredentialBroker != nil {
+	if !ResetLoading() || s.AccountRef == nil || s.CredentialBroker != nil {
 		return
 	}
 	statuses, ok := s.AccountRef.UsageStatusSnapshot()

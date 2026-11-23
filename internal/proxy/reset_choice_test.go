@@ -273,15 +273,16 @@ func TestOneCodexAccountIsChosenAtATime(t *testing.T) {
 // need (here no, at 0.5), ordered by expiry, then by value; for Codex more
 // than one at a time. A holder whose projected wall falls after the expiry is
 // chosen last, with a sentence that says its reset is likely to expire
-// unused.
+// unused: x20b, whose claim at its wall (84 hours away, 0.45 of a week) is
+// worth more than x20a's (0.31), still comes after it.
 func TestInsideTheExpiryWindowEveryHolderIsChosen(t *testing.T) {
 	codex := func(id string, left float64, toRoll, expires time.Duration) choiceAccount {
 		return choiceAccount{id: id, provider: accounts.ProviderCodex, kind: accounts.ResetKindCodexRateLimits, week: left,
 			toRoll: toRoll, expires: expires, weekBurn: 0.5}
 	}
 	got := choose(choiceNow, resetCodexHold{},
-		codex("x20a", 0.1, 100*time.Hour, 20*time.Hour),
-		codex("x20b", 1.0, 150*time.Hour, 20*time.Hour),
+		codex("x20a", 0.1, 60*time.Hour, 20*time.Hour),
+		codex("x20b", 1.0, 160*time.Hour, 20*time.Hour),
 		codex("x10", 0.05, 100*time.Hour, 10*time.Hour),
 		codex("x20c", 0.1, 150*time.Hour, 20*time.Hour))
 	wantChosen(t, "Codex holders in their windows", got, ResetChoiceCodexWeek, "x10", "x20c", "x20a", "x20b")

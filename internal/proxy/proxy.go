@@ -2224,10 +2224,10 @@ type NormalizedUsage struct {
 	SelfStart *SelfStartSent `json:"self_start,omitempty"`
 	// ResetChoice is the holder's choice to run this account to its limit
 	// for its next saved reset (PATCHES §95.1), published by the daemon that
-	// holds the account in real mode only. Every daemon that ranks the
-	// account honours it (§95.2). Absent is not chosen, or a daemon from
-	// before §95. Top level only: the choice is the account's, and its meter
-	// says which pools it covers.
+	// holds the account in real mode only, for every daemon that ranks the
+	// account to honour (§95.2; until then nothing ranks on it). Absent is
+	// not chosen, or a daemon from before §95. Top level only: the choice is
+	// the account's, and its meter says which pools it covers.
 	ResetChoice *ResetChoice `json:"reset_choice,omitempty"`
 	// Fresh distinguishes a score computed from a current usage fetch from one
 	// carried forward as a seed after a failed fetch. A stale reading is still
