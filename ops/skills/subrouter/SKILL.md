@@ -149,6 +149,7 @@ To see every reset an account holds, read the `resets` list on its `usage-status
 - Name the account by its exact profile name or email. A near miss gets `did you mean ...? nothing was sent`.
 - The command asks y/N only when the week has more than 10% left, rolls within a day, or is unread. Without a terminal it refuses, and `--yes` answers. Pass `--yes` only after the operator answers yes to that question.
 - The command prints one line. If it says `may have landed`, check the `1x reset` column in `sr status` before any retry.
+- The daemon that makes a claim records it in `usage-history.jsonl`, with each meter's used fraction and roll time before and after, and logs `reset claim recorded` (§92.1). `SUBROUTER_USAGE_HISTORY=0` turns the record off. A redeem that `sr reset` makes from the CLI itself (`SUBROUTER_CODEX_SERVER=local`, or a machine with no server configured) reaches no daemon and is not recorded.
 
 ## Read the pool's burn (§92.2)
 
