@@ -3383,3 +3383,15 @@ Tested in Docker, in `internal/proxy/unstarted_week_test.go`. `TestUsageStatusPu
 - Tests: `selectacct/unstarted_week_test.go`, `selectacct/codex_weekly_test.go` (`TestCodexPrefersTheSoonestRefresh`), `cmd/subrouter/start_unstarted_week_test.go`, `internal/proxy/unstarted_week_test.go`, `internal/proxy/pool_ui_test.go` (the fuse tests), `ops/bin/srq selftest`
 - Docs: `ops/OPERATING.md`, `ops/skills/subrouter/SKILL.md`
 - Related: amends §10 and §31 P2 (an unstarted week no longer ranks as an even pace), §41 and §56 (it ranks above the drain), and §13 and §31 (one more `normalized` field, read from a peer).
+
+## 87. Every view names an account by its label, not its ID
+
+A Codex OAuth login is keyed by `accounts.CodexOAuthIdentifier`: `codex-owner-` plus a SHA-256 of the user and workspace, so that one person's two workspaces stay apart. Every path that adds a Codex record goes through it. The usage-status rows publish that key in `id` and `email`, and the name a person knows, normally the login email, in `label`. Older Codex records and every Claude account use their name as their ID, so the readers named each row by its ID, and an owner-keyed account showed as a hash. `sr plot`'s "unspent · expiring soonest" printed `codex-owner-` and 18 hex digits where the account's email belonged.
+
+§87.1 `sr plot` names each account by its label and falls back to its ID. Both renderers do this, `internal/burnpace` and `ops/bin/sr-plot`, kept in parity, and so do `srq pool`, `srdash` and the pool board: the account rows, the move dialog, the flash message and the Sessions tab. The Sessions tab gets the label through a new `account_label` on each session. Peer rows carry the label the box published. Commands and files that take an ID keep the ID: pins, `srq dir`, `srq serving` and the prune preview.
+
+§87.2 The CLI views show the label at once. The pool board's Sessions-tab label is filled in by the daemon, so it shows after that daemon's next deploy.
+
+- Code: `internal/burnpace` (`model.go`, `render.go`, `snapshot.go`, `week.go`), `ops/bin/sr-plot`, `ops/bin/srq`, `ops/bin/srdash`, `internal/proxy/pool_ui.go`, `internal/proxy/pool_ui.html`, `internal/proxy/proxy.go` (`AccountStatus.Label`)
+- Tests: `TestPlotNamesAnAccountByItsLabel`, the `codex-owner-labels` parity scenario, `TestBoardCarriesEachAccountsLabel`, `sr-plot --selftest`, `srq selftest`
+- Docs: `ops/OPERATING.md`
