@@ -158,7 +158,7 @@ To see every reset an account holds, read the `resets` list on its `usage-status
 - A low burn with a high share at the limit means spent accounts, not an idle pool: an account at its limit burns 0.
 - `not enough history yet` is not 0. A figure needs readings over half its window (12 hours for 24 hours), and the 24-hour trend needs 36 hours.
 - A peer named `not counted` publishes no burn (a build from before §92, or its history off) or has not answered for 15 minutes. Its accounts are left out, not read as 0.
-- Each daemon reads only its own accounts' history, `usage-history.jsonl` in its state directory. A daemon that was down leaves a gap. Nothing ranks or routes on the figures. `SUBROUTER_USAGE_HISTORY=0` turns them off.
+- Each daemon reads only its own accounts' history, `usage-history.jsonl` beside its `sessions.json` (the folder of `--sessions`, `~/.subrouter` by default). A daemon that was down leaves a gap. Nothing ranks or routes on the figures. `SUBROUTER_USAGE_HISTORY=0` turns them off.
 
 ## Add an account
 
