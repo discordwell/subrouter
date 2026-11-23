@@ -10,7 +10,8 @@ on:
     branches: [main]
   # The full suite (unit tests, cross-compiles, the Docker profiles) runs only
   # when someone starts it:  gh workflow run ci.yml --ref <branch>
-  # Every other event runs the public check alone (ops/PATCHES.md §74).
+  # Every other event runs the public check, and on a pull request or push
+  # also the board page and srq selftests (ops/PATCHES.md §74).
   workflow_dispatch:
 
 permissions:
@@ -85,6 +86,14 @@ jobs:
         with:
           go-version-file: go.mod
 
+      # The node version the Docker test image carries. The board page tests
+      # run in it, and SUBROUTER_TEST_REQUIRE_NODE=1 below fails them without it.
+      - name: Set up Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: 26.13.1
+          package-manager-cache: false
+
       - name: Check formatting
         # Nothing checked gofmt, so unformatted files reached main.
         run: |
@@ -102,6 +111,8 @@ jobs:
         run: go vet ./...
 
       - name: Test
+        env:
+          SUBROUTER_TEST_REQUIRE_NODE: "1"
         run: CGO_ENABLED=0 go test ./...
 
       - name: Test the ops tools
@@ -109,6 +120,34 @@ jobs:
         # suite depends on the other, so a red one does not skip this.
         if: ${{ !cancelled() }}
         run: cd ops && go test -count=1 ./...
+
+      - name: Test srq
+        if: ${{ !cancelled() }}
+        run: python3 ops/bin/srq selftest
+
+  # Every pull request and push runs the board page's node tests and srq's
+  # selftest, which need no Go build. Nothing waits on this job: it is not
+  # in the "Build, vet, test" gate (ops/PATCHES.md §74).
+  page-and-srq:
+    name: Board page and srq selftests
+    if: ${{ github.event_name != 'merge_group' }}
+    runs-on: ${{ fromJSON(vars.LINUX_RUNNER || '"ubuntu-latest"') }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: 26.13.1
+          package-manager-cache: false
+
+      - name: Test the board page
+        run: node --test internal/proxy/pool_ui_page_test.mjs
+
+      - name: Test srq
+        if: ${{ !cancelled() }}
+        run: python3 ops/bin/srq selftest
 
   # The classifier skips the unit job when a change touches only Markdown,
   # planning/ or cloudflare/, and the docs are where most private pointers

@@ -836,12 +836,9 @@ func TestUsageStatusAndTheBoardShowTheDaemonsOwnStart(t *testing.T) {
 // once this daemon has sent its own turn on an unstarted week, the row says
 // "start sent HH:MM" beside its PRISTINE fuse, in the browser's time, with
 // ×2 from the second send in a row. Before a send, on a running week, and once
-// the clock runs, no row says it. Skipped where there is no node.
+// the clock runs, no row says it. Without node, see nodeForTest.
 func TestTheBoardPageShowsTheDaemonsOwnStart(t *testing.T) {
-	node, err := exec.LookPath("node")
-	if err != nil {
-		t.Skipf("no node to run the board page: %v", err)
-	}
+	node := nodeForTest(t)
 	setStartUnstartedWeekForTest(t, true)
 	setSelfStartWeekForTest(t, true, "")
 	d := newUnstartedCodexDaemon(t, map[string][2]float64{freshAccount: {0, 604800}, midweekAccount: {20, 300000}})

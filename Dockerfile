@@ -38,6 +38,12 @@ RUN mkdir -p /home/agent/.claude \
     /home/agent/.subrouter \
     /home/agent/.config/subrouter
 
+# The board page tests in internal/proxy run its script in node. With
+# SUBROUTER_TEST_REQUIRE_NODE=1 they fail when node is missing instead of
+# skipping, which is how they once went unrun in this image.
+COPY --from=node:26.13.1-bookworm-slim /usr/local/bin/node /usr/local/bin/node
+ENV SUBROUTER_TEST_REQUIRE_NODE=1
+
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
