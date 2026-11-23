@@ -413,6 +413,11 @@ const codexResetExpiryScanInterval = 10 * time.Second
 // readings for the reading moment of an automatic claim (PATCHES §93.1).
 const autoResetScanInterval = 10 * time.Second
 
+// claimFollowUpScanInterval is how often the daemon looks for an account whose
+// saved resets a landed claim left unread and the provider now lets it read
+// (PATCHES §102.2).
+const claimFollowUpScanInterval = 10 * time.Second
+
 const maxSecretFileBytes = 64 << 10
 
 func secretFromEnvironment(valueName, fileName string) (string, error) {
@@ -1953,6 +1958,12 @@ func serve(args []string) error {
 	// PATCHES §93.1: the reading moment. Each pass reads the rows the usage
 	// reads already published; SUBROUTER_AUTO_RESET=0 keeps every pass empty.
 	go server.RunAutoReset(activeGenerationCtx, autoResetScanInterval)
+	// PATCHES §102.2: after a landed claim whose own read did not read the
+	// account's saved resets, each pass reads it again once the provider's
+	// hold-off ends. Off with --fetch-usage=false, since it reads usage.
+	if *fetchUsage {
+		go server.RunClaimFollowUps(activeGenerationCtx, claimFollowUpScanInterval)
+	}
 
 	// No upstream idle score refresher (RunUsageScoreRefresher, #378): PATCHES
 	// 44.3 took #378's hand-off only. The auto-switch sweep and the usage-status

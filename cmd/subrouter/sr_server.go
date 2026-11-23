@@ -1917,6 +1917,7 @@ func usageRowsFromServerUsageStatuses(statuses []remoteServerUsageStatus) []srUs
 			credits:               status.Credits,
 			complimentaryReset:    status.ComplimentaryReset,
 			resets:                status.Resets,
+			resetsFromClaim:       status.ResetsFromClaim,
 			extraUsage:            status.ExtraUsage,
 			costTier:              status.CostTier,
 			costTierRank:          status.CostTierRank,

@@ -1702,6 +1702,11 @@ func (r *AccountRef) fetchUsageWindowsShared(ctx context.Context, client *http.C
 					r.usageWindowsFailures[failureKey] = failure
 					persistedFailure = &failure
 				}
+				// Before the waiters wake: the row they build from this read
+				// carries its block, not the one a claim left (§102.1). And
+				// before the flight leaves the map: a read that finds no
+				// flight finds the block read (§102.2's follow-up).
+				r.noteResetBlockRead(account.Provider, account.ID, blockRead, flight.started, blockReadPathOf(fetchCtx))
 				if r.usageWindowsFlights[flightKey] == flight {
 					delete(r.usageWindowsFlights, flightKey)
 				}
@@ -1711,9 +1716,6 @@ func (r *AccountRef) fetchUsageWindowsShared(ctx context.Context, client *http.C
 				} else if clearPersistedFailure {
 					r.clearUsageThrottleState(cacheKey)
 				}
-				// Before the waiters wake: the row they build from this read
-				// carries its block, not the one a claim left (§102.1).
-				r.noteResetBlockRead(account.Provider, account.ID, blockRead, flight.started)
 				close(flight.done)
 			}()
 			flight.windows, flight.resetStatus, flight.supplementalFresh, flight.err = r.fetchAccountUsageLive(fetchCtx, client, account)
@@ -1914,10 +1916,12 @@ func (r *AccountRef) fetchClaudeOAuthUsageLive(ctx context.Context, client *http
 // call renewed the chain.
 func (r *AccountRef) fetchCodexUsageDetails(ctx context.Context, client *http.Client, account accounts.Account) (accounts.CodexUsageDetails, bool, error) {
 	// Every live read of this daemon's own Codex account passes here, and
-	// is recorded as old as its read's start (PATCHES §29, §92.1).
+	// is recorded as old as its read's start (PATCHES §29, §92.1). Its count
+	// is a reading of the account's credits (§102.1).
 	record := func(account accounts.Account, started time.Time, details accounts.CodexUsageDetails, err error) {
 		if err == nil {
 			r.history().observe(account, details.Windows, started)
+			r.noteResetBlockRead(accounts.ProviderCodex, account.ID, details.ComplimentaryReset, started, blockReadPathOf(ctx))
 		}
 	}
 	started := time.Now()
@@ -3754,7 +3758,6 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 			next.Windows = details.Windows
 			next.Credits = details.Credits
 			next.ComplimentaryReset = details.ComplimentaryReset
-			r.noteResetBlockRead(accounts.ProviderCodex, account.ID, details.ComplimentaryReset, measuredAt)
 			next.UsageFresh = true
 			next.UsageMeasuredAt = measuredAt
 			// The reading's time is when its fetch started (PATCHES §29).
@@ -7068,6 +7071,7 @@ func (s Server) redeemAccountChecked(ctx context.Context, account accounts.Accou
 	after, err := accounts.FetchCodexUsageDetails(ctx, s.AccountRef.client, account)
 	if err != nil {
 		result.readAfter.err = err
+		s.armClaimFollowUp(account, result.readAfter)
 		return result
 	}
 	history.observe(account, after.Windows, afterAt)

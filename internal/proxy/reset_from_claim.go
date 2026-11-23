@@ -24,7 +24,9 @@ import (
 type claimedReset struct {
 	// at is when the provider's answer said it used the reset. A read sent
 	// after it is a reading after the claim.
-	at time.Time
+	at       time.Time
+	provider accounts.Provider
+	id       string
 	// kind is the kind of reset used: Claude's "week" or "fable", or a Codex
 	// credit's reset_type.
 	kind   string
@@ -33,8 +35,13 @@ type claimedReset struct {
 	// block is the last block read before the claim with the claimed reset
 	// counted as used; nil once a reading of the block replaced it.
 	block *accounts.ComplimentaryResetInfo
+	// read is the reading that replaced block.
+	read *accounts.ComplimentaryResetInfo
 	// meters are the meters the claim gave back.
 	meters []claimedMeter
+	// followUp reads the account again when the claim path's own read did
+	// not read the block (§102.2); nil otherwise and once it ends.
+	followUp *claimFollowUp
 }
 
 // claimedMeter is one meter a claim gave back, as the usage windows name it.
@@ -141,6 +148,21 @@ func codexBlockAfterRedeem(before *accounts.ComplimentaryResetInfo) *accounts.Co
 type claimedResets struct {
 	mu    sync.Mutex
 	byKey map[string]*claimedReset
+	// now nil is time.Now: the clock the follow-up reads are timed by.
+	now func() time.Time
+	// runs is set while RunClaimFollowUps runs: a daemon that runs no
+	// follow-up pass arms none, and its sweep keeps its own reset read.
+	runs bool
+}
+
+func (c *claimedResets) clock() time.Time {
+	c.mu.Lock()
+	now := c.now
+	c.mu.Unlock()
+	if now != nil {
+		return now()
+	}
+	return time.Now()
 }
 
 func (r *AccountRef) sharedClaimedResets() *claimedResets {
@@ -198,7 +220,7 @@ func (s Server) noteResetClaimed(account accounts.Account, used resetClaimed) {
 		return
 	}
 	provider := accountProviderOrCodex(account)
-	claim := &claimedReset{at: time.Now(), kind: used.kind, label: account.ID,
+	claim := &claimedReset{at: time.Now(), provider: provider, id: account.ID, kind: used.kind, label: account.ID,
 		logger: s.Logger, block: used.block, meters: used.meters}
 	if strings.TrimSpace(account.Label) != "" {
 		claim.label = account.Label
@@ -241,11 +263,12 @@ func (r *AccountRef) forgetFableBeforeClaim(account accounts.Account, claim *cla
 	delete(r.claudeSupplemental, key)
 }
 
-// noteResetBlockRead takes a block read at readAt for the account: a known
-// block read after the account's last landed claim replaces the block the
-// claim left. A reading that still lists the reset the claim used wins, and
-// one Warn says so.
-func (r *AccountRef) noteResetBlockRead(provider accounts.Provider, id string, read *accounts.ComplimentaryResetInfo, readAt time.Time) {
+// noteResetBlockRead takes a block read at readAt by the read by for the
+// account: a known block read after the account's last landed claim replaces
+// the block the claim left, and one Info line says which read took it and how
+// long after the claim (§102.2). A reading that still lists the reset the
+// claim used wins, and one Warn says so.
+func (r *AccountRef) noteResetBlockRead(provider accounts.Provider, id string, read *accounts.ComplimentaryResetInfo, readAt time.Time, by blockReadPath) {
 	if r == nil || read == nil || !read.Known {
 		return
 	}
@@ -257,18 +280,23 @@ func (r *AccountRef) noteResetBlockRead(provider accounts.Provider, id string, r
 		return
 	}
 	expected := claim.block
-	claim.block = nil
+	claim.block, claim.read = nil, cloneResetInfo(read)
 	if len(claim.meters) == 0 {
 		delete(memory.byKey, claimedResetKey(provider, id))
 	}
 	memory.mu.Unlock()
-	if claimedLeft(read, claim.kind) <= claimedLeft(expected, claim.kind) || claim.logger == nil {
+	if claim.logger == nil {
+		return
+	}
+	fields := []any{"account", claim.label, "provider", string(provider), "kind", claim.kind,
+		"claimed_at", claim.at.UTC().Format(time.RFC3339), "read_at", readAt.UTC().Format(time.RFC3339)}
+	claim.logger.Info(firstReadingAfterClaimMessage, append(fields,
+		"after_seconds", int64(readAt.Sub(claim.at)/time.Second), "read_by", string(by))...)
+	if claimedLeft(read, claim.kind) <= claimedLeft(expected, claim.kind) {
 		return
 	}
 	claim.logger.Warn("saved resets: the first reading after a claim still lists the reset the claim used; the reading stands",
-		"account", claim.label, "provider", string(provider), "kind", claim.kind,
-		"claimed_at", claim.at.UTC().Format(time.RFC3339), "read_at", readAt.UTC().Format(time.RFC3339),
-		"left_after_claim", claimedLeft(expected, claim.kind), "left_read", claimedLeft(read, claim.kind))
+		append(fields, "left_after_claim", claimedLeft(expected, claim.kind), "left_read", claimedLeft(read, claim.kind))...)
 }
 
 // claimedLeft is how many resets of kind block holds: by kind where the

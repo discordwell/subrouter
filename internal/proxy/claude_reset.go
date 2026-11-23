@@ -331,7 +331,7 @@ func (s Server) readClaudeResetStatus(work, caller context.Context, account acco
 		if err == nil {
 			windows := displayClaudeWindows(claudeUsageWindows(usage))
 			ref.noteClaudeResetStatus(account.ID, account.Token, status, windows, started)
-			ref.noteResetBlockRead(accounts.ProviderClaude, account.ID, agentclaude.ResetInfo(status, started), started)
+			ref.noteResetBlockRead(accounts.ProviderClaude, account.ID, agentclaude.ResetInfo(status, started), started, readByClaimRoute)
 			ref.history().observe(account, windows, started)
 			return claudeResetState{status: status, windows: windows, source: "live", at: started}, nil
 		}
@@ -636,6 +636,7 @@ func (s Server) afterClaudeReset(ctx context.Context, account accounts.Account) 
 	ref.InvalidateUsageStatusCache()
 	var windows []accounts.UsageWindow
 	windows, _, read.measuredAt, read.servedOver, read.err = ref.fetchUsageWindowsCachedReason(withReadAfterClaim(ctx), ref.client, account)
+	s.armClaimFollowUp(account, read)
 	if read.err != nil {
 		if s.Logger != nil {
 			s.Logger.Warn("claude reset re-read failed", "account", account.ID, "error", read.err)
@@ -974,16 +975,33 @@ func (r *AccountRef) finishClaudeResetFallback(id, token string, started time.Ti
 	r.claudeResetStatuses[id] = current
 }
 
+// fetchClaudeResetFallback is one read of account's block with Claude Code's
+// own query, which the caller marked in flight: the answer is stored for the
+// sweep, and a block read after a claim is a reading of it.
+func (r *AccountRef) fetchClaudeResetFallback(ctx context.Context, account accounts.Account) error {
+	started := time.Now()
+	usage, status, err := agentclaude.FetchResetStatus(ctx, r.client, account.Token)
+	r.finishClaudeResetFallback(account.ID, account.Token, started, usage, status, err)
+	if err == nil {
+		r.noteResetBlockRead(accounts.ProviderClaude, account.ID, agentclaude.ResetInfo(status, started), started, blockReadPathOf(ctx))
+	}
+	return err
+}
+
 // claudeResetFromFallback is account's saved reset from the fallback read,
 // or nil. With start, it starts a background read when the last one is older
 // than the fallback interval (or there is none), and serves the previous
 // answer up to twice the interval old meanwhile. Without start it only serves
 // that answer: nothing is sent, marked in flight or stamped. Off unless
-// EnableClaudeResetFallback.
+// EnableClaudeResetFallback. While a claim on the account waits on a reading,
+// its follow-up reads the block instead, at the provider's deadline (§102.2):
+// this read does not wait out the provider's hold-off, and after a refusal it
+// waits an hour.
 func (r *AccountRef) claudeResetFromFallback(account accounts.Account, start bool) *accounts.ComplimentaryResetInfo {
 	if r == nil || account.Provider != accounts.ProviderClaude || strings.TrimSpace(account.Token) == "" {
 		return nil
 	}
+	start = start && !r.claimFollowUpArmed(accounts.ProviderClaude, account.ID)
 	now := time.Now()
 	r.claudeResetMu.Lock()
 	defer r.claudeResetMu.Unlock()
@@ -998,16 +1016,10 @@ func (r *AccountRef) claudeResetFromFallback(account accounts.Account, start boo
 	if start && (!ok || now.Sub(entry.at) >= every) && !entry.inflight {
 		entry.inflight = true
 		r.claudeResetStatuses[account.ID] = entry
-		client, token, id := r.client, account.Token, account.ID
 		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), claudeResetFallbackTimeout)
+			ctx, cancel := context.WithTimeout(withBlockReadPath(context.Background(), readByFallback), claudeResetFallbackTimeout)
 			defer cancel()
-			started := time.Now()
-			usage, status, err := agentclaude.FetchResetStatus(ctx, client, token)
-			r.finishClaudeResetFallback(id, token, started, usage, status, err)
-			if err == nil {
-				r.noteResetBlockRead(accounts.ProviderClaude, id, agentclaude.ResetInfo(status, started), started)
-			}
+			_ = r.fetchClaudeResetFallback(ctx, account)
 		}()
 	}
 	if entry.info == nil || entry.at.IsZero() || now.Sub(entry.at) >= 2*every {

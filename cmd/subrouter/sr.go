@@ -350,6 +350,10 @@ type srUsageRow struct {
 	// credits (fillResetsFromLocalDaemon); nil otherwise, as this process
 	// reads no credit list.
 	resets []accounts.HeldReset
+	// resetsFromClaim marks complimentaryReset as known from the account's
+	// last landed claim, not from a reading (the daemon's resets_from_claim,
+	// PATCHES §102): the 1x reset cell ends in "^".
+	resetsFromClaim bool
 	// costTier and costTierRank are the server's Claude cost tier for this
 	// account (see proxy.ClaudeCostOrder); empty when the server predates it.
 	costTier              string
@@ -4342,18 +4346,28 @@ func usageRowWeeklyWindow(row srUsageRow) (accounts.UsageWindow, bool) {
 
 func usageGridResetCell(row srUsageRow) usageGridCell {
 	if usageProvider(row) == accounts.ProviderClaude {
-		return usageGridClaudeResetCell(row, true)
+		return resetFromClaimCell(row, usageGridClaudeResetCell(row, true))
 	}
-	return usageGridCodexResetCell(row)
+	return resetFromClaimCell(row, usageGridCodexResetCell(row))
 }
 
 // usageGridResetCellUndated is the reset cell without a use-by date, for a
 // table too narrow to carry one.
 func usageGridResetCellUndated(row srUsageRow) usageGridCell {
 	if usageProvider(row) == accounts.ProviderClaude {
-		return usageGridClaudeResetCell(row, false)
+		return resetFromClaimCell(row, usageGridClaudeResetCell(row, false))
 	}
-	return usageGridCodexResetCell(row)
+	return resetFromClaimCell(row, usageGridCodexResetCell(row))
+}
+
+// resetFromClaimCell marks a reset cell read from a block the daemon knows
+// from the account's last landed claim, not from a reading: "1 Fable 3/9^",
+// "used^" (PATCHES §102). No automatic claim goes by such a block.
+func resetFromClaimCell(row srUsageRow, cell usageGridCell) usageGridCell {
+	if row.resetsFromClaim && cell.Text != "" {
+		cell.Text += "^"
+	}
+	return cell
 }
 
 // usageGridClaudeResetCell reads a Claude account's saved usage-limit reset
