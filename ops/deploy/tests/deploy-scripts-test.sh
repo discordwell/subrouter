@@ -391,7 +391,7 @@ if [ -n "$sock" ]; then
         late=$(cat "$FAKE_LAUNCHD/socket-late" 2>/dev/null || echo 0)
         if [ "$up" = 1 ] && [ "$late" -gt 0 ]; then echo $((late - 1)) > "$FAKE_LAUNCHD/socket-late"; up=0; fi
         word=serving; [ -n "$sup" ] && word=owned_by_supervisor; word=${FAKE_CLAUDE_WORD:-$word}
-        case "$lpath" in /_subrouter/health) body="{\"ok\": true, \"claude_socket\": \"$word\"}" ;; *) code=404 ;; esac ;;
+        case "$lpath" in /_subrouter/health) body="{\"ok\": true, \"claude_socket\": \"$word\"${FAKE_PIN_CONTROL_PLANE:+, \"pin_control_plane\": \"$FAKE_PIN_CONTROL_PLANE\"}}" ;; *) code=404 ;; esac ;;
       drain)
         { [ -z "$sup" ] && [ -n "$running" ] && [ "$lpath" = /_subrouter/drain-status ]; } || up=0
         turns=${FAKE_TURNS:-0}
@@ -4812,6 +4812,7 @@ fi
 # socket serving, pool mode. The Claude Code and Codex answer the word their
 # prompt asks for, and a launch the shim routed to the daemon is a session in
 # $H/served, which srq serving reads (FAKE_NO_SESSIONS=1: the daemon has none).
+# A pinned Claude turn under FAKE_SPENT_PIN fails (route_spent_setup).
 route_launch_setup() {
   route_setup SUBROUTER_CLAUDE_SOCKET="$C/home/.subrouter/claude.sock"
   rm -f "$H/.claude/settings.json"   # it names a route, and a route word refuses then
@@ -4831,6 +4832,11 @@ for a; do
   case "$a" in --version) echo "9.9.9 (Claude Code)"; exit 0 ;; "Reply with exactly one word, in lowercase: "*) word="${a##*: }" ;; esac
   prev="$a"
 done
+pin=$(printf '%s\n' "${ANTHROPIC_CUSTOM_HEADERS:-}" | sed -n 's/^X-Subrouter-Account-ID: //p')
+if [ -n "$pin" ] && [ -n "${FAKE_SPENT_PIN:-}" ]; then
+  case "$FAKE_SPENT_PIN" in limited) echo "$sid $pin" >> "$HOME/served" ;; failover) echo "$sid acct-pool" >> "$HOME/served" ;; esac
+  echo "API Error: 429 rate_limit_error" >&2; exit 1
+fi
 [ -n "$sid" ] && [ -n "${ANTHROPIC_UNIX_SOCKET:-}${ANTHROPIC_BASE_URL:-}" ] && echo "$sid acct-pool" >> "$HOME/served"
 echo "$word"
 SH
@@ -4848,11 +4854,12 @@ sid="cx-$$-$RANDOM"; echo "session id: $sid"
 [ -n "$out" ] && echo "$word" > "$out"
 exit 0'
   stub uuidgen 'printf "%08x-%04x-4%03x-8%03x-%012x\n" "$$" "$RANDOM" "$((RANDOM % 4096))" "$((RANDOM % 4096))" "$RANDOM$RANDOM"'
-  # srq serving answers as ops/bin/srq does: the account (0), or its line for a
-  # session the daemon does not list (1).
+  # srq serving answers as ops/bin/srq does: the account (0), its line for a
+  # session the daemon does not list (1), or, FAKE_SRQ_DOWN=1, its error (2).
   cat > "$C/srq" <<'SH'
 #!/bin/bash
 [ "$1" = serving ] || exit 2
+[ -z "${FAKE_SRQ_DOWN:-}" ] || { echo "srq: cannot reach subrouter at http://127.0.0.1:31415/_subrouter/sessions: <urlopen error [Errno 111] Connection refused>" >&2; exit 2; }
 [ -z "${FAKE_NO_SESSIONS:-}" ] && a=$(awk -v s="$2" '$1 == s { a = $2 } END { print a }' "$HOME/served" 2>/dev/null) && [ -n "$a" ] && { echo "$a"; exit 0; }
 echo "unassigned (session $2): not listed by the daemon (no local assignment; a §49+ daemon also lists live peer holds)"
 exit 1
@@ -4992,6 +4999,54 @@ if begin route-failed-check-without-paradev-blocks-the-gate; then
   run_route_launch -- pool
   expect_rc 1; expect_out "no passing 'claude-route test' today"
   [ "$(cat "$H/.claude-route/mode")" = off ] && ok || bad "mode is $(cat "$H/.claude-route/mode")"
+  finish
+fi
+
+# test's check on a pin to a laptop Claude account flagged ineligible (spent, or
+# inside its owner's holdout): the launch fails, fast, and no other account
+# serves it. The daemon names the pin's control plane, since the stub world has
+# no PlistBuddy to read the identity account from the plist. FAKE_SPENT_PIN says
+# where the daemon put the failing turn: refused (answered once, finally, before
+# any assignment: no row, PATCHES §89), limited (the provider's limit, on that
+# account's row) or failover (another account's row).
+route_spent_setup() {
+  route_launch_setup
+  printf 'claude\tcl-spent\tcl-spent\t\tlocal\tno:inside its owner holdout\tno\n' >> "$H/.claude-route/accounts.tsv"
+}
+run_spent_test() { run_route_launch FAKE_PIN_CONTROL_PLANE=identity "$@" -- test; }
+spent_sid() { sed -n 's/.* route=pool word=account pin=cl-spent at=local sid=\([^ ]*\).*/\1/p' "$H/.claude-route/launch.log"; }
+expect_spent() { # PASS|FAIL
+  local got; got=$(grep -E "^  (PASS|FAIL)  pinned 'cl-spent' \(spent\) fails fast" "$C/out")
+  [ "$(printf '%s\n' "$got" | cut -c3-6)" = "$1" ] && ok || bad "the (spent) check: want one $1 line, got: ${got:-none}"
+  local n; n=$(grep -c " route=pool word=account pin=cl-spent at=local sid=" "$H/.claude-route/launch.log")
+  [ "$n" = 1 ] && ok || bad "test made $n launches pinned to cl-spent, want 1"
+}
+expect_spent_said() { # what test.err says about the pinned launch's session
+  local sid; sid=$(spent_sid)
+  grep -F -- "$sid" "$H/.claude-route/test.err" | grep -Fq -- "$1" && ok || bad "test.err lacks, for $sid: $1"
+}
+
+if begin route-test-spent-pin-refused-before-assignment-passes; then
+  route_spent_setup; run_spent_test FAKE_SPENT_PIN=refused
+  expect_spent PASS
+  finish
+fi
+
+if begin route-test-spent-pin-on-exactly-that-account-passes; then
+  route_spent_setup; run_spent_test FAKE_SPENT_PIN=limited
+  expect_spent PASS
+  finish
+fi
+
+if begin route-test-spent-pin-on-another-account-fails; then
+  route_spent_setup; run_spent_test FAKE_SPENT_PIN=failover
+  expect_spent FAIL; expect_spent_said "acct-pool"
+  finish
+fi
+
+if begin route-test-spent-pin-with-srq-failing-fails; then
+  route_spent_setup; run_spent_test FAKE_SPENT_PIN=refused FAKE_SRQ_DOWN=1
+  expect_spent FAIL; expect_spent_said "srq: cannot reach subrouter"
   finish
 fi
 
