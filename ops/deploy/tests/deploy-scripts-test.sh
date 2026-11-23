@@ -4848,11 +4848,14 @@ sid="cx-$$-$RANDOM"; echo "session id: $sid"
 [ -n "$out" ] && echo "$word" > "$out"
 exit 0'
   stub uuidgen 'printf "%08x-%04x-4%03x-8%03x-%012x\n" "$$" "$RANDOM" "$((RANDOM % 4096))" "$((RANDOM % 4096))" "$RANDOM$RANDOM"'
+  # srq serving answers as ops/bin/srq does: the account (0), or its line for a
+  # session the daemon does not list (1).
   cat > "$C/srq" <<'SH'
 #!/bin/bash
-[ "$1" = serving ] && [ -z "${FAKE_NO_SESSIONS:-}" ] || exit 1
-a=$(awk -v s="$2" '$1 == s { a = $2 } END { print a }' "$HOME/served" 2>/dev/null)
-[ -n "$a" ] && echo "$a"
+[ "$1" = serving ] || exit 2
+[ -z "${FAKE_NO_SESSIONS:-}" ] && a=$(awk -v s="$2" '$1 == s { a = $2 } END { print a }' "$HOME/served" 2>/dev/null) && [ -n "$a" ] && { echo "$a"; exit 0; }
+echo "unassigned (session $2): not listed by the daemon (no local assignment; a §49+ daemon also lists live peer holds)"
+exit 1
 SH
   chmod 755 "$C/srq"
 }
