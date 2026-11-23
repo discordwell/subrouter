@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"math"
 	"os"
@@ -575,8 +576,14 @@ func (h *UsageHistory) compact() ([]usageHistoryLine, error) {
 	return lines, err
 }
 
-// readUsageHistoryFile reads every line it can decode; a line it cannot is
-// skipped.
+// usageHistoryMaxLine is far longer than any line the history writes, so a
+// longer one is damage.
+const usageHistoryMaxLine = 64 << 10
+
+// readUsageHistoryFile reads every line it can decode; a line it cannot, or
+// one longer than usageHistoryMaxLine, is skipped. Ending the read there
+// instead would load nothing and stop every compaction, and with it the 35
+// days and the size bound, until the file was removed.
 func readUsageHistoryFile(path string) ([]usageHistoryLine, error) {
 	file, err := os.Open(path)
 	if err != nil {
@@ -584,16 +591,24 @@ func readUsageHistoryFile(path string) ([]usageHistoryLine, error) {
 	}
 	defer file.Close()
 	var lines []usageHistoryLine
-	scanner := bufio.NewScanner(file)
-	scanner.Buffer(make([]byte, 0, 64<<10), 1<<20)
-	for scanner.Scan() {
-		var line usageHistoryLine
-		if json.Unmarshal(scanner.Bytes(), &line) != nil || !line.valid() {
-			continue
+	reader := bufio.NewReaderSize(file, usageHistoryMaxLine)
+	for {
+		raw, err := reader.ReadSlice('\n')
+		overlong := errors.Is(err, bufio.ErrBufferFull)
+		for errors.Is(err, bufio.ErrBufferFull) {
+			_, err = reader.ReadSlice('\n')
 		}
-		lines = append(lines, line)
+		var line usageHistoryLine
+		if !overlong && json.Unmarshal(raw, &line) == nil && line.valid() {
+			lines = append(lines, line)
+		}
+		if errors.Is(err, io.EOF) {
+			return lines, nil
+		}
+		if err != nil {
+			return lines, err
+		}
 	}
-	return lines, scanner.Err()
 }
 
 func (line usageHistoryLine) valid() bool {
