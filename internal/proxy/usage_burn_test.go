@@ -271,7 +271,7 @@ func usageStatusBurn(t *testing.T, server Server) map[string]UsageBurn {
 
 // claudeBurnPeer is a peer whose one Claude account's usage-status row
 // carries the figures a real history computes from its series.
-func claudeBurnPeer(t *testing.T, now time.Time, id string, weekRate, fableRate float64) *RemotePool {
+func claudeBurnPeer(t *testing.T, now time.Time, id string, weekRate, fableRate float64) (*RemotePool, *httptest.Server) {
 	t.Helper()
 	h := burnHistory(t, now)
 	roll := now.Add(3 * burnDay)
@@ -297,7 +297,7 @@ func claudeBurnPeer(t *testing.T, now time.Time, id string, weekRate, fableRate 
 	t.Cleanup(peer.Close)
 	pool := NewRemotePool(peer.URL, "", "")
 	pool.Name = "claude-box"
-	return pool
+	return pool, peer
 }
 
 // Behaviour 3. The route answers per meter over this daemon's accounts and
@@ -330,22 +330,27 @@ func TestTheBurnRouteCountsLocalAndPeerAccounts(t *testing.T) {
 	old := codexBox(t, codexWeekScore("old@example.com", 50, 400000))
 	old.pool.Name = "old-box"
 
-	laptop := newUnstartedCodexDaemon(t, map[string][2]float64{"steady@example.com": {20, 300000}, "short@example.com": {20, 300000}})
+	laptop := newUnstartedCodexDaemon(t, map[string][2]float64{
+		"steady@example.com": {20, 300000}, "short@example.com": {20, 300000}, "newer@example.com": {20, 300000},
+	})
 	h := burnHistory(t, now)
 	laptop.server.AccountRef.SetUsageHistory(h)
 	seedSeries(h, codex("steady@example.com"), now, span, 0, codexRising(line(0.10, 1, span), fixedRoll(roll)))
 	seedSeries(h, codex("short@example.com"), now, 11*time.Hour, 0, codexRising(line(0.40, 0, 11*time.Hour), fixedRoll(roll)))
-	laptop.server.RemotePeers = []*RemotePool{boxPool, claudeBurnPeer(t, now, "opus@example.com", 0.5, 1.5), old.pool}
+	// A series 30 hours long has the last 24 hours and not the 24 before.
+	seedSeries(h, codex("newer@example.com"), now, 30*time.Hour, 0, codexRising(line(0.05, 3, 30*time.Hour), fixedRoll(roll)))
+	claudePeer, claudeServer := claudeBurnPeer(t, now, "opus@example.com", 0.5, 1.5)
+	laptop.server.RemotePeers = []*RemotePool{boxPool, claudePeer, old.pool}
 
 	report := burnReport(t, laptop.server)
 	week := poolMeter(t, report, "codex", usageMeterWeek)
-	// 24 hours: the laptop's steady 1.0 and the box's 2.0; the short series
-	// has no figure. 6 hours: the short series, flat, joins them.
+	// The last hour and 6 hours: the laptop's steady 1.0, flat short and newer
+	// 3.0, and the box's 2.0. 24 hours: the short series has no figure.
 	for _, c := range []struct {
 		window       string
 		burn         float64
 		counted, few int
-	}{{"1h", 1, 3, 0}, {"6h", 1, 3, 0}, {"24h", 1.5, 2, 1}} {
+	}{{"1h", 1.5, 4, 0}, {"6h", 1.5, 4, 0}, {"24h", 2, 3, 1}} {
 		got := week.Windows[c.window]
 		if !burnNear(got.Burn, c.burn, 0.002) || got.Accounts != c.counted || got.NotEnoughHistory != c.few || !burnNear(got.AtLimit, 0, 0) {
 			t.Errorf("Codex week over %s: %+v (burn %v); want %.1f over %d accounts, %d without enough history, none at the limit",
@@ -353,17 +358,18 @@ func TestTheBurnRouteCountsLocalAndPeerAccounts(t *testing.T) {
 		}
 	}
 	// The box's account doubled its pace a day ago; nothing else changed.
+	// The newer series has no day before, so it is not in the 24-hour trend.
 	if trend := week.Trend["24h"]; !burnNear(trend.Change, 0.5, 0.002) || trend.Accounts != 2 {
 		t.Errorf("Codex week 24h trend = %+v, want +0.5 over the 2 accounts with both days", trend)
 	}
-	if trend := week.Trend["6h"]; !burnNear(trend.Change, 0, 0.002) || trend.Accounts != 3 {
-		t.Errorf("Codex week 6h trend = %+v, want 0 over 3 accounts", trend)
+	if trend := week.Trend["6h"]; !burnNear(trend.Change, 0, 0.002) || trend.Accounts != 4 {
+		t.Errorf("Codex week 6h trend = %+v, want 0 over 4 accounts", trend)
 	}
 	var held []string
 	for _, account := range week.Accounts {
 		held = append(held, account.Pool+" "+account.ID)
 	}
-	if want := []string{"local short@example.com", "local steady@example.com", "box rising@example.com"}; !sameStrings(held, want) {
+	if want := []string{"local short@example.com", "local steady@example.com", "local newer@example.com", "box rising@example.com"}; !sameStrings(held, want) {
 		t.Errorf("the Codex week counts %v, want %v: the shared account once, from here, and nothing of the old box", held, want)
 	}
 	if steady := accountWindows(t, week, "steady@example.com"); !burnNear(steady["24h"].Burn, 1, 0.002) {
@@ -393,6 +399,24 @@ func TestTheBurnRouteCountsLocalAndPeerAccounts(t *testing.T) {
 	}
 	if p := peers["old-box"]; p.Counted || !strings.Contains(p.Reason, "publishes no burn") {
 		t.Errorf("the old box = %+v, want not counted, saying it publishes no burn", p)
+	}
+
+	// The Claude peer goes away. Its last body is kept, and once that is more
+	// than 15 minutes old its figures are no longer counted.
+	claudeServer.Close()
+	claudePeer.admin.mu.Lock()
+	entry := claudePeer.admin.entries[remotePoolUsagePath]
+	entry.at, entry.tried = entry.at.Add(-20*time.Minute), entry.tried.Add(-20*time.Minute)
+	claudePeer.admin.entries[remotePoolUsagePath] = entry
+	claudePeer.admin.mu.Unlock()
+	gone := burnReport(t, laptop.server)
+	for _, p := range gone.Peers {
+		if p.Name == "claude-box" && (p.Counted || !strings.Contains(p.Reason, "last usage reading is 20m")) {
+			t.Errorf("the Claude peer 20 minutes after its last body = %+v, want not counted, naming the age", p)
+		}
+	}
+	if fable := poolMeter(t, gone, "claude", usageMeterFable); len(fable.Accounts) != 0 || fable.Windows["24h"].Burn != nil {
+		t.Errorf("with the Claude peer's body 20 minutes old the Fable meter = %+v, want no accounts and no figure", fable)
 	}
 }
 
