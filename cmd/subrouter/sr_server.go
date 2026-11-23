@@ -1670,6 +1670,11 @@ type remoteServerUsageStatus struct {
 	// (PATCHES §92.2). Decoded so this type takes every field the daemon
 	// publishes (the §47 wire test); `srq burn` shows it, no table here does.
 	Burn proxy.UsageBurn `json:"burn,omitempty"`
+	// ResetsFromClaim and NotReadSinceClaim say what the account's last
+	// landed claim left unread (PATCHES §102.1). Decoded so this type takes
+	// every field the daemon publishes (the §47 wire test).
+	ResetsFromClaim   bool     `json:"resets_from_claim,omitempty"`
+	NotReadSinceClaim []string `json:"not_read_since_claim,omitempty"`
 }
 
 func (r srRunner) fetchServerAccountsResponse(ctx context.Context, server srServerConfig) (*http.Response, error) {

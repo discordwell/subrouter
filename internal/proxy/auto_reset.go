@@ -1005,8 +1005,14 @@ func (s Server) autoResetWarmSessionOn(account accounts.Account) bool {
 // grant Anthropic names next (next_grant_id), from the block this daemon last
 // read with the account's login, which is the week reset before any Fable
 // reset. Codex: a credit, when the reading says one is available; which one
-// is read only for a claim (autoResetCodexCredit).
+// is read only for a claim (autoResetCodexCredit). Neither until a reading of
+// the block follows the account's last landed claim.
 func (s Server) autoResetNextFor(account accounts.Account, row *AccountUsageStatus, moment autoResetMoment, now time.Time) autoResetNext {
+	if claim, ok := s.AccountRef.claimedResetFor(accountProviderOrCodex(account), account.ID); ok && claim.block != nil {
+		// Nothing claims on a block that is not a reading (§102.1).
+		return autoResetNext{none: "the account's saved resets have not been read; its saved resets were last known from the claim at " +
+			claim.at.UTC().Format(time.RFC3339) + ", not from a reading"}
+	}
 	if accountProviderOrCodex(account) == accounts.ProviderCodex {
 		reset := (*accounts.ComplimentaryResetInfo)(nil)
 		if row != nil {

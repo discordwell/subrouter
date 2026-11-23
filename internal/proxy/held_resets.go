@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"log/slog"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -234,12 +235,15 @@ func codexResetCount(row AccountUsageStatus) (int, string, bool) {
 
 // withHeldResets sets each row's resets: a Claude row's from the block it
 // carries, a Codex row's from its count and the credit list as last read.
+// A row whose account's last landed claim no reading has replaced carries
+// the block that claim left first (§102.1), and its resets are built from it.
 // It logs each unknown kind. The input may be the shared cached snapshot, so
 // it is copied, not mutated.
 func (s Server) withHeldResets(statuses []AccountUsageStatus) []AccountUsageStatus {
 	memory := s.AccountRef.sharedHeldResets()
 	now := memory.clock()
 	out := append([]AccountUsageStatus(nil), statuses...)
+	s.withResetsFromClaims(out)
 	for i := range out {
 		out[i].Resets = nil
 		if reset := out[i].ComplimentaryReset; reset != nil && reset.Source == agentclaude.ResetProgram {
@@ -297,6 +301,18 @@ func (h *heldResets) codexHeld(id string, count int, source string, now time.Tim
 		})
 	}
 	return accounts.HeldResets(readings, now)
+}
+
+// forgetCredit drops a credit redeemed on account id from the list as last
+// read: it is spent at the provider (§102.1).
+func (h *heldResets) forgetCredit(id, creditID string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if entry := h.codex[id]; entry != nil {
+		entry.credits = slices.DeleteFunc(slices.Clone(entry.credits), func(credit accounts.RateLimitResetCredit) bool {
+			return credit.ID == creditID
+		})
+	}
 }
 
 // warnUnknown logs each unknown kind on row, once an hour per account and
