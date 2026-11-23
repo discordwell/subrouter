@@ -4,7 +4,8 @@
 #
 #   off    the real Claude Code, untouched: your own login
 #   pool   ANTHROPIC_UNIX_SOCKET -> the daemon's Claude socket: every request goes
-#          through the pool, and Claude Code keeps its first-party features
+#          through the pool, and Claude Code keeps its first-party features. It names
+#          the Max plan every pooled account has (CLAUDE_CODE_SUBSCRIPTION_TYPE=max)
 #
 # Route words: one-launch exceptions typed FIRST. The default (the mode file) never changes.
 #   claude local ...       safety mode: your own login, subrouter dropped completely
@@ -51,7 +52,7 @@
 #   claude-route off              roll back NEW launches to your own login (instant)
 #   claude-route codex pool [--force] | codex off   the same switch for NEW Codex launches (ships off)
 #   claude-route advisor on | advisor off   Claude Code's experimental advisor tool in NEW pool launches
-#                                 (ships off; claude local is never changed)
+#                                 (ships off: CLAUDE_CODE_DISABLE_ADVISOR_TOOL=1; claude local is never changed)
 #   claude-route uninstall        remove the shims and the PATH lines (the socket stays: socket-off)
 #   claude-route socket-off [--force] [--restart-supervisor]
 #                                 stop serving the socket (refuses while pool sessions use it)
@@ -718,12 +719,17 @@ keep() { [ -n "${!1+x}" ] || put "$1" "$2"; }   # only when absent: the user's o
 # 2026-11-23 owner: the advisor is an option, off by default.
 # `claude-route advisor on` writes on to $route_home/advisor; a pool launch then gets Claude Code's
 # experimental advisor tool, which a plain login gets from an Anthropic-side flag (PATCHES §97). The
-# variable opens Claude Code's gate; with no model named, a socket session picks none. A Claude Code
-# command ($1 reserved) gets no --settings; a --settings of the caller's own, later, wins.
+# variable opens Claude Code's gate; with no model named, a socket session gets at most a standby
+# advisor that its model cannot call. A Claude Code command ($1 reserved) gets no --settings; a
+# --settings of the caller's own, later, wins.
+# 2026-11-23 owner: pooled sessions present the plain login's subscription type; the advisor stays off unless switched on.
+# A pool token names no plan, so Claude Code ran its web-fetch agent on the main model, not Haiku.
+# Every pooled account is a Max plan, so both pool routes name it (PATCHES §100). A plan also brings
+# that standby advisor, so while the advisor is off the shim disables the tool.
 advisor_settings=""
 add_advisor() { # $1 = the first argument
     local a=""; [ -f "$route_home/advisor" ] && [ -r "$route_home/advisor" ] && read -r a < "$route_home/advisor"
-    [ "${a%$'\r'}" = on ] || return 0
+    if [ "${a%$'\r'}" != on ]; then keep CLAUDE_CODE_DISABLE_ADVISOR_TOOL 1; return 0; fi
     keep CLAUDE_CODE_ENABLE_EXPERIMENTAL_ADVISOR_TOOL 1
     [[ "$reserved" == *" $1 "* ]] || advisor_settings='{"advisorModel":"opus"}'
 }
@@ -786,6 +792,7 @@ case "$route" in
         put ENABLE_CLAUDEAI_MCP_SERVERS 0
         if [ -n "$pin" ]; then put ANTHROPIC_CUSTOM_HEADERS "$(pin_headers)"; else keep ANTHROPIC_CUSTOM_HEADERS "X-Subrouter-Agent: claude"; fi
         keep CLAUDE_CODE_PROMPT_CACHE_TTL 1h
+        keep CLAUDE_CODE_SUBSCRIPTION_TYPE max            # the plan every pooled account has (add_advisor says why)
         add_advisor "${1:-}"
         export CLAUDE_ROUTE_SET="${set_keys# }"
         ;;
@@ -797,6 +804,7 @@ case "$route" in
         keep ENABLE_TOOL_SEARCH true
         keep CLAUDE_CODE_PROMPT_CACHE_TTL 1h
         keep CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY 1
+        keep CLAUDE_CODE_SUBSCRIPTION_TYPE max
         add_advisor "${1:-}"
         export CLAUDE_ROUTE_SET="${set_keys# }"
         ;;
@@ -814,7 +822,7 @@ if [ -n "${CLAUDE_ROUTE_DRYRUN:-}" ]; then
     echo "word=${word:-<none>}"
     echo "pin=${pin:-<none>}${pin_at:+ at=$pin_at}${pin_flags:+ flags=$pin_flags}"
     printf 'args='; [ $# -gt 0 ] && printf '[%s]' "$@"; echo
-    for k in ANTHROPIC_BASE_URL ANTHROPIC_UNIX_SOCKET CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_AUTH_TOKEN ANTHROPIC_API_KEY CLAUDE_CODE_USE_BEDROCK ANTHROPIC_CUSTOM_HEADERS ENABLE_TOOL_SEARCH CLAUDE_CODE_PROMPT_CACHE_TTL CLAUDE_CONFIG_DIR CLAUDE_SECURESTORAGE_CONFIG_DIR CLAUDE_CODE_OAUTH_SCOPES ENABLE_CLAUDEAI_MCP_SERVERS CLAUDE_CODE_ENABLE_EXPERIMENTAL_ADVISOR_TOOL CLAUDE_ROUTE_SET; do
+    for k in ANTHROPIC_BASE_URL ANTHROPIC_UNIX_SOCKET CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_AUTH_TOKEN ANTHROPIC_API_KEY CLAUDE_CODE_USE_BEDROCK ANTHROPIC_CUSTOM_HEADERS ENABLE_TOOL_SEARCH CLAUDE_CODE_PROMPT_CACHE_TTL CLAUDE_CONFIG_DIR CLAUDE_SECURESTORAGE_CONFIG_DIR CLAUDE_CODE_OAUTH_SCOPES ENABLE_CLAUDEAI_MCP_SERVERS CLAUDE_CODE_ENABLE_EXPERIMENTAL_ADVISOR_TOOL CLAUDE_CODE_DISABLE_ADVISOR_TOOL CLAUDE_CODE_SUBSCRIPTION_TYPE CLAUDE_ROUTE_SET; do
         v="${!k-<unset>}"
         case "$k:$v" in *TOKEN:ssh-placeholder|*TOKEN:subrouter|*:"<unset>") ;; *TOKEN:*|*API_KEY:*) v="<set>" ;; esac
         echo "$k=${v//$nl/\\n}"
@@ -1629,10 +1637,12 @@ FAKE
     check "  ...with a login-less credential store" has "$o" "CLAUDE_SECURESTORAGE_CONFIG_DIR=$ROUTE_HOME/securestorage" "CLAUDE_CODE_OAUTH_SCOPES=<unset>" "ENABLE_CLAUDEAI_MCP_SERVERS=0"
     # The dry runs on this route home follow its advisor file: on, a pool launch's arguments
     # start with the advisor's --settings (PATCHES §97). AP is that start, or nothing.
-    local adv AV='<unset>' AP=""; adv=$(advisor_now)
-    [ "$adv" = on ] && { AV=1; AP='[--settings][{"advisorModel":"opus"}]'; }
-    o=$(dry PATH="$P_SHIM" CLAUDE_ROUTE=pool "$SHIM" -p hi); check "advisor $adv: a pool launch follows it" has "$o" "route=pool" "CLAUDE_CODE_ENABLE_EXPERIMENTAL_ADVISOR_TOOL=$AV" "args=$AP[-p][hi]"
-    o=$(dry PATH="$P_SHIM" "$SHIM" local -p hi);             check "  ...and claude local never has it" has "$o" "route=off" "CLAUDE_CODE_ENABLE_EXPERIMENTAL_ADVISOR_TOOL=<unset>" "args=[-p][hi]"
+    # Off, the tool is disabled; both ways, a pool launch names the Max plan (PATCHES §100).
+    local adv AV='<unset>' AD=1 AP=""; adv=$(advisor_now)
+    [ "$adv" = on ] && { AV=1; AD='<unset>'; AP='[--settings][{"advisorModel":"opus"}]'; }
+    o=$(dry PATH="$P_SHIM" CLAUDE_ROUTE=pool "$SHIM" -p hi); check "advisor $adv: a pool launch follows it" has "$o" "route=pool" "CLAUDE_CODE_ENABLE_EXPERIMENTAL_ADVISOR_TOOL=$AV" "CLAUDE_CODE_DISABLE_ADVISOR_TOOL=$AD" "args=$AP[-p][hi]"
+    check "  ...and names the Max plan" has "$o" "CLAUDE_CODE_SUBSCRIPTION_TYPE=max"
+    o=$(dry PATH="$P_SHIM" "$SHIM" local -p hi);             check "  ...and claude local never has it" has "$o" "route=off" "CLAUDE_CODE_ENABLE_EXPERIMENTAL_ADVISOR_TOOL=<unset>" "CLAUDE_CODE_DISABLE_ADVISOR_TOOL=<unset>" "CLAUDE_CODE_SUBSCRIPTION_TYPE=<unset>" "args=[-p][hi]"
     o=$(dry PATH="$P_SHIM" CLAUDE_ROUTE=pool CLAUDE_CODE_OAUTH_SCOPES="user:inference user:mcp_servers" CLAUDE_SECURESTORAGE_CONFIG_DIR="$HOME/.claude" "$SHIM"); check "  ...even when the caller set the scopes or pointed the store at ~/.claude" has "$o" "CLAUDE_SECURESTORAGE_CONFIG_DIR=$ROUTE_HOME/securestorage" "CLAUDE_CODE_OAUTH_SCOPES=<unset>"
     o=$(dry PATH="$P_SHIM" CLAUDE_ROUTE=off CLAUDE_SECURESTORAGE_CONFIG_DIR="$ROUTE_HOME/securestorage" ENABLE_CLAUDEAI_MCP_SERVERS=0 "$SHIM"); check "off drops the pool's credential store" has "$o" "route=off" "CLAUDE_SECURESTORAGE_CONFIG_DIR=<unset>" "ENABLE_CLAUDEAI_MCP_SERVERS=<unset>"
     o=$(dry PATH="$P_SHIM" CLAUDE_ROUTE=pool CLAUDE_ROUTE_SOCKET=/nonexistent/claude.sock "$SHIM"); check "pool, dead socket: TCP" has "$o" "route=pool-tcp" "ANTHROPIC_BASE_URL=$TCP" "ANTHROPIC_UNIX_SOCKET=<unset>"

@@ -174,7 +174,7 @@ claude-route codex pool
 
 A switch changes only new launches. A Claude Code session that is already running keeps its route, so quit Claude Code and start it again. To go back, run `claude-route off` and `claude-route codex off`. For one launch on your own login, type `claude local`.
 
-Pool launches have no advisor tool by default. Your own login has it. To add it to new pool launches, run `claude-route advisor on`. To remove it, run `claude-route advisor off`. "Use claude-route" in [OPERATING.md](OPERATING.md) says what it costs.
+Pool launches have no advisor tool by default. Your own login has it. To add it to new pool launches, run `claude-route advisor on`. To remove it, run `claude-route advisor off`. "Use claude-route" in [OPERATING.md](OPERATING.md) says what it costs. Pool launches also name the Max plan that every pooled account has, as your own Max login does.
 
 ## Check that it works
 

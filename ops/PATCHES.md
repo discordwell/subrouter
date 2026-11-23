@@ -4238,3 +4238,53 @@ Residuals. A wrong guess costs one request for each waiting turn, and each such 
 - Tests: `internal/proxy/auto_reset_read_after_test.go`, `ops/docscheck/read_after_docs_test.go`
 - Docs: `ops/OPERATING.md` (Automatic resets, the claim record), `ops/skills/subrouter/SKILL.md`
 - Related: corrects §93.2's resend rule and §92.1's claim record; keeps §93.2's latch and §96's choice as they are; the marks are §93.2's and §46's.
+
+## 100. Pool launches name the Max plan, and the advisor stays off by disabling it
+
+A socket-mode pool session authenticates with the shim's placeholder `CLAUDE_CODE_OAUTH_TOKEN`. Claude Code 2.1.330 reads the plan of such a token from `CLAUDE_CODE_SUBSCRIPTION_TYPE`, and the shim set none. Socket mode also skips Claude Code's bootstrap, so the list of models the org serves stays empty. With neither, Claude Code's check that the org serves a model fails for every model. Two things follow (code, and measured where marked):
+- The built-in web-fetch agent (`agent:builtin:web-fetch`) runs on the session's own model, where a Max login runs it on Haiku (code). The pool sent 58 such requests between 11-20 and 11-23: 41 on Fable 5.2, 17 on Opus 5.5 and none on Haiku (measured). At Claude Code's list prices they cost about $172, against about $2.50 on Haiku.
+- No standby advisor is sent, where a plain login sends one.
+
+The owner, 2026-11-23: pooled sessions present the plain login's subscription type, and the advisor stays off unless it is switched on (§97: "I'm fine giving the option to turn it on but leaving it off by default if we can.").
+
+Measured on laptop pool sessions (route `pool`, Sonnet, `-p`, one launch each), read from each session's `api-request-shape` and `api-request` rows and its usage. The prompt asked Claude Code to fetch one small public page.
+
+| Launch | Tools sent | Advisor | Betas | Web-fetch agent's model | First request's prompt tokens |
+|---|---|---|---|---|---|
+| The pool route before this section | 12 | none | 20 | `claude-sonnet-5-5` | 35,043 |
+| + `CLAUDE_CODE_SUBSCRIPTION_TYPE=max` + `CLAUDE_CODE_DISABLE_ADVISOR_TOOL=1` | 12 | none | 19 | `claude-haiku-5-5` | 35,045 |
+| + `CLAUDE_CODE_SUBSCRIPTION_TYPE=max` only | 13 | standby, `claude-opus-5-5`, deferred | 20 | `claude-haiku-5-5` | 35,045 |
+| + that and §97's `on` (its variable and `--settings`) | 13 | `claude-opus-5-5`, deferred | 20 | `claude-haiku-5-5` | 36,401 |
+
+- The plan alone sends the standby advisor at no prompt cost, but the model cannot use it. Asked to call its advisor, that session searched its deferred tools for `advisor`, found none and answered without one.
+- With §97's `on` and the plan, the same prompt called the advisor once. In that call, `claude-opus-5-5` read 37,995 input tokens uncached and wrote 380 output tokens. Claude Code put it at $0.16 at list prices.
+- Without the advisor, requests drop the `advisor-tool-2026-03-01` beta, so they send 19 betas, where a plain login and the pool route before this section send 20.
+
+§100.1 Routes `pool` and `pool-tcp`, pinned or not, set `CLAUDE_CODE_SUBSCRIPTION_TYPE=max` unless the caller set it. Every pooled account is a Max plan. While `~/.claude-route/advisor` is not `on`, both routes also set `CLAUDE_CODE_DISABLE_ADVISOR_TOOL=1` unless the caller set it. That keeps the plan's standby advisor out, so a pool launch stays advisor-off by default, as §97 left it. With the advisor `on`, they leave `CLAUDE_CODE_DISABLE_ADVISOR_TOOL` unset and add §97's variable and `--settings` as before, because the standby alone cannot be called. Both variables join `CLAUDE_ROUTE_SET`, so a `claude local`, a `CLAUDE_ROUTE=off` launch or a credential command started inside a pool session drops them. Routes `off`, `credentials` and `inherited` set neither. The dry run prints both. The shim marks the default with the owner's dated wording.
+
+§100.2 `claude-route test` checks that a pool launch disables the tool while the advisor is off and leaves it enabled while it is on, that the launch names the plan either way (the new check "...and names the Max plan"), and that `claude local` gets neither variable.
+
+Launches through this branch's shim, from a scratch route home against the live daemon (Sonnet, `-p`):
+- Advisor off, fetch prompt: 12 tools, no advisor, and the web-fetch agent's two requests on `claude-haiku-5-5`. The first request's prompt was 35,045 tokens.
+- Advisor off, a Bash command that prints the environment: the session's Bash saw `CLAUDE_ROUTE_ACTIVE=pool`, the socket and `CLAUDE_CODE_DISABLE_ADVISOR_TOOL=1`, but not `CLAUDE_CODE_SUBSCRIPTION_TYPE`.
+- Advisor on, advisor prompt: 13 tools, and the advisor was called once on `claude-opus-5-5` (37,995 input tokens, 267 output).
+
+Readings of the design, each with its reason.
+- The plan is `max` for every launch, and the shim does not ask the daemon. Every pooled account is a Max plan, and the measured gates read only the plan. The shim leaves `CLAUDE_CODE_RATE_LIMIT_TIER` unset, because the tier belongs to each account.
+- The tool is disabled while the advisor is off, instead of leaving the standby in each request. The standby costs no prompt tokens, but the owner's default is no advisor.
+
+Side effects, measured on these launches.
+- With a plan set, Claude Code fetches its Grove settings and Grove notice config at start, and gets a 401 for each. It skips the remote-settings fetch, which also gets a 401 without a plan. None of these calls reached the daemon: in that window its log shows only `/api/hello`, `/api/claude_code/policy_limits` and `/v1/messages`. So each launch now sends Anthropic two refused calls, where it sent one before. They carry the placeholder token (inferred from the 401s).
+
+Residuals.
+- A `claude` started from a pool session's own Bash tool takes route `inherited` without the plan. Claude Code withholds `CLAUDE_CODE_SUBSCRIPTION_TYPE` from the processes it starts (measured above; code: the child environment's withheld list). Such a session runs as pool sessions did before this section, with the advisor still disabled. Subagents run inside the session and keep the plan.
+- On `pool-tcp`, Claude Code sends no OAuth token, and it reads the plan only for an OAuth token (code), so the plan does nothing there. The route sets it for parity with `pool`.
+- Interactive sessions, Fable and Opus main threads, and the bootstrap's missing `client_data` are not measured here. The plan does not bring the bootstrap back: socket mode still skips it.
+- Running sessions keep what they started with.
+
+Not changed: `claude local`, launches on the `off` route, and the daemon.
+
+- Code: `ops/bin/claude-route` (the shim's `pool` and `pool-tcp` routes and `add_advisor`, the dry run, `cmd_test`, the usage text)
+- Tests: `ops/deploy/tests/deploy-scripts-test.sh` (`route-pool-names-the-plan-and-disables-the-advisor-when-off`, `route-pool-names-the-plan-without-disable-when-the-advisor-is-on`, `route-a-launch-inside-a-pool-session-drops-the-plan`), `ops/deploy/tests/deploy_scripts_test.go`. With `origin/main`'s `claude-route`, all three fail and §97's four still pass. Each of five one-change mutants, run in a scratch copy, fails the cases named: the plan also set on route `off` (all three); the plan exported, not kept, so it is missing from `CLAUDE_ROUTE_SET` and overrides the caller's own value (off, inside a pool session); the tool disabled with the advisor on too (on); the tool not disabled while off (all three); no plan on `pool-tcp` (off, on). `route-test-with-the-advisor-on-passes-what-it-passes-off` also fails for the first, third and fourth, through test's new checks.
+- Docs: `ops/OPERATING.md` (Use claude-route), `ops/GETTING-STARTED.md`
+- Related: changes §97's off state from setting nothing to disabling the tool; §97's `on` is unchanged.
