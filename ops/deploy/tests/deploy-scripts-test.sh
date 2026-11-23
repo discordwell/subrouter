@@ -4856,13 +4856,13 @@ a=$(awk -v s="$2" '$1 == s { a = $2 } END { print a }' "$HOME/served" 2>/dev/nul
 SH
   chmod 755 "$C/srq"
 }
-# Paradev's wrappers in ~/.paradev/bin: each runs the first other one on PATH
-# (the shim), Codex's with Paradev's hooks prefix, and logs the launch.
+# Paradev's wrappers in ~/${1:-.paradev}/bin: each runs the first other one on
+# PATH (the shim), Codex's with Paradev's hooks prefix, and logs the launch.
 route_paradev() {
-  local tool
-  mkdir -p "$H/.paradev/bin"
+  local tool d="$H/${1:-.paradev}/bin"
+  mkdir -p "$d"
   for tool in claude codex; do
-    cat > "$H/.paradev/bin/$tool" <<'SH'
+    cat > "$d/$tool" <<'SH'
 #!/bin/bash
 tool="${0##*/}"; self="$(cd "$(dirname "$0")" && pwd -P)"
 echo "paradev wrapper $tool $*" >> "$FAKE_LOG"
@@ -4874,7 +4874,7 @@ for d in "${dirs[@]}"; do
 done
 exit 127
 SH
-    chmod 755 "$H/.paradev/bin/$tool"
+    chmod 755 "$d/$tool"
   done
   stub paradev 'echo "[{\"presetId\": \"claude\", \"args\": [\"--dangerously-skip-permissions\"]}, {\"presetId\": \"codex\", \"promptArgs\": [\"--\"]}]"'
 }
@@ -4952,6 +4952,17 @@ if begin route-check-and-test-with-paradev-go-through-its-wrapper; then
   expect_line "  PASS  codex pinned through Paradev's wrapper answers"
   expect_log "^paradev wrapper codex cx-lap exec --skip-git-repo-check Reply with exactly one word, in lowercase: foxtrot"
   expect_test_counts
+  finish
+fi
+
+if begin route-check-finds-paradev-build-and-superset-wrappers; then
+  # A Paradev build's own home, and Superset's (Paradev's old name).
+  route_launch_setup
+  for d in .paradev-canary .superset .superset-canary; do
+    rm -rf "$H"/.paradev* "$H"/.superset*; route_paradev "$d"
+    run_route_launch -- check
+    expect_rc 0; expect_out "launch: Paradev's wrapper $H/$d/bin/claude -> shim -> claude, as a new Paradev session launches it"
+  done
   finish
 fi
 

@@ -433,6 +433,7 @@ var requiredCases = []string{
 	"route-check-without-paradev-launches-through-the-shim",
 	"route-test-without-paradev-skips-only-the-paradev-cases",
 	"route-check-and-test-with-paradev-go-through-its-wrapper",
+	"route-check-finds-paradev-build-and-superset-wrappers",
 	"route-failed-check-without-paradev-blocks-the-gate",
 	// sr-triage: rc-file exports by name only, probes bounded without
 	// timeout(1), the install found off PATH (§48).
