@@ -4040,7 +4040,7 @@ func claudeUsageWindows(usage *agentclaude.UsageResponse) []accounts.UsageWindow
 	)
 	add("5h", fiveHourSeconds, usage.FiveHour)
 	add("7d", sevenDaySeconds, usage.SevenDay)
-	add(agentclaude.FableWindowName, sevenDaySeconds, usage.SevenDayOAuthApps)
+	add(agentclaude.FableWindowName, sevenDaySeconds, usage.FableLimit())
 	// Opus and Sonnet have no limit of their own -- they spend the general
 	// 5h/7d budget -- and the usage endpoint reports their buckets as null. A
 	// bucket is published only when Anthropic reports one; a null bucket gets
@@ -7213,6 +7213,7 @@ func fetchClaudeUsageLive(ctx context.Context, client *http.Client, account acco
 		return nil, nil, err
 	}
 	windows := claudeUsageWindows(usage)
+	fableMeterDisagreement.check(account.ID, usage)
 	var reset *agentclaude.ResetStatus
 	if err == nil {
 		// A malformed block is not read, never "none": reset stays nil.

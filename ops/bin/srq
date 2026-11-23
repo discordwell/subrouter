@@ -80,8 +80,9 @@ SHORT_WINDOWS = {
 # Presence of one of these windows is the real limit-reached signal on codex
 # ("spend/reached" on a usage-based seat); neither exists on claude.
 REACHED_WINDOWS = ("reached", "spend/reached")
-# Claude's Fable meter (seven_day_oauth_apps, the anthropic-ratelimit-unified-
-# 7d_oi header). NOT a per-feature copy of a base window, although it carries
+# Claude's Fable meter (the usage answer's limits[] Fable row, else
+# seven_day_oauth_apps, PATCHES §64; the anthropic-ratelimit-unified-7d_oi
+# header). NOT a per-feature copy of a base window, although it carries
 # Feature "claude-fable" -- which is why account_windows() never sees it. It is
 # the one independent meter, it reads over 100%, and a pool whose 5h/7d look
 # fine can have every account refusing on it. Same match as sr's own

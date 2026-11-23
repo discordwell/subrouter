@@ -3430,6 +3430,52 @@ func TestListAccountsReadsProfilesWithCredentials(t *testing.T) {
 	}
 }
 
+// A limits[] row that does not decode, or a limits value that is not a list,
+// costs only itself: the usage read that routing depends on still decodes,
+// and the Fable meter comes from what did.
+func TestUsageReadSurvivesDriftedLimitsRows(t *testing.T) {
+	for _, tc := range []struct {
+		name, limits string
+		want         float64
+	}{
+		{"a drifted row next to the Fable row", `[{"kind":"weekly_scoped","percent":"lots","scope":{"model":{"display_name":"Fable"}}},` +
+			`{"kind":"weekly_scoped","percent":30,"resets_at":null,"scope":{"model":{"display_name":"Fable"}}}]`, 30},
+		{"limits not a list", `{"kind":"weekly_scoped"}`, 7},
+		{"limits null", `null`, 7},
+	} {
+		var usage UsageResponse
+		body := `{"seven_day":{"utilization":20,"resets_at":"2030-01-02T00:00:00Z"},"seven_day_oauth_apps":{"utilization":7,"resets_at":""},"limits":` + tc.limits + `}`
+		if err := json.Unmarshal([]byte(body), &usage); err != nil {
+			t.Fatalf("%s: the usage read failed: %v", tc.name, err)
+		}
+		if usage.SevenDay == nil {
+			t.Fatalf("%s: lost the seven_day window", tc.name)
+		}
+		if fable := usage.FableLimit(); fable == nil || fable.Utilization == nil || *fable.Utilization != tc.want {
+			t.Fatalf("%s: Fable meter = %+v, want %v", tc.name, fable, tc.want)
+		}
+	}
+}
+
+// Of several Fable rows, the most used one is the meter, since every Fable
+// model spends the one pool; a row with no percent is not a reading.
+func TestFableLimitIsTheMostUsedFableRow(t *testing.T) {
+	row := func(name, percent string) string {
+		return `{"kind":"weekly_scoped","group":"weekly","percent":` + percent +
+			`,"resets_at":"2030-01-02T00:00:00.000Z","scope":{"model":{"display_name":"` + name + `"}}}`
+	}
+	body := `{"seven_day_oauth_apps":{"utilization":7,"resets_at":""},"limits":[` +
+		row("Fable 5.1", "30") + "," + row("Fable 5.2", "80") + "," + row("Fable", "null") + "," + row("Fable 5", "55") + `]}`
+	var usage UsageResponse
+	if err := json.Unmarshal([]byte(body), &usage); err != nil {
+		t.Fatal(err)
+	}
+	fable := usage.FableLimit()
+	if fable == nil || fable.Utilization == nil || *fable.Utilization != 80 || fable.ResetsAt != "2030-01-02T00:00:00.000Z" {
+		t.Fatalf("Fable meter = %+v, want the Fable 5.2 row at 80%% with its resets_at", fable)
+	}
+}
+
 // Anthropic rejects subscription-OAuth Messages calls that do not look like
 // Claude Code with a headerless 429 regardless of quota (verified live
 // 2026-07-04 on a fresh Max 20x account). The probe must carry the Claude Code

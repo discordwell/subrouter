@@ -4573,6 +4573,79 @@ func TestClaudeUsageWindowsTagModelWeeklyBuckets(t *testing.T) {
 	}
 }
 
+// The CLI's own usage read builds the Fable window as the daemon does: from
+// the limits[] Fable row ("Fable 5.2" counts), ahead of seven_day_oauth_apps.
+func TestLocalClaudeUsageReadTakesTheFableWindowFromTheLimitsRow(t *testing.T) {
+	rowResets := time.Now().Add(2 * 24 * time.Hour).UTC().Truncate(time.Second)
+	client := &http.Client{Transport: srRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Path != "/api/oauth/usage" {
+			t.Fatalf("unexpected request to %s: the limits[] row is the Fable meter, no probe", req.URL.Path)
+		}
+		body := `{"seven_day":{"utilization":40,"resets_at":"2030-01-02T00:00:00Z"},` +
+			`"seven_day_oauth_apps":{"utilization":0,"resets_at":"2030-01-05T00:00:00Z"},"limits":[` +
+			`{"kind":"weekly_scoped","group":"weekly","percent":88,"resets_at":"` + rowResets.Format(time.RFC3339) + `","severity":"warning","is_active":false,"scope":{"model":{"display_name":"Fable 5.2"}}}]}`
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(body))}, nil
+	})}
+	windows, _, err := fetchClaudeUsageWindowsAndReset(context.Background(), client, "access-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fable *accounts.UsageWindow
+	for i := range windows {
+		if windows[i].Name == agentclaude.FableWindowName {
+			fable = &windows[i]
+		}
+	}
+	if fable == nil || fable.UsedPercent != 88 || fable.Feature != agentclaude.FableFeature {
+		t.Fatalf("Fable window = %+v, want 88%% used from the Fable 5.2 row, not 0 from seven_day_oauth_apps", fable)
+	}
+	want := int64(2 * 24 * 60 * 60)
+	if fable.ResetAfterSeconds > want || fable.ResetAfterSeconds < want-60 {
+		t.Fatalf("Fable ResetAfterSeconds = %d, want ~%d from the row's resets_at", fable.ResetAfterSeconds, want)
+	}
+}
+
+// sr's Fable window is a weekly_scoped row named Fable in any case; a
+// weekly_all or session row scoped to Fable is not it, so the window falls
+// back to seven_day_oauth_apps.
+func TestLocalClaudeUsageReadTakesAWeeklyScopedRowNamedFableInAnyCase(t *testing.T) {
+	row := func(kind, group, name string, percent int) string {
+		return `{"kind":"` + kind + `","group":"` + group + `","percent":` + strconv.Itoa(percent) +
+			`,"resets_at":"2030-01-02T00:00:00.000Z","severity":"normal","is_active":false,"scope":{"model":{"display_name":"` + name + `"}}}`
+	}
+	for _, tc := range []struct {
+		name string
+		rows []string
+		want float64
+	}{
+		{"weekly_all and session rows named Fable", []string{row("weekly_all", "weekly", "Fable", 99), row("session", "session", "Fable", 97)}, 10},
+		{"lower case", []string{row("weekly_scoped", "weekly", "fable", 30)}, 30},
+		{"upper case with a version", []string{row("weekly_scoped", "weekly", "FABLE 5.2", 40)}, 40},
+	} {
+		body := `{"seven_day":{"utilization":40,"resets_at":"2030-01-02T00:00:00Z"},` +
+			`"seven_day_oauth_apps":{"utilization":10,"resets_at":"2030-01-05T00:00:00Z"},"limits":[` + strings.Join(tc.rows, ",") + `]}`
+		client := &http.Client{Transport: srRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+			if req.URL.Path != "/api/oauth/usage" {
+				t.Fatalf("%s: unexpected request to %s", tc.name, req.URL.Path)
+			}
+			return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(body))}, nil
+		})}
+		windows, _, err := fetchClaudeUsageWindowsAndReset(context.Background(), client, "access-token")
+		if err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		var fable []accounts.UsageWindow
+		for _, window := range windows {
+			if window.Name == agentclaude.FableWindowName {
+				fable = append(fable, window)
+			}
+		}
+		if len(fable) != 1 || fable[0].UsedPercent != tc.want {
+			t.Fatalf("%s: Fable windows = %+v, want one at %v%% used", tc.name, fable, tc.want)
+		}
+	}
+}
+
 func TestClaudeStatusRendersExtraUsageBalanceAndDisabledState(t *testing.T) {
 	t.Setenv("COLUMNS", "220")
 	limit, used := 2000.0, 750.0
