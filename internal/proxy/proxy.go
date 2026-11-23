@@ -4754,7 +4754,8 @@ func (s Server) handleHealth(w http.ResponseWriter, request *http.Request) {
 		payload[ShadowHealthProofField] = proof
 	}
 	payload["codex_provider_selection"] = true
-	// Automatic resets (PATCHES §93.3): the mode and the owner's condition.
+	// Automatic resets (PATCHES §93.3, §94.3): the mode, the owner's condition
+	// and whether §94.2's rule decides.
 	payload["auto_reset"] = autoResetHealth()
 	if s.ClaudeSocketStatus != nil {
 		payload["claude_socket"] = s.ClaudeSocketStatus()
