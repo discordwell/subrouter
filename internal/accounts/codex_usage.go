@@ -201,6 +201,13 @@ type ComplimentaryResetInfo struct {
 	// IneligibleReason is Anthropic's ineligible_reason, verbatim, or
 	// "no_profile_scope" for a token that cannot read the block at all.
 	IneligibleReason string `json:"ineligible_reason,omitempty"`
+	// Held is every reset the block lists, by kind and expiry (HeldResets,
+	// PATCHES §91.1), read with it and published beside it as the row's
+	// resets, never inside this block. Empty for a known block that holds
+	// none. Nil for a block not read, for one restored from JSON (the
+	// persisted usage snapshot), and on a Codex reading, whose list the
+	// daemon builds from the credit list.
+	Held []HeldReset `json:"-"`
 }
 
 type codexUsageResponse struct {
