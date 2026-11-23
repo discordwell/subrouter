@@ -4891,6 +4891,71 @@ if begin route-advisor-leaves-claude-local-alone; then
   finish
 fi
 
+# 2026-11-23 owner: pooled sessions present the plain login's subscription type; the advisor stays off unless switched on.
+# Both pool routes name the Max plan every pooled account has. That plan also
+# brings Claude Code's standby advisor, so while the advisor is off they disable
+# the tool. Every other route sets neither (PATCHES §100).
+PLAN_VAR=CLAUDE_CODE_SUBSCRIPTION_TYPE
+NO_ADVISOR_VAR=CLAUDE_CODE_DISABLE_ADVISOR_TOOL
+if begin route-pool-names-the-plan-and-disables-the-advisor-when-off; then
+  route_shim_setup; route_shim_pool
+  rm -f "$H/.claude/settings.json"   # it names a route, and a route word refuses then
+  run_shim CLAUDE_ROUTE_DRYRUN=1 -- -p hi
+  expect_rc 0; expect_line "route=pool"; expect_line "$PLAN_VAR=max"; expect_line "$NO_ADVISOR_VAR=1"; expect_line "$ADVISOR_VAR=<unset>"; expect_line "args=[-p][hi]"
+  run_shim CLAUDE_ROUTE_DRYRUN=1 CLAUDE_ROUTE_SOCKET=/nonexistent/claude.sock -- -p hi
+  expect_rc 0; expect_line "route=pool-tcp"; expect_line "$PLAN_VAR=max"; expect_line "$NO_ADVISOR_VAR=1"; expect_line "$ADVISOR_VAR=<unset>"; expect_line "args=[-p][hi]"
+  # The caller's own values win.
+  run_shim CLAUDE_ROUTE_DRYRUN=1 "$PLAN_VAR=pro" "$NO_ADVISOR_VAR=0" -- -p hi
+  expect_rc 0; expect_line "route=pool"; expect_line "$PLAN_VAR=pro"; expect_line "$NO_ADVISOR_VAR=0"
+  # local, off and a route of the caller's own get neither.
+  run_shim CLAUDE_ROUTE_DRYRUN=1 -- local -p hi
+  expect_rc 0; expect_line "route=off"; expect_line "$PLAN_VAR=<unset>"; expect_line "$NO_ADVISOR_VAR=<unset>"
+  run_shim CLAUDE_ROUTE_DRYRUN=1 CLAUDE_ROUTE=off -- -p hi
+  expect_rc 0; expect_line "route=off"; expect_line "$PLAN_VAR=<unset>"; expect_line "$NO_ADVISOR_VAR=<unset>"
+  run_shim CLAUDE_ROUTE_DRYRUN=1 ANTHROPIC_BASE_URL=http://example.invalid -- -p hi
+  expect_rc 0; expect_line "route=inherited"; expect_line "$PLAN_VAR=<unset>"; expect_line "$NO_ADVISOR_VAR=<unset>"
+  finish
+fi
+
+if begin route-pool-names-the-plan-without-disable-when-the-advisor-is-on; then
+  route_shim_setup; route_shim_pool
+  rm -f "$H/.claude/settings.json"
+  run_route_stub_deploy advisor on
+  run_shim CLAUDE_ROUTE_DRYRUN=1 -- -p hi
+  expect_rc 0; expect_line "route=pool"; expect_line "$PLAN_VAR=max"; expect_line "$NO_ADVISOR_VAR=<unset>"; expect_line "$ADVISOR_VAR=1"; expect_line "$ADVISOR_ARGS"
+  run_shim CLAUDE_ROUTE_DRYRUN=1 CLAUDE_ROUTE_SOCKET=/nonexistent/claude.sock -- -p hi
+  expect_rc 0; expect_line "route=pool-tcp"; expect_line "$PLAN_VAR=max"; expect_line "$NO_ADVISOR_VAR=<unset>"; expect_line "$ADVISOR_VAR=1"; expect_line "$ADVISOR_ARGS"
+  run_shim -- -p hi
+  expect_rc 0; expect_line "CLAUDE_ROUTE_ACTIVE=pool"; expect_line "$PLAN_VAR=max"; expect_no_out "$NO_ADVISOR_VAR="
+  run_shim CLAUDE_ROUTE_DRYRUN=1 -- local -p hi
+  expect_rc 0; expect_line "route=off"; expect_line "$PLAN_VAR=<unset>"; expect_line "$NO_ADVISOR_VAR=<unset>"
+  # With the advisor off again, the tool is disabled again.
+  run_route_stub_deploy advisor off
+  run_shim CLAUDE_ROUTE_DRYRUN=1 -- -p hi
+  expect_rc 0; expect_line "$PLAN_VAR=max"; expect_line "$NO_ADVISOR_VAR=1"
+  finish
+fi
+
+if begin route-a-launch-inside-a-pool-session-drops-the-plan; then
+  # A pool launch's environment as its shim leaves it, handed to the launches a
+  # session might start: local, off and a credential command drop what the shim
+  # set, and a plain claude takes the parent's route as it finds it.
+  route_shim_setup; route_shim_pool
+  rm -f "$H/.claude/settings.json"
+  run_shim -- -p hi
+  expect_rc 0; expect_line "CLAUDE_ROUTE_ACTIVE=pool"; expect_line "$PLAN_VAR=max"; expect_line "$NO_ADVISOR_VAR=1"
+  set_line=$(grep '^CLAUDE_ROUTE_SET=' "$C/out")
+  parent=("$set_line" CLAUDE_ROUTE_ACTIVE=pool)
+  for k in ${set_line#CLAUDE_ROUTE_SET=}; do parent+=("$(grep -m1 "^$k=" "$C/out")"); done
+  dropped() { expect_rc 0; expect_line "CLAUDE_ROUTE_ACTIVE=$1"; expect_no_out "$PLAN_VAR="; expect_no_out "$NO_ADVISOR_VAR="; }
+  run_shim "${parent[@]}" -- local -p hi;              dropped off
+  run_shim "${parent[@]}" CLAUDE_ROUTE=off -- -p hi;   dropped off
+  run_shim "${parent[@]}" -- auth login;               dropped credentials
+  run_shim "${parent[@]}" -- -p hi
+  expect_rc 0; expect_line "CLAUDE_ROUTE_ACTIVE=inherited"; expect_line "$PLAN_VAR=max"; expect_line "$NO_ADVISOR_VAR=1"
+  finish
+fi
+
 # check, check codex and test, on a Mac with no Paradev app unless
 # route_paradev adds its wrappers. Both shims as install writes them, the
 # socket serving, pool mode. The Claude Code and Codex answer the word their

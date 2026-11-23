@@ -434,6 +434,11 @@ var requiredCases = []string{
 	"route-advisor-on-sets-it-for-pool-and-pool-tcp",
 	"route-advisor-off-removes-it",
 	"route-advisor-leaves-claude-local-alone",
+	// Both pool routes name the Max plan; while the advisor is off they
+	// disable the tool; no other route gets either (PATCHES §100).
+	"route-pool-names-the-plan-and-disables-the-advisor-when-off",
+	"route-pool-names-the-plan-without-disable-when-the-advisor-is-on",
+	"route-a-launch-inside-a-pool-session-drops-the-plan",
 	// check, check codex and test without the Paradev app launch as a new
 	// terminal does, skip only the cases about its wrapper, and still gate.
 	"route-check-without-paradev-launches-through-the-shim",
