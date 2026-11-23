@@ -169,7 +169,8 @@ Each `proxy request` line names the `agent`, `session`, `account`, `path`, and `
 | `claude-route status` | The mode, the shims, the socket (`STAND-IN` when a stand-in holds it, PATCHES §84), the identity account, and the last test. |
 | `claude-route pool`, `claude-route off` | New Claude Code launches use the pool over the socket, or your own login. |
 | `claude-route codex pool`, `claude-route codex off` | The same switch for new Codex launches. |
-| `claude-route test` | The wet test. `pool` refuses without a pass today. |
+| `claude-route test` | The wet test. `pool` refuses without a pass today. Without the Paradev app, the checks of its wrapper print `SKIP` and count as neither a pass nor a failure. |
+| `claude-route check`, `claude-route check codex` | One real launch, made as a new session makes it. It goes through Paradev's wrapper when this Mac has one, and through the shim otherwise. `codex pool` refuses without a passing `check codex` today. |
 | `claude-route socket-on`, `claude-route socket-off` | Start or stop the daemon's Claude socket through `deploy-laptop.sh`. A supervised job also needs `--restart-supervisor`. |
 | `claude-route accounts` | The account names that route words accept. |
 | `claude-route install`, `claude-route uninstall` | Add or remove the shims and their PATH lines. |
