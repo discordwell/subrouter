@@ -6,7 +6,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"os/exec"
 	"reflect"
 	"strings"
 	"testing"
@@ -200,13 +199,10 @@ func TestAPeersResetsListChangesNoRanking(t *testing.T) {
 // each kind an account holds with its count and its soonest expiry, in the
 // browser's time: a Codex account's credits, first not read, then read, then
 // from the last good read; a Claude account's week and Fable resets beside
-// the 2x; and a peer that publishes no list, marked ~. Skipped where there is
-// no node.
+// the 2x; and a peer that publishes no list, marked ~. Without node, see
+// nodeForTest.
 func TestTheBoardPageMarksEachResetKindWithItsSoonestExpiry(t *testing.T) {
-	node, err := exec.LookPath("node")
-	if err != nil {
-		t.Skipf("no node to run the board page: %v", err)
-	}
+	node := nodeForTest(t)
 	base := time.Now().UTC().Truncate(time.Second)
 	d := newCreditDaemon(t, map[string]int{creditAccount: 3, otherCreditAccount: 0},
 		map[string][]map[string]any{creditAccount: threeCredits(base)})
