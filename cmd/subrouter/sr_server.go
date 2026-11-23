@@ -1656,6 +1656,10 @@ type remoteServerUsageStatus struct {
 	// Absent from servers older than the patch that publishes it, and absent
 	// means unknown — never treat a missing normalized view as "no headroom".
 	Normalized *proxy.NormalizedUsage `json:"normalized,omitempty"`
+	// Resets is every saved reset the account holds (PATCHES §91.1), decoded
+	// so this type takes every field the daemon publishes; no table reads it
+	// yet.
+	Resets []accounts.HeldReset `json:"resets,omitzero"`
 }
 
 func (r srRunner) fetchServerAccountsResponse(ctx context.Context, server srServerConfig) (*http.Response, error) {
