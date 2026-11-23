@@ -160,16 +160,17 @@ claude-route test
 
 It makes real launches with Haiku, a few tokens each, on the pool and on your own login, and checks each one against the daemon's session table. The last line counts the results, as in `== claude: <n> passed, 0 failed;  codex: <n> passed, 0 failed ==`.
 
-Some checks launch through the Paradev app's wrappers in `~/.paradev/bin`. If you do not use Paradev, those checks fail. Read the other results. If they all pass, add `--force` to the commands below.
+Its first lines say how it launches. With the Paradev app, a launch goes through Paradev's wrapper in `~/.paradev/bin`, as a new Paradev session does. Without Paradev, a launch goes through the shim, as a new Terminal window does, and the checks of Paradev's wrapper print `SKIP`. A skipped check counts as neither a pass nor a failure.
 
 Switch new launches to the pool:
 
 ```bash
 claude-route pool
+claude-route check codex
 claude-route codex pool
 ```
 
-`claude-route pool` refuses until `claude-route test` has passed today. `claude-route codex pool` also wants a passing `claude-route check codex`, which needs Paradev.
+`claude-route pool` refuses until `claude-route test` has passed today. `claude-route check codex` makes one real Codex launch through the pool with your own `~/.codex` config. `claude-route codex pool` refuses until it and the Codex checks of `claude-route test` have passed today.
 
 A switch changes only new launches. A Claude Code session that is already running keeps its route, so quit Claude Code and start it again. To go back, run `claude-route off` and `claude-route codex off`. For one launch on your own login, type `claude local`.
 
