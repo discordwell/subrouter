@@ -2099,6 +2099,10 @@ type AccountUsageStatus struct {
 	// expiry (withHeldResets, PATCHES §91.1). [] is a reading that holds
 	// none; absent is no reading, as complimentary_reset's absence is.
 	Resets []accounts.HeldReset `json:"resets,omitzero"`
+	// Burn is how fast this daemon's own account spends each meter, from its
+	// usage history (PATCHES §92.2). Outside normalized: a peer shows it and
+	// ranks on nothing in it. Absent with the history off or no series.
+	Burn UsageBurn `json:"burn,omitempty"`
 }
 
 // NormalizedUsage is the provider-independent view of an account's capacity, as
@@ -4542,6 +4546,9 @@ func (s Server) routeTable() []serverRoute {
 		fn(AccountStatePath, s.requireAdmin(s.handleAccountState), false),
 		fn(ClaudeCredentialDeathsPath, s.requireAdmin(s.handleClaudeCredentialDeaths), false),
 		fn("/_subrouter/device-usage", s.requireAdmin(s.handleDeviceUsage), false),
+		// The pool's burn (PATCHES §92.2): private and admin-gated, as
+		// pool.json is, since it relays every peer's accounts.
+		fn(UsageBurnPath, s.requireAdmin(s.handleUsageBurn), false),
 		// Unlisted /_subrouter/* must 404 rather than fall through to the
 		// catch-all proxy handler below.
 		fn("/_subrouter/", http.NotFound, false),
@@ -5102,7 +5109,8 @@ func (s Server) handleUsageStatus(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "usage sweep in progress", http.StatusServiceUnavailable)
 			return
 		}
-		writeJSON(w, s.withHeldResets(s.withNewSessionVerdicts(s.withNormalizedUsage(s.withCodexCapacityMarks(s.withClaudeCostTiers(s.AccountRef.withResetAdvice(withWeeklyCooked(s.withSessionActivity(s.withSessionCounts(s.withRequestTimeExhaustionWindows(s.withClaudeWebBalances(statuses))))))))))))
+		statuses = s.withHeldResets(s.withNewSessionVerdicts(s.withNormalizedUsage(s.withCodexCapacityMarks(s.withClaudeCostTiers(s.AccountRef.withResetAdvice(withWeeklyCooked(s.withSessionActivity(s.withSessionCounts(s.withRequestTimeExhaustionWindows(s.withClaudeWebBalances(statuses)))))))))))
+		writeJSON(w, s.AccountRef.withUsageBurn(statuses))
 		return
 	}
 	accounts := s.accountListContext(r.Context())
