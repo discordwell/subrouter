@@ -314,6 +314,14 @@ type poolRow struct {
 	// §91.2). Absent with no reading. Shown, never ranked on.
 	Resets        []poolReset `json:"resets,omitzero"`
 	ResetsPartial bool        `json:"resets_partial,omitempty"`
+
+	// ResetChoice is the account's holder's choice to run it to its limit for
+	// its next saved reset, as the holder publishes it in real mode
+	// (normalized.reset_choice), and WouldChoose the same in shadow mode,
+	// which nothing ranks on (PATCHES §95). This daemon's own rows and a
+	// peer's alike; a choice this build cannot read is left out.
+	ResetChoice *selectacct.ResetChoice `json:"reset_choice,omitempty"`
+	WouldChoose *selectacct.ResetChoice `json:"would_choose,omitempty"`
 }
 
 // poolSpill is the cross-pool verdict for one provider, computed from the REAL
@@ -641,7 +649,7 @@ func (s Server) poolBoard(ctx context.Context, boardModel, machineID string) poo
 	if s.AccountRef != nil {
 		localStatuses = s.AccountRef.UsageStatuses(ctx)
 		s.updateSchedulerFromUsageStatusesContext(ctx, localStatuses)
-		localStatuses = s.withHeldResets(s.withNormalizedUsage(s.withRequestTimeExhaustionWindows(localStatuses)))
+		localStatuses = s.withResetChoices(s.withHeldResets(s.withNormalizedUsage(s.withRequestTimeExhaustionWindows(localStatuses))))
 	}
 	localAccounts := s.accountListContext(ctx)
 	// TWO schedulers, on purpose, and the split is the point.
@@ -856,6 +864,13 @@ func applyPoolReadings(row *poolRow, status AccountUsageStatus, scheduler select
 		row.FableResets = reset.RemainingByKind[string(agentclaude.ResetKindFable)]
 	}
 	row.Resets, row.ResetsPartial = poolResetsOf(status)
+	row.ResetChoice, row.WouldChoose = nil, nil
+	if status.Normalized != nil && status.Normalized.ResetChoice != nil && status.Normalized.ResetChoice.Known() {
+		row.ResetChoice = status.Normalized.ResetChoice
+	}
+	if status.WouldChoose != nil && status.WouldChoose.Known() {
+		row.WouldChoose = status.WouldChoose
+	}
 
 	score, known := scheduler.LookupScore(status.Provider, status.ID)
 	row.Measured = known && measurable

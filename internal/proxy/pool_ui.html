@@ -115,6 +115,9 @@ tr.row td:last-child{border-radius:0 8px 8px 0}
 /* each kind of saved reset with its soonest expiry (PATCHES §91.2) */
 .wreset,.creset,.ureset,.rpart{font-family:var(--mono);font-size:9.5px;color:var(--dim);white-space:nowrap}
 .ureset{color:var(--burn)}
+/* an account its holder chose to run to its limit for its next saved reset (PATCHES §95) */
+.chosen,.wouldchoose{font-family:var(--mono);font-size:9.5px;white-space:nowrap}
+.chosen{color:var(--drain)} .wouldchoose{color:var(--dim)}
 
 /* pool badge */
 .pool{font-family:var(--mono);font-size:9.5px;letter-spacing:.04em;padding:1px 5px;border-radius:5px;border:1px solid var(--edge);color:var(--dim)}
@@ -239,6 +242,8 @@ input.filter:focus{border-color:rgba(59,233,199,.5)}
   <span><b class="creset">R3 12/14</b> holds 3 Codex reset credits, the soonest ending 12/14; <b>R3 ?</b> its daemon has not read their dates yet; <b>12/14*</b> the date is from the last good read of the credit list</span>
   <span><b class="ureset">U1</b> a saved reset of a kind its daemon does not know: shown, never claimed automatically</span>
   <span><b class="rpart">~</b> its daemon publishes no full list of resets (before PATCHES §91), so this is what its complimentary_reset says</span>
+  <span><b class="chosen">chosen week #1</b> its daemon chose it to run to its limit on its week (or Fable meter) so that its next saved reset is claimed there: new sessions go there first, #1 first; the title says why</span>
+  <span><b class="wouldchoose">would choose week #1</b> what real mode would choose; its daemon is in shadow mode, so nothing ranks on it</span>
   <span><b class="st burn">◐</b> burn &mdash; refused for new sessions, but a pin still holds</span>
   <span><b class="st week">○</b> exhausted</span>
   <span><b class="st unknown">?</b> unmeasured &mdash; not measured, which is not the same as healthy</span>
@@ -360,7 +365,7 @@ function claudeCells(r){
     + '<td>'+meter(r.weekly_left, r.state, null)+'</td>'
     + '<td class="num">'+dur(live(r.weekly_roll_s))+'</td>'
     + '<td class="num">'+(r.pace!==undefined?(r.pace*1e7).toFixed(1):"–")+(r.reset_hold?' <span class="hold">2x</span>':'')
-    + (r.resets ? resetMarks(r) : (r.fable_resets?' <span class="freset">F'+r.fable_resets+'</span>':''))+'</td>';
+    + (r.resets ? resetMarks(r) : (r.fable_resets?' <span class="freset">F'+r.fable_resets+'</span>':''))+choiceMark(r)+'</td>';
 }
 function codexCells(r){
   const f=r.fuse;
@@ -376,7 +381,7 @@ function codexCells(r){
     + '<td class="num">'+(r.weekly_left!==undefined?pct(r.weekly_left):(r.headroom!==undefined?pct(r.headroom):"–"))+'</td>'
     + '<td>'+meter(r.weekly_left!==undefined?r.weekly_left:r.headroom, r.state, f)+'</td>'
     + '<td class="num">'+dur(live(r.weekly_roll_s))+'</td>'
-    + '<td>'+fuseTag+startTag+resetMarks(r)+'</td>'
+    + '<td>'+fuseTag+startTag+resetMarks(r)+choiceMark(r)+'</td>'
     + '<td class="num warn">'+forfeit+'</td>'
     + '<td>'+sparkTag+'</td>';
 }
@@ -405,6 +410,19 @@ function resetMarks(r){
   }
   if(html && r.resets_partial) html += ' <span class="rpart" title="its daemon publishes no full list; this is what its complimentary_reset says">~</span>';
   return html;
+}
+
+/* The account's daemon chose it to run to its limit for its next saved reset
+   (PATCHES §95): reset_choice in real mode, would_choose in shadow mode, with
+   the meter and the place in that daemon's order. */
+const CHOICE_METERS = {week:"week", fable:"Fable", codex_week:"week"};
+function choiceMark(r){
+  const c = r.reset_choice || r.would_choose;
+  if(!c) return "";
+  const real = !!r.reset_choice;
+  const text = (real ? "chosen " : "would choose ")+CHOICE_METERS[c.meter]+" #"+c.order;
+  const title = real ? c.why : "shadow mode, nothing ranks on it: "+c.why;
+  return ' <span class="'+(real ? "chosen" : "wouldchoose")+'" title="'+esc(title)+'">'+esc(text)+'</span>';
 }
 
 function renderBoard(){
