@@ -172,9 +172,11 @@ const (
 	AutoResetRefusedByCondition AutoResetVerdict = "refused_by_condition"
 	AutoResetNoClaim            AutoResetVerdict = "no_claim"
 	// AutoResetClaimed is a real-mode claim the provider says used the reset
-	// (§93.2); AutoResetFailed one that did not come back as used.
-	AutoResetClaimed AutoResetVerdict = "claimed"
-	AutoResetFailed  AutoResetVerdict = "failed"
+	// (§93.2); AutoResetMayHaveLanded one whose answer leaves that unknown,
+	// which only a reading settles; AutoResetFailed any other.
+	AutoResetClaimed       AutoResetVerdict = "claimed"
+	AutoResetMayHaveLanded AutoResetVerdict = "may_have_landed"
+	AutoResetFailed        AutoResetVerdict = "failed"
 )
 
 // AutoResetDecision is one decision about claiming an account's next saved

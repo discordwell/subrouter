@@ -83,7 +83,10 @@ type autoResetClaimResult struct {
 	// back (autoResetBackUsed), so the waiting turns go to the same account.
 	back bool
 	// sent: a claim request may have reached the provider.
-	sent   bool
+	sent bool
+	// unsure: the provider's answer leaves it unknown whether the reset was
+	// used.
+	unsure bool
 	reason string
 }
 
@@ -333,8 +336,11 @@ func (s Server) finishAutoResetClaim(key string, claim *autoResetClaim, d AutoRe
 	delete(memory.running, key)
 	claim.result = result
 	d.At, d.Verdict, d.Reason = now, AutoResetFailed, d.Reason+"; "+result.reason
-	if result.landed {
+	switch {
+	case result.landed:
 		d.Verdict = AutoResetClaimed
+	case result.unsure:
+		d.Verdict = AutoResetMayHaveLanded
 	}
 	memory.last[key] = d
 	memory.mu.Unlock()
@@ -375,7 +381,7 @@ func (s Server) autoResetClaimClaude(account accounts.Account, grant string) (au
 	case response.Result == agentclaude.ResetResultReset:
 		return autoResetClaimResult{landed: true, sent: true, reason: "Anthropic used the reset (result reset)"}, response.WindowsAfter
 	case response.Unconfirmed:
-		return autoResetClaimResult{sent: true, reason: "Anthropic's answer, " + answered + " " + response.Error +
+		return autoResetClaimResult{sent: true, unsure: true, reason: "Anthropic's answer, " + answered + " " + response.Error +
 			", leaves it unknown whether the reset was used: it may have landed"}, nil
 	}
 	return autoResetClaimResult{sent: true, reason: "Anthropic answered " + answered + " " + response.Error}, nil
@@ -422,7 +428,7 @@ func (s Server) autoResetClaimCodex(account accounts.Account, f autoResetFacts) 
 		s.AccountRef.InvalidateUsageStatusCache()
 		return autoResetClaimResult{landed: true, sent: true, reason: "the credit " + credit + " was redeemed"}, result.WindowsAfter
 	case sent:
-		return autoResetClaimResult{sent: true, reason: "the consume did not come back as a redeem (" + result.Error + "); it may have landed"}, nil
+		return autoResetClaimResult{sent: true, unsure: true, reason: "the consume did not come back as a redeem (" + result.Error + "); it may have landed"}, nil
 	}
 	return autoResetClaimResult{reason: "nothing was sent: " + result.Error}, nil
 }

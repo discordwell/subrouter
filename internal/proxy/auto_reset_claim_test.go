@@ -765,7 +765,7 @@ func TestAFailedClaimLeavesTheTurnWithTodaysAnswer(t *testing.T) {
 		reason  string
 	}{
 		{"anthropic refuses the token", func() (int, string) { return http.StatusForbidden, `{}` }, false, AutoResetFailed, "auth_error"},
-		{"a 5xx that may have landed", func() (int, string) { return http.StatusInternalServerError, `{}` }, false, AutoResetFailed, "may have landed"},
+		{"a 5xx that may have landed", func() (int, string) { return http.StatusInternalServerError, `{}` }, false, AutoResetMayHaveLanded, "may have landed"},
 		{"not limited", func() (int, string) { return http.StatusOK, `{"result":"not_limited"}` }, false, AutoResetFailed, "not_limited"},
 		{"the wait passes its bound", nil, true, AutoResetClaimed, "Anthropic used the reset"},
 	} {
@@ -846,7 +846,7 @@ func TestAFailedClaimLeavesTheTurnWithTodaysAnswer(t *testing.T) {
 			!reflect.DeepEqual(served, []string{heldCodex + " 429", spareCodex + " 200"}) {
 			t.Fatalf("the turn got %d %.200q; %d consumes, served %v; want today's move after one consume", status, body, consumes, served)
 		}
-		if decision := f.decision(heldCodex); decision.Verdict != AutoResetFailed || !strings.Contains(decision.Reason, "it may have landed") {
+		if decision := f.decision(heldCodex); decision.Verdict != AutoResetMayHaveLanded || !strings.Contains(decision.Reason, "it may have landed") {
 			t.Fatalf("last decision %+v", decision)
 		}
 	})

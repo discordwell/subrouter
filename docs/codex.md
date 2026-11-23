@@ -157,6 +157,14 @@ credits are finite and do not regenerate. Three bounds apply once it is on:
   retries, plus every concurrent session seeing the same cooked pool) cannot
   drain the reserve.
 
+This fork also claims saved resets by itself at an account's own usage limit
+(`ops/OPERATING.md`, Automatic resets; `ops/PATCHES.md` §93). By default it
+runs in shadow mode, which logs what it would redeem and spends nothing. In
+real mode (`SUBROUTER_AUTO_RESET=1`) the daemon that holds the account redeems
+its credit that expires soonest, by default only while the week has under 1%
+left, and keeps the account's turns waiting on it. Real mode refuses to start beside `SUBROUTER_CODEX_AUTO_RATE_LIMIT_RESET=1` or
+`--reset-credit-autospend=spend`, so only one thing spends credits.
+
 Eligibility is decided against live upstream usage, never against Subrouter's
 cached scores -- those scores are what just reported the pool empty. An account
 that is not actually cooked, or holds no credit, keeps what it has. A workspace

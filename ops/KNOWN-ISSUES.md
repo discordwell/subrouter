@@ -323,7 +323,7 @@ Fixed by [PATCHES.md §50](PATCHES.md). It affects every build before it with a 
 - **A reserved holder may never burn down early.** The reserve gate reads `WeeklyHeadroom` (less the live debit and, with `SUBROUTER_FABLE_RESERVATION=1`, the Fable reservation), so a reserve above the holder's spendable week keeps it out.
 - **The legacy peer path can keep a 2x up to a body's age past expiry.** A peer on the legacy or `ignoresTargets` path anchors published seconds at now with no body-age gate, so an hour-old last-good body keeps the 2x up to an hour past the grant's expiry. Ranking only.
 - **`sr status` does not show early burndown.** Its Pick column can say `not routable` for a holder being drained. Read `srq pool` (`burndown·reset n/m`, `2x`) or the pool board.
-- **Nothing claims the reset.** An early-burndown holder sits at its wall until the owner runs `sr claude reset <name>` or the week rolls.
+- **In shadow mode, the default, nothing claims the reset.** An early-burndown holder stays at its wall until the owner runs `sr claude reset <name>` or the week rolls, and the daemon logs what it would claim (§93). With `SUBROUTER_AUTO_RESET=1` the daemon that holds the account claims the reset there itself, behind the owner's under-1% condition, and the account's turns wait for it on the account (§93.2).
 
 ## Residual gaps §57 leaves open
 
