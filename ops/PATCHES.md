@@ -6,7 +6,7 @@ The fork point is upstream `93bef02` (`v0.1.54`, 2026-08-03). Two upstream merge
 
 Sections are in numeric order, but past §17 the numbers are not chronological. Three sections came from branches outside the main line:
 
-- §63 was never merged, and its code is not in this repo. §64's code reached `main` on 2026-11-22, after its text.
+- §63 was never merged, and its code is not in this repo. §64's code reached `main` only with the change that ported it on 2026-11-22, after its text.
 - §68 was once numbered §62, where it collided with the other §62.
 - §14 is left out on purpose.
 
@@ -1540,10 +1540,10 @@ came from `seven_day_oauth_apps`, which Claude Code never reads. Spent Fable fel
 `claude-opus-5`, the May 2026 Opus.
 
 This text was first written on 2026-11-09, for code on a branch that was never merged. The
-code reached `main` on 2026-11-22, and only then: until that change, a daemon built from
-`main` held every account on any grant (§56's rule), read the Fable meter from
-`seven_day_oauth_apps` alone and fell to `claude-opus-5`. The text below was corrected to the
-ported code where the two differ.
+code reached `main` only with the change that ported it on 2026-11-22: until that change, a
+daemon built from `main` held every account on any grant (§56's rule), read the Fable meter
+from `seven_day_oauth_apps` alone and fell to `claude-opus-5`. The text below was corrected to
+the ported code where the two differ.
 
 Measured on `eight-alpha` (2026-11-09, 19:22Z): a claim took the week from 100 % to 42 %
 used and the Fable meter from 116 % to 0 %. So the Fable limit is half the week, and a reset
@@ -1620,13 +1620,15 @@ key, where before the turn was served as Fable 5.
 The views name the kind. `complimentary_reset.remaining_by_kind` splits `remaining` by kind
 (`{"week":1,"fable":1}`; absent from a pre-§64 daemon). `sr status`'s `1x reset` cell reads
 `2 Fable 3/9` when every reset left is a Fable reset and `1 +1F 12/10` when a week reset has
-Fable resets behind it (the week reset's date); undated, `2 Fable` and `1 +1F`. pool.json
-rows carry `reset_hold_s` (seconds to the week hold's end) and `fable_resets`, and the board
-shows `F2` beside the pace, apart from the `2x`. `srq pool` adds an `Fn` column. The board's
-notes, its legend, `srq`'s legend and the decision reason say "week reset" where they said
-"saved reset". `sr claude reset` still claims Anthropic's `next_grant_id`, of either kind,
-and its line names the kind and what Anthropic cleared, with the Fable meter beside the
-week: `Fable reset claimed — cleared seven_day_overage_included; 7d 100% -> 42% used, 5h 3%,
+Fable resets behind it (the week hold's end, even when a Fable reset ends sooner); undated,
+`2 Fable` and `1 +1F`. The first number counts every reset that is not a Fable reset; no grant
+of kind `other` has been seen. pool.json rows carry `reset_hold_s` (seconds to the week hold's
+end) and `fable_resets`, and the board shows `F2` beside the pace, apart from the `2x`.
+`srq pool` adds an `Fn` column. The board's notes, its legend, `srq`'s legend and the decision
+reason say "week reset" where they said "saved reset". `sr claude reset` still claims
+Anthropic's `next_grant_id`, of either kind, and its line names the kind and what Anthropic
+cleared, with the Fable meter beside the week:
+`Fable reset claimed — cleared seven_day_overage_included; 7d 100% -> 42% used, 5h 3%,
 Fable 116% -> 0%; …` (an older daemon's answer, which names no grant, reads `reset claimed`).
 
 Owner decision, 2026-11-09: "The resets last until March; we will absolutely chill on them,
@@ -1644,7 +1646,7 @@ will show it.
 
 - Knobs: `SUBROUTER_RESET_HOLD_PRIORITY` (still switches the week hold; `0` on a pre-§64 box stops its early drain). The meter, the Opus target and the Bedrock ids have no switch; going back is a rebuild.
 - Code: `internal/agents/claude/reset.go` (`ResetGrant.Kind`, `ResetInfo`, `weekHeldUntil`), `internal/proxy/claude_reset.go` (`resetHeldUntil`, `heldWeekResetSeconds`), `internal/agents/claude/store.go` (`UsageResponse.FableLimit`, `UsageLimits`), `claudeUsageWindows` in `internal/proxy/proxy.go` and `cmd/subrouter/sr.go`, `internal/proxy/claude_fable_meter.go` (`fableMeterWarner`), `internal/proxy/claude_opus_substitute.go` (`claudeSubstituteOpusModel`, `claudeOpusModel`), `internal/proxy/bedrock.go` (`bedrockFableModelIDFor`), `internal/proxy/bedrock_cost.go` (`bedrockPriceFor`), `cmd/subrouter/sr_claude.go` (`bedrockModelID`)
-- Tests (each run in Docker, red with its change taken out and green with it). The reset half: `internal/agents/claude/reset_test.go` (`TestResetGrantKindIsWhatItsClaimGivesBack`, `TestResetInfoCountsWhatIsLeftByKind`, `TestResetInfoHoldsTheWeekOnlyOnGrantsThatClearIt`, `TestParseResetGrantKeepsTypeGivesBackWeeklyAndUnavailableReason`); `internal/proxy/reset_hold_test.go` (`TestAFableOnlyResetRanksAsNoReset`, `TestAWeekResetHoldsTheAccountUntilItsEnd`, `TestTheWeekHoldEndsWithTheSoonerWeekReset`, `TestTheWeekHoldTravelsApartFromFableResets`, and §56's tests with Fable-only, mixed and legacy-key rows); `internal/proxy/claude_reset_test.go` (`TestClaudeResetClaimsTheNextGrantOfEitherKind`); `cmd/subrouter/sr_provider_reset_test.go` (`TestClaudeResetCellNamesAFableResetAsOne`, `TestClaudeResetSaysWhichKindItClaimedAndWhatItGaveBack`); `srq selftest` (the §64 block). The meter: `internal/proxy/claude_fable_meter_test.go` (`TestTheFableMeterIsTheLimitsFableRowWhenTheAnswerHasOne`, `TestClaudeFableMeterDisagreementWarnsOncePerAccountPerHour`, `TestClaudeFableMeterIsQuietWithoutSevenDayOAuthApps`); `internal/proxy/claude_ratelimit_routing_test.go` (`TestClaudeFableWindowComesFromTheLimitsRow`, `TestClaudeFableWindowIsAWeeklyScopedRowNamedFableInAnyCase`); `internal/agents/claude/store_test.go` (`TestUsageReadSurvivesDriftedLimitsRows`, `TestFableLimitIsTheMostUsedFableRow`); `cmd/subrouter/sr_test.go` (`TestLocalClaudeUsageReadTakesTheFableWindowFromTheLimitsRow`, `TestLocalClaudeUsageReadTakesAWeeklyScopedRowNamedFableInAnyCase`). The Opus target: `internal/proxy/claude_opus_substitute_test.go` (`TestClaudeOpusModelIsTheNewestOpusWithTheClientSuffix`, `TestClaudeFableHandlerSubstitutesOpusWhenFablePoolExhausted` and the rest of the file), `internal/proxy/claude_opus_substitute_commit_test.go`, and §71's `internal/proxy/subagent_fable_pin_test.go`. Bedrock: `internal/proxy/claude_fable_test.go` (`TestServeClaudeFableFallbackServesTheRequestedFableModel`, `TestAStreamedBedrockFableFallbackIsServedAndPricedAsTheRequestedModel`, `TestABedrockThrottleOnFable52NamesItAndBumpsFable5sQuota`); `internal/proxy/bedrock_cost_test.go` (`TestBedrockUsageCost`); `cmd/subrouter/sr_claude_aws_test.go` (`TestBedrockModelID`)
+- Tests (each run in Docker, red with its change taken out and green with it). The reset half: `internal/agents/claude/reset_test.go` (`TestResetGrantKindIsWhatItsClaimGivesBack`, `TestResetInfoCountsWhatIsLeftByKind`, `TestResetInfoHoldsTheWeekOnlyOnGrantsThatClearIt`, `TestParseResetGrantKeepsTypeGivesBackWeeklyAndUnavailableReason`); `internal/proxy/reset_hold_test.go` (`TestAFableOnlyResetRanksAsNoReset`, `TestAWeekResetHoldsTheAccountUntilItsEnd`, `TestTheWeekHoldEndsWithTheSoonerWeekReset`, `TestTheWeekHoldTravelsApartFromFableResets`, and §56's tests with Fable-only, mixed, legacy-key and week-key-only rows, the board's box rows among them); `internal/proxy/claude_reset_test.go` (`TestClaudeResetClaimsTheNextGrantOfEitherKind`); `cmd/subrouter/sr_provider_reset_test.go` (`TestClaudeResetCellNamesAFableResetAsOne`, with a Fable reset that ends before the week reset; `TestClaudeResetSaysWhichKindItClaimedAndWhatItGaveBack`); `srq selftest` (the §64 block); `internal/proxy/pool_ui_page_test.mjs`, a Node test that runs the board page's own script on a pool.json answer and checks the `F2` and `2x` marks and the legend (`node --test`, in Docker in the Node image; the Go test image has no Node). The meter: `internal/proxy/claude_fable_meter_test.go` (`TestTheFableMeterIsTheLimitsFableRowWhenTheAnswerHasOne`, `TestClaudeFableMeterDisagreementWarnsOncePerAccountPerHour`, `TestClaudeFableMeterIsQuietWithoutSevenDayOAuthApps`); `internal/proxy/claude_ratelimit_routing_test.go` (`TestClaudeFableWindowComesFromTheLimitsRow`, `TestClaudeFableWindowIsAWeeklyScopedRowNamedFableInAnyCase`); `internal/agents/claude/store_test.go` (`TestUsageReadSurvivesDriftedLimitsRows`, `TestFableLimitIsTheMostUsedFableRow`); `cmd/subrouter/sr_test.go` (`TestLocalClaudeUsageReadTakesTheFableWindowFromTheLimitsRow`, `TestLocalClaudeUsageReadTakesAWeeklyScopedRowNamedFableInAnyCase`). The Opus target: `internal/proxy/claude_opus_substitute_test.go` (`TestClaudeOpusModelIsTheNewestOpusWithTheClientSuffix`, `TestClaudeFableHandlerSubstitutesOpusWhenFablePoolExhausted` and the rest of the file), `internal/proxy/claude_opus_substitute_commit_test.go`, and §71's `internal/proxy/subagent_fable_pin_test.go`. Bedrock: `internal/proxy/claude_fable_test.go` (`TestServeClaudeFableFallbackServesTheRequestedFableModel`, `TestAStreamedBedrockFableFallbackIsServedAndPricedAsTheRequestedModel`, `TestABedrockThrottleOnFable52NamesItAndBumpsFable5sQuota`); `internal/proxy/bedrock_cost_test.go` (`TestBedrockUsageCost`); `cmd/subrouter/sr_claude_aws_test.go` (`TestBedrockModelID`)
 - Related: amends §11 (the Opus target and the Fable meter), §46 (which grant is current), §56 (which grants hold an account), §65 (the meter its `fable_week_spent` reads) and §71 (the Opus its rewrite names).
 
 ## 65. An Opus or Sonnet turn ranks an account whose Fable meter is spent at up to 2x
