@@ -85,6 +85,31 @@ func (r *SchedulerRef) NoteNewSession(scheduler Scheduler, acct account.Account)
 	return true
 }
 
+// ClaimStartMark sets the start mark of a local account at at, for a request
+// the daemon sends itself to start the account's week (PATCHES §90), unless a
+// mark is live at at: a new session placed there first, or an earlier send,
+// already started it, so there is one start per mark, whoever comes first.
+// It reports the mark's expiry and whether it set it. Unlike NoteNewSession it
+// ignores §86's switch, which governs the ranking only: with the priority off
+// the mark still keeps the daemon from sending twice.
+func (r *SchedulerRef) ClaimStartMark(provider account.Provider, accountID string, at time.Time) (time.Time, bool) {
+	if r == nil || accountID == "" {
+		return time.Time{}, false
+	}
+	key := ScoreKey(provider, accountID)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.startSentUntil[key].After(at) {
+		return time.Time{}, false
+	}
+	if r.startSentUntil == nil {
+		r.startSentUntil = make(map[string]time.Time)
+	}
+	until := at.Add(StartSentMarkDuration)
+	r.startSentUntil[key] = until
+	return until, true
+}
+
 // StartSentUntil reports when acct's start mark expires, while it stands: a
 // status surface says the priority is off until then.
 func (r *SchedulerRef) StartSentUntil(provider account.Provider, accountID string) (time.Time, bool) {
