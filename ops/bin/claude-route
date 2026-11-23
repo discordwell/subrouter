@@ -1394,6 +1394,8 @@ build_launch_env() {
     done
     # A test of another route home (CLAUDE_ROUTE_HOME) keeps it: its shims, its mode, its log.
     [ -n "${CLAUDE_ROUTE_HOME:-}" ] && CLEAN+=("CLAUDE_ROUTE_HOME=$ROUTE_HOME")
+    # A moved daemon too: the launches must reach the daemon this script checks them against.
+    for v in CLAUDE_ROUTE_SOCKET CLAUDE_ROUTE_TCP CLAUDE_ROUTE_PLIST; do [ -n "${!v:-}" ] && CLEAN+=("$v=${!v}"); done
     local IFS=:
     for d in $PATH; do case "$d" in "$SHIM_DIR"|"$HOME"/.claude-route/bin|"$HOME"/.paradev/bin|"$HOME"/.paradev-*/bin) ;; *) BASE="${BASE:+$BASE:}$d" ;; esac; done
 }
