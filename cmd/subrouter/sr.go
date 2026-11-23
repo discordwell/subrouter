@@ -345,8 +345,10 @@ type srUsageRow struct {
 	complimentaryReset *accounts.ComplimentaryResetInfo
 	extraUsage         *accounts.ExtraUsageInfo
 	// resets is the daemon's list of every saved reset the account holds
-	// (PATCHES §91), on a row read from a daemon; nil on a row this process
-	// read itself, which reads no credit list.
+	// (PATCHES §91), on a row read from a daemon, and on a Codex row this
+	// process read itself when this machine's daemon counted the same
+	// credits (fillResetsFromLocalDaemon); nil otherwise, as this process
+	// reads no credit list.
 	resets []accounts.HeldReset
 	// costTier and costTierRank are the server's Claude cost tier for this
 	// account (see proxy.ClaudeCostOrder); empty when the server predates it.
@@ -2169,7 +2171,7 @@ func (r srRunner) fetchUsageRows(ctx context.Context) ([]srUsageRow, error) {
 		}()
 	}
 	wg.Wait()
-	fillClaudeResetsFromLocalDaemon(ctx, r, rows[claudeOffset:])
+	fillResetsFromLocalDaemon(ctx, r, rows)
 	// Opt-in only: see claudeWebBalanceEnabled (sr_claude_balance.go).
 	if claudeWebBalanceEnabled() {
 		enrichClaudeRowsWithWebBalances(ctx, rows)
