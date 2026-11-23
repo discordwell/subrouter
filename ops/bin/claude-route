@@ -1627,6 +1627,12 @@ FAKE
     o=$(dry PATH="$P_SHIM" CLAUDE_ROUTE=off "$SHIM");  check "off: untouched"   has "$o" "route=off" "ANTHROPIC_BASE_URL=<unset>" "CLAUDE_CODE_OAUTH_TOKEN=<unset>"
     o=$(dry PATH="$P_SHIM" CLAUDE_ROUTE=pool "$SHIM"); check "pool: socket route" has "$o" "route=pool" "ANTHROPIC_BASE_URL=http://api.anthropic.com" "ANTHROPIC_UNIX_SOCKET=$SOCK" "CLAUDE_CODE_OAUTH_TOKEN=ssh-placeholder" "ANTHROPIC_AUTH_TOKEN=<unset>"
     check "  ...with a login-less credential store" has "$o" "CLAUDE_SECURESTORAGE_CONFIG_DIR=$ROUTE_HOME/securestorage" "CLAUDE_CODE_OAUTH_SCOPES=<unset>" "ENABLE_CLAUDEAI_MCP_SERVERS=0"
+    # The dry runs on this route home follow its advisor file: on, a pool launch's arguments
+    # start with the advisor's --settings (PATCHES §97). AP is that start, or nothing.
+    local adv AV='<unset>' AP=""; adv=$(advisor_now)
+    [ "$adv" = on ] && { AV=1; AP='[--settings][{"advisorModel":"opus"}]'; }
+    o=$(dry PATH="$P_SHIM" CLAUDE_ROUTE=pool "$SHIM" -p hi); check "advisor $adv: a pool launch follows it" has "$o" "route=pool" "CLAUDE_CODE_ENABLE_EXPERIMENTAL_ADVISOR_TOOL=$AV" "args=$AP[-p][hi]"
+    o=$(dry PATH="$P_SHIM" "$SHIM" local -p hi);             check "  ...and claude local never has it" has "$o" "route=off" "CLAUDE_CODE_ENABLE_EXPERIMENTAL_ADVISOR_TOOL=<unset>" "args=[-p][hi]"
     o=$(dry PATH="$P_SHIM" CLAUDE_ROUTE=pool CLAUDE_CODE_OAUTH_SCOPES="user:inference user:mcp_servers" CLAUDE_SECURESTORAGE_CONFIG_DIR="$HOME/.claude" "$SHIM"); check "  ...even when the caller set the scopes or pointed the store at ~/.claude" has "$o" "CLAUDE_SECURESTORAGE_CONFIG_DIR=$ROUTE_HOME/securestorage" "CLAUDE_CODE_OAUTH_SCOPES=<unset>"
     o=$(dry PATH="$P_SHIM" CLAUDE_ROUTE=off CLAUDE_SECURESTORAGE_CONFIG_DIR="$ROUTE_HOME/securestorage" ENABLE_CLAUDEAI_MCP_SERVERS=0 "$SHIM"); check "off drops the pool's credential store" has "$o" "route=off" "CLAUDE_SECURESTORAGE_CONFIG_DIR=<unset>" "ENABLE_CLAUDEAI_MCP_SERVERS=<unset>"
     o=$(dry PATH="$P_SHIM" CLAUDE_ROUTE=pool CLAUDE_ROUTE_SOCKET=/nonexistent/claude.sock "$SHIM"); check "pool, dead socket: TCP" has "$o" "route=pool-tcp" "ANTHROPIC_BASE_URL=$TCP" "ANTHROPIC_UNIX_SOCKET=<unset>"
@@ -1688,15 +1694,15 @@ NAIVE
     check "local drops a CLAUDE_CONFIG_DIR inside ~/.subrouter (a pool profile)" has "$o" "route=off" "CLAUDE_CONFIG_DIR=<unset>" "note=CLAUDE_CONFIG_DIR pointed into ~/.subrouter"
     o=$(dry PATH="$P_SHIM" CLAUDE_CONFIG_DIR="$tmp/own-config" "$SHIM" local)
     check "  ...and keeps one of your own"                             has "$o" "CLAUDE_CONFIG_DIR=$tmp/own-config"
-    o=$(dry PATH="$P_SHIM" CLAUDE_ROUTE=pool "$SHIM" -- local);          check "'-- local' is a prompt"              has "$o" "word=<none>" "args=[--][local]"
-    o=$(dry PATH="$P_SHIM" CLAUDE_ROUTE=pool "$SHIM" "local please");    check "'local please' is a prompt"          has "$o" "word=<none>" "args=[local please]"
-    o=$(dry PATH="$P_SHIM" CLAUDE_ROUTE=pool "$SHIM" -p local);          check "a word after a flag is a prompt"     has "$o" "word=<none>" "args=[-p][local]"
-    o=$(dry PATH="$P_SHIM" CLAUDE_ROUTE=pool "$SHIM" @README.md);       check "an @-mention is a prompt, never a word" has "$o" "route=pool" "word=<none>" "args=[@README.md]"
+    o=$(dry PATH="$P_SHIM" CLAUDE_ROUTE=pool "$SHIM" -- local);          check "'-- local' is a prompt"              has "$o" "word=<none>" "args=$AP[--][local]"
+    o=$(dry PATH="$P_SHIM" CLAUDE_ROUTE=pool "$SHIM" "local please");    check "'local please' is a prompt"          has "$o" "word=<none>" "args=$AP[local please]"
+    o=$(dry PATH="$P_SHIM" CLAUDE_ROUTE=pool "$SHIM" -p local);          check "a word after a flag is a prompt"     has "$o" "word=<none>" "args=$AP[-p][local]"
+    o=$(dry PATH="$P_SHIM" CLAUDE_ROUTE=pool "$SHIM" @README.md);       check "an @-mention is a prompt, never a word" has "$o" "route=pool" "word=<none>" "args=$AP[@README.md]"
     o=$(dry PATH="$P_FRONT" CLAUDE_ROUTE=pool "$F_CLAUDE" --dangerously-skip-permissions --model opus --effort xhigh local)
-    pcheck "Paradev's launch shape is never a word"                      has "$o" "route=pool" "word=<none>" "args=[--dangerously-skip-permissions][--model][opus][--effort][xhigh][local]"
+    pcheck "Paradev's launch shape is never a word"                      has "$o" "route=pool" "word=<none>" "args=$AP[--dangerously-skip-permissions][--model][opus][--effort][xhigh][local]"
     o=$(dry PATH="$P_FRONT" CLAUDE_ROUTE=pool "$F_CLAUDE" local -p hi)
     pcheck "a word through Paradev's wrapper"                            has "$o" "route=off" "word=local" "args=[-p][hi]"
-    o=$(dry PATH="$P_SHIM" CLAUDE_ROUTE_WORDS=0 "$SHIM" local);          check "CLAUDE_ROUTE_WORDS=0 turns words off" has "$o" "word=<none>" "args=[local]"
+    o=$(dry PATH="$P_SHIM" CLAUDE_ROUTE=pool CLAUDE_ROUTE_WORDS=0 "$SHIM" local); check "CLAUDE_ROUTE_WORDS=0 turns words off" has "$o" "word=<none>" "args=$AP[local]"
     o=$(dry PATH="$P_SHIM" "$SHIM" locl); rc=$?;                       check "a typo of 'local' sends nothing (2)" eval 'code_is $rc 2 && has "$o" "refused=near" "did you mean '"'"'local'"'"'"'
     mkdir -p "$tmp/proj/.claude"; printf '{"env":{"ANTHROPIC_BASE_URL":"http://example.invalid"}}\n' > "$tmp/proj/.claude/settings.json"
     o=$(cd "$tmp/proj" && perl -e 'alarm 20; exec @ARGV' env "${clean[@]}" CLAUDE_ROUTE_DRYRUN=1 PATH="$P_SHIM" "$SHIM" local); rc=$?
@@ -1708,7 +1714,7 @@ NAIVE
         o=$(dry PATH="$P_SHIM" "$SHIM" "$UP" -p hi)
         case "$o" in
             *route=refused*) check "'$UP': refused before launch ($(printf '%s\n' "$o" | sed -n 's/^refused=//p'))" has "$o" "refused=" "word=account" ;;
-            *) check "'$UP': pinned to the canonical id over the socket" has "$o" "route=pool" "word=account" "pin=$LC at=local" "args=[-p][hi]" "ANTHROPIC_CUSTOM_HEADERS=X-Subrouter-Agent: claude\\nX-Subrouter-Account-ID: $LC"
+            *) check "'$UP': pinned to the canonical id over the socket" has "$o" "route=pool" "word=account" "pin=$LC at=local" "args=$AP[-p][hi]" "ANTHROPIC_CUSTOM_HEADERS=X-Subrouter-Agent: claude\\nX-Subrouter-Account-ID: $LC"
                o=$(dry PATH="$P_SHIM" "ANTHROPIC_CUSTOM_HEADERS=X-Keep: 1${NL}x-subrouter-account-id: someone-else" "$SHIM" "$LC")
                check "  ...a caller's own header kept, a stray selector removed" has "$o" "ANTHROPIC_CUSTOM_HEADERS=X-Keep: 1\\nX-Subrouter-Agent: claude\\nX-Subrouter-Account-ID: $LC"
                o=$(dry PATH="$P_SHIM" CLAUDE_ROUTE=off "$SHIM" "$LC");          check "  ...the word beats CLAUDE_ROUTE=off" has "$o" "route=pool" "pin=$LC"
@@ -1739,7 +1745,7 @@ NAIVE
     mkdir -p "$tmp/empty-home"
     o=$(dry PATH="$P_SHIM" CLAUDE_ROUTE_HOME="$tmp/empty-home" CLAUDE_ROUTE_TCP=http://127.0.0.1:9 CLAUDE_ROUTE_SOCKET=/nonexistent/claude.sock "$SHIM" hello); rc=$?
     check "no directory at all: a bare word is refused, not guessed (2)"   eval 'code_is $rc 2 && has "$o" "refused=unavailable"'
-    o=$(dry PATH="$P_SHIM" CLAUDE_ROUTE=pool "$SHIM" hello-zz-prompt);  check "an unknown plain word is a prompt"   has "$o" "word=<none>" "args=[hello-zz-prompt]"
+    o=$(dry PATH="$P_SHIM" CLAUDE_ROUTE=pool "$SHIM" hello-zz-prompt);  check "an unknown plain word is a prompt"   has "$o" "word=<none>" "args=$AP[hello-zz-prompt]"
 
     echo "== route words: pin rules against a stand-in daemon (dry run) =="
     cat > "$tmp/fixture.json" <<'JSON'
