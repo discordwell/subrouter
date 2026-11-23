@@ -3395,3 +3395,15 @@ A Codex OAuth login is keyed by `accounts.CodexOAuthIdentifier`: `codex-owner-` 
 - Code: `internal/burnpace` (`model.go`, `render.go`, `snapshot.go`, `week.go`), `ops/bin/sr-plot`, `ops/bin/srq`, `ops/bin/srdash`, `internal/proxy/pool_ui.go`, `internal/proxy/pool_ui.html`, `internal/proxy/proxy.go` (`AccountStatus.Label`)
 - Tests: `TestPlotNamesAnAccountByItsLabel`, the `codex-owner-labels` parity scenario, `TestBoardCarriesEachAccountsLabel`, `sr-plot --selftest`, `srq selftest`
 - Docs: `ops/OPERATING.md`
+
+## 88. claude-route proves the pool on a Mac without the Paradev app
+
+`claude-route check` and `claude-route check codex` launched through `~/.paradev/bin/claude` and `~/.paradev/bin/codex`, and `claude-route test` had cases on that path. On a Mac without Paradev they failed. `claude-route pool` and `claude-route codex pool` refuse until those pass, so such a Mac could switch only with `--force`, which also skips the checks that do apply.
+
+§88.1 `launch_front` looks for an executable wrapper in `~/.paradev/bin`, `~/.paradev-*/bin`, `~/.superset/bin` and `~/.superset-*/bin`. With one, the checks launch the way a new Paradev session does: wrapper, then shim, then the real binary, as before. Without one, they launch the way a new terminal does: shim, then the real binary. `check` prints which path it proved. In `test`, the nine checks about the wrapper itself print `SKIP ... (no Paradev wrapper)` and count as neither a pass nor a failure. Neither gate changed: a check that applies and fails still blocks it.
+
+§88.2 The launches that `test` and `check` make now keep `CLAUDE_ROUTE_SOCKET`, `CLAUDE_ROUTE_TCP` and `CLAUDE_ROUTE_PLIST`, as they already kept `CLAUDE_ROUTE_HOME`. Before, they dropped them. With the daemon moved, the shims they launched went to the default socket and port, not to the daemon `claude-route` was checking.
+
+- Code: `ops/bin/claude-route` (`launch_front`, `build_launch_env`, `cmd_check`, `cmd_check_codex`, `cmd_test`)
+- Tests: `ops/deploy/tests/deploy-scripts-test.sh` (`route-check-without-paradev-launches-through-the-shim`, `route-test-without-paradev-skips-only-the-paradev-cases`, `route-check-and-test-with-paradev-go-through-its-wrapper`, `route-check-finds-paradev-build-and-superset-wrappers`, `route-failed-check-without-paradev-blocks-the-gate`), `ops/deploy/tests/deploy_scripts_test.go`
+- Docs: `ops/GETTING-STARTED.md`, `ops/OPERATING.md`
