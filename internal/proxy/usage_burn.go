@@ -211,6 +211,9 @@ type UsagePoolMeter struct {
 	Trend map[string]UsagePoolTrend `json:"trend"`
 	// Accounts is each account's own figures, this daemon's first.
 	Accounts []UsageAccountBurn `json:"accounts"`
+	// Need is whether the pool needs its saved resets on the meter, from its
+	// pressure (PATCHES §94.1).
+	Need *MeterNeed `json:"need,omitempty"`
 }
 
 // UsagePoolWindow is one window's pool figure.
@@ -306,6 +309,9 @@ func (s Server) handleUsageBurn(w http.ResponseWriter, r *http.Request) {
 type usageBurnPeerRead struct {
 	peer UsageBurnPeer
 	rows []usageBurnAccount
+	// holders is the counted peer's accounts that hold saved resets, with or
+	// without figures (§94.1's expiry window).
+	holders []resetHolder
 }
 
 // readPeerBurn takes the figures out of a peer's usage-status body. A peer
@@ -325,27 +331,33 @@ func readPeerBurn(name string, usage AdminSnapshot) usageBurnPeerRead {
 		return read
 	}
 	var rows []struct {
-		ID       string    `json:"id"`
-		Provider string    `json:"provider"`
-		Label    string    `json:"label"`
-		Burn     UsageBurn `json:"burn"`
+		ID       string                 `json:"id"`
+		Provider string                 `json:"provider"`
+		Label    string                 `json:"label"`
+		Burn     UsageBurn              `json:"burn"`
+		Resets   []accounts.HeldReset   `json:"resets"`
+		Windows  []accounts.UsageWindow `json:"windows"`
 	}
 	if err := json.Unmarshal(usage.Body, &rows); err != nil {
 		read.peer.Reason = "its usage body did not decode"
 		return read
 	}
+	var holders []resetHolder
 	for _, row := range rows {
+		provider := string(accountProviderOrCodex(accounts.Account{Provider: accounts.Provider(row.Provider)}))
+		if holder, ok := resetHolderOf(provider, row.ID, row.Resets, row.Windows); ok {
+			holders = append(holders, holder)
+		}
 		if len(row.Burn) == 0 {
 			continue
 		}
-		provider := string(accountProviderOrCodex(accounts.Account{Provider: accounts.Provider(row.Provider)}))
 		read.rows = append(read.rows, usageBurnAccount{name, provider, row.ID, row.Label, row.Burn})
 	}
 	if len(read.rows) == 0 {
 		read.peer.Reason = "it publishes no burn: a build from before §92, or its usage history is off"
 		return read
 	}
-	read.peer.Counted, read.peer.Accounts = true, len(read.rows)
+	read.peer.Counted, read.peer.Accounts, read.holders = true, len(read.rows), holders
 	return read
 }
 
@@ -383,9 +395,10 @@ func usagePoolMeters(rows []usageBurnAccount) []UsagePoolMeter {
 	out := make([]UsagePoolMeter, 0, len(keys)+len(extra))
 	for _, key := range append(keys, extra...) {
 		held := byMeter[key]
+		windows := poolBurnWindows(held)
 		out = append(out, UsagePoolMeter{
 			Provider: key.provider, Meter: key.meter, Label: usageMeterLabel(key.provider, key.meter),
-			Windows: poolBurnWindows(held), Trend: poolBurnTrends(held), Accounts: held,
+			Windows: windows, Trend: poolBurnTrends(held), Accounts: held, Need: meterNeed(windows, held),
 		})
 	}
 	return out
@@ -394,30 +407,35 @@ func usagePoolMeters(rows []usageBurnAccount) []UsagePoolMeter {
 func poolBurnWindows(held []UsageAccountBurn) map[string]UsagePoolWindow {
 	out := map[string]UsagePoolWindow{}
 	for _, name := range usageBurnPoolWindows {
-		var window UsagePoolWindow
-		var sum, covered, atLimit float64
-		for _, account := range held {
-			figure := account.Windows[name]
-			if figure.Burn == nil {
-				window.NotEnoughHistory++
-				continue
-			}
-			window.Accounts++
-			sum += *figure.Burn
-			covered += figure.Covered
-			atLimit += figure.AtLimit * figure.Covered
-		}
-		if window.Accounts > 0 {
-			burn := roundBurn(sum / float64(window.Accounts))
-			window.Burn = &burn
-			if covered > 0 {
-				share := roundBurn(atLimit / covered)
-				window.AtLimit = &share
-			}
-		}
-		out[name] = window
+		out[name] = poolWindowOf(held, name)
 	}
 	return out
+}
+
+// poolWindowOf is the pool figure of held over one window.
+func poolWindowOf(held []UsageAccountBurn, name string) UsagePoolWindow {
+	var window UsagePoolWindow
+	var sum, covered, atLimit float64
+	for _, account := range held {
+		figure := account.Windows[name]
+		if figure.Burn == nil {
+			window.NotEnoughHistory++
+			continue
+		}
+		window.Accounts++
+		sum += *figure.Burn
+		covered += figure.Covered
+		atLimit += figure.AtLimit * figure.Covered
+	}
+	if window.Accounts > 0 {
+		burn := roundBurn(sum / float64(window.Accounts))
+		window.Burn = &burn
+		if covered > 0 {
+			share := roundBurn(atLimit / covered)
+			window.AtLimit = &share
+		}
+	}
+	return window
 }
 
 func poolBurnTrends(held []UsageAccountBurn) map[string]UsagePoolTrend {

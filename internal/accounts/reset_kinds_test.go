@@ -51,8 +51,8 @@ func publishedHeld(t *testing.T, held []HeldReset) string {
 // An account's resets are one entry per kind and expiry, counted, in the
 // order the provider uses them: Claude's week reset first, then its Fable
 // resets, soonest first; an unknown kind after every known one, flagged and
-// with no place in that order. A claim restarting the clock is assumed, and
-// says so.
+// with no place in that order. Whether a claim restarts the clock says
+// whether it was measured (the week reset, §94.1) or is assumed.
 func TestHeldResetsListsEachKindAndExpiryInTheProvidersOrder(t *testing.T) {
 	now := time.Date(2026, 11, 23, 12, 0, 0, 0, time.UTC)
 	yes := true
@@ -70,7 +70,7 @@ func TestHeldResetsListsEachKindAndExpiryInTheProvidersOrder(t *testing.T) {
 		claude(fable, 0, "2026-12-20T00:00:00Z"),
 	}, now)
 	want := `[` +
-		`{"kind":"week","count":1,"expires_at":"2026-12-10T22:00:00Z","expiry":"read","gives_back":["seven_day","seven_day_overage_included"],"restarts_clock":"assumed_no","needs_limit":true,"order":1},` +
+		`{"kind":"week","count":1,"expires_at":"2026-12-10T22:00:00Z","expiry":"read","gives_back":["seven_day","seven_day_overage_included"],"restarts_clock":"measured_no","needs_limit":true,"order":1},` +
 		`{"kind":"fable","count":1,"expires_at":"2027-01-15T00:00:00Z","expiry":"read","gives_back":["seven_day_overage_included"],"restarts_clock":"assumed_no","needs_limit":true,"order":2},` +
 		`{"kind":"fable","count":2,"expires_at":"2027-03-09T07:59:00Z","expiry":"read","gives_back":["seven_day_overage_included"],"restarts_clock":"assumed_no","needs_limit":true,"order":3},` +
 		`{"kind":"unknown","count":1,"expires_at":"2026-12-01T00:00:00Z","expiry":"read","gives_back":["five_hour"],"restarts_clock":"unknown","needs_limit":true,"manual_only":true}` +

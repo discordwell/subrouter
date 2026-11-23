@@ -36,15 +36,38 @@ const (
 // the credit list is read the count is the kind this key names.
 const CodexResetCountSource = "rate_limit_reset_credits"
 
-// ClockRestart says whether a claim starts a new seven days. Every value the
-// table holds today is assumed: no claim has recorded the roll time before
-// and after, which §92's claim records are to settle.
+// ClockRestart says whether a claim starts a new seven days, and whether that
+// was measured or is assumed.
 type ClockRestart string
 
 const (
 	ClockRestartAssumedYes ClockRestart = "assumed_yes"
 	ClockRestartAssumedNo  ClockRestart = "assumed_no"
+	// ClockRestartMeasuredNo is a kind a claim was seen not to restart: the
+	// account's roll was the same instant before and after (PATCHES §94.1).
+	ClockRestartMeasuredNo ClockRestart = "measured_no"
 	ClockRestartUnknown    ClockRestart = "unknown"
+)
+
+// Restarts reports whether a claim of the kind starts a new seven days, and
+// false for known when nothing says.
+func (c ClockRestart) Restarts() (restarts, known bool) {
+	switch c {
+	case ClockRestartAssumedYes:
+		return true, true
+	case ClockRestartAssumedNo, ClockRestartMeasuredNo:
+		return false, true
+	}
+	return false, false
+}
+
+// ResetMeter is the meter a kind is claimed on: the one its holder spends to
+// reach the limit the claim lifts, named as the usage history names it.
+type ResetMeter string
+
+const (
+	ResetMeterWeek  ResetMeter = "week"
+	ResetMeterFable ResetMeter = "fable"
 )
 
 // ResetReading is one saved reset as a provider's reading states it, before
@@ -70,7 +93,9 @@ type ResetKindSpec struct {
 	Matches func(ResetReading) bool
 	// GivesBack is the meters a claim gives back, in the provider's names,
 	// when the reading names none itself.
-	GivesBack     []string
+	GivesBack []string
+	// Meter is the meter a holder spends to reach this kind's limit.
+	Meter         ResetMeter
 	RestartsClock ClockRestart
 	// NeedsLimit is whether a claim is accepted only at the limit, when the
 	// reading does not say (a Claude grant's use_requires_limit does).
@@ -90,8 +115,12 @@ var defaultResetKinds = []ResetKindSpec{
 		Matches: func(r ResetReading) bool {
 			return len(r.Clears) == 0 || slices.Contains(r.Clears, "seven_day")
 		},
-		GivesBack:     []string{"seven_day"},
-		RestartsClock: ClockRestartAssumedNo,
+		GivesBack: []string{"seven_day"},
+		Meter:     ResetMeterWeek,
+		// Measured 2026-11-23 (PATCHES §94.1): a week reset claimed by hand
+		// at 100% used left the week's roll the same instant, and gave back
+		// the week and the Fable meter.
+		RestartsClock: ClockRestartMeasuredNo,
 		NeedsLimit:    true,
 		// The owner, 2026-11-22: the provider uses the week reset first, then
 		// the Fable resets.
@@ -104,6 +133,7 @@ var defaultResetKinds = []ResetKindSpec{
 			return slices.Contains(r.Clears, "seven_day_overage_included") && !slices.Contains(r.Clears, "seven_day")
 		},
 		GivesBack:     []string{"seven_day_overage_included"},
+		Meter:         ResetMeterFable,
 		RestartsClock: ClockRestartAssumedNo,
 		NeedsLimit:    true,
 		UseOrder:      2,
@@ -117,6 +147,7 @@ var defaultResetKinds = []ResetKindSpec{
 		// What the redeem code and its fakes assume (reset_autospend.go): the
 		// weekly window refills.
 		GivesBack:     []string{"weekly"},
+		Meter:         ResetMeterWeek,
 		RestartsClock: ClockRestartAssumedYes,
 		NeedsLimit:    false,
 		UseOrder:      1,
@@ -146,6 +177,17 @@ func UseResetKinds(table []ResetKindSpec) (restore func()) {
 func ClassifyReset(reading ResetReading) (ResetKindSpec, bool) {
 	for _, spec := range ResetKinds() {
 		if spec.Provider == reading.Provider && spec.Matches(reading) {
+			return spec, true
+		}
+	}
+	return ResetKindSpec{}, false
+}
+
+// ResetKindNamed is the table entry for provider's kind, as a list entry
+// names it; false for unknown and for a kind the table does not hold.
+func ResetKindNamed(provider Provider, kind ResetKind) (ResetKindSpec, bool) {
+	for _, spec := range ResetKinds() {
+		if spec.Provider == provider && spec.Kind == kind {
 			return spec, true
 		}
 	}
@@ -208,6 +250,20 @@ type HeldReset struct {
 	// ManualOnly marks a kind the table does not know: shown, never claimed
 	// automatically.
 	ManualOnly bool `json:"manual_only,omitempty"`
+	// ExpiryWindow is when the daemon that holds the account starts spending
+	// this reset before it expires (PATCHES §94.1). Set on that daemon's own
+	// rows, for a known kind with a date.
+	ExpiryWindow *ResetExpiryWindow `json:"expiry_window,omitempty"`
+}
+
+// ResetExpiryWindow is the stretch before a reset's expiry in which any demand
+// at the account's limit is reason enough to claim it.
+type ResetExpiryWindow struct {
+	OpensAt time.Time `json:"opens_at"`
+	// LeadSeconds is how long before the expiry the window opens.
+	LeadSeconds int64 `json:"lead_seconds"`
+	// Why says how the lead was reached, with its numbers.
+	Why string `json:"why"`
 }
 
 // Expires is the entry's expiry as a time; false when it carries none, or one

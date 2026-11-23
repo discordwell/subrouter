@@ -95,6 +95,18 @@ pool burn over 24 hours (1.00 = on pace): Claude week 0.80 (40% at the limit), C
 - A figure needs readings over at least half its window: 30 minutes for the last hour, 3 hours for 6 hours and 12 hours for 24 hours. A trend needs 9 hours of history for 6 hours and 36 hours for 24 hours. Until then `srq burn` says `not enough history yet`, never 0.
 - A peer that publishes no burn, a build from before §92 or one with the history off, is named as not counted. Its accounts are left out, not read as 0. So is a peer whose last answer is more than 15 minutes old.
 
+`srq burn` also says, under each meter, whether the pool needs its saved resets (§94.1):
+
+```text
+Claude week
+  resets needed  yes: the 24-hour pressure is 0.80, under 1.0, but the 6-hour pressure 0.95 plus its trend +0.20 is 1.15, at or above 1.1
+```
+
+- Pressure is the burn of the accounts that are not at their limit: the burn divided by the share of account-time not at the limit. A burn of 0.84 with 30% at the limit is a pressure of 1.20. When every counted account was at its limit the whole window, the pressure is `all at the limit`.
+- The answer is `yes` when the 24-hour pressure is 1.0 or more, or when the 6-hour pressure plus its trend (the change from the 6 hours before) is 1.1 or more. It is `no` otherwise. While the 24 hours have too little history, the 6-hour pressure alone decides at 1.0, then the 1-hour one. With no figure the answer is `not known yet`.
+- burn.json carries the same per meter as `need`: `answer`, `window`, `pressure` per window (a number, `"all_at_limit"` or null), `trend` and `why`. A daemon from before §94 has no `need`, and `srq burn` prints no line for it.
+- Nothing claims on it yet. §93's rule still decides.
+
 What the figures cannot say. Each account weighs the same, because plan sizes are not known. A pool figure is only as good as each daemon's history: a daemon that was down has a gap, and the rise across it is spread evenly. A meter that reads in whole percents makes the 1-hour figure move in steps of about 1.7.
 
 The history is `usage-history.jsonl`, beside `token-usage.jsonl` and `sessions.json` in the folder of the daemon's `--sessions` file (`~/.subrouter` by default; `SUBROUTER_STATE_DIR` does not move it), kept for 35 days. It loads at start, so a restart or a deploy keeps the figures. Each `usage-status` row carries its account's figures as `burn`, outside `normalized`, and `GET /_subrouter/burn.json` gives the pool figure with each account's figures. Nothing ranks or routes on any of it. `SUBROUTER_USAGE_HISTORY=0` turns the history and the figures off.
@@ -463,7 +475,7 @@ While the daemon serves its socket, the stand-in asks it for `policy_limits` as 
 
 ## Saved resets
 
-A saved reset clears an account's meters once. Anthropic has granted Claude accounts saved resets of two kinds, and Codex accounts hold rate-limit reset credits. A week reset clears the general week and discards what is left of it. A Fable reset clears only the Fable limit and gives back the part of the week that Fable spent, so it loses nothing left in the week (§64). Each claim spends one for good. Never claim one unless the account owner asked for that claim, and never switch automatic resets to real mode for them (below).
+A saved reset clears an account's meters once. Anthropic has granted Claude accounts saved resets of two kinds, and Codex accounts hold rate-limit reset credits. A week reset clears the general week and the Fable meter, and discards what is left of the week. It keeps the week's roll time: on 2026-11-23 a week reset claimed at 100% used left the roll the same instant, and took the week from 100% to 3% or less and the Fable meter from 79% to 3% or less (§94.1). A Fable reset clears only the Fable limit and gives back the part of the week that Fable spent, so it loses nothing left in the week (§64). Each claim spends one for good. Never claim one unless the account owner asked for that claim, and never switch automatic resets to real mode for them (below).
 
 - `sr status` shows a `1x reset` column on Claude and Codex tables (§46). A Claude cell names Fable resets: `2 Fable 3/9`, or `1 +1F 12/10` for a week reset with a Fable reset behind it (§64). A Codex cell shows the soonest expiry the daemon read beside the count, `3 left 12/14` (§91). On a row that `sr` reads itself, the date comes from this machine's daemon, and only when the daemon counted the same credits.
 - `sr claude reset <name|email>` claims one Claude account's next reset, of either kind, through the daemon that holds it, and says which kind it claimed and what it cleared. It asks first only when more than 10% of the week is left or the week rolls within a day.
@@ -473,7 +485,7 @@ A saved reset clears an account's meters once. Anthropic has granted Claude acco
 
 An account that holds an unclaimed Claude week reset ranks at twice a non-holder until the reset is claimed or expires, and it enters burndown below 25% of its week (§56). A Fable reset does neither (§64). `SUBROUTER_RESET_HOLD_PRIORITY=0` turns that off. `srq pool` marks week holders `2x` and their burndown as `burndown·reset`. It marks each kind of saved reset an account holds with its count and its soonest expiry: `W1 12/10` for a week reset, `F2 3/9` for Fable resets, `R3 12/14` for Codex credits, and `U1` for a kind the daemon does not know (§91). The board shows the same marks, and its legend explains them.
 
-Each `usage-status` row lists every reset the account holds in `resets`, one entry per kind and expiry date (§91). An entry gives the `kind` (`week`, `fable`, `codex_rate_limits`, or `unknown`), the `count`, `expires_at`, what a claim gives back, whether a claim restarts the seven days (`assumed_yes` or `assumed_no`: neither is measured), whether it needs the limit reached, and its `order`, the order the provider uses them in. `expiry` says where the date came from: `read`, `last_good`, `not_read`, or `none_given`. A Codex reading carries only a count, so the daemon that holds the account reads the dates from the credit list Codex.app reads. It reads at most once an hour per account, and at once when the count changes. It never reads for a count of 0 or for a peer's account, and it never redeems. A failed read keeps the last good dates, shown as `last_good` with `expiry_age_seconds`. A kind the daemon does not know is listed as `unknown` with its `raw_type` and `manual_only: true`, and logs `saved reset of a kind this daemon does not know; shown, never claimed automatically` at Warn once an hour. `complimentary_reset` is unchanged. Nothing claims or ranks on the list. `SUBROUTER_READ_CODEX_RESET_EXPIRY=0` stops the credit list reads, and every Codex count then reads `not_read`.
+Each `usage-status` row lists every reset the account holds in `resets`, one entry per kind and expiry date (§91). An entry gives the `kind` (`week`, `fable`, `codex_rate_limits`, or `unknown`), the `count`, `expires_at`, what a claim gives back, whether a claim restarts the seven days (`measured_no` for a week reset, measured on 2026-11-23; `assumed_no` for a Fable reset and `assumed_yes` for a Codex credit), whether it needs the limit reached, and its `order`, the order the provider uses them in. `expiry` says where the date came from: `read`, `last_good`, `not_read`, or `none_given`. A Codex reading carries only a count, so the daemon that holds the account reads the dates from the credit list Codex.app reads. It reads at most once an hour per account, and at once when the count changes. It never reads for a count of 0 or for a peer's account, and it never redeems. A failed read keeps the last good dates, shown as `last_good` with `expiry_age_seconds`. A kind the daemon does not know is listed as `unknown` with its `raw_type` and `manual_only: true`, and logs `saved reset of a kind this daemon does not know; shown, never claimed automatically` at Warn once an hour. `complimentary_reset` is unchanged. Nothing claims or ranks on the list. `SUBROUTER_READ_CODEX_RESET_EXPIRY=0` stops the credit list reads, and every Codex count then reads `not_read`.
 
 To see every saved reset in the pool, run `srq resets`. It prints one line per account, kind and expiry date, soonest first: when the reset expires and in how long, the kind, the count, the account's label, where the account lives, how much of its week and of its Fable meter is used, and when its week rolls. The last line totals each kind and date, such as `totals: 14 week resets expire 12/10; 3 Codex credits expire 12/14`. It reads this daemon and every peer that this daemon reads, through `/_subrouter/peers/usage-status`, so it needs no peer token. An account that two daemons hold is listed once, with both places.
 
@@ -481,7 +493,9 @@ To see every saved reset in the pool, run `srq resets`. It prints one line per a
 - `from the last good read, 3h 0m old`, or `*` after a date, is a date kept after a failed read of the credit list.
 - `its daemon gives no full list`, or `~` after the marks, is a daemon from before §91. The entries are what its `complimentary_reset` says, and a date that it does not give reads `no date given`.
 - `unknown <type>`, or `U`, is a kind that the daemon does not know. Nothing claims it automatically.
-- `assumed_yes` and `assumed_no` in `restarts_clock` are assumptions. No claim has recorded the roll time before and after yet, so neither value is measured.
+- `measured_no` in `restarts_clock` was measured: one week reset, claimed by hand on 2026-11-23, kept the account's roll time. `assumed_no` (a Fable reset) and `assumed_yes` (a Codex credit) are assumptions that no claim has settled yet.
+
+Each entry of a kind the daemon knows, with a date still ahead, also carries `expiry_window` on the rows of the daemon that holds the account (§94.1): `opens_at`, `lead_seconds` and `why`. The window opens before the expiry by 1.5 times the time the pool needs, at its present demand on that meter, to spend what the holders of that kind and date still have left. It is never under 24 hours and never longer than the time left. When the demand is not known, the lead is 24 hours. The holders and the demand are this daemon's accounts and each peer's as its last usage body gave them. A peer's rows, through `/_subrouter/peers/usage-status`, carry the peer's own windows. Nothing claims on the window yet.
 
 pool.json carries each row's list in `resets` (`kind`, `count`, `expires_at`, `expiry`), with `resets_partial: true` for a daemon from before §91.
 
@@ -593,7 +607,7 @@ All are on `127.0.0.1:31415` and answer loopback with no token.
 | `POST /_subrouter/reload-accounts` | Re-reads the store. |
 | `GET /_subrouter/drain-status` | Whether the daemon is draining. `sr drain`, `sr resume`, and `sr drain-status` use the drain socket. |
 | `POST /_subrouter/claude-reset` | Claims a saved Claude reset. Use `sr claude reset` only, and only when asked. |
-| `GET /_subrouter/burn.json` | The pool's burn per meter over this daemon's and every peer's accounts, with the trend, the share at the limit, and each account's figures (§92.2). |
+| `GET /_subrouter/burn.json` | The pool's burn per meter over this daemon's and every peer's accounts, with the trend, the share at the limit, each account's figures (§92.2), and whether the pool needs its saved resets (`need`, §94.1). |
 
 ### Settings
 

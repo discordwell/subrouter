@@ -279,12 +279,28 @@ func usageStatusResets(t *testing.T, body []byte) map[string]usageResets {
 		}
 		return out.String()
 	}
+	// The list as §91 publishes it: each entry's expiry window is §94.1's,
+	// and reset_worth_test.go reads it.
+	withoutWindows := func(raw json.RawMessage) json.RawMessage {
+		var list []accounts.HeldReset
+		if raw == nil || json.Unmarshal(raw, &list) != nil || list == nil {
+			return raw
+		}
+		for i := range list {
+			list[i].ExpiryWindow = nil
+		}
+		out, err := json.Marshal(list)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
 	out := map[string]usageResets{}
 	for _, row := range rows {
 		var id string
 		_ = json.Unmarshal(row["id"], &id)
 		raw, present := row["resets"]
-		out[id] = usageResets{present: present, resets: compact(raw), complimentary: compact(row["complimentary_reset"])}
+		out[id] = usageResets{present: present, resets: compact(withoutWindows(raw)), complimentary: compact(row["complimentary_reset"])}
 	}
 	return out
 }
@@ -380,7 +396,7 @@ func TestUsageStatusListsEveryClaudeResetByKindAndExpiry(t *testing.T) {
 		yes := true
 		wantResets(t, "a week reset and two Fable resets", rows["a-both"],
 			accounts.HeldReset{Kind: accounts.ResetKindClaudeWeek, Count: 1, ExpiresAt: week, Expiry: accounts.ResetExpiryRead,
-				GivesBack: []string{"seven_day", "seven_day_overage_included"}, RestartsClock: accounts.ClockRestartAssumedNo, NeedsLimit: &yes, Order: 1},
+				GivesBack: []string{"seven_day", "seven_day_overage_included"}, RestartsClock: accounts.ClockRestartMeasuredNo, NeedsLimit: &yes, Order: 1},
 			accounts.HeldReset{Kind: accounts.ResetKindClaudeFable, Count: 2, ExpiresAt: fable, Expiry: accounts.ResetExpiryRead,
 				GivesBack: []string{"seven_day_overage_included"}, RestartsClock: accounts.ClockRestartAssumedNo, NeedsLimit: &yes, Order: 2})
 		wantResets(t, "a block with no grants", rows["b-none"])

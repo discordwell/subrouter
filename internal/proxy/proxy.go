@@ -5123,7 +5123,7 @@ func (s Server) handleUsageStatus(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		statuses = s.withAutoResets(s.withHeldResets(s.withNewSessionVerdicts(s.withNormalizedUsage(s.withCodexCapacityMarks(s.withClaudeCostTiers(s.AccountRef.withResetAdvice(withWeeklyCooked(s.withSessionActivity(s.withSessionCounts(s.withRequestTimeExhaustionWindows(s.withClaudeWebBalances(statuses))))))))))))
-		writeJSON(w, s.AccountRef.withUsageBurn(statuses))
+		writeJSON(w, s.withResetWindows(s.AccountRef.withUsageBurn(statuses)))
 		return
 	}
 	accounts := s.accountListContext(r.Context())
