@@ -707,14 +707,14 @@ func TestAnUnknownResetKindIsShownAndWarnedOnceAnHour(t *testing.T) {
 		now := time.Now().UTC().Truncate(time.Second)
 		ends := now.Add(10 * 24 * time.Hour)
 		short := map[string]any{"id": "short_reset", "resets_total": 1, "resets_left": 1, "ends_at": ends.Format(time.RFC3339),
-			"clears": []string{"five_hour"}, "paused": false, "usable_now": true, "use_requires_limit": true}
+			"clears": []string{"five_hour"}, "type": "session_boost", "paused": false, "usable_now": true, "use_requires_limit": true}
 		box, _, _ := claudeUsageBox(t, map[string]string{"a-short": resetHoldUsage(now, 50, cedarEmberBlock(short))}, nil)
 		logs := &syncBuffer{}
 		box.Logger = slog.New(slog.NewJSONHandler(logs, nil))
 		clock := now
 		box.AccountRef.sharedHeldResets().now = func() time.Time { return clock }
 		yes := true
-		want := accounts.HeldReset{Kind: accounts.ResetKindUnknown, Count: 1, ExpiresAt: ends.Format(time.RFC3339), Expiry: accounts.ResetExpiryRead,
+		want := accounts.HeldReset{Kind: accounts.ResetKindUnknown, RawType: "session_boost", Count: 1, ExpiresAt: ends.Format(time.RFC3339), Expiry: accounts.ResetExpiryRead,
 			GivesBack: []string{"five_hour"}, RestartsClock: accounts.ClockRestartUnknown, NeedsLimit: &yes, ManualOnly: true}
 		for _, step := range []struct {
 			after time.Duration
@@ -728,8 +728,8 @@ func TestAnUnknownResetKindIsShownAndWarnedOnceAnHour(t *testing.T) {
 			}
 		}
 		line := jsonLogLines(logs, unknownResetMessage)[0]
-		if line["level"] != "WARN" || line["provider"] != "claude" || !slices.Equal(anyStrings(line["clears"]), []string{"five_hour"}) {
-			t.Fatalf("warning %v, want a Warn naming the provider and what it clears", line)
+		if line["level"] != "WARN" || line["provider"] != "claude" || line["raw_type"] != "session_boost" || !slices.Equal(anyStrings(line["clears"]), []string{"five_hour"}) {
+			t.Fatalf("warning %v, want a Warn naming the provider, the grant's own type and what it clears", line)
 		}
 	})
 	t.Run("a Codex credit", func(t *testing.T) {

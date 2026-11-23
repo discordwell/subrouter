@@ -19,6 +19,7 @@ package claude
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/rand"
 	"encoding/json"
@@ -120,6 +121,10 @@ type ResetGrant struct {
 	PercentUsed map[string]int `json:"percent_used,omitempty"`
 	// Type is "session", "weekly" or "full"; anything else reads as "".
 	Type string `json:"type,omitempty"`
+	// RawType is the grant's type as Anthropic wrote it, any value kept, so
+	// a grant of a type Claude Code does not know is listed with it
+	// (PATCHES §91.1). Never encoded: every block and answer stays as it was.
+	RawType string `json:"-"`
 	// GivesBackWeekly is a grant whose claim also hands back to the general
 	// week what the limits it clears had spent of it: Claude Code calls such
 	// a grant a Fable reset.
@@ -169,8 +174,10 @@ func (g ResetGrant) Kind() ResetKind {
 	return ResetKindOther
 }
 
+// reading is the grant as the kinds table reads it. A grant decoded from an
+// answer's JSON has no RawType, so its Type stands in.
 func (g ResetGrant) reading() accounts.ResetReading {
-	return accounts.ResetReading{Provider: accounts.ProviderClaude, Source: ResetProgram, Type: g.Type, Clears: g.Clears}
+	return accounts.ResetReading{Provider: accounts.ProviderClaude, Source: ResetProgram, Type: cmp.Or(g.RawType, g.Type), Clears: g.Clears}
 }
 
 // held is what the grant leaves the account holding, for the row's resets.
@@ -291,8 +298,9 @@ func parseResetGrant(value any) (ResetGrant, bool) {
 	grant.Paused, _ = object["paused"].(bool)
 	grant.UsableNow, _ = object["usable_now"].(bool)
 	grant.GivesBackWeekly, _ = object["gives_back_weekly"].(bool)
-	if kind := resetString(object["type"]); resetGrantTypes[kind] {
-		grant.Type = kind
+	grant.RawType = resetString(object["type"])
+	if resetGrantTypes[grant.RawType] {
+		grant.Type = grant.RawType
 	}
 	if reason := resetString(object["unavailable_reason"]); resetUnavailableReasons[reason] {
 		grant.UnavailableReason = reason

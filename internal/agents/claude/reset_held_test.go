@@ -54,6 +54,19 @@ func TestResetInfoListsEveryResetByKindAndExpiry(t *testing.T) {
 	if got := string(read(t)); got != `[]` {
 		t.Fatalf("a block with no grants listed %s, want []", got)
 	}
+	// A grant of a type Claude Code does not read is listed with that type
+	// as Anthropic wrote it, though the grant's Type stays as Claude Code
+	// reads it.
+	cowork := map[string]any{"id": "cowork_reset", "resets_left": 1, "type": "cowork_boost", "ends_at": "2026-12-20T00:00:00Z",
+		"clears": []string{"seven_day_cowork"}, "use_requires_limit": true}
+	want = `[{"kind":"unknown","raw_type":"cowork_boost","count":1,"expires_at":"2026-12-20T00:00:00Z","expiry":"read","gives_back":["seven_day_cowork"],"restarts_clock":"unknown","needs_limit":true,"manual_only":true}]`
+	if got := string(read(t, cowork)); got != want {
+		t.Fatalf("a grant of a new type\n got %s\nwant %s", got, want)
+	}
+	raw, _ := json.Marshal(map[string]any{"eligible": true, "grants": []any{cowork}})
+	if status, _ := ParseResetStatus(raw); status.Grants[0].Type != "" {
+		t.Fatalf("the grant's Type is %q, want it empty as Claude Code reads an unknown type", status.Grants[0].Type)
+	}
 	unread, _ := ParseResetStatus(json.RawMessage(`{"eligible":false,"ineligible_reason":"unavailable","grants":[]}`))
 	if info := ResetInfo(unread, now); info == nil || info.Held != nil {
 		t.Fatalf("Anthropic's failed read listed %#v, want no list", info)
