@@ -134,7 +134,7 @@ func ConsumeRateLimitResetCredit(ctx context.Context, client *http.Client, accou
 	}
 	defer res.Body.Close()
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
-		return RateLimitResetCredit{}, fmt.Errorf("consume rate-limit reset credit failed: %s", res.Status)
+		return RateLimitResetCredit{}, &RateLimitResetConsumeError{StatusCode: res.StatusCode, Status: res.Status}
 	}
 
 	var out rateLimitResetConsumeResponse
@@ -142,6 +142,18 @@ func ConsumeRateLimitResetCredit(ctx context.Context, client *http.Client, accou
 		return RateLimitResetCredit{}, err
 	}
 	return out.Credit, nil
+}
+
+// RateLimitResetConsumeError is a consume the server answered with a status
+// other than 2xx. A 4xx refused the request, so the credit was not used; a
+// 5xx leaves that unknown (PATCHES §93.4).
+type RateLimitResetConsumeError struct {
+	StatusCode int
+	Status     string
+}
+
+func (e *RateLimitResetConsumeError) Error() string {
+	return "consume rate-limit reset credit failed: " + e.Status
 }
 
 // FirstAvailableRateLimitResetCredit lists the account's credits and returns

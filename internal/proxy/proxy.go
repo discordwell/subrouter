@@ -6478,6 +6478,10 @@ type RateLimitResetResult struct {
 	// expiring, pool_blocked); empty for manual redeems.
 	Reason string `json:"reason,omitempty"`
 	Error  string `json:"error,omitempty"`
+	// consumeStatus is the status a failed consume was answered with, 0 when
+	// none came back: §93.4 tells a refusal (4xx) from a consume that may
+	// have landed.
+	consumeStatus int
 }
 
 // handleRateLimitReset redeems a ChatGPT Pro "rate-limit reset" credit for one
@@ -6986,6 +6990,10 @@ func (s Server) redeemAccountChecked(ctx context.Context, account accounts.Accou
 	if err != nil {
 		history.finishClaim(draft, err.Error(), false)
 		result.Error = err.Error()
+		var answered *accounts.RateLimitResetConsumeError
+		if errors.As(err, &answered) {
+			result.consumeStatus = answered.StatusCode
+		}
 		return result
 	}
 	history.finishClaim(draft, "redeemed", true)
@@ -15343,7 +15351,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 	if len(walls) > 0 && t.server != nil {
 		for _, wall := range walls {
 			if !wall.decided {
-				t.server.autoResetAtTheWall(wall, autoResetTurnAfterFailover(wall.account.ID, response, err))
+				t.server.autoResetAtTheWall(wall, t.server.autoResetTurnAfterFailover(wall.account, response, err))
 			}
 		}
 		response = markAutoResetWallsSeen(response)
