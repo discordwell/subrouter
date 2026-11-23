@@ -63,14 +63,15 @@ func (r *AccountRef) pinOnlyAccounts() map[string]bool {
 	return nil
 }
 
-// pinOnlyAccount reports whether the account with this ID takes pinned
-// sessions only.
-func (r *AccountRef) pinOnlyAccount(id string) bool {
+// PinOnlyAccount reports whether the account with this ID takes pinned
+// sessions only. serve's sr auto-switch reads it too: a listed account is
+// never made the active Claude profile.
+func (r *AccountRef) PinOnlyAccount(id string) bool {
 	return r.pinOnlyAccounts()[id]
 }
 
 func (s Server) pinOnlyAccount(id string) bool {
-	return s.AccountRef.pinOnlyAccount(id)
+	return s.AccountRef.PinOnlyAccount(id)
 }
 
 // withoutPinOnly drops the pin-only accounts from a failover's candidates.

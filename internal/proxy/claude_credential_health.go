@@ -520,7 +520,7 @@ func (s Server) noteClaudeProxySuccess(account accounts.Account) {
 // records what it proves: a credential death, or a live credential. It
 // returns what agentclaude.FetchFableUsageWindows returns.
 func (r *AccountRef) claudeFableProbe(ctx context.Context, client *http.Client, account accounts.Account) ([]accounts.UsageWindow, error) {
-	if r.claudeIdentityOnlyAccount(account) || r.pinOnlyAccount(account.ID) {
+	if r.claudeIdentityOnlyAccount(account) || r.PinOnlyAccount(account.ID) {
 		// A Messages call spends the identity-only account's quota
 		// (control_plane.go), and a pin-only account's, which only its pinned
 		// sessions spend (§98). No windows and no error: the usage read stands
@@ -568,7 +568,7 @@ func (r *AccountRef) noteClaudeProbeResult(account accounts.Account, result agen
 // (exhausted until a known reset) so its credential death is noticed
 // without traffic. Its answer is liveness evidence only, never a score.
 func (r *AccountRef) probeClaudeLiveness(ctx context.Context, client *http.Client, account accounts.Account) {
-	if r.claudeIdentityOnlyAccount(account) || r.pinOnlyAccount(account.ID) {
+	if r.claudeIdentityOnlyAccount(account) || r.PinOnlyAccount(account.ID) {
 		// Never a paid probe on the identity-only account (control_plane.go),
 		// or on a pin-only one (§98).
 		return

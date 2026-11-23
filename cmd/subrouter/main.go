@@ -1920,6 +1920,7 @@ func serve(args []string) error {
 				DelayFirstSweep:    true,
 				ScoreSnapshots:     sharedScoreStore,
 				ClaudeIdentityOnly: server.IdentityOnlyAccountID,
+				PinOnly:            accountRef.PinOnlyAccount,
 			})
 		}
 	} else if srSwitchInterval > 0 && credentialBroker == nil {

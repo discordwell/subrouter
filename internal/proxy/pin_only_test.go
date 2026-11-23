@@ -496,11 +496,11 @@ func TestAnEmptyPinOnlyListMarksNoAccount(t *testing.T) {
 		}
 	}
 	ref.SetPinOnlyAccounts([]string{" " + pinOnlyID + " "})
-	if !ref.pinOnlyAccount(pinOnlyID) || ref.pinOnlyAccount("spare") {
+	if !ref.PinOnlyAccount(pinOnlyID) || ref.PinOnlyAccount("spare") {
 		t.Fatalf("the list reads %v", ref.pinOnlyAccounts())
 	}
 	var nilRef *AccountRef
-	if nilRef.pinOnlyAccount(pinOnlyID) {
+	if nilRef.PinOnlyAccount(pinOnlyID) {
 		t.Fatal("a nil ref marks an account")
 	}
 }
