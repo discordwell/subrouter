@@ -190,7 +190,7 @@ func (s Scheduler) compare(left, right account.Account, now time.Time, allowEndg
 					winner = rightScore
 				}
 				if winner.BurndownCause(now) == BurndownCauseReset {
-					return leftEndgame, "early burndown: holds an unclaimed saved reset and under 25% of its week is left"
+					return leftEndgame, "early burndown: holds an unclaimed week reset and under 25% of its week is left"
 				}
 				return leftEndgame, "inside its weekly roll window; that budget expires either way"
 			}

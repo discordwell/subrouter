@@ -502,18 +502,43 @@ def _burndown_cause(norm):
 
 
 def _held_reset_hours(norm):
-    """Hours until the account's unclaimed saved reset expires, else None.
+    """Hours until the account's unclaimed week reset expires, else None.
 
-    normalized.seconds_to_held_reset_expiry (PATCHES §56) is published only
-    while the owner ranks the account on that hold, at twice its weekly pace:
-    the reset unclaimed, the grant unexpired, its switch on. Absent is no hold,
-    and all a daemon from before §56 can say.
+    normalized.seconds_to_held_week_reset_expiry (PATCHES §56, §64) is
+    published only while the owner ranks the account on that hold, at twice
+    its weekly pace: a reset that clears the week unclaimed, the grant
+    unexpired, its switch on. A reset that clears only the Fable limit holds
+    nothing. A daemon from before §64 publishes only
+    seconds_to_held_reset_expiry, for a Fable reset too, and is read as the
+    daemons read it: the legacy key only when the week key is absent. Absent
+    is no hold, and all a daemon from before §56 can say.
     """
-    secs = norm.get("seconds_to_held_reset_expiry") if isinstance(norm, dict) else None
+    if not isinstance(norm, dict):
+        return None
+    secs = norm.get("seconds_to_held_week_reset_expiry")
+    if secs is None:
+        secs = norm.get("seconds_to_held_reset_expiry")
     # bool is an int in Python; a true here is not a duration.
     if type(secs) not in (int, float) or secs <= 0:
         return None
     return round(secs / 3600, 1)
+
+
+def _fable_resets(row):
+    """How many unclaimed resets that clear only the Fable limit the row holds, else 0.
+
+    complimentary_reset.remaining_by_kind (PATCHES §64) splits the account's
+    saved resets by what a claim gives back. A Fable reset holds nothing: no
+    2x, no early burndown. Absent (none, not read, or a daemon from before
+    §64) is 0.
+    """
+    reset = row.get("complimentary_reset")
+    if not isinstance(reset, dict) or reset.get("source") != "cedar_ember" or reset.get("available") is not True:
+        return 0
+    kinds = reset.get("remaining_by_kind")
+    left = kinds.get("fable") if isinstance(kinds, dict) else None
+    # bool is an int in Python; a true here is not a count.
+    return left if type(left) is int and left > 0 else 0
 
 
 def _weekly_unstarted(norm):
@@ -625,6 +650,7 @@ def summarize(row):
             # week. The raw per-window fields below are the unmixed truth.
             **raw_usage(row),
             **_verdicts(norm),
+            "fable_resets": _fable_resets(row),
         }
 
     w = weekly_window(row)
@@ -646,6 +672,7 @@ def summarize(row):
         "source": "windows",
         **raw_usage(row),
         **_verdicts(norm),
+        "fable_resets": _fable_resets(row),
     }
 
 
@@ -784,6 +811,8 @@ def _render_sections(rows, where, peer=False):
         # daemon before §56 (and every pool past the grant's expiry) reads as
         # before.
         show_hold = any(r["held_reset_expires_in_hours"] is not None for r in sub)
+        # Likewise a column only where an account holds a Fable reset (§64).
+        fable_reset_width = max((len(f"F{r['fable_resets']}") for r in sub if r["fable_resets"]), default=0)
         # Likewise a column only where an account's week has not started (§86).
         show_unstarted = any(r["weekly_unstarted"] for r in sub)
         lines, any_slots, any_reset = [], False, False
@@ -804,6 +833,8 @@ def _render_sections(rows, where, peer=False):
             roll = "    -" if r["weekly_reset_hours"] is None else f"{r['weekly_reset_hours']:>5.0f}h"
             if show_hold:
                 roll += "  2x" if r["held_reset_expires_in_hours"] is not None else "    "
+            if fable_reset_width:
+                roll += f"  {'F' + str(r['fable_resets']) if r['fable_resets'] else '':<{fable_reset_width}}"
             if show_unstarted:
                 roll += "  unstarted" if r["weekly_unstarted"] else " " * 11
             fallback = not peer and local_fallback(r)
@@ -849,15 +880,18 @@ def _render_sections(rows, where, peer=False):
                          "fspent = the Fable meter this daemon publishes: an Opus or Sonnet turn ranks the account at up to"
                          " 2x its weekly pace as it fills, while SUBROUTER_FABLE_SPENT_PREFERENCE is on")
         if any_reset:
-            extra.append("·reset = early burndown: holds an unclaimed saved reset and under 25% of its week is left")
+            extra.append("·reset = early burndown: holds an unclaimed week reset and under 25% of its week is left")
         if show_hold:
             # A peer's 2x is the peer's word that it holds the reset. This
             # daemon ranks it at 2x only when it runs §56 with its switch on:
             # while the box is deployed first, or with the switch off here, a
             # box holder reads 2x and ranks at 1x.
-            extra.append("2x = the peer says it holds an unclaimed saved reset; ranked 2x here only on §56 with its switch on"
+            extra.append("2x = the peer says it holds an unclaimed week reset; ranked 2x here only on §56 with its switch on"
                          if peer else
-                         "2x = holds an unclaimed saved reset: ranked at twice a local non-holder until claimed or expired")
+                         "2x = holds an unclaimed week reset: ranked at twice a local non-holder until claimed or expired")
+        if fable_reset_width:
+            extra.append("Fn = n unclaimed Fable resets: a Fable claim gives back the Fable limit, not the week,"
+                         " so they bring no 2x and no early burndown")
         if show_unstarted:
             # The fact is published whatever the owner's switch says; the
             # daemon that places the session ranks on it with its own switch.
@@ -1266,7 +1300,7 @@ def cmd_selftest(_argv):
 
     early = [holder_row(0, True, "burndown", "reset", live_sessions=1, allowed_sessions=2),
              holder_row(1, False, "at_cap", "reset", live_sessions=2, allowed_sessions=2)]
-    reset_legend = "·reset = early burndown: holds an unclaimed saved reset and under 25% of its week is left"
+    reset_legend = "·reset = early burndown: holds an unclaimed week reset and under 25% of its week is left"
     local = rendered([summarize(r) for r in early])
     check("local: an early burndown 100h from its roll reads burndown·reset n/m",
           "rolls   100h  new=yes (burndown·reset 1/2)\n" in local)
@@ -1302,12 +1336,12 @@ def cmd_selftest(_argv):
     check("a non-holder in the same section keeps the columns aligned",
           len(lines) == 2 and "2x" not in lines[1] and lines[0].index("new=") == lines[1].index("new="))
     check("the legend explains 2x",
-          "NO = evicted;\n       2x = holds an unclaimed saved reset: ranked at twice a local non-holder"
+          "NO = evicted;\n       2x = holds an unclaimed week reset: ranked at twice a local non-holder"
           " until claimed or expired)\n" in text)
     remote = rendered([summarize(r) for r in boosted], peer=True)
     check("peer: 2x is the peer's word, ranked 2x here only on §56 with its switch on",
           "rolls   100h  2x  new=yes\n" in remote
-          and "\n       2x = the peer says it holds an unclaimed saved reset; ranked 2x here only on §56"
+          and "\n       2x = the peer says it holds an unclaimed week reset; ranked 2x here only on §56"
               " with its switch on)\n" in remote
           and "ranked at twice" not in remote)
     check("--json carries the hold in hours, and its absence as null",
@@ -1334,6 +1368,43 @@ def cmd_selftest(_argv):
               "  new=fallback (at_cap 2/2)\n"
               "  acct2                              5h=  20%  7d=  40%  fable= 104%  rolls   100h  new=yes\n"
               "\n"))
+
+    print("only a week reset reads 2x; a Fable reset reads Fn; an older daemon's key reads as before (PATCHES §64)")
+    # Every account held a Fable reset from 2026-11-09, and a daemon before
+    # §64 held each on it, so a 2x on every row singled out nobody.
+
+    def fable_reset_row(i, fable, week=0, **keys):
+        row = holder_row(i, True, "eligible")
+        row["normalized"].update(keys)
+        kinds = {k: v for k, v in (("week", week), ("fable", fable)) if v}
+        row["complimentary_reset"] = {"known": True, "source": "cedar_ember", "available": bool(kinds),
+                                      "remaining": week + fable, "remaining_by_kind": kinds}
+        return row
+
+    week_hold = {"seconds_to_held_week_reset_expiry": 580000, "seconds_to_held_reset_expiry": 580000}
+    check("a §64 daemon's week hold reads 2x", summarize(fable_reset_row(0, 0, 1, **week_hold))["held_reset_expires_in_hours"] == 161.1)
+    check("the week key alone reads 2x",
+          summarize(fable_reset_row(0, 0, 1, seconds_to_held_week_reset_expiry=580000))["held_reset_expires_in_hours"] == 161.1)
+    check("an older daemon's legacy key alone reads 2x, as before",
+          summarize(fable_reset_row(0, 2, seconds_to_held_reset_expiry=580000))["held_reset_expires_in_hours"] == 161.1)
+    mixed = [fable_reset_row(0, 1, 1, **week_hold), fable_reset_row(1, 2), holder_row(2, True, "eligible")]
+    text = rendered([summarize(r) for r in mixed])
+    lines = [ln for ln in text.splitlines() if ln.startswith("  acct")]
+    check("a week holder with a Fable reset reads 2x and F1", "rolls   100h  2x  F1  new=yes\n" in text)
+    check("a Fable-only holder reads F2 and no 2x", len(lines) == 3 and "      F2  new=yes" in lines[1] and "2x" not in lines[1])
+    check("a row with neither keeps the columns aligned",
+          "2x" not in lines[2] and "F" not in lines[2].split("rolls")[1]
+          and lines[0].index("new=") == lines[1].index("new=") == lines[2].index("new="))
+    check("the legend explains Fn",
+          "\n       Fn = n unclaimed Fable resets: a Fable claim gives back the Fable limit, not the week,"
+          " so they bring no 2x and no early burndown)\n" in text)
+    check("--json carries the Fable resets, and their absence as 0",
+          summarize(mixed[1])["fable_resets"] == 2 and summarize(mixed[2])["fable_resets"] == 0)
+    check("an unavailable reading or a boolean count is no Fable reset",
+          summarize(dict(fable_reset_row(0, 2), complimentary_reset={"source": "cedar_ember", "available": False,
+                                                                     "remaining_by_kind": {"fable": 2}}))["fable_resets"] == 0
+          and summarize(dict(fable_reset_row(0, 2), complimentary_reset={"source": "cedar_ember", "available": True,
+                                                                         "remaining_by_kind": {"fable": True}}))["fable_resets"] == 0)
 
     print("a published spent Fable meter is shown; an older daemon reads as before (PATCHES §65)")
     # An Opus or Sonnet turn ranks an account at up to 2x its pace as its Fable

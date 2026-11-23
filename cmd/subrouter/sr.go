@@ -4357,6 +4357,9 @@ func usageGridResetCellUndated(row srUsageRow) usageGridCell {
 // (another ineligible_reason), "n/a" (a token that cannot read it), and "?"
 // when nothing was read -- an old daemon, a failed read, Anthropic's own
 // "unavailable", or a usage answer without the block. "?" is never "none".
+// Resets that clear only the Fable limit are named as such (PATCHES §64):
+// "2 Fable 3/9" when every reset left is one, "1 +1F 12/10" (one reset that
+// clears the week, one Fable reset) when both kinds are left.
 func usageGridClaudeResetCell(row srUsageRow, dated bool) usageGridCell {
 	if row.authMode != accounts.AuthModeOAuth {
 		return usageGridCell{}
@@ -4381,9 +4384,20 @@ func usageGridClaudeResetCell(row srUsageRow, dated bool) usageGridCell {
 			}
 			return usageGridCell{Text: "not elig", Style: ansiDim}
 		}
+		fable := info.RemainingByKind[string(agentclaude.ResetKindFable)]
+		expiresAt := info.ExpiresAt
 		text := fmt.Sprintf("%d left", *info.Remaining)
+		switch {
+		case fable >= *info.Remaining:
+			text = fmt.Sprintf("%d Fable", fable)
+		case fable > 0:
+			text = fmt.Sprintf("%d +%dF", *info.Remaining-fable, fable)
+			if info.WeekHeldUntil != "" {
+				expiresAt = info.WeekHeldUntil
+			}
+		}
 		if dated {
-			if expires, ok := agentclaude.ParseResetTime(info.ExpiresAt); ok {
+			if expires, ok := agentclaude.ParseResetTime(expiresAt); ok {
 				text += " " + expires.Local().Format("1/2")
 			}
 		}
