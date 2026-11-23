@@ -820,10 +820,17 @@ func TestPeerOneDialTriesTheTailnetWhenTheCooldownEnds(t *testing.T) {
 	clock.Store(time.Unix(1_800_000_000, 0).UnixNano())
 	pool.tailnet.now = func() time.Time { return time.Unix(0, clock.Load()) }
 	var tailnetDials atomic.Int32
+	// probing closes when the dial that took the probe reaches the tailnet.
+	// Five public answers do not mean it has, because on a busy machine it can
+	// still be on its way.
+	probing := make(chan struct{})
 	release := make(chan struct{})
 	dial := pool.dialPeer(func(ctx context.Context, _, addr string) (net.Conn, error) {
 		if addr == "100.64.0.7:31416" {
-			if tailnetDials.Add(1) > 1 {
+			if n := tailnetDials.Add(1); n > 1 {
+				if n == 2 {
+					close(probing)
+				}
 				select {
 				case <-release:
 				case <-ctx.Done():
@@ -852,6 +859,11 @@ func TestPeerOneDialTriesTheTailnetWhenTheCooldownEnds(t *testing.T) {
 		if err := <-results; err != nil {
 			t.Fatal(err)
 		}
+	}
+	select {
+	case <-probing:
+	case err := <-results:
+		t.Fatalf("all %d dials answered (last: %v) and none tried the tailnet as the cooldown ended", dials, err)
 	}
 	if got := tailnetDials.Load() - 1; got != 1 {
 		t.Fatalf("%d of %d dials tried the tailnet as the cooldown ended; want 1", got, dials)
