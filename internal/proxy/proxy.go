@@ -1982,7 +1982,8 @@ type AccountStatus struct {
 	Provider accounts.Provider `json:"provider"`
 	AuthMode accounts.AuthMode `json:"auth_mode"`
 	// Label is the human name for the record. For an owner-identified Codex
-	// account it reads "email [plan]" where ID is an opaque owner hash.
+	// account it is the login email, while ID and Email hold the opaque owner
+	// hash. The plan is never part of it (AccountUsageStatus.PlanType).
 	Label       string `json:"label,omitempty"`
 	Email       string `json:"email,omitempty"`
 	Source      string `json:"source"`
