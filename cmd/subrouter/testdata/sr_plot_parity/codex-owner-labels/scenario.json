@@ -1,0 +1,13 @@
+{
+ "now": "2026-11-22T18:00:00Z",
+ "utc_offset_seconds": -21600,
+ "zone": "America/Chicago",
+ "lines": 40,
+ "local": {
+  "body": "local.json"
+ },
+ "peer_view": {
+  "body": "peers.json"
+ },
+ "boxes": []
+}

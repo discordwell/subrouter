@@ -1,0 +1,62 @@
+[
+ {
+  "id": "alpha",
+  "provider": "claude",
+  "auth_mode": "oauth",
+  "email": "alpha@example.com",
+  "auth_checked": true,
+  "auth_valid": true,
+  "windows": [
+   {
+    "Name": "7d",
+    "UsedPercent": 40,
+    "LimitWindowSeconds": 604800,
+    "ResetAfterSeconds": 216000
+   }
+  ]
+ },
+ {
+  "id": "codex-owner-31b894d0a2567b7c17c0d75761d918e7cf83b430dc7c35757ff95a7a93aecdf8",
+  "provider": "codex",
+  "label": "owner-a@example.com",
+  "auth_mode": "oauth",
+  "email": "codex-owner-31b894d0a2567b7c17c0d75761d918e7cf83b430dc7c35757ff95a7a93aecdf8",
+  "auth_checked": true,
+  "auth_valid": true,
+  "windows": [
+   {
+    "Name": "primary",
+    "UsedPercent": 30,
+    "LimitWindowSeconds": 604800,
+    "ResetAfterSeconds": 72000
+   }
+  ]
+ },
+ {
+  "id": "codex-owner-43ce068d7daaf69aa76274c7b97e308af2e490a59314d34157b8ea85b2232880",
+  "provider": "codex",
+  "label": "owner-c@example.com",
+  "auth_mode": "oauth",
+  "email": "codex-owner-43ce068d7daaf69aa76274c7b97e308af2e490a59314d34157b8ea85b2232880",
+  "auth_checked": true,
+  "auth_valid": true,
+  "windows": [
+   {
+    "Name": "primary",
+    "UsedPercent": 10,
+    "LimitWindowSeconds": 604800,
+    "ResetAfterSeconds": 144000
+   }
+  ]
+ },
+ {
+  "id": "codex-owner-3efb079b455327ceb6b70f69e4ca68801c2807e3b39b7cec88049bc16be56bf8",
+  "provider": "codex",
+  "label": "owner-d@example.com",
+  "auth_mode": "oauth",
+  "email": "codex-owner-3efb079b455327ceb6b70f69e4ca68801c2807e3b39b7cec88049bc16be56bf8",
+  "auth_checked": false,
+  "auth_valid": false,
+  "sweep_cut": true
+ }
+]

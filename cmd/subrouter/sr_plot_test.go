@@ -994,6 +994,50 @@ func TestPlotDrawsTheSamePageWhateverOrderReadsFinish(t *testing.T) {
 	}
 }
 
+// A Codex account enrolled with owner claims has the ID codex-owner-<hash>,
+// and its usage-status row carries the hash in email too; the login email is
+// its label. On 2026-11-22 the expiring list named such a peer account by the
+// first 30 characters of its ID.
+func TestPlotNamesAnAccountByItsLabel(t *testing.T) {
+	plotMachine(t)
+	unlockRemoteGateForTest(t)
+	owner := func(c string) string { return "codex-owner-" + strings.Repeat(c, 64) }
+	labelled := func(c string, used, resetHours float64) remoteServerUsageStatus {
+		row := plotRow(accounts.ProviderCodex, owner(c), used, resetHours)
+		row.Label, row.Email = "owner-"+c+"@example.com", row.ID
+		return row
+	}
+	unmeasured := remoteServerUsageStatus{ID: owner("d"), Provider: accounts.ProviderCodex, Label: "owner-d@example.com",
+		AuthMode: accounts.AuthModeOAuth, SweepCut: true}
+	serveLocalPlotDaemon(t,
+		plotRowsBody(t, plotRow(accounts.ProviderClaude, "alpha", 40, 60), labelled("a", 30, 20), labelled("c", 10, 40), unmeasured),
+		plotPeersBody(t, wirePeer("box", []remoteServerUsageStatus{labelled("b", 0, 18.6), labelled("c", 20, 40)},
+			true, plotThursday.Add(-5*time.Second), "")))
+
+	out, errOut, err := runPlot(t)
+	if err != nil || errOut != "" {
+		t.Fatalf("err = %v, stderr = %q\n%s", err, errOut, out)
+	}
+	lines := strings.Split(out, "\n")
+	start := slices.Index(lines, "  unspent · expiring soonest")
+	if start < 0 || start+3 >= len(lines) {
+		t.Fatalf("no expiring list:\n%s", out)
+	}
+	var names []string
+	for _, line := range lines[start+1 : start+4] {
+		names = append(names, strings.Fields(line)[0])
+	}
+	if want := []string{"owner-b@example.com", "owner-a@example.com", "owner-c@example.com"}; !slices.Equal(names, want) {
+		t.Errorf("expiring names = %v, want %v: the peer's account, then this machine's, by label\n%s", names, want, out)
+	}
+	requirePlotSays(t, out,
+		"1 unmeasured — not in the numbers: owner-d@example.com",
+		"same account disagrees across scopes: owner-c@example.com")
+	if strings.Contains(out, "codex-owner-") {
+		t.Errorf("the page prints an owner-keyed ID:\n%s", out)
+	}
+}
+
 func TestPlotExitsQuietlyWhenThePageSaysWhy(t *testing.T) {
 	unmeasured := remoteServerUsageStatus{ID: "l-cut", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, SweepCut: true}
 	cases := []struct {

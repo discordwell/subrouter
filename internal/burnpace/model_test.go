@@ -359,10 +359,10 @@ func TestWeekRulesAreTheOnlyWeek(t *testing.T) {
 	)}, thursday0701)
 
 	wantLeft := []LeftOut{
-		{"codex", "five-hour-primary", LeftNoWeeklyWindow},
-		{"codex", "short-primary", LeftNoWeeklyWindow},
-		{"codex", "spend", LeftNoWeeklyWindow},
-		{"claude", "weekly", LeftNoWeeklyWindow},
+		{Provider: "codex", ID: "five-hour-primary", Why: LeftNoWeeklyWindow},
+		{Provider: "codex", ID: "short-primary", Why: LeftNoWeeklyWindow},
+		{Provider: "codex", ID: "spend", Why: LeftNoWeeklyWindow},
+		{Provider: "claude", ID: "weekly", Why: LeftNoWeeklyWindow},
 	}
 	if !slices.Equal(m.LeftOut, wantLeft) {
 		t.Fatalf("left out = %v, want %v", m.LeftOut, wantLeft)
@@ -465,9 +465,9 @@ func TestRowVerdictsMergeAcrossScopes(t *testing.T) {
 		t.Errorf("stale = %d, want 2: home's copy of fresh and the peer's rolled copy of dup were sweep-cut, though local's copies are kept", m.Stale)
 	}
 	wantLeft := []LeftOut{
-		{"claude", "cut-10", LeftAuthInvalid},
-		{"claude", "cut-2", LeftAuthInvalid},
-		{"claude", "gone", LeftUnmeasured},
+		{Provider: "claude", ID: "cut-10", Why: LeftAuthInvalid},
+		{Provider: "claude", ID: "cut-2", Why: LeftAuthInvalid},
+		{Provider: "claude", ID: "gone", Why: LeftUnmeasured},
 	}
 	if !slices.Equal(m.LeftOut, wantLeft) {
 		t.Errorf("left out = %v, want %v: sorted as strings, first reason wins, u was measured on home", m.LeftOut, wantLeft)
@@ -630,7 +630,7 @@ func TestTheModelSaysWhatEveryCapturedPageSays(t *testing.T) {
 				t.Fatalf("the page does not end with the bottom notes %q", m.Bottom())
 			}
 			if p.outcome == NothingMeasured {
-				if last := m.LeftOut[len(m.LeftOut)-1].ID; !strings.HasSuffix(rest, last) {
+				if last := m.LeftOut[len(m.LeftOut)-1].Name(); !strings.HasSuffix(rest, last) {
 					t.Errorf("the page has a bottom line the model lacks, after %q", last)
 				}
 				return
@@ -649,7 +649,7 @@ func TestTheModelSaysWhatEveryCapturedPageSays(t *testing.T) {
 			if len(m.LeftOut) > 0 {
 				var ids []string
 				for _, l := range m.LeftOut {
-					ids = append(ids, l.ID)
+					ids = append(ids, l.Name())
 				}
 				if !strings.Contains(squeeze.Replace(body), squeeze.Replace("— not in the numbers: "+strings.Join(ids, ", "))) {
 					t.Errorf("the page does not leave out %v", ids)
@@ -661,7 +661,7 @@ func TestTheModelSaysWhatEveryCapturedPageSays(t *testing.T) {
 			}
 			for i, a := range m.Expiring() {
 				got := expiringRow.FindStringSubmatch(lines[start+1+i])
-				want := []string{a.ID, strconv.FormatFloat((1-a.Used)*100, 'f', 0, 64), strconv.FormatFloat(a.ResetHours, 'f', 1, 64)}
+				want := []string{a.Name(), strconv.FormatFloat((1-a.Used)*100, 'f', 0, 64), strconv.FormatFloat(a.ResetHours, 'f', 1, 64)}
 				if got == nil || !slices.Equal(got[1:], want) {
 					t.Errorf("expiring row %d = %q, want %v", i, lines[start+1+i], want)
 				}
