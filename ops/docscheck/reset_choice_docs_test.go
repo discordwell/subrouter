@@ -99,3 +99,34 @@ func TestDocsSayWhatAChoiceDoesToRouting(t *testing.T) {
 		}
 	}
 }
+
+// What a reader must find to see the choices and to go back (PATCHES §95.3):
+// the srq pool marks in real and shadow mode, a chosen account's sessions of
+// its allowance and the --json field, the srq resets window column, the
+// expiry burndown and its lead, and the setting that takes this daemon's own
+// choices out of routing.
+var resetChoiceViewDocNames = []string{
+	"chosen week #1",
+	"would choose week #1",
+	"chosen 3/20",
+	"reset_choice_mode",
+	"OPEN since",
+	"expiry burndown",
+	"1.5 times",
+	"SUBROUTER_AUTO_RESET=shadow",
+}
+
+func TestDocsSayHowToSeeTheChoicesAndGoBack(t *testing.T) {
+	root := repoRoot(t)
+	for _, rel := range []string{"ops/OPERATING.md", "ops/skills/subrouter/SKILL.md"} {
+		data, err := os.ReadFile(filepath.Join(root, rel))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, name := range resetChoiceViewDocNames {
+			if !strings.Contains(string(data), name) {
+				t.Errorf("%s does not name %q, which a reader needs to see the accounts chosen for a reset and to go back", rel, name)
+			}
+		}
+	}
+}

@@ -361,3 +361,10 @@ A pre-§59 daemon (with §58) holds a turn whose lookup fails and retries the sa
 - **A spilled turn may land on a different peer account each turn** (ranking picks each time and no hold pins it), so its prompt cache can be cold on the peer, as any first peer turn is.
 - **Codex websocket turns** get sticky DNS but are neither spilled nor held (§58).
 - **Tool calls** (`ssh`, `gh`) use the system resolver and still fail during a DNS outage.
+
+## Residual gaps §95 leaves open
+
+- **`sr status` does not show a choice.** Read `srq pool` (`chosen week #1`, or `would choose week #1` in shadow mode) or the pool board.
+- **A daemon from before §95 ignores a peer's choice.** It places new sessions on its own ranking, so only the holder's own routing loads its chosen accounts. Deploy every daemon before a holder goes to real mode.
+- **The board marks the first peer's choices only**, since it has a panel for the first peer alone (§31's D0). `srq pool` reads every configured peer.
+- **The `paced allowance` log line reports only accounts in their burndown window**, not a chosen account's allowance (§95.2). `srq pool` shows it as `chosen n/m`.

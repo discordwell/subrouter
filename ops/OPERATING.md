@@ -159,10 +159,10 @@ env -u CODEX_HOME -u SUBROUTER_CLOUD_CONFIG SUBROUTER_STATE_DIR=$t/state HOME=$t
 | Command | Answer |
 |---|---|
 | `srq serving [<session-id>] [--json]` | The account that serves the session. With no ID, it reads `CLAUDE_CODE_SESSION_ID`. |
-| `srq pool [--local\|--remote] [--json]` | Each provider's accounts, meters, and `new=` verdicts, on this daemon and each peer. |
+| `srq pool [--local\|--remote] [--json]` | Each provider's accounts, meters, and `new=` verdicts, on this daemon and each peer, with the accounts chosen for a reset (§95). |
 | `srq dir <label>` | The profile directory of one account, from the daemon. |
 | `srq selftest` | The regression fixtures. It needs no daemon. |
-| `srq resets [--json]` | Every saved reset in the pool, soonest expiry first, then the totals per kind and expiry date (§91). |
+| `srq resets [--json]` | Every saved reset in the pool, soonest expiry first, with when each one's expiry window opens, then the totals per kind and expiry date (§91, §95). |
 | `srq burn [--json]` | How fast the pool spends each weekly meter, with the trend and the share at the limit (§92.2). |
 
 `srq serving` prints `<account>` for a local session, and `<account> on <peer>  [remote]` for one a peer serves, with exit code 0. It prints `unassigned (session ...)` and exits 1 when the daemon has no row for the session. That happens before the session's first model turn, for a client that does not route through subrouter, and after a peer hold lapses.
@@ -495,7 +495,7 @@ To see every saved reset in the pool, run `srq resets`. It prints one line per a
 - `unknown <type>`, or `U`, is a kind that the daemon does not know. Nothing claims it automatically.
 - `measured_no` in `restarts_clock` was measured: one week reset, claimed by hand on 2026-11-23, kept the account's roll time. `assumed_no` (a Fable reset) and `assumed_yes` (a Codex credit) are assumptions that no claim has settled yet.
 
-Each entry of a kind the daemon knows, with a date still ahead, also carries `expiry_window` on the rows of the daemon that holds the account (§94.1): `opens_at`, `lead_seconds` and `why`. The window opens before the expiry by 1.5 times the time the pool needs, at its present demand on that meter, to spend what the holders of that kind and date still have left. It is never under 24 hours and never longer than the time left. When the demand is not known, the lead is 24 hours. The holders and the demand are this daemon's accounts and each peer's as its last usage body gave them. The daemon's background pass reads a peer again when that body is more than 5 minutes old (§95.1). A peer's rows, through `/_subrouter/peers/usage-status`, carry the peer's own windows. Inside the window an automatic claim needs only demand at the limit (below).
+Each entry of a kind the daemon knows, with a date still ahead, also carries `expiry_window` on the rows of the daemon that holds the account (§94.1): `opens_at`, `lead_seconds` and `why`. The window opens before the expiry by 1.5 times the time the pool needs, at its present demand on that meter, to spend what the holders of that kind and date still have left. It is never under 24 hours and never longer than the time left. When the demand is not known, the lead is 24 hours. The holders and the demand are this daemon's accounts and each peer's as its last usage body gave them. The daemon's background pass reads a peer again when that body is more than 5 minutes old (§95.1). A peer's rows, through `/_subrouter/peers/usage-status`, carry the peer's own windows. Inside the window an automatic claim needs only demand at the limit, and every holder of that kind and date is chosen and loaded: the expiry burndown (below). `srq resets` shows each window in its `window` column, `opens 12/8 10:00 in 15d 2h` or `OPEN since 12/8 10:00` (§95.3).
 
 pool.json carries each row's list in `resets` (`kind`, `count`, `expires_at`, `expiry`), with `resets_partial: true` for a daemon from before §91.
 
@@ -567,7 +567,7 @@ How many, and in what order:
 - Claude Fable: every account whose next reset is a Fable reset and that qualifies on the Fable meter, in the same order. An account whose next reset is a week reset is never chosen for Fable, even with its Fable meter spent: that reset is claimed on the week.
 - Codex: one account at a time, the one whose claim at its wall adds the most, as the owner put it: "pick one account, burn it to the ground, use its reset, then pick a new account". It stays chosen for at least 30 minutes while it qualifies. After that it gives way only to an account whose claim adds more. When its credit is spent, or it stops qualifying, the next one is chosen.
 
-The expiry burndown. Inside a reset kind's expiry window (see Saved resets above), every holder of that kind and date is chosen, whatever the pool's need, the soonest expiry first, then by what a claim adds. For Codex that lifts "one at a time" to as many accounts as the window holds. A holder that would reach its limit only after its reset expires, even with the pool's whole demand on it, is still chosen, last, and its reason says that its reset is likely to expire unused.
+The expiry burndown. In the owner's words, "when resets are running out of time, be aggressive". It starts when a reset kind's expiry window opens (see Saved resets above). The window opens before the expiry by 1.5 times the time the pool needs, at its present demand on that meter, to spend what the holders of that kind and date still have left, and never less than 24 hours before. So a pool that spends slowly, or holds many such resets, starts earlier. From then every holder of that kind and date is chosen, whatever the pool's need, the soonest expiry first, then by what a claim adds. For Codex that lifts "one at a time" to as many accounts as the window holds. A holder that would reach its limit only after its reset expires, even with the pool's whole demand on it, is still chosen, last, and its reason says that its reset is likely to expire unused.
 
 The modes follow `SUBROUTER_AUTO_RESET`:
 
@@ -590,9 +590,14 @@ What a choice does to routing (§95.2). Only a choice published in real mode mov
 
 Every daemon honours a choice published in real mode, the holder's own and its peers', whatever its own mode: the holder decides for its accounts. In shadow mode this daemon's own choices rank nowhere. `pool.json` and the board show the ranking with each `reason`, such as `chosen to run to its limit for its next saved reset`.
 
-To go back: `SUBROUTER_AUTO_RESET=shadow` keeps this daemon's choices out of routing, and `SUBROUTER_RESET_LOADING=0` makes the daemon ignore every choice, its peers' too. Each needs a restart.
-
 `SUBROUTER_RESET_LOADING=0` stops this daemon from choosing in any mode, and it then ignores a peer's choice too. Unset or `1` is on, the default. Any other value stops the daemon from starting, and it logs a Warn at startup when it is `0`. A change needs a restart.
+
+See the choices without the log (§95.3):
+
+- `srq pool` prints the choice at the end of the account's line, in this daemon's section and in a peer's: `chosen week #1` is an account chosen in real mode for its week, first in its holder's order; `chosen Fable #1` is one chosen for its Fable meter; a Codex account reads `chosen week #1` too. In shadow mode the same choice reads `would choose week #1`, and nothing ranks on it. The verdict of a chosen account reads `new=yes (chosen 3/20)`: 3 sessions in flight of the 20 it will take. At its allowance it reads `at_cap 20/20`. A section with no choice prints no mark and no legend line. `srq pool --json` carries `reset_choice_mode` (`real` or `shadow`), `reset_choice_meter`, `reset_choice_order` and `reset_choice_why`.
+- `srq resets` has a `window` column wherever a daemon publishes expiry windows: `opens 12/8 10:00 in 15d 2h` is when the expiry burndown of that kind and date starts, `OPEN since 12/8 10:00` means it has started, and `-` means none is published (a kind the daemon does not know, no date, or a daemon from before §94). `srq resets --json` carries each `expiry_window`.
+- The board marks a chosen account after its reset marks: `chosen week #1`, or `would choose week #1` in shadow mode. The mark's title is the reason, and the legend explains both.
+- `pool.json` carries `reset_choice` (real mode) or `would_choose` (shadow mode) on each row, `{"meter": ..., "order": ..., "why": ...}`, as the account's holder published it, this daemon's rows and a peer's alike.
 
 Read the choices in the log:
 
@@ -606,7 +611,13 @@ grep -h 'reset loading:' ~/Library/Logs/subrouter.err.log* | tail
 
 The pool these choices and §94's decisions read. Each daemon reads its peers' usage when a routing decision, `burn.json` or the board needs it. The background pass, every 10 seconds, also reads a peer again when its last usage body is more than 5 minutes old, through the same read. So a daemon that routes nothing still counts every peer that answers, where before it judged need, value and the expiry windows on its own accounts alone once no peer had been read for 15 minutes. A turn at the wall and a read of `usage-status` never read a peer, so two daemons cannot set off each other's reads. With automatic resets off, no pass reads anything.
 
-To go back, set `SUBROUTER_RESET_LOADING=0` and restart, or turn automatic resets off with `SUBROUTER_AUTO_RESET=0`.
+To go back, restart the daemon with one of these:
+
+- `SUBROUTER_AUTO_RESET=shadow`, or unset (the default): this daemon's own choices rank nowhere, and it still honours a peer's real-mode choice.
+- `SUBROUTER_RESET_LOADING=0`: this daemon chooses nothing and ranks on no choice, its own or a peer's.
+- `SUBROUTER_AUTO_RESET=0`: automatic resets are off, so this daemon claims and chooses nothing and no pass reads a peer. It still honours a peer's real-mode choice.
+
+A session that went to a chosen account stays there, as every warm session does.
 
 ## Troubleshoot
 
