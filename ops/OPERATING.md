@@ -80,6 +80,25 @@ A peer's send changes no ranking here. Until the peer's reading turns, this daem
 
 `SUBROUTER_SELF_START_WEEK=0` turns the daemon's own turn off. `SUBROUTER_SELF_START_MODEL` names another model for it. `SUBROUTER_START_UNSTARTED_WEEK=0` turns the priority and the session marks off. The two are independent: with the priority off, the daemon still sends its turn and marks the account. Either way the daemon still reads and publishes the fact, and a peer ranks on it by its own switch.
 
+### Read the pool's burn
+
+Burn says how fast the pool spends each weekly meter (§92.2). Each daemon keeps a history of its own accounts' meter readings, and from it each account's burn over the last hour, 6 hours and 24 hours: the rise in the meter's used fraction in that time, divided by that time's share of the week. 1.00 spends the budget exactly as fast as the week lasts, 2.00 twice as fast, and 0 not at all. A roll or a claim that gives budget back adds nothing. The meters are Claude's week, Claude's Fable meter and Codex's week.
+
+The pool figure is the mean over the accounts on this daemon and on every peer, each account weighing the same. Read it with `srq burn`, or one line at the end of `srq pool`:
+
+```text
+pool burn over 24 hours (1.00 = on pace): Claude week 0.80 (40% at the limit), Claude Fable 1.10, Codex week not enough history yet; srq burn says more
+```
+
+- The trend compares the last 6 or 24 hours with the 6 or 24 hours before them. `up 0.20 on the 6 hours before` means the burn over the last 6 hours is 0.20 higher than over the 6 hours before.
+- The share at the limit is how much of the accounts' time was spent at 99.5% used or more. A spent account cannot take more work, so it burns 0 however much is sent to it. A low burn with a high share at the limit means the pool is short, not idle.
+- A figure needs readings over at least half its window: 30 minutes for the last hour, 3 hours for 6 hours and 12 hours for 24 hours. A trend needs 9 hours of history for 6 hours and 36 hours for 24 hours. Until then `srq burn` says `not enough history yet`, never 0.
+- A peer that publishes no burn, a build from before §92 or one with the history off, is named as not counted. Its accounts are left out, not read as 0. So is a peer whose last answer is more than 15 minutes old.
+
+What the figures cannot say. Each account weighs the same, because plan sizes are not known. A pool figure is only as good as each daemon's history: a daemon that was down has a gap, and the rise across it is spread evenly. A meter that reads in whole percents makes the 1-hour figure move in steps of about 1.7.
+
+The history is `usage-history.jsonl` in the state directory, `~/.subrouter` unless `SUBROUTER_STATE_DIR` names another, kept for 35 days. It loads at start, so a restart or a deploy keeps the figures. Each `usage-status` row carries its account's figures as `burn`, outside `normalized`, and `GET /_subrouter/burn.json` gives the pool figure with each account's figures. Nothing ranks or routes on any of it. `SUBROUTER_USAGE_HISTORY=0` turns the history and the figures off.
+
 ## Avoid the dangerous commands
 
 These commands change state that every running client depends on, or spend something that does not come back. Run them only when you mean to.
@@ -132,6 +151,7 @@ env -u CODEX_HOME -u SUBROUTER_CLOUD_CONFIG SUBROUTER_STATE_DIR=$t/state HOME=$t
 | `srq dir <label>` | The profile directory of one account, from the daemon. |
 | `srq selftest` | The regression fixtures. It needs no daemon. |
 | `srq resets [--json]` | Every saved reset in the pool, soonest expiry first, then the totals per kind and expiry date (§91). |
+| `srq burn [--json]` | How fast the pool spends each weekly meter, with the trend and the share at the limit (§92.2). |
 
 `srq serving` prints `<account>` for a local session, and `<account> on <peer>  [remote]` for one a peer serves, with exit code 0. It prints `unassigned (session ...)` and exits 1 when the daemon has no row for the session. That happens before the session's first model turn, for a client that does not route through subrouter, and after a peer hold lapses.
 
@@ -524,6 +544,7 @@ Each daemon records every claim it makes, by hand or by the Codex failover and b
 | `~/.claude-route/` | The shims, the mode files, and `claude-route`'s launch log. |
 | `~/.config/subrouter/cloud.json` | Written by `sr setup`. It holds the proxy token. |
 | `~/Library/Logs/subrouter.err.log` | The daemon log, with rotated copies `.1` to `.3`. |
+| `~/.subrouter/usage-history.jsonl` | The daemon's own meter readings and reset claims, 35 days, at most 32 MiB (§92). |
 
 ### Routes
 
@@ -541,6 +562,7 @@ All are on `127.0.0.1:31415` and answer loopback with no token.
 | `POST /_subrouter/reload-accounts` | Re-reads the store. |
 | `GET /_subrouter/drain-status` | Whether the daemon is draining. `sr drain`, `sr resume`, and `sr drain-status` use the drain socket. |
 | `POST /_subrouter/claude-reset` | Claims a saved Claude reset. Use `sr claude reset` only, and only when asked. |
+| `GET /_subrouter/burn.json` | The pool's burn per meter over this daemon's and every peer's accounts, with the trend, the share at the limit, and each account's figures (§92.2). |
 
 ### Settings
 
@@ -572,7 +594,7 @@ The daemon reads these from its environment when it starts.
 | `SUBROUTER_READ_CODEX_RESET_EXPIRY` | on | `0` stops the daemon from reading its own Codex accounts' reset credit list for the credits' expiry dates (§91). A value it does not recognize stops the daemon. |
 | `SUBROUTER_CODEX_AUTO_RATE_LIMIT_RESET` | off | `1` lets failover spend a Codex reset credit. |
 | `SUBROUTER_PUBLIC_ADMIN` | off | On a box, `1` serves admin routes on the public listener to named admin tokens. |
-| `SUBROUTER_USAGE_HISTORY` | on | `0` stops recording this daemon's own meter readings and reset claims in `usage-history.jsonl` (§92.1). A value it does not recognize stops the daemon. |
+| `SUBROUTER_USAGE_HISTORY` | on | `0` stops recording this daemon's own meter readings and reset claims in `usage-history.jsonl` (§92.1), and with them the burn figures (§92.2). A value it does not recognize stops the daemon. |
 
 Most of these log an unreadable value and start with the default. Six do not. `SUBROUTER_RESET_HOLD_PRIORITY`, `SUBROUTER_FABLE_RESERVATION`, `SUBROUTER_START_UNSTARTED_WEEK`, `SUBROUTER_SELF_START_WEEK`, `SUBROUTER_READ_CODEX_RESET_EXPIRY` and `SUBROUTER_USAGE_HISTORY` accept only `1` or `0`, or `true` or `false`, `yes` or `no`, `on` or `off`. Any other value stops `serve` from starting, and on a plain job launchd then restarts it forever. The other on/off settings read any value but `1`, `true`, `yes`, or `on` as off, and log nothing.
 
