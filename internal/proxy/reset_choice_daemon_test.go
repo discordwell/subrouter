@@ -385,6 +385,10 @@ func TestTheBackgroundPassReadsAStalePeerAndNothingElseDoes(t *testing.T) {
 	stale := time.Now().Add(-10 * time.Minute)
 	pool.admin.entries = map[string]remotePoolAdminEntry{remotePoolUsagePath: {body: peerBody(0.6), at: stale, tried: stale}}
 	d.server.RemotePool = pool
+	// Handler copies the Server it is built from, so the turns below see the
+	// peer only through a handler built after RemotePool is set.
+	d.proxy = httptest.NewServer(d.server.Handler())
+	t.Cleanup(d.proxy.Close)
 
 	if would, _ := published(t, usageRows(t, d.server)["held"]); would != nil || requests.Load() != 0 {
 		t.Fatalf("usage-status: would_choose %+v and %d peer requests, want neither", would, requests.Load())
