@@ -108,6 +108,27 @@ func autoResetOn() bool {
 	return mode != AutoResetOff
 }
 
+// autoResetWorthOn is SUBROUTER_AUTO_RESET_WORTH (PATCHES §94.2): on, a claim
+// is made only when §94's rule finds it worth making; off, §93.1's rule
+// decides alone. Never set, it is off, so a Server that serve did not set up
+// decides as §93 did; serve sets it on unless the switch says 0.
+var autoResetWorthOn atomic.Bool
+
+// SetAutoResetWorth turns §94.2's rule on or off for the process.
+func SetAutoResetWorth(on bool) { autoResetWorthOn.Store(on) }
+
+// AutoResetWorth reports whether §94.2's rule decides.
+func AutoResetWorth() bool { return autoResetWorthOn.Load() }
+
+// autoResetFoldsOlderSpenders reports real mode, in which the one decision
+// spends Codex credits and the two older automatic paths spend none
+// (§94.2): the failover redeem of SUBROUTER_CODEX_AUTO_RATE_LIMIT_RESET, and
+// the background spender in its spending mode, which then only advises.
+func autoResetFoldsOlderSpenders() bool {
+	mode, _ := AutoReset()
+	return mode == AutoResetReal
+}
+
 // autoResetMoment is when a claim is considered: at the wall, or on a reading.
 type autoResetMoment string
 
@@ -150,6 +171,19 @@ func (k autoResetKind) meter() autoResetMeter {
 	return autoResetWeek
 }
 
+// tableKind is the kinds table's name for k (accounts.ResetKindNamed).
+func (k autoResetKind) tableKind() accounts.ResetKind {
+	switch k {
+	case autoResetKindWeek:
+		return accounts.ResetKindClaudeWeek
+	case autoResetKindFable:
+		return accounts.ResetKindClaudeFable
+	case autoResetKindCodexCredit:
+		return accounts.ResetKindCodexRateLimits
+	}
+	return accounts.ResetKindUnknown
+}
+
 func (k autoResetKind) words() string {
 	switch k {
 	case autoResetKindWeek:
@@ -171,6 +205,10 @@ const (
 	// under-1-percent condition failed.
 	AutoResetRefusedByCondition AutoResetVerdict = "refused_by_condition"
 	AutoResetNoClaim            AutoResetVerdict = "no_claim"
+	// AutoResetHeldBack is every check of §93.1 passed and §94.2's rule found
+	// a claim not worth making now: the pool does not need the reset, or a
+	// claim would add too little before the roll.
+	AutoResetHeldBack AutoResetVerdict = "held_back"
 	// AutoResetClaimed is a real-mode claim the provider says used the reset
 	// (§93.2); AutoResetMayHaveLanded one whose answer leaves that unknown,
 	// which only a reading settles; AutoResetFailed any other.
@@ -217,6 +255,9 @@ type autoResetNext struct {
 type autoResetReading struct {
 	left float64 // fraction left, 0 to 1
 	at   time.Time
+	// roll is when the meter's window rolls, as the reading gave it; zero
+	// when it gave none.
+	roll time.Time
 }
 
 // autoResetFacts is everything one decision reads.
@@ -233,16 +274,43 @@ type autoResetFacts struct {
 	readings       map[autoResetMeter]autoResetReading
 	nearEmpty      bool
 	now            time.Time
+	// worth is what §94.2's rule reads; nil decides by §93.1's rule alone
+	// (SUBROUTER_AUTO_RESET_WORTH=0).
+	worth *autoResetWorth
 }
 
-// decideAutoReset is the one decision (PATCHES §93.1), for an account this
-// daemon holds (only such an account ever has a moment): claim when a moment
-// has come, its credential is alive, there is demand on it, its next reset is
-// one this daemon knows and can claim now, and -- while the owner's condition
-// is on -- the meter that reset gives back has under 1% left. It returns the
-// verdict with its reason; the caller fills in who, when and the turn. A
-// later rule (burn rate and expiry) replaces this function and leaves the
-// claim alone.
+// autoResetWorth is what §94.2's rule reads about a claim of the next reset.
+type autoResetWorth struct {
+	// label names the meter the reset is claimed on: Claude week, Claude
+	// Fable, Codex week.
+	label string
+	// need is the pool's need on that meter, with its pressures.
+	need MeterNeed
+	// own is the account's own figures on that meter.
+	own UsageMeterBurn
+	// restarts is the kind's restarts_clock in the kinds table.
+	restarts accounts.ClockRestart
+	// roll is when the account's window on that meter rolls; zero when not
+	// read.
+	roll time.Time
+	// expires is when the reset expires; zero when it has no date.
+	expires time.Time
+	// window is the kind and date's expiry window (§94.1); nil without one.
+	window *accounts.ResetExpiryWindow
+}
+
+// resetValueFloor is the least share of a week a claim must add, outside
+// the expiry window and last chance: a claim worth less is held back.
+const resetValueFloor = 0.25
+
+// decideAutoReset is the one decision (PATCHES §93.1, §94.2), for an account
+// this daemon holds (only such an account ever has a moment): claim when a
+// moment has come, its credential is alive, there is demand on it, its next
+// reset is one this daemon knows and can claim now, and -- while the owner's
+// condition is on -- the meter that reset gives back has under 1% left. With
+// §94.2's facts it then claims only when the claim is worth making
+// (decideWorth). It returns the verdict with its reason; the caller fills in
+// who, when and the turn.
 func decideAutoReset(f autoResetFacts) AutoResetDecision {
 	d := AutoResetDecision{Moment: string(f.moment), Verdict: AutoResetNoClaim}
 	switch {
@@ -279,7 +347,48 @@ func decideAutoReset(f autoResetFacts) AutoResetDecision {
 	}
 	d.Verdict = AutoResetWouldClaim
 	d.Reason = moment + "; " + next
+	if f.worth != nil {
+		d.Verdict, d.Reason = decideWorth(*f.worth, f.now, d.Reason)
+	}
 	return d
+}
+
+// decideWorth is §94.2's rule, once every check of §93.1 has passed. A reset
+// whose clock nobody knows is never claimed. Inside its expiry window, or in
+// its last chance, it is claimed at any value. Otherwise it is claimed only
+// when the pool needs its saved resets on the meter and a claim adds at least
+// resetValueFloor of a week before the roll.
+func decideWorth(w autoResetWorth, now time.Time, reason string) (AutoResetVerdict, string) {
+	pool, _ := longestPressure(w.need.Pressure)
+	rate := claimRateOf(w.own, pool)
+	value := claimValueOf(w.restarts, w.roll.Sub(now), rate)
+	if _, known := w.restarts.Restarts(); !known {
+		return AutoResetNoClaim, reason + "; " + value.why + "; such a reset is never claimed automatically"
+	}
+	if w.window != nil && !now.Before(w.window.OpensAt) {
+		return AutoResetWouldClaim, fmt.Sprintf("%s; inside its expiry window, open since %s, %s before the reset expires: any demand at the limit is enough",
+			reason, w.window.OpensAt.UTC().Format(time.RFC3339), shortDuration(time.Duration(w.window.LeadSeconds)*time.Second))
+	}
+	if !w.roll.IsZero() && lastChance(w.expires, w.roll, rate) {
+		return AutoResetWouldClaim, fmt.Sprintf("%s; its last chance: it expires at %s, before the account could meet its next wall after the roll at %s at the rate %s",
+			reason, w.expires.UTC().Format(time.RFC3339), w.roll.UTC().Format(time.RFC3339), rate)
+	}
+	if w.need.Answer == ResetNeedNo {
+		return AutoResetHeldBack, fmt.Sprintf("%s; held back: the pool does not need its saved resets on the %s (%s), so the rest of the pool can carry the work",
+			reason, w.label, w.need.Why)
+	}
+	if w.need.Answer != ResetNeedYes {
+		return AutoResetNoClaim, fmt.Sprintf("%s; the pool's burn on the %s is not known yet (%s), so nothing is claimed", reason, w.label, w.need.Why)
+	}
+	if w.roll.IsZero() {
+		return AutoResetNoClaim, fmt.Sprintf("%s; the account's roll on the %s is not read, so what a claim would add is not known", reason, w.label)
+	}
+	if value.value < resetValueFloor {
+		return AutoResetHeldBack, fmt.Sprintf("%s; held back: the roll is %s away, and a claim would add %.2f of a week, under the floor of %.2f (%s)",
+			reason, shortDuration(max(w.roll.Sub(now), 0)), value.value, resetValueFloor, value.why)
+	}
+	return AutoResetWouldClaim, fmt.Sprintf("%s; the pool needs its saved resets on the %s (%s), and a claim adds %.2f of a week (%s)",
+		reason, w.label, w.need.Why, value.value, value.why)
 }
 
 // autoResetMeterLeft is how much meter has left: nothing, when the wall's
@@ -662,9 +771,45 @@ func (s Server) considerAutoReset(ctx context.Context, account accounts.Account,
 		f.next = s.autoResetCodexCredit(ctx, memory, account, f.now)
 		d = decideAutoReset(f)
 	}
+	// §94.2's facts are gathered only for a claim §93.1's rule would make.
+	if d.Verdict == AutoResetWouldClaim && AutoResetWorth() {
+		f.worth = s.autoResetWorthFor(account, f)
+		d = decideAutoReset(f)
+	}
 	d.At, d.Account, d.Provider, d.Mode, d.Turn = f.now, account.ID, provider, mode.String(), turn
 	d.Label = autoResetLabel(row, account.ID)
 	return d, f
+}
+
+// autoResetWorthFor is what §94.2's rule reads about claiming f's next reset
+// on account: the pool's need on the meter its kind is claimed on, from this
+// daemon's last sweep and each counted peer's last usage body; the account's
+// own figures and roll on that meter; the reset's expiry; and the expiry
+// window of its kind and date.
+func (s Server) autoResetWorthFor(account accounts.Account, f autoResetFacts) *autoResetWorth {
+	provider := usageHistoryProvider(account)
+	spec, _ := accounts.ResetKindNamed(accounts.Provider(provider), f.next.kind.tableKind())
+	rows, _ := s.AccountRef.UsageStatusSnapshot()
+	rows = s.AccountRef.withUsageBurn(s.withHeldResets(rows))
+	pool := s.resetPoolOf(rows, f.now)
+	meter := pool.meter(provider, spec.Meter)
+	w := &autoResetWorth{label: meter.Label, need: needOf(nil, nil), restarts: spec.RestartsClock,
+		roll: f.readings[f.next.kind.meter()].roll}
+	if meter.Need != nil {
+		w.need = *meter.Need
+	}
+	for _, row := range rows {
+		if row.ID == account.ID && usageHistoryProvider(accounts.Account{ID: row.ID, Provider: row.Provider}) == provider {
+			w.own = row.Burn[string(spec.Meter)]
+			break
+		}
+	}
+	reset := accounts.HeldReset{Kind: spec.Kind, Count: 1, ExpiresAt: f.next.expiresAt}
+	w.expires, _ = reset.Expires()
+	if window, ok := pool.window(provider, reset); ok {
+		w.window = &window
+	}
+	return w
 }
 
 // actOnAutoReset keeps d as the account's last decision and acts on it:
@@ -737,10 +882,10 @@ func autoResetReadingsOf(row *AccountUsageStatus) map[autoResetMeter]autoResetRe
 // autoResetReadingsIn is those meters in windows, a reading measured at.
 func autoResetReadingsIn(provider accounts.Provider, windows []accounts.UsageWindow, at time.Time) map[autoResetMeter]autoResetReading {
 	out := map[autoResetMeter]autoResetReading{}
-	note := func(meter autoResetMeter, used float64) {
-		left := min(max((100-used)/100, 0), 1)
+	note := func(meter autoResetMeter, window accounts.UsageWindow) {
+		left := min(max((100-window.UsedPercent)/100, 0), 1)
 		if current, ok := out[meter]; !ok || left < current.left {
-			out[meter] = autoResetReading{left: left, at: at}
+			out[meter] = autoResetReading{left: left, at: at, roll: window.ResetTime(at)}
 		}
 	}
 	for _, window := range windows {
@@ -749,12 +894,12 @@ func autoResetReadingsIn(provider accounts.Provider, windows []accounts.UsageWin
 		}
 		switch {
 		case provider == accounts.ProviderClaude && window.Name == "7d" && window.Feature == "":
-			note(autoResetWeek, window.UsedPercent)
+			note(autoResetWeek, window)
 		case provider == accounts.ProviderClaude && window.Name == agentclaude.FableWindowName:
-			note(autoResetFable, window.UsedPercent)
+			note(autoResetFable, window)
 		case provider == accounts.ProviderCodex && !accounts.IsModelScopedWindow(window) &&
 			!accounts.IsSpendWindow(window) && accounts.IsLongQuotaWindow(window):
-			note(autoResetWeek, window.UsedPercent)
+			note(autoResetWeek, window)
 		}
 	}
 	return out

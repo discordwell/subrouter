@@ -44,3 +44,41 @@ func TestDocsSayTheWeekResetKeepsItsRoll(t *testing.T) {
 		}
 	}
 }
+
+// What a reader of the operator doc and the agent skill must find about the
+// rule of PATCHES §94.2: its switch, the held-back verdict, and that real
+// mode turns the two older Codex spenders off.
+var worthRuleNames = []string{"SUBROUTER_AUTO_RESET_WORTH", "held_back", "SUBROUTER_CODEX_AUTO_RATE_LIMIT_RESET", "reset claim contradicts the kinds table"}
+
+// What no doc but ops/PATCHES.md may still say since §94.2: that real mode
+// refuses to start beside the older Codex spenders.
+var staleSpenderRefusal = regexp.MustCompile(`(?i)refuses to start (?:with \x601\x60 )?beside`)
+
+func TestDocsSayHowAutomaticResetsDecideAndWhoSpends(t *testing.T) {
+	root := repoRoot(t)
+	for _, rel := range []string{"ops/OPERATING.md", "ops/skills/subrouter/SKILL.md"} {
+		data, err := os.ReadFile(filepath.Join(root, rel))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, name := range worthRuleNames {
+			if !strings.Contains(string(data), name) {
+				t.Errorf("%s does not name %q, which a reader needs to know when an automatic claim is made", rel, name)
+			}
+		}
+	}
+	for _, rel := range trackedFiles(t, root) {
+		if !strings.HasSuffix(rel, ".md") || rel == "ops/PATCHES.md" {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(root, rel))
+		if err != nil {
+			continue
+		}
+		for n, line := range strings.Split(string(data), "\n") {
+			if match := staleSpenderRefusal.FindString(line); match != "" {
+				t.Errorf("%s:%d still says %q; since §94.2 real mode starts and turns the older Codex spenders off", rel, n+1, match)
+			}
+		}
+	}
+}

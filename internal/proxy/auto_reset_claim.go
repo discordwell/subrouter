@@ -299,7 +299,7 @@ func (s Server) runAutoResetClaim(account accounts.Account, key string, claim *a
 	var after []accounts.UsageWindow
 	switch d.Provider {
 	case accounts.ProviderClaude:
-		result, after = s.autoResetClaimClaude(account, d.Reset)
+		result, after = s.autoResetClaimClaude(account, d.Reset, f)
 	case accounts.ProviderCodex:
 		result, after = s.autoResetClaimCodex(account, f)
 	default:
@@ -357,16 +357,33 @@ func (s Server) finishAutoResetClaim(key string, claim *autoResetClaim, d AutoRe
 // unless the cached one is claimable, refuses any grant but Anthropic's next
 // (so a grant the decision did not judge is never claimed), reuses a
 // request_id that may have landed, and reads the account again after a
-// reset. It returns what came of it and that reading.
-func (s Server) autoResetClaimClaude(account accounts.Account, grant string) (autoResetClaimResult, []accounts.UsageWindow) {
+// reset. At a reading moment it reads the account live first (§94.2), as the
+// Codex claim does: the meter the moment found must still read at least 99.5%
+// used, so a week that rolled since the reading is not claimed on, and while
+// the owner's condition is on the reset's meter must have under 1% left. At
+// the wall the refusal is the evidence, and nothing more is read. It returns
+// what came of it and the reading after it.
+func (s Server) autoResetClaimClaude(account accounts.Account, grant string, f autoResetFacts) (autoResetClaimResult, []accounts.UsageWindow) {
 	work, cancelWork := context.WithTimeout(context.Background(), ClaudeResetBudget)
 	defer cancelWork()
 	caller, cancelCaller := context.WithTimeout(work, autoResetClaudePatience)
 	defer cancelCaller()
 	claim := false
-	response, code := s.claudeReset(work, caller, ClaudeResetRequest{
-		Account: account.ID, ConfirmAccount: account.ID, DryRun: &claim, GrantID: grant,
-	})
+	request := ClaudeResetRequest{Account: account.ID, ConfirmAccount: account.ID, DryRun: &claim, GrantID: grant}
+	if f.moment == autoResetOnAReading {
+		request.liveCheck = func(windows []accounts.UsageWindow, at time.Time) error {
+			live := autoResetReadingsIn(accounts.ProviderClaude, windows, at)
+			if moment, read := live[f.readingMeter]; !read || (1-moment.left)*100 < autoResetReadingUsed {
+				return fmt.Errorf("the live reading before the claim no longer says %s is at least 99.5%% used", f.readingMeter.words())
+			}
+			meter := f.next.kind.meter()
+			if left, read := live[meter]; f.nearEmpty && (!read || left.left >= autoResetNearEmptyLeft) {
+				return fmt.Errorf("refused by the under-1-percent condition on the live reading of %s before the claim", meter.words())
+			}
+			return nil
+		}
+	}
+	response, code := s.claudeReset(work, caller, request)
 	answered := response.Result
 	if response.Reason != "" {
 		answered += " (" + response.Reason + ")"

@@ -83,6 +83,13 @@ func (g *quotaResetGate) release(spent bool) {
 	g.mu.Unlock()
 }
 
+// failoverRedeems reports the failover redeem on: SUBROUTER_CODEX_AUTO_RATE_LIMIT_RESET
+// set, and automatic resets not in real mode, where the one decision spends
+// Codex credits instead (PATCHES §94.2).
+func (s Server) failoverRedeems() bool {
+	return s.AutoRedeemRateLimitReset && !autoResetFoldsOlderSpenders()
+}
+
 // redeemForFailover is the last stage of Codex quota failover: every account is
 // cooked, so find one that still holds a rate-limit-reset credit, spend it, and
 // hand back the revived account for the caller to route to.
@@ -91,7 +98,7 @@ func (g *quotaResetGate) release(spent bool) {
 // the interval floor, or no eligible account -- and every one of those branches
 // logs, because a failover that silently gives up is the bug this replaces.
 func (s Server) redeemForFailover(ctx context.Context, provider accounts.Provider, agentType, sessionID, userEmail string, tried map[string]struct{}) (accounts.Account, bool) {
-	if !s.AutoRedeemRateLimitReset || provider != accounts.ProviderCodex || s.AccountRef == nil {
+	if !s.failoverRedeems() || provider != accounts.ProviderCodex || s.AccountRef == nil {
 		return accounts.Account{}, false
 	}
 	if !s.quotaResetGate.claim() {

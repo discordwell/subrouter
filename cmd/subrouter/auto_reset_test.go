@@ -101,11 +101,65 @@ func TestServeSetsTheAutoReset(t *testing.T) {
 	}
 }
 
-// 8. PATCHES §93.2: only one thing may spend Codex credits by itself.
-// SUBROUTER_AUTO_RESET=1 beside the failover redeem or beside the background
-// spender in its spending mode refuses to start and names both settings; in
-// shadow or off both older paths start as they did.
-func TestAutoResetRefusesToStartBesideTheOlderCodexSpenders(t *testing.T) {
+// PATCHES §94.2: SUBROUTER_AUTO_RESET_WORTH unset or 1 is on, 0 goes back
+// to §93.1's rule, and any other value is refused with a message naming it.
+// serve sets it for the process and says at startup when it is off.
+func TestServeSetsTheAutoResetWorthRule(t *testing.T) {
+	const name = "SUBROUTER_AUTO_RESET_WORTH"
+	for raw, want := range map[string]bool{"": true, " ": true, "1": true, "0": false} {
+		t.Setenv(name, raw)
+		if got, err := autoResetWorthEnabled(); err != nil || got != want {
+			t.Fatalf("%s=%q: got %v err %v, want %v", name, raw, got, err, want)
+		}
+	}
+	for _, raw := range []string{"2", "true", "on", "off", "no"} {
+		t.Setenv(name, raw)
+		if _, err := autoResetWorthEnabled(); err == nil || !strings.Contains(err.Error(), name) {
+			t.Fatalf("%s=%q accepted (err %v)", name, raw, err)
+		}
+	}
+
+	prevMode, prevNearEmpty := proxy.AutoReset()
+	prevWorth := proxy.AutoResetWorth()
+	t.Cleanup(func() {
+		proxy.SetAutoReset(prevMode, prevNearEmpty)
+		proxy.SetAutoResetWorth(prevWorth)
+	})
+	clearControlSecretEnv(t)
+	dir := t.TempDir()
+	t.Setenv("SUBROUTER_STATE_DIR", dir)
+	t.Setenv("SUBROUTER_CLOUD_CONFIG", dir)
+	t.Setenv("SUBROUTER_AUTO_RESET", "")
+	t.Setenv("SUBROUTER_AUTO_RESET_NEAR_EMPTY", "")
+	args := []string{"--addr", "127.0.0.1:0", "--fetch-usage=false", "--sr-switch-interval=0"}
+	const offLine = "SUBROUTER_AUTO_RESET_WORTH=0: an automatic claim follows §93's rule alone"
+	for raw, want := range map[string]bool{"": true, "1": true, "0": false} {
+		t.Setenv(name, raw)
+		// Not what serve should set, so a serve that never sets it is red.
+		proxy.SetAutoResetWorth(!want)
+		log := captureDefaultLog(t)
+		if err := serveMustReturn(t, args); err == nil || !strings.Contains(err.Error(), "cmux.com config") {
+			t.Fatalf("%s=%q: serve returned %v, want the deliberate cloud-config failure", name, raw, err)
+		}
+		if got := proxy.AutoResetWorth(); got != want {
+			t.Fatalf("%s=%q: serve set the rule %v, want %v", name, raw, got, want)
+		}
+		if lines := strings.Count(log.String(), offLine); lines != map[bool]int{false: 1}[want] {
+			t.Fatalf("%s=%q: startup logged the off line %d times:\n%s", name, raw, lines, log)
+		}
+	}
+	t.Setenv(name, "yes")
+	if err := serveMustReturn(t, args); err == nil || !strings.Contains(err.Error(), name) {
+		t.Fatalf("serve with %s=yes returned %v, want a refusal naming it", name, err)
+	}
+}
+
+// 11. PATCHES §94.2: SUBROUTER_AUTO_RESET=1 no longer refuses to start beside
+// the failover redeem or the background spender in its spending mode. serve
+// starts and logs one Warn for each, naming its setting and saying that
+// automatic resets now decide; the proxy turns both off in real mode. In
+// shadow or off both older paths start as they did, with no Warn.
+func TestRealModeFoldsTheOlderCodexSpenders(t *testing.T) {
 	prevMode, prevNearEmpty := proxy.AutoReset()
 	t.Cleanup(func() { proxy.SetAutoReset(prevMode, prevNearEmpty) })
 	clearControlSecretEnv(t)
@@ -113,30 +167,41 @@ func TestAutoResetRefusesToStartBesideTheOlderCodexSpenders(t *testing.T) {
 	t.Setenv("SUBROUTER_STATE_DIR", dir)
 	t.Setenv("SUBROUTER_CLOUD_CONFIG", dir)
 	t.Setenv("SUBROUTER_AUTO_RESET_NEAR_EMPTY", "")
+	const failoverLine, spenderLine = "SUBROUTER_CODEX_AUTO_RATE_LIMIT_RESET is set and SUBROUTER_AUTO_RESET=1: the failover redeem is off, automatic resets now decide",
+		"--reset-credit-autospend=spend and SUBROUTER_AUTO_RESET=1: the background spender redeems nothing and only advises"
 	for _, c := range []struct {
 		mode, failoverRedeem, spender string
-		refusal                       []string
+		lines                         []string
 	}{
-		{"1", "1", "warn", []string{"SUBROUTER_AUTO_RESET=1", "SUBROUTER_CODEX_AUTO_RATE_LIMIT_RESET=1"}},
-		{"1", "", "spend", []string{"SUBROUTER_AUTO_RESET=1", "--reset-credit-autospend=spend"}},
+		{"1", "1", "warn", []string{failoverLine}},
+		{"1", "", "spend", []string{spenderLine}},
+		{"1", "1", "spend", []string{failoverLine, spenderLine}},
 		{"1", "", "warn", nil},
 		{"shadow", "1", "spend", nil},
 		{"0", "1", "spend", nil},
 	} {
 		t.Setenv("SUBROUTER_AUTO_RESET", c.mode)
 		t.Setenv("SUBROUTER_CODEX_AUTO_RATE_LIMIT_RESET", c.failoverRedeem)
+		log := captureDefaultLog(t)
 		err := serveMustReturn(t, []string{"--addr", "127.0.0.1:0", "--fetch-usage=false", "--sr-switch-interval=0",
 			"--reset-credit-autospend=" + c.spender})
-		if c.refusal == nil {
-			if err == nil || !strings.Contains(err.Error(), "cmux.com config") {
-				t.Fatalf("%+v: serve returned %v, want it to start (and meet the deliberate cloud-config failure)", c, err)
-			}
-			continue
+		if err == nil || !strings.Contains(err.Error(), "cmux.com config") {
+			t.Fatalf("%+v: serve returned %v, want it to start (and meet the deliberate cloud-config failure)", c, err)
 		}
-		for _, name := range c.refusal {
-			if err == nil || !strings.Contains(err.Error(), name) {
-				t.Fatalf("%+v: serve returned %v, want a refusal naming %s", c, err, name)
+		for _, line := range []string{failoverLine, spenderLine} {
+			want := 0
+			for _, expected := range c.lines {
+				if expected == line {
+					want = 1
+				}
 			}
+			if got := strings.Count(log.String(), line); got != want {
+				t.Fatalf("%+v: startup logged %q %d times, want %d:\n%s", c, line, got, want, log)
+			}
+		}
+		if want := len(c.lines); strings.Count(log.String(), "automatic resets now decide every Codex claim") != want ||
+			(want > 0 && !strings.Contains(log.String(), "level=WARN")) {
+			t.Fatalf("%+v: want %d Warns that say automatic resets now decide:\n%s", c, want, log)
 		}
 	}
 }
