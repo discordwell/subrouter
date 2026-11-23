@@ -184,7 +184,7 @@ def read_pool(daemon):
         )
         summary["clears_floor"] = floor_state(norm)
         out["accounts"].append(summary)
-    out["accounts"].sort(key=lambda a: (a.get("provider") or "", a.get("id") or ""))
+    out["accounts"].sort(key=lambda a: (a.get("provider") or "", a.get("name") or ""))
     return out
 
 
@@ -328,7 +328,7 @@ function account(a) {
   if (a.auth_valid === false) bits.push('AUTH INVALID');
   const roll = fmtRoll(a.rolls_in_hours);
   return `<div class="row">
-    <div class="id">${esc(a.id)}</div><div class="num">${left}</div>
+    <div class="id">${esc(a.name)}</div><div class="num">${left}</div>
     <div class="roll${rollClass(a.rolls_in_hours)}" title="time until the weekly window rolls">${esc(roll)}</div>
     <div class="bar"><div class="fill" style="width:${width(a)}%;background:${color(a)};${known?'':'opacity:.25'}"></div></div>
     <div class="meta">${bits.map(esc).join(' · ')}</div></div>`;
