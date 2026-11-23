@@ -58,7 +58,7 @@ python3 ops/bin/srq selftest
 python3 ops/bin/sr-plot --selftest
 python3 ops/skills/revive-workflow-agents/test_wf_revive.py
 node --test ops/skills/revive-workflow-agents/test_wf_prefix.mjs
-node --test internal/proxy/pool_ui_page_test.mjs   # the pool board page; Docker: the Node image, as the file says
+node --test internal/proxy/pool_ui_page_test.mjs   # the pool board page; go test ./internal/proxy runs it too
 ops/bin/sr-local-ci --selftest
 ```
 

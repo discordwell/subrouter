@@ -2307,9 +2307,11 @@ on main no longer stops every other change from landing. The owner: "we were pro
 much CI".
 
 §74.1 `ci.yml` takes `workflow_dispatch`. The classifier reports `code=false` for every other event, so
-a pull request, a merge group and a push to main run "Public check" and the "Build, vet, test" gate
-alone, and the gate passes on the skipped jobs as it does for a docs-only change. Start the full suite
-with `gh workflow run ci.yml --ref <branch>`; there the classifier runs everything.
+a pull request, a merge group and a push to main run "Public check" and the "Build, vet, test" gate,
+and the gate passes on the skipped jobs as it does for a docs-only change. A pull request and a
+push to main also run the board page's node tests and `srq selftest`, in a job the gate does not wait
+on. Start the full suite with `gh workflow run ci.yml --ref <branch>`; there the classifier runs
+everything.
 
 §74.2 To gate merges again once the project has users, delete the classifier's `workflow_dispatch`
 early exit.

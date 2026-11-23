@@ -37,6 +37,8 @@ func TestDockerfileTestStageIsolatesEveryAgentConfigSurface(t *testing.T) {
 		"SUBROUTER_STATE_DIR=/home/agent/.subrouter",
 		"SUBROUTER_CLOUD_CONFIG=/home/agent/.config/subrouter/cloud.json",
 		"SUBROUTER_DOCKER_TEST_HARNESS=1",
+		// Without it the board page tests skip in the harness when node is gone.
+		"SUBROUTER_TEST_REQUIRE_NODE=1",
 		// The bare-image entrypoint must clear the same three HOME-derived
 		// overrides test.sh clears, or the two entry points disagree and a
 		// direct `docker run` buries the real baseline under spurious reds.

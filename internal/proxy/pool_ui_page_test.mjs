@@ -4,10 +4,8 @@
 //
 // The page's own script runs in a vm context with a stand-in document and a fetch that answers
 // /_subrouter/pool.json, so a test reads the HTML the board draws from the JSON the daemon sends.
-// It uses only Node's own modules. The Go test image has no Node, so in Docker use the Node image:
-//
-//   docker run --rm --network none -v "$PWD:/src:ro" -w /src node:26.13.1-bookworm-slim \
-//     node --test internal/proxy/pool_ui_page_test.mjs
+// It uses only Node's own modules. TestTheBoardPagePassesItsNodeTests runs it, so
+// `deploy/docker/test.sh ./internal/proxy` does too: the Go test image has node.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
