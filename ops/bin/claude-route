@@ -1500,7 +1500,14 @@ cmd_test() {
         local sid="$1" word="$2"; shift 2
         local out; out=$(cd "$cwd" && perl -e 'alarm shift; exec @ARGV' 240 env "${clean[@]}" "$@" -p "Reply with exactly one word, in lowercase: $word" --model haiku --session-id "$sid" 2>>"$err")
         echo "[$sid] -> ${out:0:200}"
+        ASK_OUT="$out"
         [[ "$out" == *"$word"* ]]
+    }
+    # The daemon answered the last ask's pin once, finally, before any
+    # assignment (PATCHES §89). Without its answer, a launch with no row may
+    # never have reached the daemon at all.
+    daemon_refused_pin() { # sid of the last ask
+        [[ "$ASK_OUT" == *"subrouter: pinned account"* ]] || { echo "$1: no row, and the answer is not the daemon's refusal of the pin: ${ASK_OUT:0:200}"; return 1; }
     }
     resume() {
         local sid="$1" word="$2"; shift 2
@@ -1914,7 +1921,7 @@ sys.exit(1)' "$f"
             # The daemon refuses a pin inside its owner's holdout before any assignment, so no row (PATCHES §89);
             # a pin the provider itself limits has its row on exactly that account.
             t0=$(date +%s)
-            check "pinned '$LC' (spent) fails fast, no failover" eval '! ask "$w2" hotel PATH="$P_FRONT" "$F_CLAUDE" "$LC" && quick $t0 45 && { unserved "$w2" || { served "$w2" && test "$SERVED_BY" = "$LC"; }; }'
+            check "pinned '$LC' (spent) fails fast, no failover" eval '! ask "$w2" hotel PATH="$P_FRONT" "$F_CLAUDE" "$LC" && quick $t0 45 && { { unserved "$w2" && daemon_refused_pin "$w2"; } || { served "$w2" && test "$SERVED_BY" = "$LC"; }; }'
         else
             check "pinned '$LC' answers"                                  ask "$w2" hotel PATH="$P_FRONT" "$F_CLAUDE" "$LC"
             check "  ...on exactly that account"                          eval 'served "$w2" && test "$SERVED_BY" = "$LC"'

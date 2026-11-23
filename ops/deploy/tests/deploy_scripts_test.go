@@ -444,6 +444,7 @@ var requiredCases = []string{
 	"route-test-spent-pin-on-another-account-fails",
 	"route-test-spent-pin-that-answers-fails",
 	"route-test-spent-pin-that-fails-slowly-fails",
+	"route-test-spent-pin-that-never-reached-the-daemon-fails",
 	"route-test-spent-pin-with-srq-failing-fails",
 	// sr-triage: rc-file exports by name only, probes bounded without
 	// timeout(1), the install found off PATH (§48).
