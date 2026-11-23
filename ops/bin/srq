@@ -1649,7 +1649,10 @@ def _need_line(meter):
     need = meter.get("need")
     if not isinstance(need, dict) or need.get("answer") not in NEED_WORDS or not isinstance(need.get("why"), str):
         return None
-    return f"  {'resets needed':<14} {NEED_WORDS[need['answer']]}: {need['why']}"
+    answer, why = NEED_WORDS[need["answer"]], need["why"]
+    if need.get("held") is True and need["answer"] == "yes" and why.startswith("still yes: "):
+        answer, why = "still yes", why[len("still yes: "):]
+    return f"  {'resets needed':<14} {answer}: {why}"
 
 
 def _burn_meter_lines(meter):
@@ -1725,6 +1728,8 @@ def render_burn(report):
                                    " 24-hour pressure of 1.0 or more, or when the 6-hour pressure plus its rise on the"
                                    " 6 hours before reaches 1.1. Outside a reset's expiry window and its last chance,"
                                    " an automatic reset is claimed only when this says yes.)", 100, subsequent_indent=" "))
+        lines.extend(textwrap.wrap("(still yes: once yes, a daemon keeps yes until the pressure that decides it falls under"
+                                   " 0.9, and for up to 30 minutes with no figure, PATCHES §96.)", 100, subsequent_indent=" "))
     return "\n".join(lines) + "\n"
 
 
@@ -2969,6 +2974,16 @@ def cmd_selftest(_argv):
           " more, or when the 6-hour pressure plus its rise on the 6 hours before reaches 1.1. Outside a reset's expiry"
           " window and its last chance, an automatic reset is claimed only when this says yes.)"
           in " ".join(need_text.split()))
+    check("the legend says a yes holds until the pressure falls under 0.9",
+          "(still yes: once yes, a daemon keeps yes until the pressure that decides it falls under 0.9, and for up to"
+          " 30 minutes with no figure, PATCHES §96.)" in " ".join(need_text.split()))
+    held_need = json.loads(json.dumps(needs))
+    held_need["meters"][0]["need"] = {
+        "answer": "yes", "held": True, "window": "24h", "pressure": {"1h": 0.95, "6h": 0.95, "24h": 0.96}, "trend": None,
+        "why": "still yes: the 24-hour pressure is 0.96, and it turns no under 0.9"}
+    check("a held yes reads still yes, once",
+          "\nClaude week\n  resets needed  still yes: the 24-hour pressure is 0.96, and it turns no under 0.9\n"
+          in render_burn(held_need))
     odd_need = json.loads(json.dumps(needs))
     odd_need["meters"][0]["need"] = {"answer": "maybe", "why": "?"}
     odd_need["meters"][2]["need"] = "yes"

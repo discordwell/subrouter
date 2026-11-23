@@ -368,3 +368,9 @@ A pre-§59 daemon (with §58) holds a turn whose lookup fails and retries the sa
 - **A daemon from before §95 ignores a peer's choice.** It places new sessions on its own ranking, so only the holder's own routing loads its chosen accounts. Deploy every daemon before a holder goes to real mode.
 - **The board marks the first peer's choices only**, since it has a panel for the first peer alone (§31's D0). `srq pool` reads every configured peer.
 - **The `paced allowance` log line reports only accounts in their burndown window**, not a chosen account's allowance (§95.2). `srq pool` shows it as `chosen n/m`.
+
+## Residual gaps §96 leaves open
+
+- **Two daemons can still read need differently near the bar.** Each daemon holds its own answer, so a daemon that read 1.02 holds `yes` at 0.98 while one that has read nothing above 0.98 since it started says `no`. The hold steadies each daemon's answer over time, not the pool's at one moment, and each daemon decides only for its own accounts.
+- **A Claude choice keeps its old order only until 30 minutes after its gap began.** After that its order follows the value of a claim at its wall again, as every standing choice's does.
+- **Need's memory is lost at a restart and at a worker swap.** The new process answers from the figures alone. An unsettled claim is not lost: its record is on disk (§93.2), and the choice reads it.
