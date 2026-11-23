@@ -103,8 +103,10 @@ func codexEgressTransports(config *CodexEgressConfig) []http.RoundTripper {
 		// Content-Type. Upstream #450 as written: these replays
 		// use their own transports, not the labelled base transport
 		// proxyHandler builds, and unlabelled, a region's
-		// server_is_overloaded stream was its "success".
-		transports = append(transports, sniffContentTypeTransport{base: transport})
+		// server_is_overloaded stream was its "success". They bypass
+		// Server.transport(), so they strip the internal headers themselves.
+		// 2026-11-23: no subrouter-internal header reaches a provider (PATCHES 101).
+		transports = append(transports, sniffContentTypeTransport{base: providerTransport{base: transport}})
 	}
 	return transports
 }
