@@ -39,16 +39,10 @@ func SetResetLoading(on bool) { resetLoadingOn.Store(on) }
 // honours a published choice.
 func ResetLoading() bool { return resetLoadingOn.Load() }
 
-const (
-	// resetChoiceHold is the least time a Codex choice stands while the
-	// account still qualifies, so the choice does not flap between accounts
-	// whose claims are worth about the same.
-	resetChoiceHold = 30 * time.Minute
-	// resetPeerRefreshAge is how old a peer's last usage body may be before
-	// the background pass reads it again (part I): the pool the choice and
-	// §94's decision read must not be one daemon's accounts alone.
-	resetPeerRefreshAge = 5 * time.Minute
-)
+// resetPeerRefreshAge is how old a peer's last usage body may be before the
+// background pass reads it again (part I): the pool the choice and §94's
+// decision read must not be one daemon's accounts alone.
+const resetPeerRefreshAge = 5 * time.Minute
 
 // resetChoiceMeterOf names the choice for provider's meter.
 func resetChoiceMeterOf(provider string, meter accounts.ResetMeter) selectacct.ResetChoiceMeter {
@@ -236,9 +230,10 @@ type resetChoosing struct {
 // chooseResets is which of the weighed accounts this daemon chooses, and in
 // what order (PATCHES §95.1). Every Claude account that qualifies is chosen,
 // per meter. Of the Codex accounts that qualify one is chosen at a time, the
-// one whose claim at its wall is worth the most; it stands at least
-// resetChoiceHold while it qualifies, and after that gives way only to one
-// worth more. Every Codex holder inside its expiry window is chosen too.
+// one whose claim at its wall is worth the most, and it stands for as long as
+// it qualifies, whatever another is worth: "pick one account, burn it to the
+// ground, use its reset, then pick a new account". Every Codex holder inside
+// its expiry window is chosen too.
 // Within a meter, the order is the holders inside their expiry window,
 // soonest expiry first, then the rest by the value of a claim at their wall,
 // highest first, and last the holders whose reset is likely to expire unused.
@@ -281,19 +276,17 @@ func chooseResets(weighed []resetWeighing, hold resetCodexHold, now time.Time) r
 }
 
 // codexSingle is the Codex account loaded one at a time, and since when: the
-// account held, while it qualifies and either has stood less than
-// resetChoiceHold or no other is worth more; else the one worth the most.
+// account held, while it qualifies; else the one worth the most.
 func codexSingle(qualified []resetWeighing, hold resetCodexHold, now time.Time) (string, time.Time) {
 	if len(qualified) == 0 {
 		return "", time.Time{}
 	}
-	best := slices.MinFunc(qualified, compareValue)
 	for _, w := range qualified {
-		if w.candidate.key == hold.key && (now.Sub(hold.since) < resetChoiceHold || best.value <= w.value) {
+		if w.candidate.key == hold.key {
 			return hold.key, hold.since
 		}
 	}
-	return best.candidate.key, now
+	return slices.MinFunc(qualified, compareValue).candidate.key, now
 }
 
 // resetChoiceGroup is where a chosen account falls in its meter's order.

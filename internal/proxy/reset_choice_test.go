@@ -236,9 +236,9 @@ func codexHolders(change func(*choiceAccount)) []choiceAccount {
 
 // 4. Of three Codex accounts holding credits exactly one is chosen, the one
 // whose claim at its projected wall is worth the most. When its credit is
-// spent the next is chosen. A choice stands for at least 30 minutes while the
-// account still qualifies, even when another account's value passes it; after
-// that it gives way to the one worth more.
+// spent the next is chosen. A choice stands while the account still
+// qualifies, even when another account's value passes it: for Codex "pick one
+// account, burn it to the ground, use its reset, then pick a new account".
 func TestOneCodexAccountIsChosenAtATime(t *testing.T) {
 	first := choose(choiceNow, resetCodexHold{}, codexHolders(nil)...)
 	wantChosen(t, "three holders", first, selectacct.ResetChoiceCodexWeek, "c150")
@@ -261,10 +261,13 @@ func TestOneCodexAccountIsChosenAtATime(t *testing.T) {
 	}
 	held := choose(choiceNow.Add(29*time.Minute), first.hold, codexHolders(passed)...)
 	wantChosen(t, "another passes it within 30 minutes", held, selectacct.ResetChoiceCodexWeek, "c150")
-	moved := choose(choiceNow.Add(31*time.Minute), held.hold, codexHolders(passed)...)
-	wantChosen(t, "another passes it after 30 minutes", moved, selectacct.ResetChoiceCodexWeek, "c100")
-	if moved.hold.key == first.hold.key || !moved.hold.since.Equal(choiceNow.Add(31*time.Minute)) {
-		t.Fatalf("the hold after the move is %+v, want c100 since the pass", moved.hold)
+	for _, later := range []time.Duration{31 * time.Minute, 6 * time.Hour} {
+		kept := choose(choiceNow.Add(later), held.hold, codexHolders(passed)...)
+		wantChosen(t, "another passes it "+later.String()+" on", kept, selectacct.ResetChoiceCodexWeek, "c150")
+		wantWords(t, "the one passed", kept.why["c100"], "Codex accounts are loaded one at a time, and another one is loaded now")
+		if kept.hold != first.hold {
+			t.Fatalf("%s on the hold is %+v, want %+v", later, kept.hold, first.hold)
+		}
 	}
 	stays := choose(choiceNow.Add(31*time.Minute), held.hold, codexHolders(nil)...)
 	wantChosen(t, "none worth more after 30 minutes", stays, selectacct.ResetChoiceCodexWeek, "c150")
