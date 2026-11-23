@@ -269,7 +269,7 @@ func TestANonRetiredGenerationKeepsItsIdleWebSocket(t *testing.T) {
 	keptEvents := readSocket(kept)
 	moved := dialShutdownDrainSocket(t, retiringServer.URL, "retiring-session")
 	defer moved.Close()
-	movedEvents := readSocket(moved)
+	movedEvents := readSocketOnceRelayed(t, moved)
 
 	retiring.Retire()
 	expectServiceRestart(t, movedEvents, "on the retired generation's idle socket")

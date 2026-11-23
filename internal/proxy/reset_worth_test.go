@@ -375,6 +375,9 @@ func TestUsageStatusCarriesEachResetsExpiryWindow(t *testing.T) {
 		map[string][]map[string]any{"box@example.com": {codexCredit("RateLimitResetCredit_box", "available", soon)}})
 	seed(box, map[string]float64{"box@example.com": 0.5})
 	box.pass(base)
+	// The box computes its windows from its clock each time it serves a body:
+	// on a fixed clock, its own body and the one the laptop reads agree.
+	box.memory().now = func() time.Time { return base }
 	boxOwn := expiryWindowsOf(t, usageStatusBody(t, box.server, "/_subrouter/usage-status"))["box@example.com"][expiry(soon)]
 	if boxOwn == nil {
 		t.Fatalf("the box publishes no window for its own credit")
