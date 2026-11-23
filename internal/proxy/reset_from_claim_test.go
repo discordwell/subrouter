@@ -127,8 +127,10 @@ func TestAClaimByHandAndACodexRedeemLeaveTheirBlockOnTheRow(t *testing.T) {
 	})
 	t.Run("codex", func(t *testing.T) {
 		setAutoResetForTest(t, AutoResetShadow, true)
+		credits := heldCodexCredits("credit-soon", "credit-late")
+		late := credits[1].ExpiresAt
 		f := newCodexClaimFake(t, map[string]*codexClaimAccount{
-			heldCodex:  {used: 100, credits: heldCodexCredits("credit-soon", "credit-late")},
+			heldCodex:  {used: 100, credits: credits},
 			spareCodex: {used: 30},
 		})
 		memory := f.server.AccountRef.sharedHeldResets()
@@ -144,7 +146,6 @@ func TestAClaimByHandAndACodexRedeemLeaveTheirBlockOnTheRow(t *testing.T) {
 			t.Fatalf("calibration: the redeem by hand answered %d %s with %d consumes", recorder.Code, recorder.Body.String(), consumes)
 		}
 		row := claimRows(t, f.server)[heldCodex]
-		late := heldCodexCredits("credit-soon", "credit-late")[1].ExpiresAt
 		if row.ComplimentaryReset == nil || row.ComplimentaryReset.Remaining == nil || *row.ComplimentaryReset.Remaining != 1 || !row.ResetsFromClaim {
 			t.Fatalf("after the redeem held's row carries %+v (from the claim: %v), want one credit left, marked", row.ComplimentaryReset, row.ResetsFromClaim)
 		}
@@ -247,6 +248,49 @@ func TestNoClaimGoesByTheBlockAClaimLeft(t *testing.T) {
 	}
 }
 
+// 4, Codex. Nothing claims on the block a redeem left either, and for Codex
+// that rule alone stops a claim on a row that still lists a credit. After a
+// redeem by hand whose read is refused, the daemon's snapshot holds the row its
+// last sweep read before the redeem, with two credits, as a redeem that leaves
+// the snapshot in place does (the failover's). A wall on the account decides
+// no claim, says its saved resets were last known from the claim, and sends
+// no second consume.
+func TestNoCodexClaimGoesByTheBlockARedeemLeft(t *testing.T) {
+	setAutoResetForTest(t, AutoResetReal, true)
+	f := newCodexClaimFake(t, map[string]*codexClaimAccount{
+		heldCodex:  {used: 90, credits: heldCodexCredits("credit-soon", "credit-late")},
+		spareCodex: {used: 30},
+	})
+	readBefore, ok := f.server.AccountRef.UsageStatusSnapshot()
+	if !ok {
+		t.Fatal("calibration: no sweep before the redeem")
+	}
+	reads := &codexFollowUpFake{f: f, refuse: true}
+	f.server.AccountRef.client = &http.Client{Transport: reads}
+	recorder := httptest.NewRecorder()
+	f.server.Handler().ServeHTTP(recorder, loopbackAdminRequest(http.MethodPost, "/_subrouter/rate-limit-reset?email="+heldCodex+"&anytime=true", nil))
+	if consumes, _ := f.counts(); recorder.Code != http.StatusOK || consumes != 1 {
+		t.Fatalf("calibration: the redeem by hand answered %d %s with %d consumes", recorder.Code, recorder.Body.String(), consumes)
+	}
+	reads.mu.Lock()
+	reads.refuse = false
+	reads.mu.Unlock()
+	ref := f.server.AccountRef
+	ref.usageStatusMu.Lock()
+	ref.usageStatusCache, ref.usageStatusAt = readBefore, time.Now()
+	ref.usageStatusMu.Unlock()
+	f.pinSession("conversation", heldCodex)
+	f.set(heldCodex, func(a *codexClaimAccount) { a.used = 100 })
+	f.post("conversation")
+	decision := f.decision(heldCodex)
+	if consumes, _ := f.counts(); consumes != 1 || decision.Verdict != AutoResetNoClaim ||
+		!strings.Contains(decision.Reason, "its saved resets were last known from the claim at ") ||
+		!strings.Contains(decision.Reason, ", not from a reading") {
+		t.Fatalf("a wall on the block the redeem left: %d consumes, decision %+v; want no second consume, saying the credits are known from the claim",
+			consumes, decision)
+	}
+}
+
 // 5. The hold ends with the reset: after its week reset is used by hand,
 // with the block unread, the account ranks without the holder's 2x and is not
 // in early burndown, and a peer reading its row sees no hold. A claim that
@@ -315,7 +359,9 @@ func TestTheHoldEndsWithTheWeekResetItWasFor(t *testing.T) {
 
 // 6. §95's choice follows the same block: once the week reset is used, the
 // pass after the claim does not choose the account for it, and weighs it for
-// the Fable reset it has left.
+// the Fable reset it has left. The pool burns its week so fast that a week
+// reset is worth claiming at the account's next wall even on the fresh week
+// the claim gave back, so only the block keeps the week reset from the choice.
 func TestTheChoiceIsNotMadeForTheResetAClaimUsed(t *testing.T) {
 	setResetLoadingForTest(t, true)
 	setAutoResetForTest(t, AutoResetReal, true)
@@ -324,7 +370,7 @@ func TestTheChoiceIsNotMadeForTheResetAClaimUsed(t *testing.T) {
 		"spare": {week: 40, fable: 10},
 	})
 	d := f.daemon(t, "")
-	d.server.AccountRef.SetUsageHistory(claudeWeekHistory(t, map[string]float64{"held": 1.2, "spare": 1.2}))
+	d.server.AccountRef.SetUsageHistory(claudeWeekHistory(t, map[string]float64{"held": 3, "spare": 3}))
 	d.server.autoResetPass(context.Background())
 	chosen := func() (selectacct.ResetChoice, bool) {
 		d.server.AccountRef.sharedAutoResets().mu.Lock()
