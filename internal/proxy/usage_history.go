@@ -702,11 +702,10 @@ func (h *UsageHistory) segments(provider, account, meter string) []usageSegment 
 	return usageSegments(points, claims)
 }
 
-// usageSegments starts a segment where the roll moved by more than
-// usageSegmentRollMove, where a started week reads unstarted again, or where
-// the used fraction fell. The cause is claim when a claim that landed lies
-// between the two points, roll when the old roll time has passed, and drop
-// otherwise.
+// usageSegments starts a segment where the roll of a started week moved by
+// more than usageSegmentRollMove, or where the used fraction fell. The cause
+// is claim when a claim that landed lies between the two points, roll when
+// the old roll time has passed, and drop otherwise.
 func usageSegments(points []usageMeterReading, claims []int64) []usageSegment {
 	var out []usageSegment
 	for i, point := range points {
@@ -717,8 +716,7 @@ func usageSegments(points []usageMeterReading, claims []int64) []usageSegment {
 		prev := points[i-1]
 		moved := !prev.Unstarted && !point.Unstarted && prev.Roll != 0 && point.Roll != 0 &&
 			time.Duration(absInt64(point.Roll-prev.Roll))*time.Second > usageSegmentRollMove
-		restarted := !prev.Unstarted && prev.Roll != 0 && point.Unstarted
-		if !moved && !restarted && point.Used >= prev.Used-usageSegmentFall {
+		if !moved && point.Used >= prev.Used-usageSegmentFall {
 			last := &out[len(out)-1]
 			last.Points = append(last.Points, point)
 			continue

@@ -268,11 +268,21 @@ func TestOnlyThisDaemonsOwnAccountsEnterTheSeries(t *testing.T) {
 	d := newUnstartedCodexDaemon(t, map[string][2]float64{midweekAccount: {20, 300000}})
 	box := codexBox(t, codexWeekScore("box-late", 90, 400000))
 	var peerReads atomic.Int64
+	// The peer's rows carry their windows, as a real peer's usage-status does.
 	peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == remotePoolUsagePath {
-			peerReads.Add(1)
+		if r.URL.Path != remotePoolUsagePath {
+			box.serve(w, r)
+			return
 		}
-		box.serve(w, r)
+		peerReads.Add(1)
+		var rows []map[string]any
+		_ = json.Unmarshal(box.usageBody(), &rows)
+		for _, row := range rows {
+			row["windows"] = []map[string]any{{"Name": "primary", "UsedPercent": 90, "LimitWindowSeconds": 604800,
+				"ResetAfterSeconds": 400000, "reset_at": time.Now().Add(400000 * time.Second).UTC().Format(time.RFC3339)}}
+		}
+		body, _ := json.Marshal(rows)
+		_, _ = w.Write(body)
 	}))
 	t.Cleanup(peer.Close)
 	d.server.RemotePool = NewRemotePool(peer.URL, "", "")
@@ -325,22 +335,22 @@ func TestSegmentsStartAtARollAClaimAndADrop(t *testing.T) {
 		t.Fatalf("Claude segments %v of %v points, want %v of [2 2 2 1 1]", names, sizes, want)
 	}
 
-	// A Codex week whose reading turns unstarted again: after its roll, and
-	// after a redeem that restarted it.
+	// A Codex week idle to its roll, whose next week reads more used at a
+	// roll 7 days on: a roll with no fall. Then a redeem that leaves the
+	// week unstarted.
 	codex := accounts.Account{ID: "cooked@example.com", Provider: accounts.ProviderCodex}
 	read := func(used float64, resetAfter int64, after time.Duration) {
 		at := start.Add(after)
 		h.observe(codex, codexWeekRead(used, resetAfter, at), at)
 	}
-	read(90, 1800, 0)
-	read(0, 7*24*3600, time.Hour)
-	read(4, 7*24*3600-1200, 2*time.Hour)
-	read(100, 600000, 3*time.Hour)
+	read(0, 1800, 0)
+	read(5, 7*24*3600-1200, time.Hour)
+	read(100, 7*24*3600-1200-7200, 3*time.Hour)
 	h.finishClaim(h.startClaim(codex, "codex_rate_limits", start.Add(3*time.Hour+time.Minute)), "redeemed", true)
 	read(0, 7*24*3600, 3*time.Hour+2*time.Minute)
 	names, sizes = causes("codex", codex.ID, usageMeterWeek)
-	if want := []string{"", usageSegmentRoll, usageSegmentClaim}; !slices.Equal(names, want) || !slices.Equal(sizes, []int{1, 3, 1}) {
-		t.Fatalf("Codex segments %v of %v points, want %v of [1 3 1]", names, sizes, want)
+	if want := []string{"", usageSegmentRoll, usageSegmentClaim}; !slices.Equal(names, want) || !slices.Equal(sizes, []int{1, 2, 1}) {
+		t.Fatalf("Codex segments %v of %v points, want %v of [1 2 1]", names, sizes, want)
 	}
 }
 
