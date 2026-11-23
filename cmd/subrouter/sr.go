@@ -344,6 +344,10 @@ type srUsageRow struct {
 	credits            *accounts.CreditsInfo
 	complimentaryReset *accounts.ComplimentaryResetInfo
 	extraUsage         *accounts.ExtraUsageInfo
+	// resets is the daemon's list of every saved reset the account holds
+	// (PATCHES §91), on a row read from a daemon; nil on a row this process
+	// read itself, which reads no credit list.
+	resets []accounts.HeldReset
 	// costTier and costTierRank are the server's Claude cost tier for this
 	// account (see proxy.ClaudeCostOrder); empty when the server predates it.
 	costTier              string
@@ -4429,7 +4433,11 @@ func usageGridCodexResetCell(row srUsageRow) usageGridCell {
 	// Prefer the concrete count over a bare "avail" so >1 credits are visible.
 	if info.Remaining != nil {
 		if *info.Remaining > 0 {
-			return usageGridCell{Text: fmt.Sprintf("%d left", *info.Remaining), Style: ansiGreen}
+			text := fmt.Sprintf("%d left", *info.Remaining)
+			if expires, ok := soonestReadCreditExpiry(row.resets); ok {
+				text += " " + expires.Local().Format("1/2")
+			}
+			return usageGridCell{Text: text, Style: ansiGreen}
 		}
 		return usageGridCell{Text: "used", Style: ansiYellow}
 	}
@@ -4443,6 +4451,22 @@ func usageGridCodexResetCell(row srUsageRow) usageGridCell {
 		return usageGridCell{Text: compactResetStatus(info.Status), Style: ansiDim}
 	}
 	return usageGridCell{Text: "unknown", Style: ansiDim}
+}
+
+// soonestReadCreditExpiry is the soonest expiry the daemon read from a Codex
+// account's credit list (PATCHES §91.2): "3 left 12/14". A date it has not
+// read is not one; the last good read's dates are.
+func soonestReadCreditExpiry(resets []accounts.HeldReset) (time.Time, bool) {
+	var soonest time.Time
+	for _, entry := range resets {
+		if entry.Expiry != accounts.ResetExpiryRead && entry.Expiry != accounts.ResetExpiryLastGood {
+			continue
+		}
+		if expires, ok := entry.Expires(); ok && (soonest.IsZero() || expires.Before(soonest)) {
+			soonest = expires
+		}
+	}
+	return soonest, !soonest.IsZero()
 }
 
 func compactResetStatus(status string) string {
