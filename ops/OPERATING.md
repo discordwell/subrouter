@@ -131,6 +131,7 @@ env -u CODEX_HOME -u SUBROUTER_CLOUD_CONFIG SUBROUTER_STATE_DIR=$t/state HOME=$t
 | `srq pool [--local\|--remote] [--json]` | Each provider's accounts, meters, and `new=` verdicts, on this daemon and each peer. |
 | `srq dir <label>` | The profile directory of one account, from the daemon. |
 | `srq selftest` | The regression fixtures. It needs no daemon. |
+| `srq resets [--json]` | Every saved reset in the pool, soonest expiry first, then the totals per kind and expiry date (§91). |
 
 `srq serving` prints `<account>` for a local session, and `<account> on <peer>  [remote]` for one a peer serves, with exit code 0. It prints `unassigned (session ...)` and exits 1 when the daemon has no row for the session. That happens before the session's first model turn, for a client that does not route through subrouter, and after a peer hold lapses.
 
@@ -444,15 +445,25 @@ While the daemon serves its socket, the stand-in asks it for `policy_limits` as 
 
 A saved reset clears an account's meters once. Anthropic has granted Claude accounts saved resets of two kinds, and Codex accounts hold rate-limit reset credits. A week reset clears the general week and discards what is left of it. A Fable reset clears only the Fable limit and gives back the part of the week that Fable spent, so it loses nothing left in the week (§64). Each claim spends one for good. Never claim one unless the account owner asked for that claim.
 
-- `sr status` shows a `1x reset` column on Claude and Codex tables (§46). A Claude cell names Fable resets: `2 Fable 3/9`, or `1 +1F 12/10` for a week reset with a Fable reset behind it (§64).
+- `sr status` shows a `1x reset` column on Claude and Codex tables (§46). A Claude cell names Fable resets: `2 Fable 3/9`, or `1 +1F 12/10` for a week reset with a Fable reset behind it (§64). A Codex cell shows the soonest expiry the daemon read beside the count, `3 left 12/14`, on a row read from a daemon (§91). A row `sr` reads itself shows the count alone.
 - `sr claude reset <name|email>` claims one Claude account's next reset, of either kind, through the daemon that holds it, and says which kind it claimed and what it cleared. It asks first only when more than 10% of the week is left or the week rolls within a day.
 - `sr codex reset <name|email>` redeems one Codex credit at any time.
 - `sr reset [email]` redeems a Codex credit only for an account that is out of quota.
 - `SUBROUTER_CODEX_AUTO_RATE_LIMIT_RESET=1` lets failover spend a Codex credit when the whole Codex pool is out. It is off by default.
 
-An account that holds an unclaimed Claude week reset ranks at twice a non-holder until the reset is claimed or expires, and it enters burndown below 25% of its week (§56). A Fable reset does neither (§64). `SUBROUTER_RESET_HOLD_PRIORITY=0` turns that off. `srq pool` marks week holders `2x`, their burndown as `burndown·reset`, and Fable resets `F1`, `F2` and so on; the board shows the same marks.
+An account that holds an unclaimed Claude week reset ranks at twice a non-holder until the reset is claimed or expires, and it enters burndown below 25% of its week (§56). A Fable reset does neither (§64). `SUBROUTER_RESET_HOLD_PRIORITY=0` turns that off. `srq pool` marks week holders `2x` and their burndown as `burndown·reset`. It marks each kind of saved reset an account holds with its count and its soonest expiry: `W1 12/10` for a week reset, `F2 3/9` for Fable resets, `R3 12/14` for Codex credits, and `U1` for a kind the daemon does not know (§91). The board shows the same marks, and its legend explains them.
 
 Each `usage-status` row lists every reset the account holds in `resets`, one entry per kind and expiry date (§91). An entry gives the `kind` (`week`, `fable`, `codex_rate_limits`, or `unknown`), the `count`, `expires_at`, what a claim gives back, whether a claim restarts the seven days (`assumed_yes` or `assumed_no`: neither is measured), whether it needs the limit reached, and its `order`, the order the provider uses them in. `expiry` says where the date came from: `read`, `last_good`, `not_read`, or `none_given`. A Codex reading carries only a count, so the daemon that holds the account reads the dates from the credit list Codex.app reads. It reads at most once an hour per account, and at once when the count changes. It never reads for a count of 0 or for a peer's account, and it never redeems. A failed read keeps the last good dates, shown as `last_good` with `expiry_age_seconds`. A kind the daemon does not know is listed as `unknown` with its `raw_type` and `manual_only: true`, and logs `saved reset of a kind this daemon does not know; shown, never claimed automatically` at Warn once an hour. `complimentary_reset` is unchanged. Nothing claims or ranks on the list. `SUBROUTER_READ_CODEX_RESET_EXPIRY=0` stops the credit list reads, and every Codex count then reads `not_read`.
+
+To see every saved reset in the pool, run `srq resets`. It prints one line per account, kind and expiry date, soonest first: when the reset expires and in how long, the kind, the count, the account's label, where the account lives, how much of its week and of its Fable meter is used, and when its week rolls. The last line totals each kind and date, such as `totals: 14 week resets expire 12/10; 3 Codex credits expire 12/14`. It reads this daemon and every peer that this daemon reads, through `/_subrouter/peers/usage-status`, so it needs no peer token. An account that two daemons hold is listed once, with both places.
+
+- `expiry not read`, or `?` in a mark, means the daemon has not read that account's credit list yet, or `SUBROUTER_READ_CODEX_RESET_EXPIRY=0` stops the reads. It never means that the credit does not expire.
+- `from the last good read, 3h 0m old`, or `*` after a date, is a date kept after a failed read of the credit list.
+- `its daemon gives no full list`, or `~` after the marks, is a daemon from before §91. The entries are what its `complimentary_reset` says, and a date that it does not give reads `no date given`.
+- `unknown <type>`, or `U`, is a kind that the daemon does not know. Nothing claims it automatically.
+- `assumed_yes` and `assumed_no` in `restarts_clock` are assumptions. No claim has recorded the roll time before and after yet, so neither value is measured.
+
+pool.json carries each row's list in `resets` (`kind`, `count`, `expires_at`, `expiry`), with `resets_partial: true` for a daemon from before §91.
 
 ## Troubleshoot
 
