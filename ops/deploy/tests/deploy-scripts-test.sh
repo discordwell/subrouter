@@ -4897,20 +4897,23 @@ expect_test_counts() {
 
 if begin route-check-without-paradev-launches-through-the-shim; then
   # check and check codex launched through ~/.paradev/bin unconditionally, so
-  # without Paradev they failed and codex pool could not pass its gate.
+  # without Paradev they failed and codex pool could not pass its gate. The
+  # daemon's socket is moved: route=pool, not pool-tcp, says the shim found it.
   route_launch_setup
-  run_route_launch -- check
+  mkdir -p "$H/moved"; mv "$H/.subrouter/claude.sock" "$H/moved/claude.sock"
+  moved=(CLAUDE_ROUTE_SOCKET="$H/moved/claude.sock" FAKE_CLAUDE_SOCKET="$H/moved/claude.sock")
+  run_route_launch "${moved[@]}" -- check
   expect_rc 0; expect_out "launch: shim $H/.claude-route/bin/claude -> claude, as a new terminal launches it (no Paradev wrapper)"
   expect_out "mode=pool  route=pool  answer=ready  pool account=acct-pool"
-  run_route_launch -- check codex
+  run_route_launch "${moved[@]}" -- check codex
   expect_rc 0; expect_out "launch: shim $H/.claude-route/bin/codex -> codex, as a new terminal launches it (no Paradev wrapper)"
   expect_out "answer=ready  pool account=cx-pool"
   grep -q "^PASS $(date +%Y-%m-%d) .*; CODEX_HOME=$H/.codex)$" "$H/.claude-route/last-codex-check" && ok || bad "last-codex-check: $(cat "$H/.claude-route/last-codex-check")"
   expect_no_log "paradev wrapper"
   pass_today "$H/.claude-route/last-test"; pass_today "$H/.claude-route/last-codex-test"
-  run_route_launch -- pool
+  run_route_launch "${moved[@]}" -- pool
   expect_rc 0; expect_out "mode: pool. NEW Claude Code launches"
-  run_route_launch -- codex pool
+  run_route_launch "${moved[@]}" -- codex pool
   expect_rc 0; expect_out "codex mode: pool. NEW Codex launches"
   finish
 fi
