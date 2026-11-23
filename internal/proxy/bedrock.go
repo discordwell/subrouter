@@ -139,7 +139,30 @@ func (s Server) bedrockHandler() http.Handler {
 	})
 }
 
+// bedrockFableModelID serves a Fable request whose model names no Fable
+// version (the "fable" alias, or no model at all).
 const bedrockFableModelID = "us.anthropic.claude-fable-5"
+
+// bedrockFableModelIDFor maps the client's model to its Bedrock inference
+// profile, so each Fable version is served, metered and priced as itself on
+// Bedrock rather than as Fable 5. "[1m]" is Claude Code's context-window
+// marker, not part of the id; an id already qualified for Bedrock passes
+// through.
+func bedrockFableModelIDFor(model string) string {
+	m := strings.ToLower(strings.TrimSpace(model))
+	if i := strings.IndexByte(m, '['); i >= 0 {
+		m = m[:i]
+	}
+	switch {
+	case strings.Contains(m, "anthropic."):
+		return m
+	case strings.HasPrefix(m, "claude-fable-"):
+		return "us.anthropic." + m
+	default:
+		return bedrockFableModelID
+	}
+}
+
 const (
 	claudeCodeAutoClassifierSelectorPrefix = "/model/us.anthropic.claude-opus-5[1m]/"
 	claudeCodeAutoClassifierResolvedPrefix = "/model/us.anthropic.claude-opus-5/"
@@ -220,6 +243,11 @@ func (s Server) claudeFableBedrockResponse(ctx context.Context, body []byte) (*h
 	if raw, ok := payload["stream"]; ok {
 		_ = json.Unmarshal(raw, &stream)
 	}
+	var requestedModel string
+	if raw, ok := payload["model"]; ok {
+		_ = json.Unmarshal(raw, &requestedModel)
+	}
+	modelID := bedrockFableModelIDFor(requestedModel)
 	// Bedrock takes the model in the URL and streaming via the endpoint; the body
 	// must carry anthropic_version and must not carry model/stream.
 	delete(payload, "model")
@@ -234,7 +262,7 @@ func (s Server) claudeFableBedrockResponse(ctx context.Context, body []byte) (*h
 	if stream {
 		endpoint = "invoke-with-response-stream"
 	}
-	path := "/model/" + bedrockFableModelID + "/" + endpoint
+	path := "/model/" + modelID + "/" + endpoint
 	var resp *http.Response
 	var sourceName, region string
 	started := time.Now()
@@ -246,9 +274,9 @@ func (s Server) claudeFableBedrockResponse(ctx context.Context, body []byte) (*h
 		}
 		if resp.StatusCode == http.StatusTooManyRequests {
 			if s.Logger != nil {
-				s.Logger.Warn("bedrock throttled", "model", bedrockFableModelID, "path", path, "bedrock_source", sourceName, "region", region)
+				s.Logger.Warn("bedrock throttled", "model", modelID, "path", path, "bedrock_source", sourceName, "region", region)
 			}
-			cfg.onThrottle(sourceName, region, bedrockFableModelID)
+			cfg.onThrottle(sourceName, region, modelID)
 		}
 		if !stream || resp.StatusCode != http.StatusOK {
 			break
@@ -319,7 +347,7 @@ func (s Server) claudeFableBedrockResponse(ctx context.Context, body []byte) (*h
 				watchdog.stop()
 				_ = body.Close()
 				_ = pw.Close()
-				s.recordClaudeFableBedrockCost(streamStarted, streamRegion, http.StatusOK, result.Usage, result.HaveUsage)
+				s.recordClaudeFableBedrockCost(modelID, streamStarted, streamRegion, http.StatusOK, result.Usage, result.HaveUsage)
 			}()
 			return &http.Response{
 				Status:        "200 OK",
@@ -351,7 +379,7 @@ func (s Server) claudeFableBedrockResponse(ctx context.Context, body []byte) (*h
 			s.Logger.Warn("claude-fable bedrock stream failed before content", attrs...)
 		}
 		_ = resp.Body.Close()
-		s.recordClaudeFableBedrockCost(started, region, http.StatusServiceUnavailable, bedrockUsage{}, false)
+		s.recordClaudeFableBedrockCost(modelID, started, region, http.StatusServiceUnavailable, bedrockUsage{}, false)
 		if retryable && attempt < claudeFableBedrockStreamAttempts && bedrockRetryBackoff(ctx, attempt) {
 			// The next loop iteration passes a higher retry index to
 			// signAndForwardBedrock, so the retry starts one region/source
@@ -387,7 +415,7 @@ func (s Server) claudeFableBedrockResponse(ctx context.Context, body []byte) (*h
 		s.Logger.Warn("claude-fable bedrock error response", "status", resp.StatusCode, "bedrock_source", sourceName, "region", region, "body", string(preview))
 	}
 	usage, haveUsage := parseBedrockInvokeUsage(respBody)
-	s.recordClaudeFableBedrockCost(started, region, resp.StatusCode, usage, haveUsage)
+	s.recordClaudeFableBedrockCost(modelID, started, region, resp.StatusCode, usage, haveUsage)
 	return &http.Response{
 		Status:        resp.Status,
 		StatusCode:    resp.StatusCode,
@@ -477,21 +505,21 @@ func stripBedrockUnsupportedTools(body []byte) ([]byte, int) {
 	return rebuilt, dropped
 }
 
-func (s Server) recordClaudeFableBedrockCost(started time.Time, region string, status int, usage bedrockUsage, haveUsage bool) {
+func (s Server) recordClaudeFableBedrockCost(modelID string, started time.Time, region string, status int, usage bedrockUsage, haveUsage bool) {
 	cfg := s.Bedrock
 	if cfg == nil || cfg.CostLogPath == "" {
 		return
 	}
 	record := bedrockCostRecord{
 		Timestamp:  started.UTC().Format(time.RFC3339),
-		Model:      bedrockFableModelID,
+		Model:      modelID,
 		Region:     region,
 		Status:     status,
 		DurationMs: time.Since(started).Milliseconds(),
 	}
 	if haveUsage {
 		record.Usage = usage
-		record.CostUSD = usage.costUSD(bedrockFableModelID)
+		record.CostUSD = usage.costUSD(modelID)
 	}
 	appendBedrockCostRecord(cfg.CostLogPath, record)
 }

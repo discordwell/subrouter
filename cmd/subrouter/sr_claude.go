@@ -3269,8 +3269,9 @@ func claudeLaunchSettingsJSON(configDir string, env map[string]string) ([]byte, 
 // the default Subrouter server's /bedrock endpoint. The server holds the AWS
 // credentials and SigV4-signs each request, so teammates need no AWS access.
 // All flags after an optional --model are passed through to Claude Code
-// unchanged. --model accepts a friendly alias (fable, opus, sonnet, haiku) or a
-// full Bedrock model id / inference profile; it defaults to Fable 5.
+// unchanged. --model accepts a friendly alias (fable, opus, sonnet, haiku), a
+// first-party claude-* id, or a full Bedrock model id / inference profile; it
+// defaults to Fable 5.
 func (r srRunner) claudeAWS(ctx context.Context, args []string) error {
 	server, ok, err := r.defaultRemoteServer()
 	if err != nil {
@@ -3450,7 +3451,9 @@ const bedrockSmallFastModelID = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
 
 // bedrockModelID maps a friendly model alias to a Bedrock inference profile id.
 // A value that already looks like a Bedrock id (contains "anthropic.") is passed
-// through unchanged, as is any unrecognized value.
+// through unchanged. Any other first-party claude-* id becomes its us.
+// cross-region profile, so a model released after this table (claude-fable-5-2)
+// still reaches Bedrock under a valid id. Anything else passes through.
 func bedrockModelID(name string) string {
 	trimmed := strings.TrimSpace(name)
 	lower := strings.ToLower(trimmed)
@@ -3468,9 +3471,11 @@ func bedrockModelID(name string) string {
 		return "us.anthropic.claude-sonnet-5"
 	case "haiku", "claude-haiku-4-5":
 		return bedrockSmallFastModelID
-	default:
-		return trimmed
 	}
+	if strings.HasPrefix(lower, "claude-") {
+		return "us.anthropic." + lower
+	}
+	return trimmed
 }
 
 type claudeRow struct {

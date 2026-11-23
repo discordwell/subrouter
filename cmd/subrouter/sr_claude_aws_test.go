@@ -76,6 +76,8 @@ func TestBedrockModelID(t *testing.T) {
 		"":                                 "us.anthropic.claude-fable-5",
 		"fable":                            "us.anthropic.claude-fable-5",
 		"claude-fable-5":                   "us.anthropic.claude-fable-5",
+		"claude-fable-5-1":                 "us.anthropic.claude-fable-5-1",
+		"claude-fable-5-2":                 "us.anthropic.claude-fable-5-2",
 		"opus":                             "us.anthropic.claude-opus-5-5",
 		"claude-opus-5-5":                  "us.anthropic.claude-opus-5-5",
 		"claude-opus-4-8":                  "us.anthropic.claude-opus-4-8",

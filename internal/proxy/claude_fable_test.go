@@ -2,13 +2,17 @@ package proxy
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 )
@@ -259,6 +263,166 @@ func TestServeClaudeFableFallbackUsesBedrockSources(t *testing.T) {
 	}
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200 (body %q)", rec.Code, rec.Body.String())
+	}
+}
+
+// The Bedrock fallback serves the Fable version the client asked for, and the
+// cost log names that model and prices it at that model's rates, so Fable 5.2
+// traffic is never served or billed as Fable 5.
+func TestServeClaudeFableFallbackServesTheRequestedFableModel(t *testing.T) {
+	// Each answer reports 1M input and 1M output tokens, so the cost is the
+	// model's input plus output rate per MTok: Fable 5.2 8 + 40, Fable 5.1
+	// and Fable 5 10 + 50.
+	cases := []struct {
+		clientModel string
+		wantModelID string
+		wantCostUSD float64
+	}{
+		{"claude-fable-5-2[1m]", "us.anthropic.claude-fable-5-2", 48},
+		{"claude-fable-5-1", "us.anthropic.claude-fable-5-1", 60},
+		{"us.anthropic.claude-fable-5-2", "us.anthropic.claude-fable-5-2", 48},
+		{"fable", "us.anthropic.claude-fable-5", 60},
+	}
+	for _, tc := range cases {
+		var gotPath string
+		rt := bedrockRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+			gotPath = req.URL.Path
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader(`{"type":"message","usage":{"input_tokens":1000000,"output_tokens":1000000}}`)),
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+			}, nil
+		})
+		costLog := filepath.Join(t.TempDir(), "bedrock-cost.jsonl")
+		s := Server{Bedrock: &BedrockConfig{
+			Regions:     []string{"us-east-1"},
+			Sources:     []BedrockCredentialSource{{Name: "aw0", Credentials: staticBedrockCreds()}},
+			Transport:   rt,
+			CostLogPath: costLog,
+		}}
+		req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"`+tc.clientModel+`","max_tokens":8,"messages":[]}`))
+		rec := httptest.NewRecorder()
+		if !s.serveClaudeFableFallback(rec, req) || rec.Code != http.StatusOK {
+			t.Fatalf("%s: fallback not served (status %d, body %q)", tc.clientModel, rec.Code, rec.Body.String())
+		}
+		if want := "/model/" + tc.wantModelID + "/invoke"; gotPath != want {
+			t.Fatalf("%s: bedrock path = %q, want %q", tc.clientModel, gotPath, want)
+		}
+		raw, err := os.ReadFile(costLog)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var record bedrockCostRecord
+		if err := json.Unmarshal(bytes.TrimSpace(raw), &record); err != nil {
+			t.Fatalf("%s: cost log %q: %v", tc.clientModel, raw, err)
+		}
+		if record.Model != tc.wantModelID || record.CostUSD != tc.wantCostUSD {
+			t.Fatalf("%s: cost log model = %q at $%v, want %q at $%v", tc.clientModel, record.Model, record.CostUSD, tc.wantModelID, tc.wantCostUSD)
+		}
+	}
+}
+
+// A streamed Fable 5.2 request goes to Fable 5.2's streaming endpoint, and
+// the cost record written when the stream ends names and prices Fable 5.2.
+func TestAStreamedBedrockFableFallbackIsServedAndPricedAsTheRequestedModel(t *testing.T) {
+	frames := append(
+		buildEventStreamFrame(t, `{"type":"message_start","message":{"usage":{"input_tokens":1000000}}}`),
+		buildEventStreamFrame(t, `{"type":"message_delta","usage":{"output_tokens":1000000}}`)...,
+	)
+	var gotPath string
+	rt := bedrockRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		gotPath = req.URL.Path
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(bytes.NewReader(frames)),
+			Header:     http.Header{"Content-Type": []string{"application/vnd.amazon.eventstream"}},
+		}, nil
+	})
+	costLog := filepath.Join(t.TempDir(), "bedrock-cost.jsonl")
+	s := Server{Bedrock: &BedrockConfig{
+		Regions:     []string{"us-east-1"},
+		Sources:     []BedrockCredentialSource{{Name: "aw0", Credentials: staticBedrockCreds()}},
+		Transport:   rt,
+		CostLogPath: costLog,
+	}}
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader("{}"))
+	resp, err := s.claudeFableBedrockResponse(req.Context(), []byte(`{"model":"claude-fable-5-2[1m]","stream":true,"max_tokens":8,"messages":[]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadAll(resp.Body); err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if want := "/model/us.anthropic.claude-fable-5-2/invoke-with-response-stream"; gotPath != want {
+		t.Fatalf("bedrock path = %q, want %q", gotPath, want)
+	}
+	var record bedrockCostRecord
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		raw, _ := os.ReadFile(costLog)
+		if len(bytes.TrimSpace(raw)) > 0 {
+			if err := json.Unmarshal(bytes.TrimSpace(raw), &record); err != nil {
+				t.Fatalf("cost log %q: %v", raw, err)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("no cost record after the stream ended")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if record.Model != "us.anthropic.claude-fable-5-2" || record.CostUSD != 48 {
+		t.Fatalf("cost record model = %q at $%v, want us.anthropic.claude-fable-5-2 at $48 (8 + 40)", record.Model, record.CostUSD)
+	}
+}
+
+// Bedrock throttling a Fable 5.2 request is logged as Fable 5.2, and the quota
+// bump still asks for Fable 5's per-minute quota, the one every Fable id keys
+// to.
+func TestABedrockThrottleOnFable52NamesItAndBumpsFable5sQuota(t *testing.T) {
+	quotas := &mockServiceQuotas{current: 200_000}
+	var logs bytes.Buffer
+	s := Server{
+		Logger: slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn})),
+		Bedrock: &BedrockConfig{
+			Regions: []string{"us-east-1"},
+			Sources: []BedrockCredentialSource{{Name: "aw0", Credentials: staticBedrockCreds(), Bumper: newTestBumper(quotas)}},
+			Transport: bedrockRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusTooManyRequests,
+					Body:       io.NopCloser(strings.NewReader(`{"message":"Too many tokens, please wait before trying again."}`)),
+					Header:     http.Header{"Content-Type": []string{"application/json"}},
+				}, nil
+			}),
+		},
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader("{}"))
+	resp, ok := s.claudeFableFallbackResponse(req, []byte(`{"model":"claude-fable-5-2[1m]","max_tokens":8,"messages":[]}`))
+	if !ok || resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("ok=%v resp=%v; want Bedrock's 429 as the chain's answer", ok, resp)
+	}
+	resp.Body.Close()
+	if !strings.Contains(logs.String(), "model=us.anthropic.claude-fable-5-2 ") {
+		t.Fatalf("logs:\n%s\nwant the throttle logged against us.anthropic.claude-fable-5-2", logs.String())
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		quotas.mu.Lock()
+		codes := append([]string(nil), quotas.codes...)
+		quotas.mu.Unlock()
+		if len(codes) > 0 {
+			for _, code := range codes {
+				if code != "L-9B258944" {
+					t.Fatalf("quota codes = %v, want only Fable 5's L-9B258944", codes)
+				}
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("no quota increase requested for the throttled Fable 5.2 request")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
