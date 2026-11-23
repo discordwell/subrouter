@@ -113,7 +113,7 @@ func TestClaudeFableHandlerOpusSelectionDoesNotMoveThePinBeforeAnAnswer(t *testi
 	if recorder.Code != http.StatusTooManyRequests {
 		t.Fatalf("status = %d, want the Opus 429 surfaced; body=%s", recorder.Code, recorder.Body.String())
 	}
-	if len(upstream.models) == 0 || upstream.models[0] != "claude-opus-5" {
+	if len(upstream.models) == 0 || upstream.models[0] != "claude-opus-5-5" {
 		t.Fatalf("upstream models = %v, want the Opus substitution sent", upstream.models)
 	}
 	if got := pinnedAccount(t, store, "session-opus-select"); got != "one@example.com" {

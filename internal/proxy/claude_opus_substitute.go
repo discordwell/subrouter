@@ -13,62 +13,31 @@ import (
 	"github.com/manaflow-ai/subrouter/session"
 )
 
-// claudeOpusModel maps a Fable request model to the Opus model of the same
-// generation by splicing the literal "fable" run: "claude-fable-5[1m]" becomes
-// "claude-opus-5[1m]". Deriving it beats a constant on two counts: the client's
-// bracketed context-window suffix survives verbatim (dropping "[1m]" silently
-// downgrades a 1M-context session), and the mapping stays correct when the
-// generation number moves. ok is false when the model names no Fable family.
+// claudeSubstituteOpusModel is the model a Fable request falls to once the
+// Fable pool is spent: the newest Opus, whichever Fable version was asked for.
+// The families do not release in lockstep (Fable 5.1 and 5.2 have no
+// same-numbered Opus), so matching the version number lands on an older Opus
+// at best and on an id Anthropic 404s at worst, and this stage is the last
+// rescue the session has.
+const claudeSubstituteOpusModel = "claude-opus-5-5"
+
+// claudeOpusModel maps a Fable request model to claudeSubstituteOpusModel,
+// keeping the client's bracketed context-window suffix verbatim: dropping
+// "[1m]" silently downgrades a 1M-context session to the 200k default. ok is
+// false when the model names no Fable family.
 func claudeOpusModel(model string) (string, bool) {
-	idx := strings.Index(strings.ToLower(model), "fable")
-	if idx < 0 {
+	if !claudeFableModel(model) {
 		return "", false
 	}
-	return model[:idx] + "opus" + opusGeneration(model[idx+len("fable"):]), true
-}
-
-// opusGeneration trims point-release and snapshot segments from the version
-// trailing the family name, so "-5-1[1m]" becomes "-5[1m]". The two families do
-// not release in lockstep: Fable 5.1 launched against Opus 5, and there is no
-// claude-opus-5-1, so splicing the version through verbatim names a model
-// Anthropic 404s -- which costs the substitution the entire rescue it exists to
-// perform, precisely when the Fable pool is spent and it is the only stage left.
-// Landing a generation broad is safe where landing on nothing is not: this is a
-// last resort, and a real older Opus answers where a fabricated id cannot.
-// Everything past the version -- the client's "[1m]" context-window marker --
-// survives verbatim, for the same reason the splice preserves it.
-func opusGeneration(rest string) string {
-	major, tail, ok := leadingVersionSegment(rest)
-	if !ok {
-		return rest
+	suffix := ""
+	if i := strings.IndexByte(model, '['); i >= 0 {
+		suffix = model[i:]
 	}
-	for {
-		_, remainder, more := leadingVersionSegment(tail)
-		if !more {
-			return major + tail
-		}
-		tail = remainder
-	}
-}
-
-// leadingVersionSegment splits a leading "-<digits>" run off s, returning the
-// segment with its dash, the remainder, and whether one was present.
-func leadingVersionSegment(s string) (string, string, bool) {
-	if !strings.HasPrefix(s, "-") {
-		return "", s, false
-	}
-	i := 1
-	for i < len(s) && s[i] >= '0' && s[i] <= '9' {
-		i++
-	}
-	if i == 1 {
-		return "", s, false
-	}
-	return s[:i], s[i:], true
+	return claudeSubstituteOpusModel + suffix, true
 }
 
 // claudeOpusBody rewrites the top-level "model" field of a Claude Messages
-// request body to the equivalent Opus model. Everything else is preserved
+// request body to the substitute Opus model. Everything else is preserved
 // byte-for-byte (values stay json.RawMessage), including context_management,
 // which the OAuth pool accepts and must not be stripped the way the direct
 // API-key path strips it.

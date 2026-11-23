@@ -21,23 +21,22 @@ import (
 	"github.com/manaflow-ai/subrouter/session"
 )
 
-func TestClaudeOpusModelPreservesVersionAndSuffix(t *testing.T) {
+func TestClaudeOpusModelIsTheNewestOpusWithTheClientSuffix(t *testing.T) {
 	cases := []struct {
 		in   string
 		want string
 		ok   bool
 	}{
-		{"claude-fable-5", "claude-opus-5", true},
+		// Every Fable version falls to the newest Opus; the Fable version
+		// number is not carried over, since Opus has no 5-1 or 5-2.
+		{"claude-fable-5", "claude-opus-5-5", true},
+		{"claude-fable-5-1", "claude-opus-5-5", true},
+		{"claude-fable-5-2", "claude-opus-5-5", true},
 		// The client appends the context-window suffix; dropping it silently
 		// downgrades a 1M-context session to the 200k default.
-		{"claude-fable-5[1m]", "claude-opus-5[1m]", true},
-		{"CLAUDE-FABLE-5[1m]", "CLAUDE-opus-5[1m]", true},
-		// Opus shipped no counterpart for every Fable point release: Fable 5.1
-		// launched against Opus 5, and claude-opus-5-1 does not exist. Splicing
-		// the version through verbatim names a model Anthropic 404s, which costs
-		// the substitution the whole rescue it exists to perform.
-		{"claude-fable-5-1", "claude-opus-5", true},
-		{"claude-fable-5-1[1m]", "claude-opus-5[1m]", true},
+		{"claude-fable-5-2[1m]", "claude-opus-5-5[1m]", true},
+		{"CLAUDE-FABLE-5[1m]", "claude-opus-5-5[1m]", true},
+		{"fable", "claude-opus-5-5", true},
 		{"claude-opus-5", "", false},
 		{"", "", false},
 		{"claude-sonnet-5", "", false},
@@ -56,14 +55,14 @@ func TestClaudeOpusBodyRewritesOnlyTheModel(t *testing.T) {
 	if !ok {
 		t.Fatal("fable body should be rewritable")
 	}
-	if from != "claude-fable-5[1m]" || to != "claude-opus-5[1m]" {
+	if from != "claude-fable-5[1m]" || to != "claude-opus-5-5[1m]" {
 		t.Fatalf("from/to = %q/%q", from, to)
 	}
 	var got map[string]any
 	if err := json.Unmarshal(rebuilt, &got); err != nil {
 		t.Fatal(err)
 	}
-	if got["model"] != "claude-opus-5[1m]" {
+	if got["model"] != "claude-opus-5-5[1m]" {
 		t.Fatalf("model = %v", got["model"])
 	}
 	if got["max_tokens"] != float64(8) {
@@ -120,17 +119,17 @@ func TestRewriteRequestToClaudeOpusSetsAllThreeBodyFields(t *testing.T) {
 	if !ok {
 		t.Fatal("fable request should be rewritable")
 	}
-	if from != "claude-fable-5[1m]" || to != "claude-opus-5[1m]" {
+	if from != "claude-fable-5[1m]" || to != "claude-opus-5-5[1m]" {
 		t.Fatalf("from/to = %q/%q", from, to)
 	}
-	if got := req.Header.Get("X-Subrouter-Model"); got != "claude-opus-5[1m]" {
+	if got := req.Header.Get("X-Subrouter-Model"); got != "claude-opus-5-5[1m]" {
 		t.Fatalf("X-Subrouter-Model = %q; ExtractModel reads headers before the body", got)
 	}
 	fromBody, err := io.ReadAll(req.Body)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(fromBody), "claude-opus-5[1m]") || strings.Contains(string(fromBody), "fable") {
+	if !strings.Contains(string(fromBody), "claude-opus-5-5[1m]") || strings.Contains(string(fromBody), "fable") {
 		t.Fatalf("Body = %s", fromBody)
 	}
 	if req.ContentLength != int64(len(fromBody)) {
@@ -199,7 +198,7 @@ func TestRewriteRequestToClaudeOpusUndoRestoresTheClientRequest(t *testing.T) {
 		if !ok || undo == nil {
 			t.Fatalf("header %q: a fable request must be rewritten, with an undo", clientModelHeader)
 		}
-		if got := req.Header.Get("X-Subrouter-Model"); got != "claude-opus-5" {
+		if got := req.Header.Get("X-Subrouter-Model"); got != "claude-opus-5-5" {
 			t.Fatalf("calibration, header %q: X-Subrouter-Model = %q after the rewrite", clientModelHeader, got)
 		}
 		undo()
@@ -317,7 +316,7 @@ func TestClaudeOpusSubstituteResponseServesFromOpusPool(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d", resp.StatusCode)
 	}
-	if !strings.Contains(capturedBody, `"model":"claude-opus-5[1m]"`) {
+	if !strings.Contains(capturedBody, `"model":"claude-opus-5-5[1m]"`) {
 		t.Fatalf("forwarded body = %s, want the opus model", capturedBody)
 	}
 	if auth := captured.Header.Get("Authorization"); auth != "Bearer tok-one" && auth != "Bearer tok-two" {
@@ -659,12 +658,12 @@ func TestClaudeFableHandlerSubstitutesOpusWhenFablePoolExhausted(t *testing.T) {
 	server.ClaudeUpstream = upstreamURL
 
 	recorder := httptest.NewRecorder()
-	server.Handler().ServeHTTP(recorder, opusHandlerRequest(t, "session-sub", `{"model":"claude-fable-5[1m]","max_tokens":8,"messages":[]}`))
+	server.Handler().ServeHTTP(recorder, opusHandlerRequest(t, "session-sub", `{"model":"claude-fable-5-2[1m]","max_tokens":8,"messages":[]}`))
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200 via the opus pool; body=%s logs=\n%s", recorder.Code, recorder.Body.String(), logBuf.String())
 	}
-	if len(upstream.models) != 1 || upstream.models[0] != "claude-opus-5[1m]" {
-		t.Fatalf("upstream models = %v, want one claude-opus-5[1m]", upstream.models)
+	if len(upstream.models) != 1 || upstream.models[0] != "claude-opus-5-5[1m]" {
+		t.Fatalf("upstream models = %v, want one claude-opus-5-5[1m]", upstream.models)
 	}
 	for _, header := range []string{"X-Subrouter-Model", "X-Model"} {
 		if got := upstream.headers[0].Get(header); got != "" {
