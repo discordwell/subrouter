@@ -428,6 +428,12 @@ var requiredCases = []string{
 	"route-every-credential-command-routes-credentials",
 	"route-logout-of-a-pool-profile-is-refused",
 	"route-plain-pool-launch-keeps-the-pool-store",
+	// check, check codex and test without the Paradev app launch as a new
+	// terminal does, skip only the cases about its wrapper, and still gate.
+	"route-check-without-paradev-launches-through-the-shim",
+	"route-test-without-paradev-skips-only-the-paradev-cases",
+	"route-check-and-test-with-paradev-go-through-its-wrapper",
+	"route-failed-check-without-paradev-blocks-the-gate",
 	// sr-triage: rc-file exports by name only, probes bounded without
 	// timeout(1), the install found off PATH (§48).
 	"triage-rc-exports-names-only",

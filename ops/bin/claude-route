@@ -43,8 +43,10 @@
 #                                 its lock, verifies, puts it back if anything fails; a supervised daemon needs
 #                                 --restart-supervisor)
 #   claude-route test             wet test: decisions, real launches checked against the daemon, parity
-#   claude-route check            one real launch the way a new Paradev session makes it (mode file decides)
-#   claude-route check codex      one real pooled Codex launch through Paradev's wrapper (your CODEX_HOME)
+#                                 (without a Paradev wrapper, the cases about the wrapper are skipped)
+#   claude-route check            one real launch the way a new session makes it (mode file decides):
+#                                 through Paradev's wrapper when this Mac has one, else through the shim
+#   claude-route check codex      one real pooled Codex launch, the same way (your CODEX_HOME)
 #   claude-route pool [--force]   cut over NEW launches to the pool (refuses without a passing test today)
 #   claude-route off              roll back NEW launches to your own login (instant)
 #   claude-route codex pool [--force] | codex off   the same switch for NEW Codex launches (ships off)
@@ -1405,16 +1407,33 @@ run_group() { # seconds command...
     perl -e 'my $t=shift; my $p=fork; if(!$p){setpgrp(0,0); exec @ARGV; exit 127} $SIG{ALRM}=sub{kill "KILL",-$p; exit 142}; alarm $t; waitpid($p,0); exit($?>>8)' "$@"
 }
 
-# One real launch decided by the mode file alone, made the way a new Paradev
-# session makes it (Paradev's wrapper -> shim -> claude). The post-cutover proof.
+# How a new session launches $1 (claude|codex). A new Paradev (or Superset) session runs the
+# app's wrapper, which execs the first non-Paradev one on PATH: the shim. A new terminal runs
+# the shim. Sets FRONT (what to run), FRONT_PATH (from BASE) and FRONT_VIA; fails without a wrapper.
+launch_front() {
+    local d
+    for d in "$HOME"/.paradev/bin "$HOME"/.paradev-*/bin "$HOME"/.superset/bin "$HOME"/.superset-*/bin; do
+        [ -x "$d/$1" ] && [ ! -d "$d/$1" ] || continue
+        FRONT="$d/$1"; FRONT_PATH="$d:$SHIM_DIR:$BASE"
+        FRONT_VIA="Paradev's wrapper $FRONT -> shim -> $1, as a new Paradev session launches it"
+        return 0
+    done
+    FRONT="$SHIM_DIR/$1"; FRONT_PATH="$SHIM_DIR:$BASE"
+    FRONT_VIA="shim $FRONT -> $1, as a new terminal launches it (no Paradev wrapper)"
+    return 1
+}
+
+# One real launch decided by the mode file alone, made the way a new session
+# makes it (launch_front). The post-cutover proof.
 cmd_check() {
     [ "${1:-}" = codex ] && { cmd_check_codex; return; }
     [ -x "$SHIM" ] || die "not installed: claude-route install"
     local cwd="$ROUTE_HOME/test-cwd" sid out route acct
     mkdir -p "$cwd"; sid=$(uuidgen | tr '[:upper:]' '[:lower:]')
-    build_launch_env
-    out=$(cd "$cwd" && perl -e 'alarm shift; exec @ARGV' 240 env "${CLEAN[@]}" PATH="$HOME/.paradev/bin:$SHIM_DIR:$BASE" \
-        "$HOME/.paradev/bin/claude" -p "Reply with exactly one word, in lowercase: ready" --model haiku --session-id "$sid" 2>&1)
+    build_launch_env; launch_front claude
+    echo "launch: $FRONT_VIA"
+    out=$(cd "$cwd" && perl -e 'alarm shift; exec @ARGV' 240 env "${CLEAN[@]}" PATH="$FRONT_PATH" \
+        "$FRONT" -p "Reply with exactly one word, in lowercase: ready" --model haiku --session-id "$sid" 2>&1)
     route=$($GREP -F "sid=$sid" "$ROUTE_HOME/launch.log" 2>/dev/null | tail -1 | sed -n 's/.* route=\([a-z-]*\).*/\1/p')
     acct=$("$SRQ" serving "$sid" 2>/dev/null)
     echo "mode=$(mode_now)  route=${route:-?}  answer=${out:0:80}  pool account=${acct:-none (not through the pool)}"
@@ -1422,22 +1441,24 @@ cmd_check() {
     [ "$(mode_now)" = off ] || [ -n "$acct" ]
 }
 
-# One real pooled Codex launch through Paradev's wrapper, on YOUR Codex config (CODEX_HOME,
-# ~/.codex by default: its hooks, MCP servers and notify run, and the session is saved there),
-# checked against the daemon's own session table. 'codex pool' wants it to pass first.
+# One real pooled Codex launch made the way a new session makes it (launch_front), on YOUR
+# Codex config (CODEX_HOME, ~/.codex by default: its hooks, MCP servers and notify run, and the
+# session is saved there), checked against the daemon's own session table. 'codex pool' wants
+# it to pass first.
 cmd_check_codex() {
     [ -x "$CODEX_SHIM" ] || die "codex shim not installed: claude-route install"
     local cwd="$ROUTE_HOME/test-cwd" out last sid acct res
     mkdir -p "$cwd"; rm -f "$cwd/.codex-check-last.txt"
-    build_launch_env
-    out=$(cd "$cwd" && run_group 240 env "${CLEAN[@]}" PATH="$HOME/.paradev/bin:$SHIM_DIR:$BASE" CODEX_ROUTE=pool \
-        "$HOME/.paradev/bin/codex" exec --skip-git-repo-check -o "$cwd/.codex-check-last.txt" "Reply with exactly one word, in lowercase: ready" </dev/null 2>&1)
+    build_launch_env; launch_front codex
+    echo "launch: $FRONT_VIA"
+    out=$(cd "$cwd" && run_group 240 env "${CLEAN[@]}" PATH="$FRONT_PATH" CODEX_ROUTE=pool \
+        "$FRONT" exec --skip-git-repo-check -o "$cwd/.codex-check-last.txt" "Reply with exactly one word, in lowercase: ready" </dev/null 2>&1)
     sid=$(printf '%s\n' "$out" | sed -n 's/^session id: //p' | head -1)
     last=$(cat "$cwd/.codex-check-last.txt" 2>/dev/null); rm -f "$cwd/.codex-check-last.txt"
     acct=$([ -n "$sid" ] && "$SRQ" serving "$sid" 2>/dev/null)
     echo "codex: CODEX_HOME=${CODEX_HOME:-$HOME/.codex}  session=${sid:-?}  answer=${last:0:80}  pool account=${acct:-none (not through the pool)}"
     if [[ "$last" == *ready* ]] && [ -n "$acct" ]; then res=PASS; else res=FAIL; printf '%s\n' "$out" | tail -5 >&2; fi
-    echo "$res $(date +%Y-%m-%d) $(date +%H:%M:%S) (${acct:-no pool account}; CODEX_HOME=${CODEX_HOME:-$HOME/.codex})" > "$LAST_CODEX_CHECK"
+    echo "$res $(date +%Y-%m-%d) $(date +%H:%M:%S) (${acct:-no pool account}; via $FRONT; CODEX_HOME=${CODEX_HOME:-$HOME/.codex})" > "$LAST_CODEX_CHECK"
     [ "$res" = PASS ]
 }
 
@@ -1448,6 +1469,9 @@ cmd_check_codex() {
 # connectors excepted: Claude Code turns them off for socket-mode tokens).
 # Claude checks decide last-test (the gate for 'pool'); Codex checks decide
 # last-codex-test (the gate for 'codex pool'), so one never blocks the other.
+# Launches a new session would make go through launch_front: Paradev's wrapper, or the
+# shim on a Mac without one. There the cases about the wrapper itself print SKIP and
+# count as neither a pass nor a failure.
 cmd_test() {
     [ -x "$SHIM" ] || die "not installed: claude-route install"
     local pass=0 fail=0 cpass=0 cfail=0 cwd="$ROUTE_HOME/test-cwd" err="$ROUTE_HOME/test.err" tmp
@@ -1456,11 +1480,16 @@ cmd_test() {
     build_launch_env
     local -a clean=("${CLEAN[@]}")
     local base="$BASE" NL=$'\n'
-    local P_SHIM="$SHIM_DIR:$base" P_PARADEV="$HOME/.paradev/bin:$SHIM_DIR:$base" CSHIM="$CODEX_SHIM"
+    local P_SHIM="$SHIM_DIR:$base" CSHIM="$CODEX_SHIM" FRONT FRONT_PATH FRONT_VIA pw=0 cpw=0 CVIA="the shim"
+    launch_front claude && pw=1; local F_CLAUDE="$FRONT" P_FRONT="$FRONT_PATH"; echo "claude launches: $FRONT_VIA"
+    launch_front codex && { cpw=1; CVIA="Paradev's wrapper"; }; local F_CODEX="$FRONT" CP_FRONT="$FRONT_PATH"
+    [ -x "$CSHIM" ] && echo "codex launches:  $FRONT_VIA"
     local -a fakes=()
 
     check() { local name="$1"; shift; if "$@" >>"$err" 2>&1; then echo "  PASS  $name"; pass=$((pass+1)); else echo "  FAIL  $name   (details: $err)"; fail=$((fail+1)); fi; }
     ccheck() { local name="$1"; shift; if "$@" >>"$err" 2>&1; then echo "  PASS  $name"; cpass=$((cpass+1)); else echo "  FAIL  $name   (details: $err)"; cfail=$((cfail+1)); fi; }
+    pcheck() { if [ "$pw" = 1 ]; then check "$@"; else echo "  SKIP  $1   (no Paradev wrapper)"; fi; }
+    cpcheck() { if [ "$cpw" = 1 ]; then ccheck "$@"; else echo "  SKIP  $1   (no Paradev wrapper)"; fi; }
     dry() { (cd "$cwd" && perl -e 'alarm shift; exec @ARGV' 20 env "${clean[@]}" CLAUDE_ROUTE_DRYRUN=1 "$@"); }
     cdry() { (cd "$cwd" && perl -e 'alarm shift; exec @ARGV' 20 env "${clean[@]}" CODEX_ROUTE_DRYRUN=1 "$@"); }
     has() { local out="$1"; shift; local w; for w in "$@"; do [[ "$out" == *"$w"* ]] || { echo "missing [$w] in: $out"; return 1; }; done; }
@@ -1571,7 +1600,7 @@ FAKE
     o=$(dry PATH="$P_SHIM" CLAUDE_ROUTE=off ANTHROPIC_BASE_URL=http://api.anthropic.com ANTHROPIC_UNIX_SOCKET="$SOCK" CLAUDE_CODE_OAUTH_TOKEN=ssh-placeholder CLAUDE_ROUTE_ACTIVE=pool \
         CLAUDE_ROUTE_SET="ANTHROPIC_BASE_URL ANTHROPIC_UNIX_SOCKET CLAUDE_CODE_OAUTH_TOKEN" "$SHIM"); check "explicit off inside a pool session undoes the parent's route" has "$o" "route=off" "ANTHROPIC_BASE_URL=<unset>" "ANTHROPIC_UNIX_SOCKET=<unset>" "CLAUDE_CODE_OAUTH_TOKEN=<unset>"
     o=$(dry PATH="$SHIM_DIR:$SHIM_DIR:$base" "$SHIM"); check "no self-recursion with the shim twice on PATH" has "$o" "real=/"; check "  ...(not a shim)" lacks "$o" "real=$SHIM_DIR/"
-    o=$(dry PATH="$P_PARADEV" HOME="$HOME/" "$SHIM"); check "HOME with a trailing slash never picks Paradev's wrapper" lacks "$o" "/.paradev/bin/claude" "real=$SHIM_DIR/"
+    o=$(dry PATH="$P_FRONT" HOME="$HOME/" "$SHIM"); pcheck "HOME with a trailing slash never picks Paradev's wrapper" lacks "$o" "${F_CLAUDE#"$HOME"}" "real=$SHIM_DIR/"
     mkdir -p "$tmp/naive"; cat > "$tmp/naive/claude" <<'NAIVE'
 #!/bin/bash
 # a naive wrapper: exec the first other `claude` on PATH
@@ -1582,7 +1611,7 @@ NAIVE
     chmod 755 "$tmp/naive/claude"
     # Real exec, not a dry run (a dry run never follows the exec): without the guard this spins until the alarm.
     check "a looping wrapper is caught, not spun" eval '[ "$(cd "$cwd" && perl -e "alarm 20; exec @ARGV" env "${clean[@]}" PATH="$SHIM_DIR:$tmp/naive:$base" CLAUDE_ROUTE=off "$SHIM" --version 2>/dev/null)" = "$(env "${clean[@]}" "$HOME/.local/bin/claude" --version 2>&1)" ]'
-    o=$(dry PATH="$P_PARADEV" CLAUDE_ROUTE=pool "$HOME/.paradev/bin/claude"); check "Paradev's wrapper execs the shim" has "$o" "route=pool"
+    o=$(dry PATH="$P_FRONT" CLAUDE_ROUTE=pool "$F_CLAUDE"); pcheck "Paradev's wrapper execs the shim" has "$o" "route=pool"
     o=$(dry PATH="$P_SHIM" CLAUDE_ROUTE=bogus "$SHIM"); check "an unknown CLAUDE_ROUTE is reported, not obeyed" has "$o" "note=unknown CLAUDE_ROUTE=bogus"
     mkdir -p "$tmp/ro-home"; echo off > "$tmp/ro-home/mode"; : > "$tmp/ro-home/launch.log"; chmod 444 "$tmp/ro-home/launch.log"
     check "an unwritable launch log stays quiet" eval '[ -z "$(cd "$cwd" && env "${clean[@]}" PATH="$P_SHIM" CLAUDE_ROUTE_HOME="$tmp/ro-home" "$SHIM" --version 2>&1 >/dev/null)" ]'
@@ -1621,10 +1650,10 @@ NAIVE
     o=$(dry PATH="$P_SHIM" CLAUDE_ROUTE=pool "$SHIM" "local please");    check "'local please' is a prompt"          has "$o" "word=<none>" "args=[local please]"
     o=$(dry PATH="$P_SHIM" CLAUDE_ROUTE=pool "$SHIM" -p local);          check "a word after a flag is a prompt"     has "$o" "word=<none>" "args=[-p][local]"
     o=$(dry PATH="$P_SHIM" CLAUDE_ROUTE=pool "$SHIM" @README.md);       check "an @-mention is a prompt, never a word" has "$o" "route=pool" "word=<none>" "args=[@README.md]"
-    o=$(dry PATH="$P_PARADEV" CLAUDE_ROUTE=pool "$HOME/.paradev/bin/claude" --dangerously-skip-permissions --model opus --effort xhigh local)
-    check "Paradev's launch shape is never a word"                       has "$o" "route=pool" "word=<none>" "args=[--dangerously-skip-permissions][--model][opus][--effort][xhigh][local]"
-    o=$(dry PATH="$P_PARADEV" CLAUDE_ROUTE=pool "$HOME/.paradev/bin/claude" local -p hi)
-    check "a word through Paradev's wrapper"                             has "$o" "route=off" "word=local" "args=[-p][hi]"
+    o=$(dry PATH="$P_FRONT" CLAUDE_ROUTE=pool "$F_CLAUDE" --dangerously-skip-permissions --model opus --effort xhigh local)
+    pcheck "Paradev's launch shape is never a word"                      has "$o" "route=pool" "word=<none>" "args=[--dangerously-skip-permissions][--model][opus][--effort][xhigh][local]"
+    o=$(dry PATH="$P_FRONT" CLAUDE_ROUTE=pool "$F_CLAUDE" local -p hi)
+    pcheck "a word through Paradev's wrapper"                            has "$o" "route=off" "word=local" "args=[-p][hi]"
     o=$(dry PATH="$P_SHIM" CLAUDE_ROUTE_WORDS=0 "$SHIM" local);          check "CLAUDE_ROUTE_WORDS=0 turns words off" has "$o" "word=<none>" "args=[local]"
     o=$(dry PATH="$P_SHIM" "$SHIM" locl); rc=$?;                       check "a typo of 'local' sends nothing (2)" eval 'code_is $rc 2 && has "$o" "refused=near" "did you mean '"'"'local'"'"'"'
     mkdir -p "$tmp/proj/.claude"; printf '{"env":{"ANTHROPIC_BASE_URL":"http://example.invalid"}}\n' > "$tmp/proj/.claude/settings.json"
@@ -1774,7 +1803,7 @@ cmds=set()
 for m in re.finditer(r\"^  ([a-z][a-z-]*)\s.*?(?:\[aliases: ([a-z, -]+)\])?$\", text, re.M):
     cmds.add(m.group(1)); cmds.update(x.strip() for x in (m.group(2) or \"\").split(\",\") if x.strip())
 miss=sorted(cmds-set(sys.argv[1].split())); print(\"codex commands not reserved:\", miss or \"none\"); sys.exit(1 if miss or not cmds else 0)" "$(shim_list "$CSHIM" codex_cmds)"'
-    check "Paradev's presets still put a flag first (claude) and the prompt after -- (codex)" eval 'perl -e "alarm 30; exec @ARGV" paradev agents list --local --json 2>/dev/null | python3 -I -c "
+    pcheck "Paradev's presets still put a flag first (claude) and the prompt after -- (codex)" eval 'perl -e "alarm 30; exec @ARGV" paradev agents list --local --json 2>/dev/null | python3 -I -c "
 import json,sys
 p={a[\"presetId\"]:a for a in json.load(sys.stdin)}
 ok=p[\"claude\"][\"args\"][0].startswith(\"-\") and p[\"codex\"][\"promptArgs\"]==[\"--\"]
@@ -1790,12 +1819,12 @@ sys.exit(0 if ok else 1)"'
     ccheck "codex pool: the subrouter provider block, after the prompt" has "$o" "route=pool" "[-c][model_provider=\"subrouter\"][-c][model_providers.subrouter={name=\"Subrouter\",base_url=\"$TCP/v1\",experimental_bearer_token=\"subrouter\",wire_api=\"responses\",supports_websockets=true,http_headers={\"X-Subrouter-Agent\"=\"codex\"}}]"
     o=$(cdry PATH="$P_SHIM" CODEX_ROUTE=pool "$CSHIM" --dangerously-bypass-approvals-and-sandbox -- "fix it")
     ccheck "  ...the block goes before --; the prompt stays last"      has "$o" "}}][--][fix it]"
-    o=$(cdry PATH="$P_PARADEV" CODEX_ROUTE=pool OPENAI_BASE_URL="$TCP/v1" "$HOME/.paradev/bin/codex" local)
-    ccheck "codex local through Paradev's wrapper: prefix kept, word dropped, subrouter URL dropped" has "$o" "route=off" "word=local" "args=[--enable][hooks][--dangerously-bypass-hook-trust]" "OPENAI_BASE_URL=<unset>"
+    o=$(cdry PATH="$CP_FRONT" CODEX_ROUTE=pool OPENAI_BASE_URL="$TCP/v1" "$F_CODEX" local)
+    cpcheck "codex local through Paradev's wrapper: prefix kept, word dropped, subrouter URL dropped" has "$o" "route=off" "word=local" "args=[--enable][hooks][--dangerously-bypass-hook-trust]" "OPENAI_BASE_URL=<unset>"
     o=$(cdry PATH="$P_SHIM" CODEX_ROUTE=pool "$CSHIM" -c 'projects={"/x"={trust_level="trusted"}}' --enable hooks --dangerously-bypass-hook-trust LOCAL)
     ccheck "  ...and with Paradev's project-trust -c in front"         has "$o" "route=off" "word=local"
-    o=$(cdry PATH="$P_PARADEV" CODEX_ROUTE=pool "$HOME/.paradev/bin/codex" --dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust -- local)
-    ccheck "Paradev's Codex preset shape (-- prompt) is never a word"  has "$o" "route=pool" "word=<none>" "[--][local]"
+    o=$(cdry PATH="$CP_FRONT" CODEX_ROUTE=pool "$F_CODEX" --dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust -- local)
+    cpcheck "Paradev's Codex preset shape (-- prompt) is never a word" has "$o" "route=pool" "word=<none>" "[--][local]"
     local c
     for c in login logout "mcp list" app-server --version; do
         o=$(cdry PATH="$P_SHIM" CODEX_ROUTE=pool "$CSHIM" $c); ccheck "codex $c: the real binary, untouched" has "$o" "route=passthrough" "args=[${c// /][}]"
@@ -1850,7 +1879,7 @@ sys.exit(0 if ok else 1)"'
     CX_WANT=echo; ccheck "codex pool exec answers"                       cx PATH="$P_SHIM" CODEX_ROUTE=pool "$CSHIM" exec --skip-git-repo-check "Reply with exactly one word, in lowercase: echo"
     ccheck "  ...and the pool served it"                                  eval 'served "$CX_SID"'
     if [ -n "$LX" ] && [[ "$(cdry PATH="$P_SHIM" "$CSHIM" "$LX" exec hi)" == *route=pool* ]]; then
-        CX_WANT=foxtrot; ccheck "codex pinned through Paradev's wrapper answers" cx PATH="$P_PARADEV" "$HOME/.paradev/bin/codex" "$LX" exec --skip-git-repo-check "Reply with exactly one word, in lowercase: foxtrot"
+        CX_WANT=foxtrot; ccheck "codex pinned through $CVIA answers" cx PATH="$CP_FRONT" "$F_CODEX" "$LX" exec --skip-git-repo-check "Reply with exactly one word, in lowercase: foxtrot"
         ccheck "  ...on exactly that account"                              eval 'served "$CX_SID" && test "$SERVED_BY" = "$LX"'
     fi
     ccheck "~/.codex auth file untouched (inode, mtime, size)"            test "$(stat -f '%i %m %z' "$HOME/.codex/auth.json" 2>/dev/null)" = "$cbefore"
@@ -1870,7 +1899,7 @@ for l in open(sys.argv[1]):
 sys.exit(1)' "$f"
     }
     check "'claude -p -- local' sends the word as the prompt"           escaped
-    check "'claude local' answers on your own login"                     ask "$w4" juliet PATH="$P_PARADEV" "$HOME/.paradev/bin/claude" local
+    check "'claude local' answers on your own login"                     ask "$w4" juliet PATH="$P_FRONT" "$F_CLAUDE" local
     check "  ...logged route=off word=local, and the daemon never saw it" eval '$GREP -F "sid=$w4" "$ROUTE_HOME/launch.log" | $GREP -q "route=off word=local" && unserved "$w4"'
     if [ -n "$LC" ]; then
         o=$(dry PATH="$P_SHIM" "$SHIM" "$LC")
@@ -1879,9 +1908,9 @@ sys.exit(1)' "$f"
             check "pinned '$LC': refused before launch, nothing sent" eval '(cd "$cwd" && env "${clean[@]}" PATH="$P_SHIM" "$SHIM" "$LC" -p hi --session-id "$w2" >/dev/null 2>&1); code_is $? 2 && quick $t0 10 && unserved "$w2"'
         elif [[ "$o" == *flags=*ineligible* ]]; then
             t0=$(date +%s)
-            check "pinned '$LC' (spent) fails fast with the provider's limit, no failover" eval '! ask "$w2" hotel PATH="$P_PARADEV" "$HOME/.paradev/bin/claude" "$LC" && quick $t0 45 && served "$w2" && test "$SERVED_BY" = "$LC"'
+            check "pinned '$LC' (spent) fails fast with the provider's limit, no failover" eval '! ask "$w2" hotel PATH="$P_FRONT" "$F_CLAUDE" "$LC" && quick $t0 45 && served "$w2" && test "$SERVED_BY" = "$LC"'
         else
-            check "pinned '$LC' answers"                                  ask "$w2" hotel PATH="$P_PARADEV" "$HOME/.paradev/bin/claude" "$LC"
+            check "pinned '$LC' answers"                                  ask "$w2" hotel PATH="$P_FRONT" "$F_CLAUDE" "$LC"
             check "  ...on exactly that account"                          eval 'served "$w2" && test "$SERVED_BY" = "$LC"'
         fi
     fi
@@ -1903,8 +1932,8 @@ sys.exit(1)' "$f"
     check "pool -p answers"                                ask "$s1" pong PATH="$P_SHIM" CLAUDE_ROUTE=pool "$SHIM"
     check "  ...and the pool served it"                    served "$s1"
     local first_account="$SERVED_BY"
-    check "pool via Paradev's wrapper answers"             ask "$s2" ping PATH="$P_PARADEV" CLAUDE_ROUTE=pool "$HOME/.paradev/bin/claude"
-    check "  ...and the pool served it"                    served "$s2"
+    pcheck "pool via Paradev's wrapper answers"            ask "$s2" ping PATH="$P_FRONT" CLAUDE_ROUTE=pool "$F_CLAUDE"
+    pcheck "  ...and the pool served it"                   served "$s2"
     check "pool --resume answers"                          resume "$s1" again PATH="$P_SHIM" CLAUDE_ROUTE=pool "$SHIM"
     check "  ...on the same pinned account"                eval 'served "$s1" && test "$SERVED_BY" = "$first_account"'
     ( ask "$s3" alpha PATH="$P_SHIM" CLAUDE_ROUTE=pool "$SHIM" >>"$err" 2>&1; echo $? > "$tmp/t3" ) &
