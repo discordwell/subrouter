@@ -66,6 +66,22 @@ func TestBedrockUsageCost(t *testing.T) {
 	if got := cache.costUSD("fable"); math.Abs(got-1.0) > 1e-9 {
 		t.Fatalf("fable cache-read cost = %v, want 1.00 (0.1x input)", got)
 	}
+	// Anthropic list prices per MTok: Fable 5.2 in 8, out 40, cache write 5m 10,
+	// 1h 16, cache read 0.2; Fable 5.1 as Fable 5 but cache read 0.25.
+	every := bedrockUsage{
+		InputTokens: 1_000_000, OutputTokens: 1_000_000, CacheReadTokens: 1_000_000,
+		CacheWriteTokens: 2_000_000,
+		CacheCreation:    bedrockCacheCreation{Ephemeral5m: 1_000_000, Ephemeral1h: 1_000_000},
+	}
+	if got := every.costUSD("us.anthropic.claude-fable-5-2"); math.Abs(got-74.2) > 1e-9 {
+		t.Fatalf("fable 5.2 cost = %v, want 74.20 (8 + 40 + 0.2 + 10 + 16)", got)
+	}
+	if got := every.costUSD("us.anthropic.claude-fable-5-1"); math.Abs(got-92.75) > 1e-9 {
+		t.Fatalf("fable 5.1 cost = %v, want 92.75 (10 + 50 + 0.25 + 12.5 + 20)", got)
+	}
+	if got := every.costUSD("us.anthropic.claude-fable-5"); math.Abs(got-93.5) > 1e-9 {
+		t.Fatalf("fable 5 cost = %v, want 93.50 (10 + 50 + 1 + 12.5 + 20)", got)
+	}
 }
 
 func TestSummarizeBedrockCost(t *testing.T) {

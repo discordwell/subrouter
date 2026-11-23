@@ -41,12 +41,18 @@ type bedrockPricing struct {
 	cacheWrite1h float64
 }
 
-// bedrockPriceFor returns pricing for a Bedrock model id / inference profile.
-// Cache read is 0.1x input and cache write (5m) is 1.25x input, per Anthropic
-// list pricing. Unknown models price at 0 so cost is never overstated.
+// bedrockPriceFor returns pricing for a Bedrock model id / inference profile,
+// per Anthropic list pricing. Cache write (5m) is 1.25x input; cache read is
+// 0.1x input, except Fable 5.1 and 5.2, which read cache at 0.025x. Fable
+// versions price apart, newest first so "fable-5" never claims a 5.x id.
+// Unknown models price at 0 so cost is never overstated.
 func bedrockPriceFor(model string) bedrockPricing {
 	m := strings.ToLower(model)
 	switch {
+	case strings.Contains(m, "fable-5-2"):
+		return bedrockPricing{input: 8, output: 40, cacheRead: 0.2, cacheWrite: 10, cacheWrite1h: 16}
+	case strings.Contains(m, "fable-5-1"):
+		return bedrockPricing{input: 10, output: 50, cacheRead: 0.25, cacheWrite: 12.5, cacheWrite1h: 20}
 	case strings.Contains(m, "fable"):
 		return bedrockPricing{input: 10, output: 50, cacheRead: 1, cacheWrite: 12.5, cacheWrite1h: 20}
 	case strings.Contains(m, "opus"):
