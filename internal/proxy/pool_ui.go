@@ -307,6 +307,13 @@ type poolRow struct {
 	PinRefusal string `json:"pin_refusal,omitempty"`
 
 	Windows []poolWindow `json:"windows,omitempty"`
+
+	// Resets is every saved reset the account holds, compact: its daemon's
+	// usage-status list, or what its complimentary_reset says when that
+	// daemon publishes none, with ResetsPartial set (poolResetsOf, PATCHES
+	// §91.2). Absent with no reading. Shown, never ranked on.
+	Resets        []poolReset `json:"resets,omitzero"`
+	ResetsPartial bool        `json:"resets_partial,omitempty"`
 }
 
 // poolSpill is the cross-pool verdict for one provider, computed from the REAL
@@ -634,7 +641,7 @@ func (s Server) poolBoard(ctx context.Context, boardModel, machineID string) poo
 	if s.AccountRef != nil {
 		localStatuses = s.AccountRef.UsageStatuses(ctx)
 		s.updateSchedulerFromUsageStatusesContext(ctx, localStatuses)
-		localStatuses = s.withNormalizedUsage(s.withRequestTimeExhaustionWindows(localStatuses))
+		localStatuses = s.withHeldResets(s.withNormalizedUsage(s.withRequestTimeExhaustionWindows(localStatuses)))
 	}
 	localAccounts := s.accountListContext(ctx)
 	// TWO schedulers, on purpose, and the split is the point.
@@ -848,6 +855,7 @@ func applyPoolReadings(row *poolRow, status AccountUsageStatus, scheduler select
 	if reset := status.ComplimentaryReset; reset != nil && reset.Source == agentclaude.ResetProgram && reset.Available {
 		row.FableResets = reset.RemainingByKind[string(agentclaude.ResetKindFable)]
 	}
+	row.Resets, row.ResetsPartial = poolResetsOf(status)
 
 	score, known := scheduler.LookupScore(status.Provider, status.ID)
 	row.Measured = known && measurable

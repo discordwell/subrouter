@@ -874,14 +874,25 @@ func TestTheBoardPageShowsTheDaemonsOwnStart(t *testing.T) {
 // UTC, and returns each account's row as the page drew it.
 func (d *unstartedCodexDaemon) renderBoardPage(t *testing.T, node string) map[string]string {
 	t.Helper()
+	return renderPoolPage(t, d.server, node)
+}
+
+// renderPoolPage is renderBoardPage for any daemon.
+func renderPoolPage(t *testing.T, server Server, node string) map[string]string {
+	t.Helper()
 	page := httptest.NewRecorder()
-	d.server.handlePoolPage(page, loopbackRequest(http.MethodGet, "/_subrouter/pool", ""))
+	server.handlePoolPage(page, loopbackRequest(http.MethodGet, "/_subrouter/pool", ""))
+	pool := httptest.NewRecorder()
+	server.handlePoolData(pool, loopbackRequest(http.MethodGet, "/_subrouter/pool.json", ""))
+	if pool.Code != http.StatusOK {
+		t.Fatalf("pool.json = %d: %s", pool.Code, pool.Body.String())
+	}
 	dir := t.TempDir()
 	pagePath, poolPath := filepath.Join(dir, "pool.html"), filepath.Join(dir, "pool.json")
 	if err := os.WriteFile(pagePath, page.Body.Bytes(), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(poolPath, d.poolJSON(t), 0o600); err != nil {
+	if err := os.WriteFile(poolPath, pool.Body.Bytes(), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
