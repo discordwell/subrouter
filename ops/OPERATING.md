@@ -97,7 +97,7 @@ pool burn over 24 hours (1.00 = on pace): Claude week 0.80 (40% at the limit), C
 
 What the figures cannot say. Each account weighs the same, because plan sizes are not known. A pool figure is only as good as each daemon's history: a daemon that was down has a gap, and the rise across it is spread evenly. A meter that reads in whole percents makes the 1-hour figure move in steps of about 1.7.
 
-The history is `usage-history.jsonl` in the state directory, `~/.subrouter` unless `SUBROUTER_STATE_DIR` names another, kept for 35 days. It loads at start, so a restart or a deploy keeps the figures. Each `usage-status` row carries its account's figures as `burn`, outside `normalized`, and `GET /_subrouter/burn.json` gives the pool figure with each account's figures. Nothing ranks or routes on any of it. `SUBROUTER_USAGE_HISTORY=0` turns the history and the figures off.
+The history is `usage-history.jsonl`, beside `token-usage.jsonl` and `sessions.json` in the folder of the daemon's `--sessions` file (`~/.subrouter` by default; `SUBROUTER_STATE_DIR` does not move it), kept for 35 days. It loads at start, so a restart or a deploy keeps the figures. Each `usage-status` row carries its account's figures as `burn`, outside `normalized`, and `GET /_subrouter/burn.json` gives the pool figure with each account's figures. Nothing ranks or routes on any of it. `SUBROUTER_USAGE_HISTORY=0` turns the history and the figures off.
 
 ## Avoid the dangerous commands
 
@@ -485,7 +485,7 @@ To see every saved reset in the pool, run `srq resets`. It prints one line per a
 
 pool.json carries each row's list in `resets` (`kind`, `count`, `expires_at`, `expiry`), with `resets_partial: true` for a daemon from before §91.
 
-Each daemon records every claim it makes, by hand or by the Codex failover and background spender, in `usage-history.jsonl` in its state directory, with each meter's used fraction and roll time from the last reading before the claim and the first reading after it (§92.1). It logs the same as `reset claim recorded` at Info: `before` and `after` hold one group per meter. A claim that did not reset the account is marked `failed` and has no `after`. A redeem `sr reset` makes from the CLI itself (`--local`, `SUBROUTER_CODEX_SERVER=local`, or a machine with no server configured) reaches no daemon and is not recorded. The same file holds the daemon's own meter readings for 35 days, at most 32 MiB. `SUBROUTER_USAGE_HISTORY=0` turns it off.
+Each daemon records every claim it makes, by hand or by the Codex failover and background spender, in `usage-history.jsonl` beside its `sessions.json`, with each meter's used fraction and roll time from the last reading before the claim and the first reading after it (§92.1). It logs the same as `reset claim recorded` at Info: `before` and `after` hold one group per meter. A claim that did not reset the account is marked `failed` and has no `after`. A redeem `sr reset` makes from the CLI itself (`--local`, `SUBROUTER_CODEX_SERVER=local`, or a machine with no server configured) reaches no daemon and is not recorded. The same file holds the daemon's own meter readings for 35 days, at most 32 MiB. `SUBROUTER_USAGE_HISTORY=0` turns it off.
 
 ## Troubleshoot
 
