@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"context"
 	"fmt"
+	"math"
 	"slices"
 	"strings"
 	"sync"
@@ -74,8 +75,8 @@ type resetCandidate struct {
 	// name for its provider: claude or codex.
 	key, provider, id, label string
 	// out says why the account cannot be chosen whatever the pool says: a
-	// dead credential, an owner's reserve, no saved reset. "" when it is
-	// weighed.
+	// dead credential, an owner's reserve, an automatic claim not settled,
+	// no saved reset. "" when it is weighed.
 	out string
 	// next is the provider's next reset on the account: the one a claim at
 	// its limit spends.
@@ -105,6 +106,14 @@ type resetWeighing struct {
 	// unused is a reset that expires before the account could reach its
 	// limit, even with the pool's whole demand on it.
 	unused bool
+	// onPool is a candidate that fails on the pool alone: its need on the
+	// meter is no or unknown, or its demand is not known (PATCHES §96).
+	onPool bool
+	// waiting is a choice that keeps its place through such a gap, and place
+	// the order it keeps when it qualifies again, 0 for none
+	// (chooseAcrossGaps).
+	waiting bool
+	place   int
 }
 
 const resetUnknownToRoll = time.Duration(-1 << 62)
@@ -184,9 +193,9 @@ func (p resetPool) weigh(c resetCandidate) resetWeighing {
 	case w.window:
 		w.qualifies = true
 	case need.Answer == ResetNeedUnknown:
-		w.why = fmt.Sprintf("the pool's burn on the %s is not known yet (%s)", pool.Label, need.Why)
+		w.why, w.onPool = fmt.Sprintf("the pool's burn on the %s is not known yet (%s)", pool.Label, need.Why), true
 	case need.Answer == ResetNeedNo:
-		w.why = fmt.Sprintf("the pool does not need its saved resets on the %s (%s)", pool.Label, need.Why)
+		w.why, w.onPool = fmt.Sprintf("the pool does not need its saved resets on the %s (%s)", pool.Label, need.Why), true
 	case last:
 		w.qualifies = true
 		w.why = fmt.Sprintf("%s, and it is its %s's last chance: it expires at %s, before the account could meet its next wall after the roll at %s",
@@ -195,6 +204,7 @@ func (p resetPool) weigh(c resetCandidate) resetWeighing {
 		w.why = fmt.Sprintf("%s, but its %s is unread, so where it reaches its limit is not known", needs, autoResetMeter(spec.Meter).words())
 	case !wallKnown:
 		w.why = fmt.Sprintf("%s, but the pool's demand on it is not known, so where the account reaches its limit is not known", needs)
+		w.onPool = true
 	case reading.roll.IsZero():
 		w.why = fmt.Sprintf("%s, but its roll is not read, so what a claim at its limit adds is not known", needs)
 	case value.value < resetValueFloor:
@@ -236,22 +246,26 @@ type resetChoosing struct {
 // its expiry window is chosen too.
 // Within a meter, the order is the holders inside their expiry window,
 // soonest expiry first, then the rest by the value of a claim at their wall,
-// highest first, and last the holders whose reset is likely to expire unused.
+// highest first, and last the holders whose reset is likely to expire unused;
+// within each, an account back from a gap in the pool's need takes its old
+// place first (§96). A hold on an account waiting out such a gap stands.
 func chooseResets(weighed []resetWeighing, hold resetCodexHold, now time.Time) resetChoosing {
 	out := resetChoosing{choices: map[string]selectacct.ResetChoice{}, notChosen: map[string]string{}}
 	byMeter := map[selectacct.ResetChoiceMeter][]resetWeighing{}
 	var codex []resetWeighing
+	holdWaits := false
 	for _, w := range weighed {
 		switch {
 		case !w.qualifies:
 			out.notChosen[w.candidate.key] = w.why
+			holdWaits = holdWaits || (w.waiting && w.candidate.key == hold.key)
 		case w.meter == selectacct.ResetChoiceCodexWeek:
 			codex = append(codex, w)
 		default:
 			byMeter[w.meter] = append(byMeter[w.meter], w)
 		}
 	}
-	single, since := codexSingle(codex, hold, now)
+	single, since := codexSingle(codex, hold, holdWaits, now)
 	if single != "" {
 		out.codex = resetCodexHold{key: single, since: since}
 	}
@@ -276,9 +290,13 @@ func chooseResets(weighed []resetWeighing, hold resetCodexHold, now time.Time) r
 }
 
 // codexSingle is the Codex account loaded one at a time, and since when: the
-// account held, while it qualifies; else the one worth the most.
-func codexSingle(qualified []resetWeighing, hold resetCodexHold, now time.Time) (string, time.Time) {
-	if len(qualified) == 0 {
+// account held, while it qualifies or waits out a gap in the pool's need
+// (holdWaits); else the one worth the most.
+func codexSingle(qualified []resetWeighing, hold resetCodexHold, holdWaits bool, now time.Time) (string, time.Time) {
+	switch {
+	case holdWaits:
+		return hold.key, hold.since
+	case len(qualified) == 0:
 		return "", time.Time{}
 	}
 	for _, w := range qualified {
@@ -305,6 +323,9 @@ func compareChosen(a, b resetWeighing) int {
 	if ga, gb := resetChoiceGroup(a), resetChoiceGroup(b); ga != gb {
 		return ga - gb
 	}
+	if pa, pb := resetChoicePlace(a), resetChoicePlace(b); pa != pb {
+		return cmp.Compare(pa, pb)
+	}
 	if resetChoiceGroup(a) != 1 && !a.expires.Equal(b.expires) {
 		switch {
 		case a.expires.IsZero():
@@ -318,6 +339,71 @@ func compareChosen(a, b resetWeighing) int {
 	}
 	return compareValue(a, b)
 }
+
+// resetChoicePlace sorts an account back in its place from before a gap in
+// the pool's need by that place, ahead of every account chosen afresh.
+func resetChoicePlace(w resetWeighing) int {
+	if w.place > 0 {
+		return w.place
+	}
+	return math.MaxInt
+}
+
+// resetChoiceGap is how long a choice keeps its place once it stops
+// qualifying only because the pool's need on its meter turned no or unknown
+// (PATCHES §96), so a need that flickers does not swap the account loaded for
+// another.
+const resetChoiceGap = 30 * time.Minute
+
+// resetGap is a choice keeping its place through a gap in the pool's need:
+// the choice as it stood when the gap began, and when that was.
+type resetGap struct {
+	chosen resetChosen
+	since  time.Time
+}
+
+// chooseAcrossGaps is chooseResets with what the last pass left: its
+// choices and the gaps still open (PATCHES §96). A choice that now fails only
+// on the pool keeps its place for resetChoiceGap from then. It is not chosen
+// while it waits, so nothing publishes or ranks it, and a Codex hold on it
+// stands. When it qualifies again before its time is up it takes its old order
+// back, ahead of any account chosen afresh, until that time. A choice that
+// stops for any other reason is dropped at once. It returns the choice and the
+// gaps to keep.
+func chooseAcrossGaps(weighed []resetWeighing, before map[string]resetChosen, gaps map[string]resetGap,
+	hold resetCodexHold, now time.Time) (resetChoosing, map[string]resetGap) {
+	kept := map[string]resetGap{}
+	for i := range weighed {
+		w := &weighed[i]
+		key := w.candidate.key
+		gap, open := gaps[key]
+		open = open && now.Sub(gap.since) <= resetChoiceGap
+		was, chosen := before[key]
+		switch {
+		case w.qualifies && open && gap.chosen.choice.Meter == w.meter:
+			w.place = gap.chosen.choice.Order
+			w.why += fmt.Sprintf("; it keeps the place it had before the pool's need paused, until %s", rfc3339(gap.since.Add(resetChoiceGap)))
+			kept[key] = gap
+		case w.qualifies || !w.onPool:
+			// Chosen afresh, or dropped at once.
+		case chosen:
+			gap = resetGap{chosen: was, since: now}
+			fallthrough
+		case open:
+			w.waiting = true
+			w.why += fmt.Sprintf("; it keeps its place until %s, should the need return", rfc3339(gap.since.Add(resetChoiceGap)))
+			kept[key] = gap
+		}
+	}
+	_, chosen := before[hold.key]
+	if _, open := kept[hold.key]; !chosen && !open {
+		// The hold waited out its gap and the need did not return in time.
+		hold = resetCodexHold{}
+	}
+	return chooseResets(weighed, hold, now), kept
+}
+
+func rfc3339(t time.Time) string { return t.UTC().Format(time.RFC3339) }
 
 // compareValue puts the claim worth more first, then the account with more
 // time from its wall to its roll, then by label and ID so the order is fixed.
@@ -381,9 +467,9 @@ func (s Server) chooseResetAccounts() {
 		}
 	}
 	memory.mu.Lock()
-	hold := memory.codexHold
+	last, gaps, hold := memory.choices, memory.resetGaps, memory.codexHold
 	memory.mu.Unlock()
-	choosing := chooseResets(weighed, hold, now)
+	choosing, gaps := chooseAcrossGaps(weighed, last, gaps, hold, now)
 	labels := map[string]resetChosen{}
 	for _, w := range weighed {
 		labels[w.candidate.key] = resetChosen{label: w.candidate.label, provider: w.candidate.provider}
@@ -396,7 +482,7 @@ func (s Server) chooseResetAccounts() {
 	}
 	memory.mu.Lock()
 	before := memory.choices
-	memory.choices, memory.codexHold = chosen, choosing.codex
+	memory.choices, memory.codexHold, memory.resetGaps = chosen, choosing.codex, gaps
 	memory.mu.Unlock()
 	s.logResetChoices(mode, before, chosen, choosing.notChosen)
 }
@@ -417,11 +503,14 @@ func (s Server) resetCandidateOf(row *AccountUsageStatus, scheduler selectacct.S
 		readings: autoResetReadingsOf(row), burn: row.Burn}
 	next, held := s.nextHeldReset(account, row)
 	score, _ := scheduler.KnownScore(schedulerAccountProvider(provider), account.ID)
+	unsettled := s.autoResetUnsettledClaim(c.key, c.readings)
 	switch dead := s.autoResetDeadCredential(account); {
 	case dead != "":
 		c.out = "its credential is dead: " + dead
 	case score.Reserve > 0:
 		c.out = fmt.Sprintf("it has an owner's reserve of %.0f%% of its week, which loading would spend", score.Reserve*100)
+	case unsettled != "":
+		c.out = unsettled
 	case row.Resets == nil:
 		c.out = "its saved resets have not been read"
 	case !held:

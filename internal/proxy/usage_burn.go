@@ -302,6 +302,7 @@ func (s Server) handleUsageBurn(w http.ResponseWriter, r *http.Request) {
 		rows = append(rows, read.rows...)
 	}
 	report.Meters = usagePoolMeters(rows)
+	s.AccountRef.sharedResetNeeds().hold(report.Meters, now)
 	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, report)
 }
