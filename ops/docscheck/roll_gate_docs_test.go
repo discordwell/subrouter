@@ -9,11 +9,16 @@ import (
 )
 
 // What a reader of the operator doc and the agent skill must find since
-// PATCHES §103: the owner's 24-hour gate and its one exception, the Fable
-// week room, the rule's steps and field for them, how `srq pool` shows a
-// claim either holds, and what the claim's last check says when it holds one.
-var rollGateNames = []string{"§103", "under 24 hours", "last chance", "25%", "roll_gate", "week_room", "week_left",
-	"(rolls in 6h, under 24h)", "(week 3% left, under 25%)", "(week not read)", "§103 holds it on the reading before the claim"}
+// PATCHES §103: the owner's 24-hour gate and its one exception, the rule's
+// step for it, how `srq pool` shows a claim it holds, what the claim's last
+// check says when it holds one, and since §105 that the week does not hold a
+// Fable reset.
+var rollGateNames = []string{"§103", "under 24 hours", "last chance", "roll_gate", "(rolls in 6h, under 24h)",
+	"§103 holds it on the reading before the claim", "§105", "it should not matter how much Opus is left"}
+
+// What neither may still say since §105: that a Fable reset waits for a
+// quarter of the week, or that a decision carries the week it read for that.
+var staleWeekRoom = regexp.MustCompile(`week_left|\(week \d+% left, under 25%\)|week has at least 25%|at least 25% of its week`)
 
 // What no doc but ops/PATCHES.md may still say since §103: that a claim with
 // its roll under 24 hours away is held back for what it would add, which the
@@ -31,6 +36,9 @@ func TestDocsSayNoClaimIsMadeInsideADayOfTheRoll(t *testing.T) {
 			if !strings.Contains(string(data), name) {
 				t.Errorf("%s does not name %q, which a reader needs to know why an automatic claim was held since §103", rel, name)
 			}
+		}
+		if match := staleWeekRoom.FindString(string(data)); match != "" {
+			t.Errorf("%s still says %q; since §105 the account's week does not hold a Fable reset", rel, match)
 		}
 	}
 	for _, rel := range trackedFiles(t, root) {
