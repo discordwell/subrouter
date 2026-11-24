@@ -383,3 +383,10 @@ A pre-§59 daemon (with §58) holds a turn whose lookup fails and retries the sa
 - **A 429 that names no deadline holds the account off for the daemon's own five minutes.** The follow-up waits it out, as every read of the account does.
 - **The follow-up waits for the saved resets, not for every meter.** A meter whose usage answer never carries it, on an account that takes no turn, stays named in `not_read_since_claim` until a probe or a reply measures it.
 - **Not measured:** how long Anthropic's usage endpoint holds a login off after a claim, what `Retry-After` it sends then, and whether a read at that deadline is answered.
+
+## Residual gaps §103 leaves open
+
+- **The next wall is a forecast.** It assumes the account spends its next week at the rate it spends now, so a claim that waits may meet a pool that no longer needs it. The bar of 0.8 leaves room for that, and the expiry window still claims every reset before it expires.
+- **The part of the week a Fable reset gives back is not counted.** A Fable claim is valued on the Fable meter alone, now and at the next wall. One claim gave back 50 points of the week too; how much it gives back in general is not measured.
+- **A decision remembers that a claim passed the comparison only as its last decision.** A decision on the account in between, such as one the owner's condition refused, or a restart, makes the next comparison use the full bar again.
+- **Walls are counted one a week from the next roll.** A Codex credit that restarts the seven days moves the rolls after it; the count does not follow.
