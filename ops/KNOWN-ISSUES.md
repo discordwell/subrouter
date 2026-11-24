@@ -383,3 +383,9 @@ A pre-§59 daemon (with §58) holds a turn whose lookup fails and retries the sa
 - **A 429 that names no deadline holds the account off for the daemon's own five minutes.** The follow-up waits it out, as every read of the account does.
 - **The follow-up waits for the saved resets, not for every meter.** A meter whose usage answer never carries it, on an account that takes no turn, stays named in `not_read_since_claim` until a probe or a reply measures it.
 - **Not measured:** how long Anthropic's usage endpoint holds a login off after a claim, what `Retry-After` it sends then, and whether a read at that deadline is answered.
+
+## Residual gaps §104 leaves open
+
+- **A Fable turn ranked across the peers alone does not load a peer's Fable choice.** §95.2 loads an account chosen for its Fable meter on the Fable pool, and a daemon honours a peer's choice. The ranking of the peers alone (the laptop's usual path, its own pool unable to serve) is still not scoped for a Fable turn, so there a Fable choice ranks as a steady account. Scoping it is one line in `peersOnlyScheduler`, but it moves the laptop's Fable sessions onto the chosen accounts at once, so it waits for the owner. An Opus or Sonnet turn is scoped since §104.
+- **A Haiku turn never ranks on the Fable meter.** §65 leaves Haiku out so that a session that opens with a Haiku call is not pinned where Fable is spent. In the 72 hours §104 measured, every placement made on a Haiku turn was a session that ran Haiku throughout, and that work spends the week as Opus does. Claude Code's own side calls are not in the transcripts, so how often a session opens with one was not measured.
+- **A legacy peer (no verdicts) still ranks unscoped**, as §65 says (`bestPeerScoreFrom`).

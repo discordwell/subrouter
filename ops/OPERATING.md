@@ -33,6 +33,8 @@ The router's verdict is `normalized.new_session` on each `usage-status` row. `sr
 
 The reasons are `eligible`, `burndown`, `exhausted`, `holdout`, `at_cap`, `short_floor`, `below_reserve`, `burn_projection`, `queue_closed`, and `pin_only`, plus `auth_invalid` for a login this daemon checked and found dead. A peer that refuses a forwarded turn names one of these, or `unknown_account`, `machine_policy`, or `not_oauth`. The order the router itself uses is `rank` and `reason` in `GET /_subrouter/pool.json`.
 
+An Opus or Sonnet turn ranks an account whose Fable meter is spent at up to twice its weekly pace: the Fable-spent preference (§65). So Opus and Sonnet work goes to accounts with no Fable left, and the accounts with Fable left keep their week for Fable. The reason names it, `higher weekly pace after the Fable-spent preference and the live-session discount`, when it decided. It is a factor in the weekly pace clause, below the drain and the accounts chosen for a reset, so it never takes a new session from an account in its last day or from a chosen one, and it never moves a session. A peer's account ranks on the Fable meter its owner publishes, `normalized.fable_week_spent`. Since §104 that holds too when this daemon ranks the peers' accounts alone because its own pool cannot serve the turn, which on a laptop whose own account is held out is most new sessions. A Fable or Haiku turn never ranks on it. `SUBROUTER_FABLE_SPENT_PREFERENCE=0` turns it off.
+
 ### Window names differ by provider
 
 `usage-status` rows carry the provider's own window names. A lookup that uses one provider's names on the other provider's rows finds nothing, and a script that reads nothing as zero headroom reports healthy accounts as spent.
@@ -755,6 +757,7 @@ The daemon reads these from its environment when it starts.
 | `SUBROUTER_OUTAGE_SPILL_BURST` | 10 | The spill's burst. |
 | `SUBROUTER_RESET_HOLD_PRIORITY` | on | `0` stops ranking reset holders at 2x (§56). A value it does not recognize stops the daemon. |
 | `SUBROUTER_FABLE_RESERVATION` | off | `1` holds back weekly budget for Fable (§57). A value it does not recognize stops the daemon. |
+| `SUBROUTER_FABLE_SPENT_PREFERENCE` | on | `0` stops ranking an Opus or Sonnet turn's accounts by their spent Fable meter (§65, §104). A value it does not recognize stops the daemon. |
 | `SUBROUTER_START_UNSTARTED_WEEK` | on | `0` stops giving the next new session first to an account whose weekly window has not started (§86). A value it does not recognize stops the daemon. |
 | `SUBROUTER_SELF_START_WEEK` | on | `0` stops the daemon from sending one tiny turn itself on its own account whose weekly window has not started (§90). A value it does not recognize stops the daemon. |
 | `SUBROUTER_SELF_START_MODEL` | `gpt-6.2-sol` | The model of that turn (§90). |
