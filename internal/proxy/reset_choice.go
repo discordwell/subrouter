@@ -134,11 +134,15 @@ func projectedWall(left float64, demand resetDemand, now time.Time) (time.Time, 
 }
 
 // weigh is whether the pool should load c (PATCHES §95.1). A candidate
-// qualifies when its next reset is of a known kind whose clock is known, and
-// either the reset is inside its expiry window, or the pool needs its saved
-// resets on the reset's meter and §94's rule would claim at the wall the
-// account is heading for: the reset is in its last chance, or a claim at the
-// projected wall adds at least resetValueFloor of a week.
+// qualifies when its next reset is of a known kind whose clock is known,
+// §103's gate would let a claim at the wall it is heading for through (its
+// roll read and at least 24 hours past that wall, or the reset's last chance;
+// for a Fable reset, at least 25% of its week left now), and either the reset
+// is inside its expiry window, or the pool needs its saved resets on the
+// reset's meter and §94's rule would claim at that wall: the reset is in its
+// last chance, or a claim at the projected wall adds at least resetValueFloor
+// of a week. With the wall not known, the gate reads the roll from now.
+// Outside the window the pool's need is read before the gate.
 func (p resetPool) weigh(c resetCandidate) resetWeighing {
 	w := resetWeighing{candidate: c, value: -1, toRoll: resetUnknownToRoll}
 	if c.out != "" {
@@ -171,42 +175,58 @@ func (p resetPool) weigh(c resetCandidate) resetWeighing {
 	}
 	poolPressure, _ := longestPressure(need.Pressure)
 	rate := claimRateOf(c.burn[string(spec.Meter)], poolPressure)
-	reading, read := c.readings[autoResetMeter(spec.Meter)]
+	meter := autoResetMeter(spec.Meter)
+	reading, read := c.readings[meter]
+	rollRead := read && !reading.roll.IsZero()
 	wall, wallKnown := time.Time{}, false
 	if read {
 		wall, wallKnown = projectedWall(reading.left, meterDemand(pool), now)
 	}
-	last := false
+	last := rollRead && lastChance(w.expires, reading.roll, rate)
 	var value claimValue
-	if wallKnown && !reading.roll.IsZero() {
+	if wallKnown && rollRead {
 		w.toRoll = reading.roll.Sub(wall)
 		value = claimValueOf(spec.RestartsClock, w.toRoll, rate)
 		w.value = value.value
-		last = lastChance(w.expires, reading.roll, rate)
 	}
 	needs := fmt.Sprintf("the pool needs its saved resets on the %s (%s)", pool.Label, need.Why)
-	heading := ""
+	heading, limit := "", now
 	if wallKnown {
 		heading = fmt.Sprintf("at the pool's whole demand it reaches its limit in %s", shortDuration(wall.Sub(now)))
+		limit = wall
+	}
+	// §103's gate, as a claim at the limit the account is heading for would
+	// meet it: nothing is loaded toward a claim the gate would hold, inside
+	// the expiry window too. Outside the window the pool's need is read first,
+	// so a choice that stops on a pause in need alone keeps its place (§96).
+	week, weekRead := c.readings[autoResetWeek]
+	hold := resetHoldOf(meter, reading.roll.Sub(limit), rollRead, last,
+		resetWeek{left: week.left, known: weekRead, why: "its week is unread"})
+	held := func(lead string) string {
+		why := "a claim of its " + kind + " at its limit would be held: " + hold.why
+		if heading != "" {
+			why = heading + "; " + why
+		}
+		return lead + ", but " + why
 	}
 	switch {
+	case w.window && hold.by != "":
+		w.why = held(w.why)
 	case w.window:
 		w.qualifies = true
 	case need.Answer == ResetNeedUnknown:
 		w.why, w.onPool = fmt.Sprintf("the pool's burn on the %s is not known yet (%s)", pool.Label, need.Why), true
 	case need.Answer == ResetNeedNo:
 		w.why, w.onPool = fmt.Sprintf("the pool does not need its saved resets on the %s (%s)", pool.Label, need.Why), true
+	case hold.by != "":
+		w.why = held(needs)
 	case last:
 		w.qualifies = true
 		w.why = fmt.Sprintf("%s, and it is its %s's last chance: it expires at %s, before the account could meet its next wall after the roll at %s",
 			needs, kind, w.expires.UTC().Format(time.RFC3339), reading.roll.UTC().Format(time.RFC3339))
-	case !read:
-		w.why = fmt.Sprintf("%s, but its %s is unread, so where it reaches its limit is not known", needs, autoResetMeter(spec.Meter).words())
 	case !wallKnown:
 		w.why = fmt.Sprintf("%s, but the pool's demand on it is not known, so where the account reaches its limit is not known", needs)
 		w.onPool = true
-	case reading.roll.IsZero():
-		w.why = fmt.Sprintf("%s, but its roll is not read, so what a claim at its limit adds is not known", needs)
 	case value.value < resetValueFloor:
 		w.why = fmt.Sprintf("%s, but %s, and a claim there adds %.2f of a week, under the floor of %.2f (%s)",
 			needs, heading, value.value, resetValueFloor, value.why)

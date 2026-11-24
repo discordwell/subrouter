@@ -473,18 +473,22 @@ func (s Server) finishAutoResetClaim(key string, claim *autoResetClaim, d AutoRe
 // Codex claim does: the meter the moment found must still read at least 99.5%
 // used, so a week that rolled since the reading is not claimed on, and while
 // the owner's condition is on the reset's meter must have under 1% left. At
-// the wall the refusal is the evidence, and nothing more is read. It returns
-// what came of it and the reading after it.
+// the wall the refusal is the evidence, and nothing more is read. At either
+// moment §103's gate is judged again on the read the claim goes by, just
+// before it sends (holdBeforeSend). It returns what came of it and the
+// reading after it.
 func (s Server) autoResetClaimClaude(account accounts.Account, grant string, f autoResetFacts) (autoResetClaimResult, []accounts.UsageWindow, resetReadAfter) {
 	work, cancelWork := context.WithTimeout(context.Background(), ClaudeResetBudget)
 	defer cancelWork()
 	caller, cancelCaller := context.WithTimeout(work, autoResetClaudePatience)
 	defer cancelCaller()
 	claim := false
-	request := ClaudeResetRequest{Account: account.ID, ConfirmAccount: account.ID, DryRun: &claim, GrantID: grant}
-	if f.moment == autoResetOnAReading {
-		request.liveCheck = func(windows []accounts.UsageWindow, at time.Time) error {
-			live := autoResetReadingsIn(accounts.ProviderClaude, windows, at)
+	request := ClaudeResetRequest{Account: account.ID, ConfirmAccount: account.ID, DryRun: &claim, GrantID: grant,
+		readLive: f.moment == autoResetOnAReading}
+	memory := s.AccountRef.sharedAutoResets()
+	request.check = func(windows []accounts.UsageWindow, at time.Time) error {
+		live := autoResetReadingsIn(accounts.ProviderClaude, windows, at)
+		if f.moment == autoResetOnAReading {
 			if moment, read := live[f.readingMeter]; !read || (1-moment.left)*100 < autoResetReadingUsed {
 				return fmt.Errorf("the live reading before the claim no longer says %s is at least 99.5%% used", f.readingMeter.words())
 			}
@@ -492,8 +496,8 @@ func (s Server) autoResetClaimClaude(account accounts.Account, grant string, f a
 			if left, read := live[meter]; f.nearEmpty && (!read || left.left >= autoResetNearEmptyLeft) {
 				return fmt.Errorf("refused by the under-1-percent condition on the live reading of %s before the claim", meter.words())
 			}
-			return nil
 		}
+		return f.holdBeforeSend(live, memory.clock())
 	}
 	response, code := s.claudeReset(work, caller, request)
 	answered := response.Result
@@ -524,22 +528,27 @@ func (s Server) autoResetClaimClaude(account accounts.Account, grant string, f a
 // reading: a credit of a kind this daemon does not know is never redeemed;
 // at a reading moment the live week must still read at least 99.5% used,
 // whatever the owner's condition, since nothing else stops a redeem of a
-// week that rolled; and while the condition is on the live week must have
-// under 1% left.
+// week that rolled; while the condition is on the live week must have under
+// 1% left; and §103's gate must pass on the live reading (holdBeforeSend).
 func (s Server) autoResetClaimCodex(account accounts.Account, f autoResetFacts) (autoResetClaimResult, []accounts.UsageWindow, resetReadAfter) {
 	ctx, cancel := context.WithTimeout(context.Background(), autoResetCodexClaimBudget)
 	defer cancel()
 	sent := false
+	memory := s.AccountRef.sharedAutoResets()
 	approve := func(live rateLimitResetCandidate, now time.Time) error {
 		if resetType := strings.TrimSpace(live.credit.ResetType); resetType != "" && resetType != codexRateLimitsResetType {
 			return fmt.Errorf("the credit it would spend is of a kind this daemon does not know (reset_type %s)", resetType)
 		}
-		week, read := autoResetReadingsIn(accounts.ProviderCodex, live.before, now)[autoResetWeek]
+		readings := autoResetReadingsIn(accounts.ProviderCodex, live.before, now)
+		week, read := readings[autoResetWeek]
 		if f.moment == autoResetOnAReading && (!read || (1-week.left)*100 < autoResetReadingUsed) {
 			return errors.New("the live reading before the consume no longer says the week is at least 99.5% used")
 		}
 		if f.nearEmpty && (!read || week.left >= autoResetNearEmptyLeft) {
 			return errors.New("refused by the under-1-percent condition on the live reading before the consume")
+		}
+		if err := f.holdBeforeSend(readings, memory.clock()); err != nil {
+			return err
 		}
 		sent = true
 		return nil

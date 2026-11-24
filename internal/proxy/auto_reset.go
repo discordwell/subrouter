@@ -259,6 +259,10 @@ type AutoResetRule struct {
 	// known. HoursToRoll is null when the account's roll was not read.
 	Value       *float64 `json:"value"`
 	HoursToRoll *float64 `json:"hours_to_roll"`
+	// WeekLeft is the share of its week the account has left, on a Fable
+	// reset's decision whose week was read (§103's week room); absent
+	// otherwise.
+	WeekLeft *float64 `json:"week_left,omitempty"`
 }
 
 // AutoResetRuleStep is where §94.2's rule decided, in its order.
@@ -268,14 +272,21 @@ const (
 	// AutoResetByUnknownClock is a kind whose restarts_clock is unknown:
 	// never claimed.
 	AutoResetByUnknownClock AutoResetRuleStep = "unknown_clock"
+	// AutoResetByRollUnread is no claim: what a claim adds, and whether the
+	// roll is a day away (§103), are not known.
+	AutoResetByRollUnread AutoResetRuleStep = "roll_unread"
+	// AutoResetByRollGate is held back: the meter the reset gives back rolls
+	// in under 24 hours, and it is not the reset's last chance (§103).
+	AutoResetByRollGate AutoResetRuleStep = "roll_gate"
+	// AutoResetByWeekRoom is a Fable reset on an account with under 25% of
+	// its week left, held back, or whose week is not read, no claim (§103).
+	AutoResetByWeekRoom AutoResetRuleStep = "week_room"
 	// AutoResetByExpiryWindow and AutoResetByLastChance claim at any value.
 	AutoResetByExpiryWindow AutoResetRuleStep = "expiry_window"
 	AutoResetByLastChance   AutoResetRuleStep = "last_chance"
 	// AutoResetByNeed is the pool's need: held back when it is no, no claim
 	// when it is unknown.
 	AutoResetByNeed AutoResetRuleStep = "need"
-	// AutoResetByRollUnread is no claim: what a claim adds is not known.
-	AutoResetByRollUnread AutoResetRuleStep = "roll_unread"
 	// AutoResetByValue is what a claim adds: held back under the floor,
 	// claimed at or above it.
 	AutoResetByValue AutoResetRuleStep = "value"
@@ -389,20 +400,43 @@ func decideAutoReset(f autoResetFacts) AutoResetDecision {
 	d.Verdict = AutoResetWouldClaim
 	d.Reason = moment + "; " + next
 	if f.worth != nil {
-		d.Verdict, d.Reason, d.Rule = decideWorth(*f.worth, f.now, d.Reason)
+		d.Verdict, d.Reason, d.Rule = decideWorth(*f.worth, meter, autoResetWeekOf(f), f.now, d.Reason)
 	}
 	return d
 }
 
-// decideWorth is §94.2's rule, once every check of §93.1 has passed. A reset
-// whose clock nobody knows is never claimed. Inside its expiry window, or in
-// its last chance, it is claimed at any value. Otherwise it is claimed only
-// when the pool needs its saved resets on the meter and a claim adds at least
-// resetValueFloor of a week before the roll. It returns the verdict, its
-// reason, and what the rule used (§94.3).
-func decideWorth(w autoResetWorth, now time.Time, reason string) (AutoResetVerdict, string, *AutoResetRule) {
+// autoResetWeekOf is the account's week as f reads it, for §103's week room:
+// nothing left when the wall's own refusal was on the week, else a reading no
+// older than five minutes (autoResetMeterLeft).
+func autoResetWeekOf(f autoResetFacts) resetWeek {
+	left, known, why := autoResetMeterLeft(f, autoResetWeek)
+	return resetWeek{left: left, known: known, why: why}
+}
+
+// rate is the rate w's claim is valued at (claimRateOf).
+func (w autoResetWorth) rate() claimRate {
 	pool, _ := longestPressure(w.need.Pressure)
-	rate := claimRateOf(w.own, pool)
+	return claimRateOf(w.own, pool)
+}
+
+// hold is §103's gate on claiming w's reset, which gives back meter, at now
+// with the account's week.
+func (w autoResetWorth) hold(meter autoResetMeter, week resetWeek, now time.Time) resetHold {
+	last := !w.roll.IsZero() && lastChance(w.expires, w.roll, w.rate())
+	return resetHoldOf(meter, w.roll.Sub(now), !w.roll.IsZero(), last, week)
+}
+
+// decideWorth is §94.2's rule, once every check of §93.1 has passed. A reset
+// whose clock nobody knows is never claimed. §103's gate comes next: no claim
+// while the roll of meter, the one the reset gives back, is unread or under
+// 24 hours away, unless it is the reset's last chance; and a Fable reset only
+// on an account whose week has at least 25% left. Inside its expiry window, or
+// in its last chance, a reset is claimed at any value. Otherwise it is claimed
+// only when the pool needs its saved resets on the meter and a claim adds at
+// least resetValueFloor of a week before the roll. It returns the verdict, its
+// reason, and what the rule used (§94.3).
+func decideWorth(w autoResetWorth, meter autoResetMeter, week resetWeek, now time.Time, reason string) (AutoResetVerdict, string, *AutoResetRule) {
+	rate := w.rate()
 	value := claimValueOf(w.restarts, w.roll.Sub(now), rate)
 	used := AutoResetRule{Need: w.need.Answer, Window: w.need.Window, Pressure: w.need.Pressure[w.need.Window], Trend: w.need.Trend}
 	if !w.roll.IsZero() {
@@ -412,6 +446,10 @@ func decideWorth(w autoResetWorth, now time.Time, reason string) (AutoResetVerdi
 			used.Value = &value.value
 		}
 	}
+	if meter == autoResetFable && week.known {
+		left := math.Round(week.left*1000) / 1000
+		used.WeekLeft = &left
+	}
 	by := func(step AutoResetRuleStep) *AutoResetRule {
 		rule := used
 		rule.DecidedBy = step
@@ -420,11 +458,17 @@ func decideWorth(w autoResetWorth, now time.Time, reason string) (AutoResetVerdi
 	if _, known := w.restarts.Restarts(); !known {
 		return AutoResetNoClaim, reason + "; " + value.why + "; such a reset is never claimed automatically", by(AutoResetByUnknownClock)
 	}
+	switch hold := w.hold(meter, week, now); hold.verdict {
+	case AutoResetHeldBack:
+		return hold.verdict, reason + "; held back: " + hold.why, by(hold.by)
+	case AutoResetNoClaim:
+		return hold.verdict, reason + "; " + hold.why + ", so nothing is claimed", by(hold.by)
+	}
 	if w.window != nil && !now.Before(w.window.OpensAt) {
 		return AutoResetWouldClaim, fmt.Sprintf("%s; inside its expiry window, open since %s, %s before the reset expires: any demand at the limit is enough",
 			reason, w.window.OpensAt.UTC().Format(time.RFC3339), shortDuration(time.Duration(w.window.LeadSeconds)*time.Second)), by(AutoResetByExpiryWindow)
 	}
-	if !w.roll.IsZero() && lastChance(w.expires, w.roll, rate) {
+	if lastChance(w.expires, w.roll, rate) {
 		return AutoResetWouldClaim, fmt.Sprintf("%s; its last chance: it expires at %s, before the account could meet its next wall after the roll at %s at the rate %s",
 			reason, w.expires.UTC().Format(time.RFC3339), w.roll.UTC().Format(time.RFC3339), rate), by(AutoResetByLastChance)
 	}
@@ -436,16 +480,41 @@ func decideWorth(w autoResetWorth, now time.Time, reason string) (AutoResetVerdi
 		return AutoResetNoClaim, fmt.Sprintf("%s; the pool's burn on the %s is not known yet (%s), so nothing is claimed", reason, w.label, w.need.Why),
 			by(AutoResetByNeed)
 	}
-	if w.roll.IsZero() {
-		return AutoResetNoClaim, fmt.Sprintf("%s; the account's roll on the %s is not read, so what a claim would add is not known", reason, w.label),
-			by(AutoResetByRollUnread)
-	}
 	if value.value < resetValueFloor {
 		return AutoResetHeldBack, fmt.Sprintf("%s; held back: the roll is %s away, and a claim would add %.2f of a week, under the floor of %.2f (%s)",
 			reason, shortDuration(max(w.roll.Sub(now), 0)), value.value, resetValueFloor, value.why), by(AutoResetByValue)
 	}
 	return AutoResetWouldClaim, fmt.Sprintf("%s; the pool needs its saved resets on the %s (%s), and a claim adds %.2f of a week (%s)",
 		reason, w.label, w.need.Why, value.value, value.why), by(AutoResetByValue)
+}
+
+// holdBeforeSend is §103's gate again on a real claim just before it sends,
+// on live, the meters of the read the claim goes by, at now: the decision's
+// roll and week, each replaced by live's when live read it after the decision's
+// reading. So a roll that came under 24 hours between the decision and the
+// send, or a week that ran low, holds the claim. With §94's rule off (no
+// worth) there is no gate.
+func (f autoResetFacts) holdBeforeSend(live map[autoResetMeter]autoResetReading, now time.Time) error {
+	if f.worth == nil {
+		return nil
+	}
+	newer := func(meter autoResetMeter) (autoResetReading, bool) {
+		reading, ok := live[meter]
+		return reading, ok && reading.at.After(f.readings[meter].at)
+	}
+	meter := f.next.kind.meter()
+	w := *f.worth
+	if reading, ok := newer(meter); ok && !reading.roll.IsZero() {
+		w.roll = reading.roll
+	}
+	week := autoResetWeekOf(f)
+	if reading, ok := newer(autoResetWeek); ok {
+		week = resetWeek{left: reading.left, known: true}
+	}
+	if hold := w.hold(meter, week, now); hold.by != "" {
+		return fmt.Errorf("§103 holds it on the reading before the claim: %s", hold.why)
+	}
+	return nil
 }
 
 // autoResetMeterLeft is how much meter has left: nothing, when the wall's

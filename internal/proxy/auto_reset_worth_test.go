@@ -41,6 +41,10 @@ type worthFixture struct {
 	window bool
 	// restarts, when set, stands for the kinds table's restarts_clock.
 	restarts accounts.ClockRestart
+	// week is a Fable reset's account's week left, as the same reading
+	// measured it; weekUnread leaves the week out of the reading (§103).
+	week       float64
+	weekUnread bool
 }
 
 // facts are the fixture's facts; with rule, §94.2's too.
@@ -51,6 +55,9 @@ func (w worthFixture) facts(rule bool) autoResetFacts {
 		readings: map[autoResetMeter]autoResetReading{
 			meter: {left: w.left, at: worthNow.Add(-time.Minute), roll: worthNow.Add(w.toRoll)},
 		}}
+	if meter == autoResetFable && !w.weekUnread {
+		f.readings[autoResetWeek] = autoResetReading{left: w.week, at: worthNow.Add(-time.Minute), roll: worthNow.Add(w.toRoll)}
+	}
 	if !rule {
 		return f
 	}
@@ -120,32 +127,34 @@ func checkWorth(t *testing.T, cases []worthCase) {
 // 1, 2 and 4, on facts. A pool at pressure 0.7 does not need the reset: held
 // back with the pressure. At 1.2 with 60 hours to the roll a claim adds 0.43
 // of a week: claimed. At 1.2 with the account's own burn 1.2 and 10 hours to
-// the roll a claim adds 0.07: held back with the hours and the share; with 40
-// hours, 0.29: claimed. No figure at all: no claim, the burn not known yet.
+// the roll, the roll is under a day away: held back by §103's gate before the
+// value is weighed; with 40 hours a claim adds 0.29: claimed. No figure at
+// all: no claim, the burn not known yet.
 func TestTheRuleClaimsOnlyWhenThePoolNeedsItAndItAddsEnough(t *testing.T) {
 	checkWorth(t, []worthCase{
 		{"pressure 0.7", weekAt07, AutoResetHeldBack, []string{"held back", "the 24-hour pressure is 0.70, under 1.0",
 			"the rest of the pool can carry the work"}},
 		{"pressure 1.2, 60 hours to the roll", weekAt12, AutoResetWouldClaim, []string{"the 24-hour pressure is 1.20, at or above 1.0",
 			"a claim adds 0.43 of a week"}},
-		{"10 hours to the roll", weekNearRoll, AutoResetHeldBack, []string{"held back: the roll is 10h away",
-			"a claim would add 0.07 of a week, under the floor of 0.25"}},
+		{"10 hours to the roll", weekNearRoll, AutoResetHeldBack, []string{"held back: the week rolls in 10h, under 24h"}},
 		{"40 hours to the roll", weekFarRoll, AutoResetWouldClaim, []string{"a claim adds 0.29 of a week"}},
 		{"no figure", weekNoFigure, AutoResetNoClaim, []string{"the pool's burn on the Claude week is not known yet"}},
 	})
 }
 
 // 3. Last chance and the expiry window each override the pool's need and the
-// value floor, and the reason says which.
+// value floor, and the reason says which. Under a day from the roll only last
+// chance does (§103): inside the window the 24-hour gate holds the claim.
 func TestLastChanceAndTheExpiryWindowOverrideTheRule(t *testing.T) {
 	var cases []worthCase
 	for name, held := range map[string]worthFixture{"pressure 0.7": weekAt07, "10 hours to the roll": weekNearRoll} {
-		cases = append(cases,
-			worthCase{name + ", expiring before the roll", expiring(held, held.toRoll/2), AutoResetWouldClaim, []string{"its last chance"}},
-			worthCase{name + ", inside the expiry window", windowOpen(held), AutoResetWouldClaim, []string{"inside its expiry window",
-				"any demand at the limit is enough"}},
-		)
+		cases = append(cases, worthCase{name + ", expiring before the roll", expiring(held, held.toRoll/2), AutoResetWouldClaim, []string{"its last chance"}})
 	}
+	cases = append(cases,
+		worthCase{"pressure 0.7, inside the expiry window", windowOpen(weekAt07), AutoResetWouldClaim, []string{"inside its expiry window",
+			"any demand at the limit is enough"}},
+		worthCase{"10 hours to the roll, inside the expiry window", windowOpen(weekNearRoll), AutoResetHeldBack,
+			[]string{"held back: the week rolls in 10h, under 24h"}})
 	// A kind whose clock nobody knows is never claimed, not even inside its
 	// window or in its last chance.
 	unknownClock := windowOpen(expiring(weekAt12, 5*time.Hour))
@@ -228,17 +237,24 @@ func worthClaude(t *testing.T, mode AutoResetMode, burns map[string]float64, pro
 	setAutoResetForTest(t, mode, true)
 	d := newAutoResetClaude(t, profiles)
 	if len(burns) > 0 {
-		now := time.Now().Add(-100 * time.Hour).Truncate(time.Second)
-		h := burnHistory(t, now)
-		for id, rate := range burns {
-			seedSeries(h, accounts.Account{ID: id, Provider: accounts.ProviderClaude}, now, 49*time.Hour, 0,
-				func(ago time.Duration, _ time.Time) []accounts.UsageWindow {
-					return claudeWeek(100*line(0.10, rate, 49*time.Hour)(ago), now.Add(3*burnDay))
-				})
-		}
-		d.server.AccountRef.SetUsageHistory(h)
+		d.server.AccountRef.SetUsageHistory(claudeWeekBurns(t, burns))
 	}
 	return d
+}
+
+// claudeWeekBurns is a usage history holding each account's Claude week
+// rising at its rate in burns over 49 hours, its clock 100 hours before now.
+func claudeWeekBurns(t *testing.T, burns map[string]float64) *UsageHistory {
+	t.Helper()
+	now := time.Now().Add(-100 * time.Hour).Truncate(time.Second)
+	h := burnHistory(t, now)
+	for id, rate := range burns {
+		seedSeries(h, accounts.Account{ID: id, Provider: accounts.ProviderClaude}, now, 49*time.Hour, 0,
+			func(ago time.Duration, _ time.Time) []accounts.UsageWindow {
+				return claudeWeek(100*line(0.10, rate, 49*time.Hour)(ago), now.Add(3*burnDay))
+			})
+	}
+	return h
 }
 
 // heldAtTheWall is held, read at 95% of a week that rolls in roll (60 hours
@@ -291,11 +307,15 @@ func TestTheDaemonDecidesByThePoolsPressureAtTheWall(t *testing.T) {
 			reason: []string{"held back", "the 24-hour pressure is 0.70, under 1.0", "the rest of the pool can carry the work"}},
 		{name: "pressure 1.2, 60 hours to the roll", worth: true, burns: map[string]float64{"spare": 1.2}, ends: ends, verdict: AutoResetWouldClaim,
 			reason: []string{"the 24-hour pressure is 1.20, at or above 1.0", "a claim adds 0.43 of a week"}},
-		// Held's own 3.0 in a pool at 2.1 adds 0.27 of a week in 15 hours;
-		// at the pool's pressure it would add 0.19.
-		{name: "its own burn 3.0, 15 hours to the roll", worth: true, burns: map[string]float64{"spare": 1.2, "held": 3.0}, ends: ends,
-			roll: 15 * time.Hour, verdict: AutoResetWouldClaim, reason: []string{"the 24-hour pressure is 2.10", "a claim adds 0.27 of a week",
+		// Held's own 2.4 in a pool at 1.5 adds 0.36 of a week in 25 hours;
+		// at the pool's pressure it would add 0.22.
+		{name: "its own burn 2.4, 25 hours to the roll", worth: true, burns: map[string]float64{"spare": 0.6, "held": 2.4}, ends: ends,
+			roll: 25 * time.Hour, verdict: AutoResetWouldClaim, reason: []string{"the 24-hour pressure is 1.50", "a claim adds 0.36 of a week",
 				"its own 24-hour rate"}},
+		// Held's own 3.0 in a pool at 2.1 would add 0.27 of a week in 15
+		// hours, but the roll is under a day away (§103).
+		{name: "its own burn 3.0, 15 hours to the roll", worth: true, burns: map[string]float64{"spare": 1.2, "held": 3.0}, ends: ends,
+			roll: 15 * time.Hour, verdict: AutoResetHeldBack, reason: []string{"held back: the week rolls in 15h, under 24h"}},
 		{name: "no history", worth: true, ends: ends, verdict: AutoResetNoClaim,
 			reason: []string{"the pool's burn on the Claude week is not known yet"}},
 		{name: "pressure 0.7, expiring before the roll", worth: true, burns: map[string]float64{"spare": 0.7}, ends: time.Now().Add(50 * time.Hour),
