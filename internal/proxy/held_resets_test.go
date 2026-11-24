@@ -398,7 +398,7 @@ func TestUsageStatusListsEveryClaudeResetByKindAndExpiry(t *testing.T) {
 			accounts.HeldReset{Kind: accounts.ResetKindClaudeWeek, Count: 1, ExpiresAt: week, Expiry: accounts.ResetExpiryRead,
 				GivesBack: []string{"seven_day", "seven_day_overage_included"}, RestartsClock: accounts.ClockRestartMeasuredNo, NeedsLimit: &yes, Order: 1},
 			accounts.HeldReset{Kind: accounts.ResetKindClaudeFable, Count: 2, ExpiresAt: fable, Expiry: accounts.ResetExpiryRead,
-				GivesBack: []string{"seven_day_overage_included"}, RestartsClock: accounts.ClockRestartAssumedNo, NeedsLimit: &yes, Order: 2})
+				GivesBack: []string{"seven_day_overage_included"}, RestartsClock: accounts.ClockRestartMeasuredNo, NeedsLimit: &yes, Order: 2})
 		wantResets(t, "a block with no grants", rows["b-none"])
 		for _, id := range []string{"c-unread", "d-no-block"} {
 			if rows[id].present {

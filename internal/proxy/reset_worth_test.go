@@ -443,7 +443,8 @@ func TestUsageStatusCarriesEachResetsExpiryWindow(t *testing.T) {
 }
 
 // Behaviour 7. The Claude week kind's restarts_clock is a measured no, and
-// usage-status publishes it; Fable stays assumed no and Codex assumed yes.
+// usage-status publishes it; since §103 so is the Fable kind's, and Codex
+// stays assumed yes.
 func TestTheClaudeWeekResetKeepsItsRollAsMeasured(t *testing.T) {
 	for _, tc := range []struct {
 		provider accounts.Provider
@@ -452,7 +453,7 @@ func TestTheClaudeWeekResetKeepsItsRollAsMeasured(t *testing.T) {
 		meter    accounts.ResetMeter
 	}{
 		{accounts.ProviderClaude, accounts.ResetKindClaudeWeek, accounts.ClockRestartMeasuredNo, accounts.ResetMeterWeek},
-		{accounts.ProviderClaude, accounts.ResetKindClaudeFable, accounts.ClockRestartAssumedNo, accounts.ResetMeterFable},
+		{accounts.ProviderClaude, accounts.ResetKindClaudeFable, accounts.ClockRestartMeasuredNo, accounts.ResetMeterFable},
 		{accounts.ProviderCodex, accounts.ResetKindCodexRateLimits, accounts.ClockRestartAssumedYes, accounts.ResetMeterWeek},
 	} {
 		spec, ok := accounts.ResetKindNamed(tc.provider, tc.kind)
@@ -478,7 +479,7 @@ func TestTheClaudeWeekResetKeepsItsRollAsMeasured(t *testing.T) {
 	for _, entry := range rows[0].Resets {
 		published[entry.Kind] = entry.RestartsClock
 	}
-	if published["week"] != "measured_no" || published["fable"] != "assumed_no" {
-		t.Errorf("usage-status lists restarts_clock %v, want the week reset measured_no and the Fable reset assumed_no", published)
+	if published["week"] != "measured_no" || published["fable"] != "measured_no" {
+		t.Errorf("usage-status lists restarts_clock %v, want the week reset and the Fable reset measured_no", published)
 	}
 }
