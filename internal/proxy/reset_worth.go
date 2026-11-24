@@ -592,11 +592,12 @@ func waitBar(stood bool) float64 {
 
 // heldThrough is how many resets of kind the list holds that expire no later
 // than expires, the reset itself among them: the ones that need a wall before
-// that date. At least 1.
+// that date. One whose date is not read (a Codex count before its credit
+// list) may expire as soon, so it counts. At least 1.
 func heldThrough(list []accounts.HeldReset, kind accounts.ResetKind, expires time.Time) int {
 	held := 0
 	for _, entry := range list {
-		if at, dated := entry.Expires(); entry.Kind == kind && (expires.IsZero() || (dated && !at.After(expires))) {
+		if at, dated := entry.Expires(); entry.Kind == kind && (expires.IsZero() || !dated || !at.After(expires)) {
 			held += entry.Count
 		}
 	}

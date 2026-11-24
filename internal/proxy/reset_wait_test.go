@@ -408,3 +408,37 @@ func TestWithTheSwitchOffEveryFixtureDecidesAsSection94(t *testing.T) {
 		}
 	}
 }
+
+// 5, the count. The resets that need a wall before a reset's expiry are the
+// ones of its kind that expire no later, itself among them, and any of the
+// kind whose date is not read, which may expire as soon.
+func TestTheResetsThatNeedAWallBeforeAnExpiryAreCounted(t *testing.T) {
+	march, january := "2027-03-09T07:59:00Z", "2027-01-15T00:00:00Z"
+	at := func(text string) time.Time { parsed, _ := time.Parse(time.RFC3339, text); return parsed }
+	claude := []accounts.HeldReset{
+		{Kind: accounts.ResetKindClaudeWeek, Count: 1, ExpiresAt: "2026-12-10T22:00:00Z"},
+		{Kind: accounts.ResetKindClaudeFable, Count: 1, ExpiresAt: january},
+		{Kind: accounts.ResetKindClaudeFable, Count: 2, ExpiresAt: march},
+	}
+	codex := []accounts.HeldReset{
+		{Kind: accounts.ResetKindCodexRateLimits, Count: 1, ExpiresAt: "2026-12-14T00:00:00Z"},
+		{Kind: accounts.ResetKindCodexRateLimits, Count: 1, ExpiresAt: "2026-12-20T00:00:00Z"},
+		{Kind: accounts.ResetKindCodexRateLimits, Count: 2, Expiry: accounts.ResetExpiryNotRead},
+	}
+	for _, tc := range []struct {
+		name    string
+		list    []accounts.HeldReset
+		kind    accounts.ResetKind
+		expires time.Time
+		want    int
+	}{
+		{"the Fable resets through March", claude, accounts.ResetKindClaudeFable, at(march), 3},
+		{"the Fable resets through January", claude, accounts.ResetKindClaudeFable, at(january), 1},
+		{"the Codex credits through 12/14, with two not read", codex, accounts.ResetKindCodexRateLimits, at("2026-12-14T00:00:00Z"), 3},
+		{"no list", nil, accounts.ResetKindClaudeFable, at(march), 1},
+	} {
+		if got := heldThrough(tc.list, tc.kind, tc.expires); got != tc.want {
+			t.Errorf("%s: %d, want %d", tc.name, got, tc.want)
+		}
+	}
+}
