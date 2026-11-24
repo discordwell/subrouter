@@ -4522,6 +4522,8 @@ Residuals. The score refresh republishes a Codex row's windows from its read but
 
 ## 103. No automatic claim inside a day of the roll, but in a reset's last chance, and a Fable reset only with room on the week
 
+Superseded in part by §105: the Fable week room (decision 2a, §103.1 item 3, `week_room` and `week_left`) is gone, from the decision, §95's choice and the claim's last check. The 24-hour gate, the unread roll and the last check on the roll stand as written here.
+
 The owner, 2026-11-24, after a day of real mode (§93 to §96, §99): "the auto-trigger is way too eager to fire when a session is almost burned out", "we had code that was being reasonably smart about how much of the week was left", and "it shouldn't be firing automatically for anything with under 24 hours left". And for Fable: "because we have more time to use those, we should be prioritizing chats where we're out of Fable but still have some Opus". The owner's decisions: (1) no automatic claim when the meter the next reset gives back rolls in under 24 hours, except the existing last chance; the expiry window does not pass this. (2a) a Fable reset is claimed automatically only on an account whose Fable meter is out and whose week still has real room, never on one nearly out of its week too. Real mode stays on. (2b), routing other models onto accounts out of Fable, is §104.
 
 What happened, in invented names. At 08:37Z one box claimed account A's Fable reset, which keeps until March. The reading said the Fable meter was 100% used and the week 97% used, and the roll was 6h23m away. §94.2 let it through on value: the account's own 24-hour rate was 7.07, in a pool whose Fable pressure was 1.05, so a claim "adds 0.27 of a week" (7.07 x 6.4 / 168), just over `resetValueFloor` 0.25. The claim gave back Fable 100% to 0% and the week 97% to 47%, and the roll stayed where it was. The day before, two week resets were claimed 18 and 20 hours before their rolls. An account's own rate after hours at its limit can be large, so the value rule alone lets almost any claim through near the roll.
@@ -4572,7 +4574,7 @@ The constants are `ResetRollWaste` (24 hours, shared with §46.11) and `resetFab
 - Code: `internal/proxy/reset_worth.go` (`ResetRollWaste`, `resetFableWeekRoom`, `resetWeek`, `resetHold`, `resetHoldOf`), `internal/proxy/auto_reset.go` (`AutoResetByRollGate`, `AutoResetByWeekRoom`, `AutoResetRule.WeekLeft`, `autoResetWeekOf`, `autoResetWorth.rate`, `autoResetWorth.hold`, `decideWorth`, `autoResetFacts.holdBeforeSend`), `internal/proxy/reset_choice.go` (`resetPool.weigh`), `internal/proxy/auto_reset_claim.go` (`autoResetClaimClaude`, `autoResetClaimCodex`), `internal/proxy/claude_reset.go` (`ClaudeResetRequest.check`, `readLive`), `cmd/subrouter/sr_provider_reset.go` (`resetWasteReasons`, `printClaudeResetPreview`), `ops/bin/srq`
 - Tests: `internal/proxy/reset_gate_test.go`, `internal/proxy/auto_reset_worth_test.go`, `internal/proxy/auto_reset_worth_view_test.go`, `internal/proxy/reset_choice_test.go`, `internal/proxy/auto_reset_claim_test.go` (the fakes' `roll` and `resetAfter`), `ops/docscheck/roll_gate_docs_test.go`, `ops/docscheck/reset_worth_docs_test.go`, `srq selftest`
 - Docs: `ops/OPERATING.md` (the decision's order, the held-back lines, `rule`, the last check, accounts chosen, the settings table), `ops/skills/subrouter/SKILL.md`, `ops/KNOWN-ISSUES.md` (Residual gaps §103 leaves open)
-- Related: amends §94.2 (the decision's order; the expiry window with an unread roll), §95.1 (which accounts are chosen), §46.11 (its constant now lives in the proxy package). §104 routes other models' sessions onto accounts out of Fable with week left.
+- Related: amends §94.2 (the decision's order; the expiry window with an unread roll), §95.1 (which accounts are chosen), §46.11 (its constant now lives in the proxy package). §104 routes other models' sessions onto accounts out of Fable with week left. Superseded in part by §105 (the Fable week room).
 
 ## 104. An Opus or Sonnet turn ranked across the peers alone reads their Fable meters too
 
@@ -4607,3 +4609,54 @@ The last two pass with the change taken out as well: they hold what §104 must n
 - Tests: `internal/proxy/opus_onto_fable_spent_test.go`, `internal/proxy/crosspool_decider_test.go` (`contractBox.usageBody`), `ops/docscheck/fable_spare_docs_test.go`
 - Docs: `ops/OPERATING.md` (The CLI's "protected" is not the router's gate, Settings), `ops/skills/subrouter/SKILL.md` (Explain why the router picked an account), `ops/KNOWN-ISSUES.md` (Residual gaps §104 leaves open)
 - Related: completes §65's reach on the peer path; leaves §65's legacy `bestPeerScoreFrom` path inert, as §65 says; leaves §95.2's Fable choice unloaded for a Fable turn ranked across the peers alone, as before; §71 is unchanged.
+
+## 105. A Fable reset does not wait on the account's week
+
+The owner, 2026-11-24, of the automatic Fable reset: "it should not matter how much Opus is left. It's just: do we have a Fable reset, is Fable out, and is the week in a reasonable time?" The burn-down toward that claim, §95's loading, should not depend on the week either. So §103's Fable week room is removed. Its 24-hour gate stays: that is "the week in a reasonable time".
+
+§105.1 What changed.
+
+`resetHoldOf` (`internal/proxy/reset_worth.go`) keeps §103's roll cases exactly: a roll not read is no claim (`roll_unread`), and a roll under `ResetRollWaste` (24 hours) away, or none past the limit, is held back (`roll_gate`) unless it is the reset's last chance. The two week-room cases are gone. A Fable reset on an account with under 25% of its week left is no longer held back, and one whose week is not read, or was read more than 5 minutes ago, is no longer refused. The predicate takes no week at all. The owner's words are on it with their date, and `resetFableWeekRoom` went with its own dated comment, since the owner removed that rule.
+
+In the three places §103 put the gate:
+- The decision (`decideWorth`) reads no week: `autoResetWeekOf` is gone. A Fable reset at its Fable wall, or on a reading at 99.5% of its Fable meter, goes on to the expiry window, last chance, need and value whatever the week reads.
+- §95's choice (`resetPool.weigh`) judges the gate on the roll alone, so an account low on its week is chosen for its Fable reset like any other.
+- The claim's last check (`autoResetFacts.holdBeforeSend`) still takes the claim's own read of the roll when it is newer than the decision's, and holds a roll that came under 24 hours. A newer reading of the week no longer holds a Fable claim.
+
+Removed with them: the type `resetWeek`, the `week` parameters of `resetHoldOf`, `autoResetWorth.hold` and `decideWorth`, the rule step `AutoResetByWeekRoom` (`week_room`), and the rule's field `AutoResetRule.WeekLeft` (`week_left`), which nothing else read.
+
+§105.2 What did not change.
+
+- The owner's under-1% condition: a reset is claimed only when the meter it gives back has under 1% left. For a Fable reset that is the Fable meter: Fable is out.
+- The pool-need step and `resetValueFloor`, the expiry window and last chance (§94).
+- The next-grant rule: only the grant Anthropic names next (`next_grant_id`) is ever claimed.
+- §103's 24-hour gate, its unread-roll step, its place in the decision before everything else, and the last check of the roll before a claim sends.
+- §104's ranking of Opus and Sonnet turns onto accounts out of Fable.
+
+§105.3 What follows from it.
+
+- An account low on its week may now be loaded with Fable work (§95) and have its Fable reset claimed once its Fable meter runs out. If its week runs out before its Fable meter does, it simply reaches its week wall with the Fable reset still held. No reset is spent there: the claim needs Fable out, and a chosen account at its limit takes no new session.
+- A Fable reset behind a week reset waits for the week reset to be used (the next-grant rule). The account's next claim spends the week reset, and the condition holds that until the week has under 1% left; §95 never chooses such an account for Fable.
+
+§105.4 What an operator sees.
+
+- No rebuilt daemon gives `week_room` or `week_left`. A Fable reset near its roll still reads `auto=held back Fable (rolls in 6h, under 24h)`.
+- `srq pool` still reads a `week_room` decision from a daemon built before §105, for the rollout: `auto=held back Fable (week under 25%)` and `auto=no claim (week not read)`. It no longer reads `week_left`, `--json` drops `auto_reset_week_left`, and the legend's §103 clause names the roll alone.
+
+§105.5 Tests, all in Docker, every provider a fake.
+
+`internal/proxy/reset_gate_test.go`, on `fableOutLowWeek`: an account whose next reset is a Fable reset, its Fable meter read a minute ago with nothing left and rolling in 3 days, its week 98% used, the pool's Fable need yes at 1.2, and a claim adding 0.51 of a week.
+- `TestAFableResetIsClaimedWhateverIsLeftOfTheWeek` replaces `TestAFableResetIsClaimedOnlyWithRoomOnTheWeek`: the decision would claim, by `value`, with the week 98% used, not read, or read 7 minutes before, as it does with the week 50% used.
+- `TestTheChoiceLoadsAFableHolderLowOnItsWeek` replaces the Fable half of `TestTheChoiceLoadsNothingTowardAClaimTheGateWouldHold`: a Fable holder with 2% of its week left is chosen for Fable, as one with 60% is.
+- `TestTheClaimsLastCheckDoesNotHoldAFableResetOnALowWeek` replaces the week case of `TestTheClaimsLastCheckJudgesTheGateAgain`: a Fable claim decided with half the week left is not held by a newer reading of 2% left.
+
+`TestTheFableClaimSixHoursBeforeTheRollIsHeld` no longer checks `week_left`; the other roll-gate tests are unchanged. With §103's code put back under these tests (`reset_worth.go`, `auto_reset.go` and `reset_choice.go` from before §105), each of the three new tests failed on the week room (held back at 2%, no claim with the week unread or stale; §95's `would be held: the week has 2.0% left, under 25%`; the last check's `§103 holds it on the reading before the claim: the week has 2.0% left`), and every roll-gate test passed. `srq selftest` covers the older daemon's labels and `--json` without `auto_reset_week_left`. `ops/docscheck/roll_gate_docs_test.go` requires the operator guide and the skill to name §105 and the owner's words, and fails on either one still saying that a Fable reset waits for a quarter of the week.
+
+§105.6 How to go back.
+
+There is no switch. Reverting this section's commits brings the week room back in all three places. `SUBROUTER_AUTO_RESET_WORTH=0` and a restart still turn §103's whole gate off in the decision and the claim's last check, as §103.4 says.
+
+- Code: `internal/proxy/reset_worth.go` (`resetHoldOf`), `internal/proxy/auto_reset.go` (`AutoResetRule`, `AutoResetRuleStep`, `autoResetWorth.hold`, `decideWorth`, `autoResetFacts.holdBeforeSend`), `internal/proxy/reset_choice.go` (`resetPool.weigh`), `ops/bin/srq`
+- Tests: `internal/proxy/reset_gate_test.go`, `ops/docscheck/roll_gate_docs_test.go`, `srq selftest`
+- Docs: `ops/OPERATING.md` (the decision's order, the held-back lines, `rule`, the last check, accounts chosen, the settings table), `ops/skills/subrouter/SKILL.md`, `ops/KNOWN-ISSUES.md` (the gaps of §103's week room resolved; Residual gaps §105 leaves open)
+- Related: supersedes §103's Fable week room (decision 2a, §103.1 item 3); amends §95.1 (which accounts are chosen). §104 is unchanged.
