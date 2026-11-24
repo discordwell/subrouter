@@ -1,6 +1,6 @@
 # Subrouter
 
-> **A maintained fork of [manaflow-ai/subrouter](https://github.com/manaflow-ai/subrouter).** Upstream has merged nothing since late October 2026, so maintenance continues here. This fork is not affiliated with or endorsed by Manaflow. Fixes that apply upstream are offered back as pull requests, and if upstream resumes, this fork follows it. [`ops/PATCHES.md`](ops/PATCHES.md) lists every change the fork makes, and [`ops/`](ops/) holds the tools that deploy and run it. To run your own subrouter on a Mac, and optionally a Linux box of your own, start with [`ops/GETTING-STARTED.md`](ops/GETTING-STARTED.md).
+> **A maintained fork of [manaflow-ai/subrouter](https://github.com/manaflow-ai/subrouter).** [`ops/PATCHES.md`](ops/PATCHES.md) lists every change the fork makes, and [`ops/`](ops/) holds the tools that deploy and run it. To run your own subrouter on a Mac, and optionally a Linux box of your own, start with [`ops/GETTING-STARTED.md`](ops/GETTING-STARTED.md).
 
 Subrouter is a local AI coding-agent proxy. It routes traffic across Codex accounts with sticky conversation-to-account assignment so cached context stays useful.
 
@@ -15,115 +15,21 @@ Subrouter is a local AI coding-agent proxy. It routes traffic across Codex accou
 
 ## Install
 
-### Keeping the CLI current on macOS
+### Build from source
 
-A shared server autoupdates its worker. A laptop does not, so clients drift behind the servers they talk to and hit failures nobody can reproduce. Install the per-user updater once:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/manaflow-ai/subrouter/main/deploy/macos/install-cli-autoupdate.sh | bash
-```
-
-It installs a LaunchAgent that checks daily, compares the release tag against `~/.subrouter/cli-version`, and exits without downloading when they match. Updates go through `install.sh`, so the release checksum is verified, and a missing binary forces a reinstall even when the marker looks current. Logs land in `~/Library/Logs/subrouter-cli-autoupdate.log`. Remove it with `launchctl bootout gui/$(id -u)/ai.manaflow.subrouter-cli-autoupdate`.
-
-On this fork, do not install it: it updates to upstream's public release (manaflow-ai/subrouter), which would replace this fork's binary and drop every fork patch. This fork publishes no release. It is built from source, and `ops/deploy/` deploys it to a Mac; see [docs/upgrades.md](docs/upgrades.md).
-
-### GCP setup prompt
-
-Paste this into Claude, Codex, or another coding agent with GCP operator access and a local browser for OAuth:
-
-```text
-Set up Subrouter as a shared production service.
-
-Inputs:
-- GCP project, zone, and instance: <project> <zone> <instance>
-- Public server URL: http://ROUTER_HOST:31415
-- Local server nickname: team
-
-Rules:
-- Do not copy ~/.codex/auth.json or local ~/.subrouter/codex/accounts/*.json to the server.
-- Server OAuth accounts must be created with fresh server-owned login flows.
-- Do not print access tokens, refresh tokens, API keys, id tokens, or admin tokens.
-- Never use SSH, SCP, or gcloud to transfer account credentials.
-- Accept port 31415 only from Google load-balancer ranges and SSH only through IAP.
-- End-user authentication and proxy traffic must use the public HTTPS hostname.
-- Use the released Subrouter binary unless I explicitly ask you to build from source.
-
-Steps:
-1. Configure the GCP project and publish the released service with deploy/gcp/publish-subrouter.sh. The installer must generate and provision its protected account-import token without printing it.
-2. Verify from this client machine:
-   sr server status team
-   curl -fsS http://ROUTER_HOST:31415/_subrouter/health
-   curl -fsS http://ROUTER_HOST:31415/_subrouter/ready
-3. Create server-owned Codex OAuth chains:
-   sr server sync team
-   Follow each OAuth flow. Do not upload local refresh tokens.
-4. Verify:
-   sr server status team
-   curl -fsS http://ROUTER_HOST:31415/_subrouter/health
-   curl -fsS http://ROUTER_HOST:31415/_subrouter/ready
-5. Report:
-   - systemd active/running status
-   - health and readiness result
-   - number of registered Codex OAuth accounts
-   - the exact command I should use for Codex through Subrouter
-```
-
-For local-only use on macOS, paste this instead:
-
-```text
-Set up Subrouter locally for Codex.
-
-Rules:
-- Do not print tokens.
-- Do not edit Codex config by hand unless Subrouter docs say so.
-
-Steps:
-1. Install:
-   curl -fsSL https://github.com/manaflow-ai/subrouter/releases/latest/download/install.sh | sh
-2. Install and verify the LaunchAgent:
-   sr install-daemon
-   curl -fsS http://127.0.0.1:31415/_subrouter/health
-   curl -fsS http://127.0.0.1:31415/_subrouter/ready
-3. Add Codex accounts:
-   sr add
-   Repeat as needed.
-4. Verify:
-   sr status
-5. Report the command I should use:
-   sr codex
-```
-
-### Manual install
-
-Install the released Go binary directly:
+This fork publishes no release. On a Mac:
 
 ```bash
-curl -fsSL https://github.com/manaflow-ai/subrouter/releases/latest/download/install.sh | sh
+git clone https://github.com/discordwell/subrouter.git
+cd subrouter
+make build
 ```
 
-On a Linux server, install to `/usr/local/bin`:
-
-```bash
-curl -fsSL https://github.com/manaflow-ai/subrouter/releases/latest/download/install.sh | sudo sh
-```
-
-Install with npm:
-
-```bash
-npm install -g subrouter
-```
-
-Install with Python:
-
-```bash
-pipx install subrouter
-```
-
-All install paths provide `subrouter`, `sr`, and `cx`. The npm and Python wrappers download the matching Go release binary for macOS, Linux, Windows, FreeBSD, OpenBSD, or NetBSD on amd64, arm64, or supported 32-bit variants. Set `SUBROUTER_BIN` to use a local binary instead.
+[`ops/GETTING-STARTED.md`](ops/GETTING-STARTED.md) goes on from `bin/subrouter` to a working pool, and adds an optional Linux box.
 
 ### Updating and rolling back
 
-This fork has no `sr update` or `sr rollback`, no `sr doctor` version check, and no `subrouter-deploy.sh`. Upstream's versions of all of them install upstream's public release binary (manaflow-ai/subrouter) in place of this fork's, which drops every fork patch (`ops/PATCHES.md` §23; §37.3 refuses the same binary in `sr server install`), so they are not wired here and the deploy wrappers are not carried. This fork is built from source (a `make build` binary reports its mainline as `local-build`). `ops/deploy/macos/deploy-laptop.sh` deploys it to the laptop. The box's deploy scripts are not in this repo. See [docs/upgrades.md](docs/upgrades.md).
+This fork has no `sr update` or `sr rollback`, no `sr doctor` version check, and no `subrouter-deploy.sh`. Upstream's versions of all of them install upstream's release binary in place of this fork's, which drops every fork patch (`ops/PATCHES.md` §23; §37.3 refuses the same binary in `sr server install`). `ops/deploy/macos/deploy-laptop.sh` deploys a build to the laptop, and `ops/deploy/lightsail/deploy-box.sh` to the box. A `make build` binary reports its mainline as `local-build`. See [docs/upgrades.md](docs/upgrades.md).
 
 ### Local macOS daemon
 
@@ -148,14 +54,9 @@ To serve other machines from this Mac instead, pass a tailnet address and an adm
 
 ### Linux systemd service
 
-On a Linux server, install the binary and service:
+On a Linux server, `sr install-systemd` installs the binary and service. [`ops/deploy/lightsail/README.md`](ops/deploy/lightsail/README.md) builds this fork for the server and runs it through `bootstrap.sh`, with the tokens a non-loopback bind needs.
 
-```bash
-curl -fsSL https://github.com/manaflow-ai/subrouter/releases/latest/download/install.sh | sudo sh
-sudo sr install-systemd --addr 0.0.0.0:31415
-```
-
-This creates a `subrouter` system user, stores state under `/var/lib/subrouter`, writes `/etc/systemd/system/subrouter.service`, installs `subrouter`, `sr`, and `cx` in `/usr/local/bin`, and starts:
+`install-systemd` creates a `subrouter` system user, stores state under `/var/lib/subrouter`, writes `/etc/systemd/system/subrouter.service`, installs `subrouter`, `sr`, and `cx` in `/usr/local/bin`, and starts:
 
 ```bash
 /usr/local/bin/subrouter serve --addr 0.0.0.0:31415 --sessions /var/lib/subrouter/sessions.json --sr-switch-interval 10m
