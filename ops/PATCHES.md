@@ -4667,7 +4667,7 @@ The owner, 2026-11-24: agents and Go tooling that look for subrouter should land
 
 §106.1 What changed.
 
-- `go.mod` names `module github.com/discordwell/subrouter`. A script rewrote all 1,341 imports of the old path, in 642 `.go` files, and gofmt sorted them. `ops/go.mod` was already `github.com/discordwell/subrouter/ops` and requires nothing from the main module.
+- `go.mod` names `module github.com/discordwell/subrouter`. A script rewrote all 1,341 imports of the old path, in 642 `.go` files, and gofmt sorted them. The line in §106.3 gives the same tree. The two constants that name the main package, `subrouterMainPackage` and `hostModulePath`, were renamed with them. `ops/go.mod` was already `github.com/discordwell/subrouter/ops` and requires nothing from the main module.
 - The other places that name the module as a build path: the `-X .../internal/buildversion` flags in `Dockerfile` and `scripts/build-release.sh`, the examples in `internal/buildversion`'s package comment and `ops/LAPTOP.md`, and the prefix that `ops/bin/sr-local-ci` strips from package names in its report. `sr host`'s source install, which is not dispatched, builds the new path.
 - `install-daemon` replaces an existing `sr` or `cx` only when it is Subrouter's. A binary built before the rename, upstream's releases among them, names `github.com/manaflow-ai/subrouter/cmd/subrouter`, and it still counts (`isSubrouterMainPackage`).
 - `AGENTS.md`: the `gh` and `glaeda-gh` commands name `discordwell/subrouter`. This repository has no merge queue, so `gh pr merge` takes `--rebase` and lands at once. The person an agent hands off to is the owner.
@@ -4680,13 +4680,13 @@ The owner, 2026-11-24: agents and Go tooling that look for subrouter should land
 
 §106.3 Merging upstream after this.
 
-Upstream's code imports `github.com/manaflow-ai/subrouter/...`. Rename its imports before it builds here, from the repository root:
+Upstream's code imports `github.com/manaflow-ai/subrouter/...`. Rename its imports before it builds here, from the repository root. The line changes import lines only, and on this tree it changes nothing:
 
 ```bash
-git grep -lz '"github.com/manaflow-ai/subrouter/' -- '*.go' | xargs -0 perl -pi -e 's#"github\.com/manaflow-ai/subrouter/#"github.com/discordwell/subrouter/#g' && gofmt -w .
+git grep -lz '"github.com/manaflow-ai/subrouter/' -- '*.go' | xargs -0 perl -pi -e 's#^(\s*(?:import\s+)?(?:[\w.]+\s+)?)"github\.com/manaflow-ai/subrouter/([^"]*)"(\s*(?://.*)?)$#$1"github.com/discordwell/subrouter/$2"$3#' && gofmt -w .
 ```
 
-Then check `git grep 'github.com/manaflow-ai/subrouter/' -- '*.go'`: what is left names upstream's releases or commits, or the pre-rename package `isSubrouterMainPackage` accepts.
+Then check `git grep 'github.com/manaflow-ai/subrouter/' -- '*.go'`. What may stay names upstream's releases or commits, or is the pre-rename package `isSubrouterMainPackage` accepts and its test. Any other use of the old path, such as a new `hostModulePath`, is renamed by hand.
 
 - Code: `go.mod`, `cmd/subrouter/install_daemon.go` (`subrouterMainPackage`, `preRenameMainPackage`, `isSubrouterMainPackage`), `cmd/subrouter/sr_host.go` (`hostModulePath`), `Dockerfile`, `scripts/build-release.sh`, `ops/bin/sr-local-ci`
 - Tests: `cmd/subrouter/install_alias_test.go` (`TestSubrouterMainPackageMatchesThisPackage`, `TestPreRenameBuildIsSubrouters`), `cmd/subrouter/sr_host_test.go`
