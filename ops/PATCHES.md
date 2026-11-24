@@ -4660,3 +4660,34 @@ There is no switch. Reverting this section's commits brings the week room back i
 - Tests: `internal/proxy/reset_gate_test.go`, `ops/docscheck/roll_gate_docs_test.go`, `srq selftest`
 - Docs: `ops/OPERATING.md` (the decision's order, the held-back lines, `rule`, the last check, accounts chosen, the settings table), `ops/skills/subrouter/SKILL.md`, `ops/KNOWN-ISSUES.md` (the gaps of §103's week room resolved; Residual gaps §105 leaves open)
 - Related: supersedes §103's Fable week room (decision 2a, §103.1 item 3); amends §95.1 (which accounts are chosen). §104 is unchanged.
+
+## 106. The Go module is `github.com/discordwell/subrouter`
+
+The owner, 2026-11-24: agents and Go tooling that look for subrouter should land on this fork, not on `manaflow-ai/subrouter`, which has merged nothing since 2026-10-25. The owner chose to rename the Go module and to point the docs at the fork. Keeping upstream merges easy is not needed.
+
+§106.1 What changed.
+
+- `go.mod` names `module github.com/discordwell/subrouter`. A script rewrote all 1,341 imports of the old path, in 642 `.go` files, and gofmt sorted them. `ops/go.mod` was already `github.com/discordwell/subrouter/ops` and requires nothing from the main module.
+- The other places that name the module as a build path: the `-X .../internal/buildversion` flags in `Dockerfile` and `scripts/build-release.sh`, the examples in `internal/buildversion`'s package comment and `ops/LAPTOP.md`, and the prefix that `ops/bin/sr-local-ci` strips from package names in its report. `sr host`'s source install, which is not dispatched, builds the new path.
+- `install-daemon` replaces an existing `sr` or `cx` only when it is Subrouter's. A binary built before the rename, upstream's releases among them, names `github.com/manaflow-ai/subrouter/cmd/subrouter`, and it still counts (`isSubrouterMainPackage`).
+- `AGENTS.md`: the `gh` and `glaeda-gh` commands name `discordwell/subrouter`. This repository has no merge queue, so `gh pr merge` takes `--rebase` and lands at once. The person an agent hands off to is the owner.
+- `README.md`: the install section builds from source and points to `ops/GETTING-STARTED.md`. No command in it fetches upstream's release, CLI autoupdater, npm or PyPI package. The Linux service points to `ops/deploy/lightsail/`.
+
+§106.2 What did not change.
+
+- What names upstream itself: the README's link to the project this forks, this file's history, the comments on ported upstream code, and the code and scripts that fetch or verify upstream's releases (`install.sh`, `npm/`, `subrouter_cli/`, `package.json`, `pyproject.toml`, `deploy/gcp/`, `deploy/macos/*autoupdate*.sh`, `.github/workflows/gcp-deploy.yml`, `sr update`'s release repository, `sr server install`'s refusal, the transport observer's golden predecessor).
+- The launchd labels, `ai.manaflow.subrouter` and the rest.
+
+§106.3 Merging upstream after this.
+
+Upstream's code imports `github.com/manaflow-ai/subrouter/...`. Rename its imports before it builds here, from the repository root:
+
+```bash
+git grep -lz '"github.com/manaflow-ai/subrouter/' -- '*.go' | xargs -0 perl -pi -e 's#"github\.com/manaflow-ai/subrouter/#"github.com/discordwell/subrouter/#g' && gofmt -w .
+```
+
+Then check `git grep 'github.com/manaflow-ai/subrouter/' -- '*.go'`: what is left names upstream's releases or commits, or the pre-rename package `isSubrouterMainPackage` accepts.
+
+- Code: `go.mod`, `cmd/subrouter/install_daemon.go` (`subrouterMainPackage`, `preRenameMainPackage`, `isSubrouterMainPackage`), `cmd/subrouter/sr_host.go` (`hostModulePath`), `Dockerfile`, `scripts/build-release.sh`, `ops/bin/sr-local-ci`
+- Tests: `cmd/subrouter/install_alias_test.go` (`TestSubrouterMainPackageMatchesThisPackage`, `TestPreRenameBuildIsSubrouters`), `cmd/subrouter/sr_host_test.go`
+- Docs: `AGENTS.md`, `README.md`, `ops/LAPTOP.md`

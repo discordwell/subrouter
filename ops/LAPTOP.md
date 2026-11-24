@@ -182,4 +182,4 @@ To turn it off, `bash ops/deploy/macos/install-standby.sh uninstall`. It takes t
 bash ops/deploy/tests/rehearse-laptop-supervisor.sh <build-a> <build-b> <scratch-dir>
 ```
 
-The two builds must differ, for example by `-X github.com/manaflow-ai/subrouter/internal/buildversion.version=<name>`. The script prints one `PASS` or `FAIL` line per check, and what clients saw during each transition.
+The two builds must differ, for example by `-X github.com/discordwell/subrouter/internal/buildversion.version=<name>`. The script prints one `PASS` or `FAIL` line per check, and what clients saw during each transition.
