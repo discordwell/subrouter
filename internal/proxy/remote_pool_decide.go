@@ -12,6 +12,7 @@ import (
 
 	"github.com/gorilla/websocket"
 	"github.com/manaflow-ai/subrouter/internal/accounts"
+	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
 	"github.com/manaflow-ai/subrouter/selectacct"
 	"github.com/manaflow-ai/subrouter/session"
 )
@@ -581,9 +582,22 @@ func (c *crossPoolRanking) recompute() (crossPoolPlacement, error) {
 // peersOnlyScheduler is the scheduler a ranking of peers' accounts alone
 // starts from: no local score, but this daemon's start marks (PATCHES §86),
 // so a peer's account it just sent a new session to loses its priority here
-// too.
+// too, and the turn's model (PATCHES §104), so an Opus or Sonnet turn ranks
+// each peer account on the Fable meter its owner published (§65), as this
+// daemon's own selection does. Without it the laptop, whose own pool usually
+// cannot serve, ranked every such turn with the preference off.
+//
+// A Fable turn stays unscoped: scoping it would also load a peer's Fable
+// choice for it (§95.2), which this path has never done (KNOWN-ISSUES).
 func (c *crossPoolRanking) peersOnlyScheduler() selectacct.Scheduler {
-	return c.server.SchedulerRef.WithStartMarks(selectacct.NewScheduler(nil))
+	scheduler := c.server.SchedulerRef.WithStartMarks(selectacct.NewScheduler(nil))
+	// 2026-11-24 owner: route Opus and other non-Fable sessions onto accounts
+	// that are out of Fable but still have week left, so Fable headroom
+	// elsewhere is kept for Fable sessions.
+	if selectacct.ModelKey(c.poolModel) == selectacct.ModelKey(agentclaude.FableFeature) {
+		return scheduler
+	}
+	return scheduler.ForModel(c.poolModel)
 }
 
 // forcedRerank is the ranking of a FORCED switch that local can serve (P8):

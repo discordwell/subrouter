@@ -142,6 +142,14 @@ func (b *contractBox) usageBody() []byte {
 		if s.WeeklyUnstarted && !b.withholdUnstarted {
 			normalized["weekly_unstarted"] = true
 		}
+		// As the owner publishes them: the Fable meter at the top level when
+		// it is used (PATCHES §65), a choice inside normalized (§95.2).
+		if s.FableSpent > 0 {
+			normalized["fable_week_spent"] = s.FableSpent
+		}
+		if s.ResetChoice.Known() {
+			normalized["reset_choice"] = s.ResetChoice
+		}
 		rows = append(rows, map[string]any{
 			"id": s.AccountID, "provider": string(b.accountProvider()), "auth_mode": "oauth",
 			"auth_checked": true, "auth_valid": true, "normalized": normalized,
