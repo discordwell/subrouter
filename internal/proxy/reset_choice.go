@@ -137,12 +137,12 @@ func projectedWall(left float64, demand resetDemand, now time.Time) (time.Time, 
 // qualifies when its next reset is of a known kind whose clock is known,
 // §103's gate would let a claim at the wall it is heading for through (its
 // roll read and at least 24 hours past that wall, or the reset's last chance;
-// for a Fable reset, at least 25% of its week left now), and either the reset
-// is inside its expiry window, or the pool needs its saved resets on the
-// reset's meter and §94's rule would claim at that wall: the reset is in its
-// last chance, or a claim at the projected wall adds at least resetValueFloor
-// of a week. With the wall not known, the gate reads the roll from now.
-// Outside the window the pool's need is read before the gate.
+// the account's week does not enter it, for a Fable reset too, §105), and
+// either the reset is inside its expiry window, or the pool needs its saved
+// resets on the reset's meter and §94's rule would claim at that wall: the
+// reset is in its last chance, or a claim at the projected wall adds at least
+// resetValueFloor of a week. With the wall not known, the gate reads the roll
+// from now. Outside the window the pool's need is read before the gate.
 func (p resetPool) weigh(c resetCandidate) resetWeighing {
 	w := resetWeighing{candidate: c, value: -1, toRoll: resetUnknownToRoll}
 	if c.out != "" {
@@ -199,9 +199,9 @@ func (p resetPool) weigh(c resetCandidate) resetWeighing {
 	// meet it: nothing is loaded toward a claim the gate would hold, inside
 	// the expiry window too. Outside the window the pool's need is read first,
 	// so a choice that stops on a pause in need alone keeps its place (§96).
-	week, weekRead := c.readings[autoResetWeek]
-	hold := resetHoldOf(meter, reading.roll.Sub(limit), rollRead, last,
-		resetWeek{left: week.left, known: weekRead, why: "its week is unread"})
+	// The gate reads the roll alone: an account low on its week is loaded
+	// toward its Fable reset like any other (§105).
+	hold := resetHoldOf(meter, reading.roll.Sub(limit), rollRead, last)
 	held := func(lead string) string {
 		why := "a claim of its " + kind + " at its limit would be held: " + hold.why
 		if heading != "" {

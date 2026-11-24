@@ -13,10 +13,10 @@ import (
 )
 
 // PATCHES §103: no automatic claim while the meter a reset gives back rolls
-// in under 24 hours, except in the reset's last chance, and a Fable reset only
-// on an account with at least 25% of its week left. The decision is judged on
-// facts, §95's choice on rows, and a real claim's last check through the
-// fakes of §93.2. No test sends a request to a real provider.
+// in under 24 hours, except in the reset's last chance. §105: the account's
+// week does not hold a Fable reset back. The decision is judged on facts,
+// §95's choice on rows, and a real claim's last check through the fakes of
+// §93.2. No test sends a request to a real provider.
 
 // gateCase is one decision on facts: its verdict, the rule's step, and words
 // its reason must carry.
@@ -54,7 +54,7 @@ var fableAt0837 = worthFixture{kind: autoResetKindFable, left: 0, toRoll: 6*time
 	pool: 1.05, own: 7.07, week: 0.03}
 
 // The 08:37 claim is held: its meter rolls in 6h23m. The rule still shows
-// what a claim would have added and the account's week.
+// what a claim would have added.
 func TestTheFableClaimSixHoursBeforeTheRollIsHeld(t *testing.T) {
 	got := decideAutoReset(fableAt0837.facts(true))
 	if got.Verdict != AutoResetHeldBack || got.Rule == nil || got.Rule.DecidedBy != AutoResetByRollGate {
@@ -67,9 +67,8 @@ func TestTheFableClaimSixHoursBeforeTheRollIsHeld(t *testing.T) {
 		}
 	}
 	rule := got.Rule
-	if rule.HoursToRoll == nil || *rule.HoursToRoll != 6.4 || rule.Value == nil || math.Abs(*rule.Value-0.269) > 0.001 ||
-		rule.WeekLeft == nil || *rule.WeekLeft != 0.03 {
-		t.Fatalf("the rule %+v, want 6.4 hours to the roll, a value of 0.269 and 0.03 of the week left", rule)
+	if rule.HoursToRoll == nil || *rule.HoursToRoll != 6.4 || rule.Value == nil || math.Abs(*rule.Value-0.269) > 0.001 {
+		t.Fatalf("the rule %+v, want 6.4 hours to the roll and a value of 0.269", rule)
 	}
 }
 
@@ -110,41 +109,38 @@ func TestOnlyLastChanceClaimsInsideADayOfTheRoll(t *testing.T) {
 	})
 }
 
-// A Fable reset is claimed only on an account whose week has at least 25%
-// left, read at most five minutes ago. A week reset has no such bar.
-func TestAFableResetIsClaimedOnlyWithRoomOnTheWeek(t *testing.T) {
-	fable := func(weekLeft float64) worthFixture {
-		return worthFixture{kind: autoResetKindFable, left: 0, toRoll: 48 * time.Hour, expires: 100 * burnDay, pool: 1.2, own: 1.2, week: weekLeft}
-	}
-	unread := fable(0.5)
+// fableOutLowWeek is an account out of Fable whose next reset, the one a
+// claim would spend, is a Fable reset: its Fable meter read a minute ago with
+// nothing left and rolling in 3 days, its week 98% used, the pool's Fable need
+// yes at 1.2, and a claim adding 1.2 x 72h / 168h = 0.51 of a week.
+var fableOutLowWeek = worthFixture{kind: autoResetKindFable, left: 0, toRoll: 72 * time.Hour, expires: 100 * burnDay,
+	pool: 1.2, own: 1.2, week: 0.02}
+
+// The owner, 2026-11-24: a Fable reset is claimed when it is the next reset,
+// Fable is out and the roll is a reasonable time away; how much of the week is
+// left does not matter (§105). A week with 2% left, one not read, and one read
+// seven minutes ago all claim, as a week with 50% left does.
+func TestAFableResetIsClaimedWhateverIsLeftOfTheWeek(t *testing.T) {
+	unread := fableOutLowWeek
 	unread.weekUnread = true
-	stale := fable(0.5).facts(true)
+	stale := fableOutLowWeek.facts(true)
 	reading := stale.readings[autoResetWeek]
 	reading.at = worthNow.Add(-7 * time.Minute)
 	stale.readings[autoResetWeek] = reading
+	half := fableOutLowWeek
+	half.week = 0.5
+	claims := []string{"a reading says the Fable meter is 100.0% used", "the next reset is a Fable reset", "a claim adds 0.51 of a week"}
 	checkGate(t, []gateCase{
-		{"its week 97% used", fable(0.03).facts(true), AutoResetHeldBack, AutoResetByWeekRoom,
-			[]string{"held back: the week has 3.0% left, under 25%", "out of Fable that still has week left"}},
-		{"its week 50% used", fable(0.5).facts(true), AutoResetWouldClaim, AutoResetByValue, []string{"a claim adds 0.34 of a week"}},
-		{"its week at 25% left", fable(0.25).facts(true), AutoResetWouldClaim, AutoResetByValue, nil},
-		{"its week unread", unread.facts(true), AutoResetNoClaim, AutoResetByWeekRoom,
-			[]string{"the week is unread, and a Fable reset is claimed only on an account whose week is read", "so nothing is claimed"}},
-		{"its week read 7 minutes ago", stale, AutoResetNoClaim, AutoResetByWeekRoom, []string{"the week was last read 7m0s ago"}},
-		{"a week reset on a week 99.6% used", worthFixture{kind: autoResetKindWeek, left: 0.004, toRoll: 48 * time.Hour,
-			expires: 17 * burnDay, pool: 1.2, own: 1.2}.facts(true), AutoResetWouldClaim, AutoResetByValue, nil},
+		{"its week 98% used", fableOutLowWeek.facts(true), AutoResetWouldClaim, AutoResetByValue, claims},
+		{"its week unread", unread.facts(true), AutoResetWouldClaim, AutoResetByValue, claims},
+		{"its week read 7 minutes ago", stale, AutoResetWouldClaim, AutoResetByValue, claims},
+		{"calibration: its week 50% used", half.facts(true), AutoResetWouldClaim, AutoResetByValue, claims},
 	})
-	if rule := decideAutoReset(fable(0.03).facts(true)).Rule; rule == nil || rule.WeekLeft == nil || *rule.WeekLeft != 0.03 {
-		t.Fatalf("the rule %+v, want week_left 0.03", rule)
-	}
-	if rule := decideAutoReset(unread.facts(true)).Rule; rule == nil || rule.WeekLeft != nil {
-		t.Fatalf("the rule %+v, want no week_left for a week not read", rule)
-	}
 }
 
 // §95 loads nothing toward a claim the gate would hold: an account whose
 // roll is under a day past the wall it is heading for is not chosen, unless
-// the reset is in its last chance, and not inside the expiry window either; a
-// Fable holder with under 25% of its week left is not chosen.
+// the reset is in its last chance, and not inside the expiry window either.
 func TestTheChoiceLoadsNothingTowardAClaimTheGateWouldHold(t *testing.T) {
 	// At 2.5 over 4 accounts, 30% of a week reaches its limit in 5h2m: a
 	// roll 25 hours out is 19h58m past it, where a claim would add 0.30.
@@ -176,7 +172,12 @@ func TestTheChoiceLoadsNothingTowardAClaimTheGateWouldHold(t *testing.T) {
 	wantChosen(t, "inside the expiry window", got, selectacct.ResetChoiceWeek, "w1", "w2", "w3")
 	wantWords(t, "inside the expiry window", got.why["held"], "is inside its expiry window", ", but at the pool's whole demand",
 		"would be held: the week rolls in 14h48m, under 24h")
+}
 
+// §95 loads a Fable holder toward its claim however little of its week is
+// left (§105): with 2% of its week it is chosen for Fable work, as it is with
+// 60%.
+func TestTheChoiceLoadsAFableHolderLowOnItsWeek(t *testing.T) {
 	fabled := func(weekLeft float64) []choiceAccount {
 		return []choiceAccount{
 			{id: "fabled", kind: accounts.ResetKindClaudeFable, week: weekLeft, fable: 0.2, toRoll: 100 * time.Hour, expires: 100 * burnDay,
@@ -186,15 +187,15 @@ func TestTheChoiceLoadsNothingTowardAClaimTheGateWouldHold(t *testing.T) {
 	}
 	wantChosen(t, "calibration: a Fable holder with 60% of its week", choose(choiceNow, resetCodexHold{}, fabled(0.6)...),
 		selectacct.ResetChoiceFable, "fabled")
-	got = choose(choiceNow, resetCodexHold{}, fabled(0.1)...)
-	wantChosen(t, "a Fable holder with 10% of its week", got, selectacct.ResetChoiceFable)
-	wantWords(t, "a Fable holder with 10% of its week", got.why["fabled"], "would be held: the week has 10.0% left, under 25%")
+	got := choose(choiceNow, resetCodexHold{}, fabled(0.02)...)
+	wantChosen(t, "a Fable holder with 2% of its week", got, selectacct.ResetChoiceFable, "fabled")
+	wantWords(t, "a Fable holder with 2% of its week", got.chosen["fabled"].Why, "a claim there adds")
 }
 
 // A real claim judges the gate again just before it sends: a roll that came
-// under 24 hours since the decision, on the clock or on a newer reading, or a
-// week that ran low, holds it; a reading older than the decision's is not
-// read; with §94's rule off there is no gate.
+// under 24 hours since the decision, on the clock or on a newer reading, holds
+// it; a reading older than the decision's is not read; with §94's rule off
+// there is no gate.
 func TestTheClaimsLastCheckJudgesTheGateAgain(t *testing.T) {
 	week := worthFixture{kind: autoResetKindWeek, left: 0.004, toRoll: 24*time.Hour + time.Minute, expires: 17 * burnDay, pool: 1.2, own: 3.0}
 	f := week.facts(true)
@@ -217,8 +218,6 @@ func TestTheClaimsLastCheckJudgesTheGateAgain(t *testing.T) {
 			map[autoResetMeter]autoResetReading{autoResetWeek: reading(worthNow, 0, 23*time.Hour)}, worthNow, "the week rolls in 23h, under 24h"},
 		{"an older reading of a roll 23 hours away", f,
 			map[autoResetMeter]autoResetReading{autoResetWeek: reading(worthNow.Add(-2*time.Minute), 0, 23*time.Hour)}, worthNow, ""},
-		{"a Fable reset whose week ran low", fableWithWeek(0.5),
-			map[autoResetMeter]autoResetReading{autoResetWeek: reading(worthNow, 0.1, 48*time.Hour)}, worthNow, "the week has 10.0% left, under 25%"},
 		{"§94's rule off", week.facts(false), nil, worthNow.Add(2 * time.Minute), ""},
 	} {
 		err := c.facts.holdBeforeSend(c.live, c.now)
@@ -231,8 +230,23 @@ func TestTheClaimsLastCheckJudgesTheGateAgain(t *testing.T) {
 	}
 }
 
-func fableWithWeek(left float64) autoResetFacts {
-	return worthFixture{kind: autoResetKindFable, left: 0, toRoll: 48 * time.Hour, expires: 100 * burnDay, pool: 1.2, own: 1.2, week: left}.facts(true)
+// The claim's last check does not hold a Fable reset on the week (§105): the
+// decision read half the week left and claims, and a reading taken since says
+// 2% left; the claim still goes.
+func TestTheClaimsLastCheckDoesNotHoldAFableResetOnALowWeek(t *testing.T) {
+	decided := fableOutLowWeek
+	decided.week = 0.5
+	f := decided.facts(true)
+	if d := decideAutoReset(f); d.Verdict != AutoResetWouldClaim {
+		t.Fatalf("calibration: the decision with half the week left is %s: %s", d.Verdict, d.Reason)
+	}
+	live := map[autoResetMeter]autoResetReading{
+		autoResetFable: {left: 0, at: worthNow, roll: worthNow.Add(72 * time.Hour)},
+		autoResetWeek:  {left: 0.02, at: worthNow, roll: worthNow.Add(72 * time.Hour)},
+	}
+	if err := f.holdBeforeSend(live, worthNow); err != nil {
+		t.Fatalf("a fresh reading of 2%% of the week left holds the Fable claim: %v", err)
+	}
 }
 
 // Through the daemon in real mode at a reading: the decision reads a roll 48
