@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/account"
+	"github.com/discordwell/subrouter/account"
 )
 
 var reference = time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)

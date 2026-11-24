@@ -5,8 +5,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
-	"github.com/manaflow-ai/subrouter/selectacct"
+	"github.com/discordwell/subrouter/internal/accounts"
+	"github.com/discordwell/subrouter/selectacct"
 )
 
 // A usage-score refresh is triggered by whichever request found the scores

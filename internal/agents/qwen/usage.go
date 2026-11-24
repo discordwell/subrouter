@@ -15,8 +15,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
-	"github.com/manaflow-ai/subrouter/internal/storepath"
+	"github.com/discordwell/subrouter/internal/accounts"
+	"github.com/discordwell/subrouter/internal/storepath"
 )
 
 const (

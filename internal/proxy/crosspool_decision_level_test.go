@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/selectacct"
+	"github.com/discordwell/subrouter/selectacct"
 )
 
 // PATCHES §39: the `remote pool decision` line for a turn selection kept on its

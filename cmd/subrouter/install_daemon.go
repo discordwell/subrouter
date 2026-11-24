@@ -18,7 +18,7 @@ import (
 	"text/template"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/broker"
+	"github.com/discordwell/subrouter/internal/broker"
 )
 
 const defaultDaemonLabel = "ai.manaflow.subrouter"
@@ -700,7 +700,13 @@ func installDaemonAlias(config daemonConfig, aliasPath string) (bool, error) {
 // Subrouter's, which an install refuses to delete without --force-shims.
 var errForeignAlias = errors.New("not a subrouter binary or a symlink to one")
 
-const subrouterMainPackage = "github.com/manaflow-ai/subrouter/cmd/subrouter"
+// subrouterMainPackage is this binary's main package. A Subrouter built before
+// PATCHES 106 renamed the module, upstream's releases among them, carries
+// preRenameMainPackage, and its sr and cx are still Subrouter's to replace.
+const (
+	subrouterMainPackage = "github.com/discordwell/subrouter/cmd/subrouter"
+	preRenameMainPackage = "github.com/manaflow-ai/subrouter/cmd/subrouter"
+)
 
 // installBinaryAlias points shimPath at subrouterPath, replacing only an
 // existing alias that is already Subrouter's.
@@ -785,7 +791,11 @@ func isSubrouterAlias(path string) (bool, error) {
 
 func isSubrouterBinary(path string) bool {
 	info, err := buildinfo.ReadFile(path)
-	return err == nil && info.Path == subrouterMainPackage
+	return err == nil && isSubrouterMainPackage(info.Path)
+}
+
+func isSubrouterMainPackage(path string) bool {
+	return path == subrouterMainPackage || path == preRenameMainPackage
 }
 
 func installCurrentExecutable(destination string) error {

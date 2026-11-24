@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/account"
+	"github.com/discordwell/subrouter/account"
 )
 
 func TestTeamClientUsesTenantScopedCredentialLeaseAPI(t *testing.T) {

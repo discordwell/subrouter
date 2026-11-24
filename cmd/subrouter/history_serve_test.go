@@ -18,8 +18,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
-	"github.com/manaflow-ai/subrouter/internal/proxy"
+	"github.com/discordwell/subrouter/internal/accounts"
+	"github.com/discordwell/subrouter/internal/proxy"
 )
 
 // Behaviour 2 of §92.1 as serve runs it: serve keeps its usage history beside

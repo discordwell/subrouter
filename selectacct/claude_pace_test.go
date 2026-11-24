@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/account"
+	"github.com/discordwell/subrouter/account"
 )
 
 // claudePoolWindows builds the window set a real Claude account produces after

@@ -11,9 +11,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/discordwell/subrouter/internal/accounts"
+	"github.com/discordwell/subrouter/session"
 	"github.com/gorilla/websocket"
-	"github.com/manaflow-ai/subrouter/internal/accounts"
-	"github.com/manaflow-ai/subrouter/session"
 )
 
 // What starts a stranded chat's hour over, and where its clock is kept

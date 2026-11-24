@@ -9,7 +9,7 @@ import (
 	"testing/synctest"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/discordwell/subrouter/internal/accounts"
 )
 
 // A 429 exhaustion mark (upstream #398, adapted; PATCHES.md §29) may only be

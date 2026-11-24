@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/session"
+	"github.com/discordwell/subrouter/session"
 )
 
 // A stranded chat's chain of holds gives up an hour after its last answered

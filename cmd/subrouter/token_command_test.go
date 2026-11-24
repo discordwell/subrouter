@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/accesstoken"
-	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/discordwell/subrouter/internal/accesstoken"
+	"github.com/discordwell/subrouter/internal/accounts"
 )
 
 var tokenTestNow = time.Date(2026, 9, 28, 12, 0, 0, 0, time.UTC)

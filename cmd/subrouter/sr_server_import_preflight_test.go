@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/discordwell/subrouter/internal/accounts"
 )
 
 // A server that authenticates by tailnet identity has no credential for the

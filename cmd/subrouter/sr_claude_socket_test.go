@@ -15,7 +15,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/proxy"
+	"github.com/discordwell/subrouter/internal/proxy"
 )
 
 // PATCHES section 29, client side. The launch is driven through the real

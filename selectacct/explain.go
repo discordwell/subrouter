@@ -4,7 +4,7 @@ import (
 	"sort"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/account"
+	"github.com/discordwell/subrouter/account"
 )
 
 // Ranking explanation.

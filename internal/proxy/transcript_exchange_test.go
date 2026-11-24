@@ -17,11 +17,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/discordwell/subrouter/internal/accounts"
+	"github.com/discordwell/subrouter/internal/transcript"
+	"github.com/discordwell/subrouter/selectacct"
+	"github.com/discordwell/subrouter/session"
 	"github.com/gorilla/websocket"
-	"github.com/manaflow-ai/subrouter/internal/accounts"
-	"github.com/manaflow-ai/subrouter/internal/transcript"
-	"github.com/manaflow-ai/subrouter/selectacct"
-	"github.com/manaflow-ai/subrouter/session"
 )
 
 // The client-boundary transcript (PATCHES §71): every exchange is recorded

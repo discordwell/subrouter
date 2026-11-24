@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/account"
+	"github.com/discordwell/subrouter/account"
 )
 
 func TestPickPrefersHeadroom(t *testing.T) {

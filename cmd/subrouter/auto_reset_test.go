@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/manaflow-ai/subrouter/internal/proxy"
+	"github.com/discordwell/subrouter/internal/proxy"
 )
 
 // 1. PATCHES §93.1's two switches. SUBROUTER_AUTO_RESET unset or shadow is

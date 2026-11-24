@@ -19,7 +19,7 @@ import (
 	"testing"
 	"time"
 
-	frontproxy "github.com/manaflow-ai/subrouter/internal/front"
+	frontproxy "github.com/discordwell/subrouter/internal/front"
 )
 
 // closeSignalListener reports when the front under test closes its public

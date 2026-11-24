@@ -21,9 +21,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/buildversion"
-	"github.com/manaflow-ai/subrouter/internal/front"
-	"github.com/manaflow-ai/subrouter/session"
+	"github.com/discordwell/subrouter/internal/buildversion"
+	"github.com/discordwell/subrouter/internal/front"
+	"github.com/discordwell/subrouter/session"
 )
 
 const inheritedListenerFDEnv = "SUBROUTER_LISTEN_FD"

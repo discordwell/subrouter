@@ -13,8 +13,8 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/broker"
-	"github.com/manaflow-ai/subrouter/internal/proxy"
+	"github.com/discordwell/subrouter/internal/broker"
+	"github.com/discordwell/subrouter/internal/proxy"
 )
 
 type srErrorsOptions struct {

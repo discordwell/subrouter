@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/manaflow-ai/subrouter/internal/fsutil"
+	"github.com/discordwell/subrouter/internal/fsutil"
 )
 
 const stateDirEnv = "SUBROUTER_STATE_DIR"

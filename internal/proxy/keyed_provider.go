@@ -10,8 +10,8 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
-	"github.com/manaflow-ai/subrouter/selectacct"
+	"github.com/discordwell/subrouter/internal/accounts"
+	"github.com/discordwell/subrouter/selectacct"
 )
 
 // ValidateCredentialUpstreams rejects configurations that could send a

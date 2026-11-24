@@ -23,12 +23,12 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
-	"github.com/manaflow-ai/subrouter/internal/agents/claude"
-	"github.com/manaflow-ai/subrouter/internal/broker"
-	"github.com/manaflow-ai/subrouter/internal/proxy"
-	"github.com/manaflow-ai/subrouter/internal/tenant"
-	"github.com/manaflow-ai/subrouter/selectacct"
+	"github.com/discordwell/subrouter/internal/accounts"
+	"github.com/discordwell/subrouter/internal/agents/claude"
+	"github.com/discordwell/subrouter/internal/broker"
+	"github.com/discordwell/subrouter/internal/proxy"
+	"github.com/discordwell/subrouter/internal/tenant"
+	"github.com/discordwell/subrouter/selectacct"
 )
 
 const srClaudeHelp = `sr claude - Manage local profiles and launch pooled Claude

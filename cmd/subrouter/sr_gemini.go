@@ -3,7 +3,7 @@ package main
 import (
 	"fmt"
 
-	"github.com/manaflow-ai/subrouter/internal/agents/gemini"
+	"github.com/discordwell/subrouter/internal/agents/gemini"
 )
 
 const srGeminiHelp = `sr gemini - Manage Gemini profiles

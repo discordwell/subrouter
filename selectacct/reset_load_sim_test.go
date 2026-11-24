@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/account"
+	"github.com/discordwell/subrouter/account"
 )
 
 // PATCHES §95.2, behaviour 10: a Codex pool over its budget, through the real

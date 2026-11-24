@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	accountpkg "github.com/manaflow-ai/subrouter/account"
-	"github.com/manaflow-ai/subrouter/internal/accounts"
+	accountpkg "github.com/discordwell/subrouter/account"
+	"github.com/discordwell/subrouter/internal/accounts"
 )
 
 func TestIrreparableClaudeRefreshFailureClassification(t *testing.T) {

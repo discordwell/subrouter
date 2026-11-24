@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/discordwell/subrouter/internal/accounts"
 )
 
 // seedLocalAPIKeyAccount stores one local account that needs no network, so a

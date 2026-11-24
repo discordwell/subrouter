@@ -1,6 +1,6 @@
 package proxy
 
-import "github.com/manaflow-ai/subrouter/internal/accounts"
+import "github.com/discordwell/subrouter/internal/accounts"
 
 // migrateUsageCredentialState carries positive quota evidence across an
 // in-place token refresh. The account-scoped telemetry cooldown is keyed

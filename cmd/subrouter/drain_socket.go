@@ -13,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/storepath"
+	"github.com/discordwell/subrouter/internal/storepath"
 )
 
 // The drain socket (PATCHES section 38.1): drain, resume and drain-status, and

@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/discordwell/subrouter/internal/accounts"
 )
 
 const (

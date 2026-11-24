@@ -9,7 +9,7 @@ import (
 	"reflect"
 	"strings"
 
-	"github.com/manaflow-ai/subrouter/internal/agents/claude"
+	"github.com/discordwell/subrouter/internal/agents/claude"
 )
 
 // Pooled and managed Claude launches point CLAUDE_CONFIG_DIR at a profile or

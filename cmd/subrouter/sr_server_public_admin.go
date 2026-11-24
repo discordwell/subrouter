@@ -47,8 +47,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/accesstoken"
-	"github.com/manaflow-ai/subrouter/internal/proxy"
+	"github.com/discordwell/subrouter/internal/accesstoken"
+	"github.com/discordwell/subrouter/internal/proxy"
 )
 
 // privateAdminDialBound caps the private URL's dial when a public admin path

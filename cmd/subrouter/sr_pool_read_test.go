@@ -14,8 +14,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
-	"github.com/manaflow-ai/subrouter/internal/proxy"
+	"github.com/discordwell/subrouter/internal/accounts"
+	"github.com/discordwell/subrouter/internal/proxy"
 )
 
 func poolStatus(provider accounts.Provider, id string) remoteServerUsageStatus {

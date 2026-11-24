@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
-	"github.com/manaflow-ai/subrouter/selectacct"
+	"github.com/discordwell/subrouter/internal/accounts"
+	"github.com/discordwell/subrouter/selectacct"
 )
 
 // PATCHES §95.2 through the daemon: in real mode new sessions go to the

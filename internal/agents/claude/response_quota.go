@@ -4,7 +4,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/discordwell/subrouter/internal/accounts"
 )
 
 // ObservedUsageWindows reads quota windows from a real Claude response. Share

@@ -15,9 +15,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
-	"github.com/manaflow-ai/subrouter/internal/broker"
-	"github.com/manaflow-ai/subrouter/session"
+	"github.com/discordwell/subrouter/internal/accounts"
+	"github.com/discordwell/subrouter/internal/broker"
+	"github.com/discordwell/subrouter/session"
 )
 
 const defaultCodexBaseURL = "http://127.0.0.1:31415/v1"

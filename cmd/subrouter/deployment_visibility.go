@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/buildversion"
+	"github.com/discordwell/subrouter/internal/buildversion"
 )
 
 type buildVisibilityView struct {

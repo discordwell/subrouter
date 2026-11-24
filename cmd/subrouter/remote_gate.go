@@ -32,8 +32,8 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/manaflow-ai/subrouter/internal/proxy"
-	"github.com/manaflow-ai/subrouter/internal/storepath"
+	"github.com/discordwell/subrouter/internal/proxy"
+	"github.com/discordwell/subrouter/internal/storepath"
 )
 
 const (

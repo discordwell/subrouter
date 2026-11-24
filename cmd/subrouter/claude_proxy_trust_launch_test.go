@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/agents/claude"
+	"github.com/discordwell/subrouter/internal/agents/claude"
 )
 
 // Every `sr claude proxy` home asked "Do you trust the files in this folder?"

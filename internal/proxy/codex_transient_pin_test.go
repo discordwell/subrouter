@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
-	"github.com/manaflow-ai/subrouter/selectacct"
+	"github.com/discordwell/subrouter/internal/accounts"
+	"github.com/discordwell/subrouter/selectacct"
 )
 
 // Owner rule P8 for Codex (PATCHES §35): only a FORCED switch moves a Codex

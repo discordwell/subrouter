@@ -10,8 +10,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
-	"github.com/manaflow-ai/subrouter/selectacct"
+	"github.com/discordwell/subrouter/internal/accounts"
+	"github.com/discordwell/subrouter/selectacct"
 )
 
 // The peer role and admin over the public listener (PATCHES §43.1).

@@ -3,7 +3,7 @@ package proxy
 import (
 	"log/slog"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/discordwell/subrouter/internal/accounts"
 )
 
 // providerSelectionPolicy states, per provider, WHEN a COLD session leaves the

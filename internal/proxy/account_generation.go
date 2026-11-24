@@ -13,9 +13,9 @@ import (
 	"runtime"
 	"strings"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
-	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
-	agentqwen "github.com/manaflow-ai/subrouter/internal/agents/qwen"
+	"github.com/discordwell/subrouter/internal/accounts"
+	agentclaude "github.com/discordwell/subrouter/internal/agents/claude"
+	agentqwen "github.com/discordwell/subrouter/internal/agents/qwen"
 )
 
 const accountDiskGenerationFile = ".account-generation"

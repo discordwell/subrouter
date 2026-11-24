@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/discordwell/subrouter/internal/accounts"
 )
 
 // PATCHES §94.1: pressure, need, the value of a claim, last chance and the

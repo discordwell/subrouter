@@ -5,8 +5,8 @@ import (
 	"errors"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
-	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
+	"github.com/discordwell/subrouter/internal/accounts"
+	agentclaude "github.com/discordwell/subrouter/internal/agents/claude"
 )
 
 // PATCHES §102.2: when the claim path's own read after a landed claim did not

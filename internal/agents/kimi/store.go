@@ -19,9 +19,9 @@ import (
 	"time"
 	"unicode"
 
-	"github.com/manaflow-ai/subrouter/account"
-	"github.com/manaflow-ai/subrouter/internal/oauthdevice"
-	"github.com/manaflow-ai/subrouter/internal/storepath"
+	"github.com/discordwell/subrouter/account"
+	"github.com/discordwell/subrouter/internal/oauthdevice"
+	"github.com/discordwell/subrouter/internal/storepath"
 )
 
 // OAuth endpoints for the Kimi Code CLI's installed-app client, matching what

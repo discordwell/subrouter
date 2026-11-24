@@ -15,8 +15,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/transcript"
-	"github.com/manaflow-ai/subrouter/session"
+	"github.com/discordwell/subrouter/internal/transcript"
+	"github.com/discordwell/subrouter/session"
 )
 
 // transcriptProcessToken makes request and stream ids unique across worker

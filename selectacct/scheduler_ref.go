@@ -8,7 +8,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/account"
+	"github.com/discordwell/subrouter/account"
 )
 
 type SchedulerRef struct {

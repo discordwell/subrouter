@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
-	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
+	"github.com/discordwell/subrouter/internal/accounts"
+	agentclaude "github.com/discordwell/subrouter/internal/agents/claude"
 )
 
 // PATCHES §31, R3 fix 1, at the sweep's other two refresh sites. The usage

@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/account"
+	"github.com/discordwell/subrouter/account"
 )
 
 // A peer account's routability, burndown and endgame cap are the PEER's own

@@ -14,9 +14,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/discordwell/subrouter/internal/accounts"
+	"github.com/discordwell/subrouter/selectacct"
 	"github.com/gorilla/websocket"
-	"github.com/manaflow-ai/subrouter/internal/accounts"
-	"github.com/manaflow-ai/subrouter/selectacct"
 )
 
 // PATCHES §99: a claim the provider says it used serves its waiting turns on

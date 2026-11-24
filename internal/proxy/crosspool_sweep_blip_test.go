@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
+	agentclaude "github.com/discordwell/subrouter/internal/agents/claude"
 )
 
 // PATCHES §31, R3 fix 1: a token refresh that got no verdict on the box's own

@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/account"
+	"github.com/discordwell/subrouter/account"
 )
 
 // Fork (PATCHES section 35.3): a rate-limit mark ranks the account after

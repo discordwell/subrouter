@@ -13,8 +13,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/account"
-	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/discordwell/subrouter/account"
+	"github.com/discordwell/subrouter/internal/accounts"
 )
 
 type Team struct {

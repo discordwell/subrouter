@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/session"
+	"github.com/discordwell/subrouter/session"
 )
 
 // PATCHES §67: a peer is DOWN only after it has answered nothing, on any

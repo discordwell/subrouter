@@ -22,8 +22,8 @@ import (
 	"github.com/klauspost/compress/zlib"
 	"github.com/klauspost/compress/zstd"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
-	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
+	"github.com/discordwell/subrouter/internal/accounts"
+	agentclaude "github.com/discordwell/subrouter/internal/agents/claude"
 )
 
 // Claude credential death tracking.

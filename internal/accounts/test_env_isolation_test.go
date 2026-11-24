@@ -4,8 +4,8 @@ import (
 	"os"
 	"testing"
 
-	"github.com/manaflow-ai/subrouter/internal/storepath"
-	"github.com/manaflow-ai/subrouter/internal/testenv"
+	"github.com/discordwell/subrouter/internal/storepath"
+	"github.com/discordwell/subrouter/internal/testenv"
 )
 
 // Tests here set HOME and then write the active Codex auth, which an exported

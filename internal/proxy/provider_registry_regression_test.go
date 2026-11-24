@@ -5,7 +5,7 @@ import (
 	"net/url"
 	"testing"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/discordwell/subrouter/internal/accounts"
 )
 
 // Codex and Claude are not registry providers, and the registry lookup sits

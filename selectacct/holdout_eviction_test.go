@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/account"
+	"github.com/discordwell/subrouter/account"
 )
 
 // The owner's holdout is a hard limit: nothing may START a session inside it.

@@ -17,8 +17,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/buildversion"
-	frontproxy "github.com/manaflow-ai/subrouter/internal/front"
+	"github.com/discordwell/subrouter/internal/buildversion"
+	frontproxy "github.com/discordwell/subrouter/internal/front"
 )
 
 const maxFrontSwitchBodyBytes = 4 << 10

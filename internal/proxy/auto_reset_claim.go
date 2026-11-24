@@ -13,10 +13,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
-	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
-	"github.com/manaflow-ai/subrouter/internal/fsutil"
-	"github.com/manaflow-ai/subrouter/selectacct"
+	"github.com/discordwell/subrouter/internal/accounts"
+	agentclaude "github.com/discordwell/subrouter/internal/agents/claude"
+	"github.com/discordwell/subrouter/internal/fsutil"
+	"github.com/discordwell/subrouter/selectacct"
 )
 
 // PATCHES §93.2: in real mode the daemon claims the reset §93.1 decided on,

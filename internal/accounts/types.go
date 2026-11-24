@@ -1,9 +1,9 @@
 package accounts
 
-import "github.com/manaflow-ai/subrouter/account"
+import "github.com/discordwell/subrouter/account"
 
 // The account value types moved to the importable package
-// github.com/manaflow-ai/subrouter/account so that consumers outside this
+// github.com/discordwell/subrouter/account so that consumers outside this
 // module (notably the hosted gateway) can use the scheduler, which is typed in
 // terms of them. Go's internal/ rule made that impossible while they lived here.
 //

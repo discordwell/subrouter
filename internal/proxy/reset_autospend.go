@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/discordwell/subrouter/internal/accounts"
 )
 
 // ResetCreditAutospend is what the background reset-credit spender does with

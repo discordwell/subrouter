@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/manaflow-ai/subrouter/selectacct"
+	"github.com/discordwell/subrouter/selectacct"
 )
 
 // PATCHES §65's kill switch reads exactly like §56's: unset is on, only an

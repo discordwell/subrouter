@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/proxy"
+	"github.com/discordwell/subrouter/internal/proxy"
 )
 
 // The hold's settings (PATCHES §58): flag > variable > default, and a

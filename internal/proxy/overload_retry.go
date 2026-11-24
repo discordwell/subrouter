@@ -5,7 +5,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/discordwell/subrouter/internal/accounts"
 )
 
 // Same-account overload retry: the Codex half of upstream manaflow-ai/subrouter's

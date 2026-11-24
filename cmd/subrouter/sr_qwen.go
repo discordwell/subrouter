@@ -17,10 +17,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
-	agentqwen "github.com/manaflow-ai/subrouter/internal/agents/qwen"
-	"github.com/manaflow-ai/subrouter/internal/broker"
-	"github.com/manaflow-ai/subrouter/internal/proxy"
+	"github.com/discordwell/subrouter/internal/accounts"
+	agentqwen "github.com/discordwell/subrouter/internal/agents/qwen"
+	"github.com/discordwell/subrouter/internal/broker"
+	"github.com/discordwell/subrouter/internal/proxy"
 )
 
 func (r srRunner) qwen(ctx context.Context, args []string) error {

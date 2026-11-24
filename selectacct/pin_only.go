@@ -1,6 +1,6 @@
 package selectacct
 
-import "github.com/manaflow-ai/subrouter/account"
+import "github.com/discordwell/subrouter/account"
 
 // Pin-only accounts (PATCHES §98, SUBROUTER_PIN_ONLY_ACCOUNTS).
 //

@@ -10,9 +10,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
-	"github.com/manaflow-ai/subrouter/internal/agents/claude"
-	"github.com/manaflow-ai/subrouter/internal/storepath"
+	"github.com/discordwell/subrouter/internal/accounts"
+	"github.com/discordwell/subrouter/internal/agents/claude"
+	"github.com/discordwell/subrouter/internal/storepath"
 )
 
 // `sr claude`, `sr claude proxy` and `sr claude run` launch Claude Code with

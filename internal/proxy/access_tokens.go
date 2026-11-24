@@ -6,7 +6,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/accesstoken"
+	"github.com/discordwell/subrouter/internal/accesstoken"
 )
 
 // Named access tokens (PATCHES §43).

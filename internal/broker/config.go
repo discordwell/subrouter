@@ -12,7 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/manaflow-ai/subrouter/internal/tenant"
+	"github.com/discordwell/subrouter/internal/tenant"
 )
 
 const DefaultBaseURL = "https://cmux.com"

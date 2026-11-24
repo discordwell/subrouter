@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/proxy"
+	"github.com/discordwell/subrouter/internal/proxy"
 )
 
 // startDrainTestServer serves handler on a fresh loopback listener and returns

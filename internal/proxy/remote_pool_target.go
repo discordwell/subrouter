@@ -7,7 +7,7 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/manaflow-ai/subrouter/selectacct"
+	"github.com/discordwell/subrouter/selectacct"
 )
 
 // Targeted forwards (PATCHES §31; owner rules P4 and P6).

@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/discordwell/subrouter/internal/accounts"
 )
 
 // keychainAnswerReuse is how long a credential the keychain gave is served

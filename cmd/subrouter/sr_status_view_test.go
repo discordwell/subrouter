@@ -13,9 +13,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
-	"github.com/manaflow-ai/subrouter/internal/broker"
-	"github.com/manaflow-ai/subrouter/internal/storepath"
+	"github.com/discordwell/subrouter/internal/accounts"
+	"github.com/discordwell/subrouter/internal/broker"
+	"github.com/discordwell/subrouter/internal/storepath"
 )
 
 // PATCHES.md 17 claims a keyless machine names no remote. It did not: the help

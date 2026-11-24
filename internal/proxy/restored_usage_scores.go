@@ -3,8 +3,8 @@ package proxy
 import (
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
-	"github.com/manaflow-ai/subrouter/selectacct"
+	"github.com/discordwell/subrouter/internal/accounts"
+	"github.com/discordwell/subrouter/selectacct"
 )
 
 // restoredUsageMaxAge bounds how old a saved observation may be and still

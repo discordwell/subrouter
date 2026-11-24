@@ -8,7 +8,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/manaflow-ai/subrouter/internal/agents/claude"
+	"github.com/discordwell/subrouter/internal/agents/claude"
 )
 
 // `sr claude proxy` runs Claude Code in claude-proxy/<hash>, which shared only

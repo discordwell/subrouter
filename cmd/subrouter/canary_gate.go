@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/proxy"
+	"github.com/discordwell/subrouter/internal/proxy"
 )
 
 // The canary gate compares the candidate worker generation with the

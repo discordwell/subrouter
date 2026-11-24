@@ -15,13 +15,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
-	agentantigravity "github.com/manaflow-ai/subrouter/internal/agents/antigravity"
-	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
-	agentgrok "github.com/manaflow-ai/subrouter/internal/agents/grok"
-	agentkimi "github.com/manaflow-ai/subrouter/internal/agents/kimi"
-	"github.com/manaflow-ai/subrouter/selectacct"
-	"github.com/manaflow-ai/subrouter/session"
+	"github.com/discordwell/subrouter/internal/accounts"
+	agentantigravity "github.com/discordwell/subrouter/internal/agents/antigravity"
+	agentclaude "github.com/discordwell/subrouter/internal/agents/claude"
+	agentgrok "github.com/discordwell/subrouter/internal/agents/grok"
+	agentkimi "github.com/discordwell/subrouter/internal/agents/kimi"
+	"github.com/discordwell/subrouter/selectacct"
+	"github.com/discordwell/subrouter/session"
 )
 
 func TestAntigravityAccountImportPublishesMultipleManagedProfiles(t *testing.T) {

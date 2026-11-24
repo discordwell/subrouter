@@ -5,7 +5,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/account"
+	"github.com/discordwell/subrouter/account"
 )
 
 // New-session verdicts (PATCHES §31).

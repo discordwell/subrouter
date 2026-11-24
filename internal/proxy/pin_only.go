@@ -3,8 +3,8 @@ package proxy
 import (
 	"strings"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
-	"github.com/manaflow-ai/subrouter/selectacct"
+	"github.com/discordwell/subrouter/internal/accounts"
+	"github.com/discordwell/subrouter/selectacct"
 )
 
 // Pin-only accounts (PATCHES §98, SUBROUTER_PIN_ONLY_ACCOUNTS).

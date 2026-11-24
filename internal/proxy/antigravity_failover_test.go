@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/discordwell/subrouter/internal/accounts"
 )
 
 func TestAntigravityRequestsAreReplayable(t *testing.T) {

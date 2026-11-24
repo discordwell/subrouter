@@ -17,8 +17,8 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/klauspost/compress/zstd"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
-	"github.com/manaflow-ai/subrouter/selectacct"
+	"github.com/discordwell/subrouter/internal/accounts"
+	"github.com/discordwell/subrouter/selectacct"
 )
 
 // The overload failover's size cap (PATCHES section 27). Upstream

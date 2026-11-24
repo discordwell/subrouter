@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/credshape"
+	"github.com/discordwell/subrouter/internal/credshape"
 )
 
 // CredentialInfo is one Antigravity account's OAuth credential.

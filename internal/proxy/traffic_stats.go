@@ -13,7 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/buildversion"
+	"github.com/discordwell/subrouter/internal/buildversion"
 )
 
 // trafficErrorClass reduces transport errors to a stable report label.

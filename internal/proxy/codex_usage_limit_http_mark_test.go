@@ -12,8 +12,8 @@ import (
 	"testing/iotest"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
-	"github.com/manaflow-ai/subrouter/selectacct"
+	"github.com/discordwell/subrouter/internal/accounts"
+	"github.com/discordwell/subrouter/selectacct"
 )
 
 // codexUsageLimitPool is a fake chatgpt.com Codex backend on which the first

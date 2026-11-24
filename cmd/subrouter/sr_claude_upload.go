@@ -12,9 +12,9 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/manaflow-ai/subrouter/internal/agents/claude"
-	"github.com/manaflow-ai/subrouter/internal/broker"
-	"github.com/manaflow-ai/subrouter/internal/tenant"
+	"github.com/discordwell/subrouter/internal/agents/claude"
+	"github.com/discordwell/subrouter/internal/broker"
+	"github.com/discordwell/subrouter/internal/tenant"
 )
 
 const (

@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/session"
+	"github.com/discordwell/subrouter/session"
 )
 
 // PATCHES §54, end to end on the e2eLaptop/e2eBox harness: the laptop restarts

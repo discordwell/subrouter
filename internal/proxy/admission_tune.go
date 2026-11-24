@@ -3,7 +3,7 @@ package proxy
 import (
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/discordwell/subrouter/internal/accounts"
 )
 
 // Self-tuning (PATCHES §70). Anthropic publishes no concurrency limit; past

@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/discordwell/subrouter/internal/accounts"
 )
 
 // PATCHES §31, R3 fix 7 (F-F): a verdict body has a maximum age. The admin

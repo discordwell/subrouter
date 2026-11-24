@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
+	agentclaude "github.com/discordwell/subrouter/internal/agents/claude"
 )
 
 func TestClaudeAccountUploadCarriesSetupTokenWithoutRefreshToken(t *testing.T) {

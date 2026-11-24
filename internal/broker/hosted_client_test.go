@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/manaflow-ai/subrouter/account"
+	"github.com/discordwell/subrouter/account"
 )
 
 func TestHostedErrorNeverCopiesResponseSecrets(t *testing.T) {

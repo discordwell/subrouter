@@ -20,7 +20,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/proxy"
+	"github.com/discordwell/subrouter/internal/proxy"
 )
 
 // drainSocketTestServer is the proxy.Server serve builds, as far as the drain

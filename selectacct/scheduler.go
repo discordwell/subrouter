@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/account"
+	"github.com/discordwell/subrouter/account"
 )
 
 var ErrNoAccounts = errors.New("no accounts available")

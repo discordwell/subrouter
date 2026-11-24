@@ -11,8 +11,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
-	"github.com/manaflow-ai/subrouter/internal/tenant"
+	"github.com/discordwell/subrouter/internal/accounts"
+	"github.com/discordwell/subrouter/internal/tenant"
 )
 
 const testTenantKey = "srt_0123456789abcdef0123456789abcdef"

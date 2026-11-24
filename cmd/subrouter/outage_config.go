@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/proxy"
+	"github.com/discordwell/subrouter/internal/proxy"
 )
 
 // Sticky DNS and the outage spill (PATCHES §59), and the peer-down grace

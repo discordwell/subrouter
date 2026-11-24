@@ -21,9 +21,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/fsutil"
-	"github.com/manaflow-ai/subrouter/internal/standby"
-	"github.com/manaflow-ai/subrouter/internal/storepath"
+	"github.com/discordwell/subrouter/internal/fsutil"
+	"github.com/discordwell/subrouter/internal/standby"
+	"github.com/discordwell/subrouter/internal/storepath"
 )
 
 // PATCHES section 79.3. `subrouter standby` is the stand-in process. A Claude

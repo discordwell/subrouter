@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/front"
+	"github.com/discordwell/subrouter/internal/front"
 )
 
 type workerLaunchReport struct {

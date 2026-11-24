@@ -14,7 +14,7 @@ import (
 	"text/template"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/storepath"
+	"github.com/discordwell/subrouter/internal/storepath"
 )
 
 const defaultSystemdServiceName = "subrouter"

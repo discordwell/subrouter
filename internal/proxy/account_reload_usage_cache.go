@@ -3,7 +3,7 @@ package proxy
 import (
 	"strings"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/discordwell/subrouter/internal/accounts"
 )
 
 // invalidateReplacedAccountUsage evicts evidence owned by a replaced or

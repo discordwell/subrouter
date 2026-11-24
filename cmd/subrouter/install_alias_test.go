@@ -87,6 +87,21 @@ func TestSubrouterMainPackageMatchesThisPackage(t *testing.T) {
 	}
 }
 
+// A Subrouter built before the module rename (PATCHES 106) is still
+// Subrouter's, so an install replaces its sr and cx without --force-shims.
+func TestPreRenameBuildIsSubrouters(t *testing.T) {
+	for path, want := range map[string]bool{
+		"github.com/discordwell/subrouter/cmd/subrouter":    true,
+		"github.com/manaflow-ai/subrouter/cmd/subrouter":    true,
+		"github.com/manaflow-ai/subrouter/cmd/mockupstream": false,
+		"example.com/tool/cmd/sr":                           false,
+	} {
+		if got := isSubrouterMainPackage(path); got != want {
+			t.Errorf("isSubrouterMainPackage(%q) = %v, want %v", path, got, want)
+		}
+	}
+}
+
 func TestInstallBinaryAliasReplacesOwnStaleSymlink(t *testing.T) {
 	dir := t.TempDir()
 	subrouter := filepath.Join(dir, "bin", "subrouter")

@@ -4,7 +4,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/account"
+	"github.com/discordwell/subrouter/account"
 )
 
 // Rate-limit marks (fork only, PATCHES section 35.3).

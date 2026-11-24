@@ -4,8 +4,8 @@ import (
 	"cmp"
 	"slices"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
-	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
+	"github.com/discordwell/subrouter/internal/accounts"
+	agentclaude "github.com/discordwell/subrouter/internal/agents/claude"
 )
 
 // The board's view of every saved reset (PATCHES §91.2). A pool.json row

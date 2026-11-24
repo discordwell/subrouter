@@ -15,11 +15,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/discordwell/subrouter/internal/accounts"
+	"github.com/discordwell/subrouter/internal/tailnet"
+	"github.com/discordwell/subrouter/selectacct"
+	"github.com/discordwell/subrouter/session"
 	"github.com/gorilla/websocket"
-	"github.com/manaflow-ai/subrouter/internal/accounts"
-	"github.com/manaflow-ai/subrouter/internal/tailnet"
-	"github.com/manaflow-ai/subrouter/selectacct"
-	"github.com/manaflow-ai/subrouter/session"
 )
 
 func scanTokenUsage(contentType, body string, chunk int) (tokenUsage, string, bool) {

@@ -20,9 +20,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
-	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
-	"github.com/manaflow-ai/subrouter/internal/storepath"
+	"github.com/discordwell/subrouter/internal/accounts"
+	agentclaude "github.com/discordwell/subrouter/internal/agents/claude"
+	"github.com/discordwell/subrouter/internal/storepath"
 )
 
 // Claude's prepaid extra-usage balance is not exposed by the OAuth usage API;

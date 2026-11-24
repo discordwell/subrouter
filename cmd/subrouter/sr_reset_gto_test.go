@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/discordwell/subrouter/internal/accounts"
 )
 
 func win(name string, used float64, limit, reset int64) accounts.UsageWindow {

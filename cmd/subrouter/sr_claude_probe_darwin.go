@@ -16,7 +16,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/storepath"
+	"github.com/discordwell/subrouter/internal/storepath"
 )
 
 // claude.ai's Cloudflare blocks Go's net/http at the TLS fingerprint level

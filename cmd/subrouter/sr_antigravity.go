@@ -14,10 +14,10 @@ import (
 	"strings"
 	"time"
 
-	baseaccount "github.com/manaflow-ai/subrouter/account"
-	agentantigravity "github.com/manaflow-ai/subrouter/internal/agents/antigravity"
-	"github.com/manaflow-ai/subrouter/internal/proxy"
-	"github.com/manaflow-ai/subrouter/internal/storepath"
+	baseaccount "github.com/discordwell/subrouter/account"
+	agentantigravity "github.com/discordwell/subrouter/internal/agents/antigravity"
+	"github.com/discordwell/subrouter/internal/proxy"
+	"github.com/discordwell/subrouter/internal/storepath"
 )
 
 const antigravityManagementHelp = `Usage: sr agy [--account [label-or-email]] [agy args...]

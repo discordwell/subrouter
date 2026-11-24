@@ -15,9 +15,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
-	agentantigravity "github.com/manaflow-ai/subrouter/internal/agents/antigravity"
-	agentkimi "github.com/manaflow-ai/subrouter/internal/agents/kimi"
+	"github.com/discordwell/subrouter/internal/accounts"
+	agentantigravity "github.com/discordwell/subrouter/internal/agents/antigravity"
+	agentkimi "github.com/discordwell/subrouter/internal/agents/kimi"
 )
 
 func TestServerAccountImportNeverFollowsRedirects(t *testing.T) {

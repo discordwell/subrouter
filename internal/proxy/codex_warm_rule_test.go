@@ -8,9 +8,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
-	"github.com/manaflow-ai/subrouter/selectacct"
-	"github.com/manaflow-ai/subrouter/session"
+	"github.com/discordwell/subrouter/internal/accounts"
+	"github.com/discordwell/subrouter/selectacct"
+	"github.com/discordwell/subrouter/session"
 )
 
 // The owner's warm rule holds for Codex exactly as it does for Claude: a warm

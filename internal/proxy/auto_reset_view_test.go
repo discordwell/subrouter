@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/discordwell/subrouter/internal/accounts"
 )
 
 // PATCHES §93.3: the views of automatic resets, and the manual claims beside

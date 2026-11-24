@@ -17,7 +17,7 @@ import (
 	"testing/synctest"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/session"
+	"github.com/discordwell/subrouter/session"
 )
 
 // newPipePeer is a peer reached over in-memory pipes, so the REAL peer client

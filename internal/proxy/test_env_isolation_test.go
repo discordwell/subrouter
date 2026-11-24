@@ -4,10 +4,10 @@ import (
 	"os"
 	"testing"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
-	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
-	"github.com/manaflow-ai/subrouter/internal/storepath"
-	"github.com/manaflow-ai/subrouter/internal/testenv"
+	"github.com/discordwell/subrouter/internal/accounts"
+	agentclaude "github.com/discordwell/subrouter/internal/agents/claude"
+	"github.com/discordwell/subrouter/internal/storepath"
+	"github.com/discordwell/subrouter/internal/testenv"
 )
 
 // Some tests here set HOME and then write the active Codex auth, which an

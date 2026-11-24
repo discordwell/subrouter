@@ -5,7 +5,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/account"
+	"github.com/discordwell/subrouter/account"
 )
 
 // Placement stats make the router's real distribution of work visible. Pick

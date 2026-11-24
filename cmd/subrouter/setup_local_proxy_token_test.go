@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/manaflow-ai/subrouter/internal/broker"
+	"github.com/discordwell/subrouter/internal/broker"
 )
 
 // readClaudeEnv returns the env block setup wrote, so a test can assert on the

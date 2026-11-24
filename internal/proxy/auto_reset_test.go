@@ -16,10 +16,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/discordwell/subrouter/internal/accounts"
+	agentclaude "github.com/discordwell/subrouter/internal/agents/claude"
+	"github.com/discordwell/subrouter/selectacct"
 	"github.com/gorilla/websocket"
-	"github.com/manaflow-ai/subrouter/internal/accounts"
-	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
-	"github.com/manaflow-ai/subrouter/selectacct"
 )
 
 // PATCHES §93.1: the mode, the two moments, the owner's under-1-percent

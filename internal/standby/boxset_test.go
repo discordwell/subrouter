@@ -18,7 +18,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/standby"
+	"github.com/discordwell/subrouter/internal/standby"
 )
 
 // peerEntry is one entry of the daemon's peers file (SUBROUTER_REMOTE_POOLS_FILE).

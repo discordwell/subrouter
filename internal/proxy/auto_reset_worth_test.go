@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/discordwell/subrouter/internal/accounts"
 )
 
 // PATCHES §94.2: an automatic claim is made only when it is worth making.

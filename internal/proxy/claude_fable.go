@@ -8,7 +8,7 @@ import (
 	"net/url"
 	"strings"
 
-	"github.com/manaflow-ai/subrouter/session"
+	"github.com/discordwell/subrouter/session"
 )
 
 // claudeFableModel reports whether a Claude request targets a Fable model.

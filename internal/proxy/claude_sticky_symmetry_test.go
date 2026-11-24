@@ -9,9 +9,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
-	"github.com/manaflow-ai/subrouter/selectacct"
-	"github.com/manaflow-ai/subrouter/session"
+	"github.com/discordwell/subrouter/internal/accounts"
+	"github.com/discordwell/subrouter/selectacct"
+	"github.com/discordwell/subrouter/session"
 )
 
 // A local Claude session is exactly as hard to move to the peer as a delegated

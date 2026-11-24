@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	baseaccount "github.com/manaflow-ai/subrouter/account"
+	baseaccount "github.com/discordwell/subrouter/account"
 )
 
 func TestParseAntigravityNativeArgsSeparatesProfileSelection(t *testing.T) {

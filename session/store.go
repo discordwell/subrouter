@@ -12,7 +12,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/fsutil"
+	"github.com/discordwell/subrouter/internal/fsutil"
 )
 
 // MaxRetainedAssignments bounds the on-disk and HTTP-visible routing history.

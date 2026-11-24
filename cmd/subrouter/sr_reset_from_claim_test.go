@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/discordwell/subrouter/internal/accounts"
 )
 
 // PATCHES §102: sr status's 1x reset cell of a row whose saved resets its

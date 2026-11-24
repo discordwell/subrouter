@@ -16,8 +16,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/discordwell/subrouter/internal/accounts"
 	"github.com/gorilla/websocket"
-	"github.com/manaflow-ai/subrouter/internal/accounts"
 )
 
 // unwrapOnlyTrafficWriter models middleware that exposes ResponseController

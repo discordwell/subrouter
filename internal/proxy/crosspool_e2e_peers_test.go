@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/selectacct"
+	"github.com/discordwell/subrouter/selectacct"
 )
 
 // End to end with SEVERAL peers (PATCHES §31, owner rule P7): the laptop ranks

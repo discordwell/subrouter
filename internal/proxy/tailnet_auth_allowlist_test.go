@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/tailnet"
+	"github.com/discordwell/subrouter/internal/tailnet"
 )
 
 // A tailnet Authorizer with an empty allowlist accepts every peer the tailnet

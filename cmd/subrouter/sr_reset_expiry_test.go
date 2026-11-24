@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/discordwell/subrouter/internal/accounts"
 )
 
 // PATCHES §91.2: on a row read from a daemon, sr status's Codex 1x reset cell

@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/discordwell/subrouter/internal/accounts"
 )
 
 // upstreamAttempt is the state of one client request as it moves through the

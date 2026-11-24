@@ -14,8 +14,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/front"
-	"github.com/manaflow-ai/subrouter/internal/proxy"
+	"github.com/discordwell/subrouter/internal/front"
+	"github.com/discordwell/subrouter/internal/proxy"
 )
 
 // A canary rollout runs a candidate worker generation beside the incumbent

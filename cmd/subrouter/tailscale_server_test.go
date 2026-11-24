@@ -16,7 +16,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/discordwell/subrouter/internal/accounts"
 )
 
 type testRoundTripFunc func(*http.Request) (*http.Response, error)

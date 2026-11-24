@@ -10,11 +10,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/discordwell/subrouter/internal/accesstoken"
+	"github.com/discordwell/subrouter/internal/accounts"
+	"github.com/discordwell/subrouter/internal/tenant"
+	"github.com/discordwell/subrouter/selectacct"
 	"github.com/gorilla/websocket"
-	"github.com/manaflow-ai/subrouter/internal/accesstoken"
-	"github.com/manaflow-ai/subrouter/internal/accounts"
-	"github.com/manaflow-ai/subrouter/internal/tenant"
-	"github.com/manaflow-ai/subrouter/selectacct"
 )
 
 // Named access tokens (PATCHES §43). The static proxy token is one secret for

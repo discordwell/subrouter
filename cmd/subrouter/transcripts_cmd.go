@@ -19,10 +19,10 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/discordwell/subrouter/internal/buildversion"
+	"github.com/discordwell/subrouter/internal/proxy"
+	"github.com/discordwell/subrouter/internal/transcript"
 	"github.com/klauspost/compress/zstd"
-	"github.com/manaflow-ai/subrouter/internal/buildversion"
-	"github.com/manaflow-ai/subrouter/internal/proxy"
-	"github.com/manaflow-ai/subrouter/internal/transcript"
 )
 
 // serveTranscriptOptions are the serve flags that decide how transcripts are

@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/discordwell/subrouter/internal/accounts"
 )
 
 type attestRoundTripFunc func(*http.Request) (*http.Response, error)

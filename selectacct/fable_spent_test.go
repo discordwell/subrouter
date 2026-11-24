@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/account"
+	"github.com/discordwell/subrouter/account"
 )
 
 // PATCHES §65: an Opus or Sonnet turn ranks an account's weekly pace at

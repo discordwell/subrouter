@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/proxy"
+	"github.com/discordwell/subrouter/internal/proxy"
 )
 
 // server.Shutdown waits for the handlers, not for work they handed off: the

@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
+	agentclaude "github.com/discordwell/subrouter/internal/agents/claude"
 )
 
 const testSetupToken = "sk-ant-oat01-TESTTOKENTESTTOKENTESTTOKENTESTTOKENTESTTOKENTESTTOKENTESTTOKENTESTTOKENTESTTOKENTESTTOK-FAKEFAKEAA"

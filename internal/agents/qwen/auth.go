@@ -15,7 +15,7 @@ import (
 	"sync"
 	"unicode"
 
-	"github.com/manaflow-ai/subrouter/internal/fsutil"
+	"github.com/discordwell/subrouter/internal/fsutil"
 )
 
 const previousAccessTokenKey = "subrouter_previous_access_token"

@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/account"
+	"github.com/discordwell/subrouter/account"
 )
 
 // Ported from upstream manaflow-ai/subrouter selectacct/capacity_test.go

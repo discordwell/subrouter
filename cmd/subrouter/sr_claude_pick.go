@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"sort"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
-	"github.com/manaflow-ai/subrouter/internal/agents/claude"
+	"github.com/discordwell/subrouter/internal/accounts"
+	"github.com/discordwell/subrouter/internal/agents/claude"
 )
 
 // pickClaudeProfile switches the active Claude profile to the one with the

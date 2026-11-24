@@ -4,8 +4,8 @@ import (
 	"os"
 	"strings"
 
-	"github.com/manaflow-ai/subrouter/internal/buildversion"
-	"github.com/manaflow-ai/subrouter/internal/proxy"
+	"github.com/discordwell/subrouter/internal/buildversion"
+	"github.com/discordwell/subrouter/internal/proxy"
 )
 
 // clientNameEnv overrides the name `sr` reports in X-Subrouter-Client.

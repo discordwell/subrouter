@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/selectacct"
+	"github.com/discordwell/subrouter/selectacct"
 )
 
 type slowCountingUsageTransport struct {

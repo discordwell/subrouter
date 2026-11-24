@@ -12,9 +12,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
-	"github.com/manaflow-ai/subrouter/internal/agents/claude"
-	"github.com/manaflow-ai/subrouter/internal/storepath"
+	"github.com/discordwell/subrouter/internal/accounts"
+	"github.com/discordwell/subrouter/internal/agents/claude"
+	"github.com/discordwell/subrouter/internal/storepath"
 )
 
 // Upstream #435's unit tests, adapted: every claude.RoutingEnvKeys entry is

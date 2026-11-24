@@ -16,7 +16,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/discordwell/subrouter/internal/accounts"
 )
 
 const srAzHelp = `sr az - Route Codex through the Azure OpenAI fallback

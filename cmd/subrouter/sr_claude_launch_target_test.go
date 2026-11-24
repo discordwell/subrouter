@@ -11,8 +11,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/manaflow-ai/subrouter/internal/agents/claude"
-	"github.com/manaflow-ai/subrouter/internal/broker"
+	"github.com/discordwell/subrouter/internal/agents/claude"
+	"github.com/discordwell/subrouter/internal/broker"
 )
 
 // localConfig is a machine keeping its credentials on itself, which is the only

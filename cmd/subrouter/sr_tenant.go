@@ -12,8 +12,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/storepath"
-	"github.com/manaflow-ai/subrouter/internal/tenant"
+	"github.com/discordwell/subrouter/internal/storepath"
+	"github.com/discordwell/subrouter/internal/tenant"
 )
 
 func srTenantHelp(program string) string {

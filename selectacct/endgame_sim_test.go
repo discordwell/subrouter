@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/account"
+	"github.com/discordwell/subrouter/account"
 )
 
 // The deterministic endgame simulation (PATCHES §55). A seeded workload of

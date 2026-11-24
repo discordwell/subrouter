@@ -10,10 +10,10 @@ import (
 	"testing"
 	"time"
 
-	accountpkg "github.com/manaflow-ai/subrouter/account"
-	"github.com/manaflow-ai/subrouter/internal/accounts"
-	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
-	"github.com/manaflow-ai/subrouter/selectacct"
+	accountpkg "github.com/discordwell/subrouter/account"
+	"github.com/discordwell/subrouter/internal/accounts"
+	agentclaude "github.com/discordwell/subrouter/internal/agents/claude"
+	"github.com/discordwell/subrouter/selectacct"
 )
 
 // Anthropic answers a revoked OAuth token's usage probe with 429, so the

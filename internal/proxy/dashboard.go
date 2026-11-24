@@ -10,8 +10,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/buildversion"
-	"github.com/manaflow-ai/subrouter/internal/transcript"
+	"github.com/discordwell/subrouter/internal/buildversion"
+	"github.com/discordwell/subrouter/internal/transcript"
 )
 
 func (s Server) handleDashboard(w http.ResponseWriter, r *http.Request) {

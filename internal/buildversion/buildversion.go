@@ -2,9 +2,9 @@
 //
 // Release builds stamp the fields at link time:
 //
-//	-ldflags "-X github.com/manaflow-ai/subrouter/internal/buildversion.version=v1.2.3
-//	          -X github.com/manaflow-ai/subrouter/internal/buildversion.commit=<sha>
-//	          -X github.com/manaflow-ai/subrouter/internal/buildversion.buildDate=<rfc3339>"
+//	-ldflags "-X github.com/discordwell/subrouter/internal/buildversion.version=v1.2.3
+//	          -X github.com/discordwell/subrouter/internal/buildversion.commit=<sha>
+//	          -X github.com/discordwell/subrouter/internal/buildversion.buildDate=<rfc3339>"
 //
 // Unstamped builds fall back to runtime/debug build info (module version,
 // vcs.revision, vcs.time, vcs.modified), and finally to "devel"/"unknown".

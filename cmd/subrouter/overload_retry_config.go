@@ -6,7 +6,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/proxy"
+	"github.com/discordwell/subrouter/internal/proxy"
 )
 
 // The Codex same-account capacity ladder's operator knobs, from upstream

@@ -10,9 +10,9 @@ import (
 	"strings"
 	"time"
 
-	baseaccount "github.com/manaflow-ai/subrouter/account"
-	agentkimi "github.com/manaflow-ai/subrouter/internal/agents/kimi"
-	"github.com/manaflow-ai/subrouter/internal/proxy"
+	baseaccount "github.com/discordwell/subrouter/account"
+	agentkimi "github.com/discordwell/subrouter/internal/agents/kimi"
+	"github.com/discordwell/subrouter/internal/proxy"
 )
 
 func (r srRunner) kimiCommand(ctx context.Context, args []string) error {

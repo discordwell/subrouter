@@ -4,8 +4,8 @@ import (
 	"encoding/json"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
-	"github.com/manaflow-ai/subrouter/selectacct"
+	"github.com/discordwell/subrouter/internal/accounts"
+	"github.com/discordwell/subrouter/selectacct"
 )
 
 func (s Server) localRefugeeCap(account, poolModel string) int {
