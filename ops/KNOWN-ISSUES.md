@@ -390,7 +390,7 @@ A pre-§59 daemon (with §58) holds a turn whose lookup fails and retries the sa
 - **Last chance does not pass the Fable week room.** A Fable reset in its last chance on an account with under 25% of its week left is not claimed automatically, and can expire unused. The owner's rule says "never on one that is nearly out of week too"; Fable resets expire months out, so the case is rare. A claim by hand still can.
 - **§95 reads the week room now, not at the projected Fable wall.** Fable work spends the week too, so an account chosen with 30% of its week left can reach its Fable wall with under 25% and be held there. It is then dropped from the choice at the next pass.
 - **At a Fable wall the week comes from the account's last reading.** A reading older than 5 minutes counts as not read, so the decision at the wall claims nothing, and the next reading moment decides.
-- **`SUBROUTER_AUTO_RESET_WORTH=0` turns the gate off with §94's rule.** The gate is a step of that rule; with it off the decision is §93's again.
+- **`SUBROUTER_AUTO_RESET_WORTH=0` turns the gate off in the decision and the claim's last check, not in §95's choice.** The gate is a step of §94's rule; with it off the decision is §93's again and claims inside a day of the roll. §95's choice never reads that switch: it keeps the gate, as it keeps §94's value rule, so it chooses and loads no account the gate would hold while the decision would still claim on one at its limit. `SUBROUTER_RESET_LOADING=0` turns the choice off.
 
 ## Residual gaps §104 leaves open
 

@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"math"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -293,6 +294,49 @@ func TestARealClaimIsHeldWhenTheLiveReadingPutsTheRollUnderADay(t *testing.T) {
 		if consumes != 0 || decision.Verdict != AutoResetFailed || !strings.Contains(decision.Reason, "nothing was sent") ||
 			!strings.Contains(decision.Reason, "§103 holds it on the reading before the claim: the week rolls in 23h, under 24h") {
 			t.Fatalf("Codex, the live roll 23 hours away: %d consumes, decision %+v; want nothing sent", consumes, decision)
+		}
+	}
+}
+
+// At the wall the Claude claim reads nothing extra when the daemon's cached
+// block offers the grant; here it does not (the grant was not usable when
+// the account was read at 95%), so the claim reads the account live, and that
+// read puts the week's roll 23 hours away. The decision went by the row's
+// roll and passed the gate; the claim's last check judges it again on the
+// read it goes by and sends nothing, and the turn moves on. The calibration
+// run, whose live read keeps the roll 48 hours away, claims in place.
+func TestARealClaimAtTheWallIsHeldWhenItsReadPutsTheRollUnderADay(t *testing.T) {
+	setAutoResetWorthForTest(t, true)
+	setAutoResetForTest(t, AutoResetReal, true)
+	for _, moved := range []bool{false, true} {
+		f := newClaudeClaimFake(t, map[string]*claudeClaimProfile{
+			"held":  {week: 95, fable: 20, grants: []bool{false}, roll: 48 * time.Hour},
+			"spare": {week: 40, fable: 10, roll: 100 * time.Hour},
+		})
+		d := f.daemon(t, "")
+		d.server.AccountRef.SetUsageHistory(claudeWeekBurns(t, map[string]float64{"spare": 1.2, "held": 3.0}))
+		d.pinSession("conversation", "held")
+		f.set("held", func(p *claudeClaimProfile) {
+			p.week = 100
+			if moved {
+				p.roll = 23 * time.Hour
+			}
+		})
+		answer := d.turn("conversation", opusModel)
+		claims, served := f.counts()
+		decision := d.decision("held")
+		if !moved {
+			if claims != 1 || decision.Verdict != AutoResetClaimed || !reflect.DeepEqual(served, []string{"held 429", "held 200"}) {
+				t.Fatalf("calibration at the wall: %d claims, served %v, decision %+v; want the week reset claimed in place",
+					claims, served, decision)
+			}
+			continue
+		}
+		if claims != 0 || decision.Verdict != AutoResetFailed ||
+			!strings.Contains(decision.Reason, "nothing was sent: §103 holds it on the reading before the claim: the week rolls in 23h, under 24h") ||
+			!reflect.DeepEqual(served, []string{"held 429", "spare 200"}) || !strings.Contains(answer.body, "msg_spare") {
+			t.Fatalf("at the wall, the claim's read puts the roll 23 hours away: %d claims, served %v, answer %+v, decision %+v; "+
+				"want nothing sent and the turn served on spare", claims, served, answer, decision)
 		}
 	}
 }
