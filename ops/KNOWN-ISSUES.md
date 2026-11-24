@@ -379,6 +379,7 @@ A pre-§59 daemon (with §58) holds a turn whose lookup fails and retries the sa
 
 - **The record of a claim and its follow-up live in memory.** A restart or a worker swap forgets them. The next reading then speaks, and until it does the restored snapshot shows what it shows, without `resets_from_claim`.
 - **A Codex usage-status sweep reads every Codex account live, whatever a hold-off.** After a redeem whose read was refused, a status read inside the hold-off reads the account again, as before §102. The follow-up's own reads keep to the deadline.
+- **The score refresh shows a Codex account's windows, not its count.** After a redeem that leaves the usage-status snapshot in place (the failover's), the re-score that follows republishes the account's windows from its read and keeps the row's count from before the redeem, unmarked, until the next sweep, at most 30 seconds later. This predates §102.
 - **A 429 that names no deadline holds the account off for the daemon's own five minutes.** The follow-up waits it out, as every read of the account does.
 - **The follow-up waits for the saved resets, not for every meter.** A meter whose usage answer never carries it, on an account that takes no turn, stays named in `not_read_since_claim` until a probe or a reply measures it.
 - **Not measured:** how long Anthropic's usage endpoint holds a login off after a claim, what `Retry-After` it sends then, and whether a read at that deadline is answered.
