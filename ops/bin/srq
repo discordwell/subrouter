@@ -591,8 +591,11 @@ def _self_start(norm):
 AUTO_RESET_VERDICTS = ("would_claim", "refused_by_condition", "held_back", "no_claim", "claimed", "failed",
                        "may_have_landed")
 AUTO_RESET_KINDS = {"week": "week", "fable": "Fable", "codex_credit": "credit"}
-# The steps of §94.2's rule a decision can stop at (PATCHES §94.3).
-AUTO_RESET_RULE_STEPS = ("unknown_clock", "expiry_window", "last_chance", "need", "roll_unread", "value")
+# The steps of §94.2's rule a decision can stop at (PATCHES §94.3), with
+# §103's gate: roll_gate (the roll under 24 hours away) and week_room (a Fable
+# reset on an account with under 25% of its week left, or its week unread).
+AUTO_RESET_RULE_STEPS = ("unknown_clock", "roll_unread", "roll_gate", "week_room", "expiry_window", "last_chance", "need",
+                         "value")
 
 
 def _auto_reset(row):
@@ -631,10 +634,11 @@ def _auto_reset(row):
 def _auto_reset_rule(rule):
     """What §94.2's rule used for a decision, flattened: the step it stopped
     at, the pool's need and pressure, what a claim adds as a share of a week,
-    and the hours to the roll. All None for a decision the rule did not make,
-    a daemon before §94, or a malformed rule (PATCHES §94.3)."""
+    the hours to the roll, and on a Fable reset's decision the share of the
+    week left (§103). All None for a decision the rule did not make, a daemon
+    before §94, or a malformed rule (PATCHES §94.3)."""
     out = {"auto_reset_decided_by": None, "auto_reset_need": None, "auto_reset_pressure": None,
-           "auto_reset_value": None, "auto_reset_hours_to_roll": None}
+           "auto_reset_value": None, "auto_reset_hours_to_roll": None, "auto_reset_week_left": None}
     if (not isinstance(rule, dict) or rule.get("decided_by") not in AUTO_RESET_RULE_STEPS
             or rule.get("need") not in ("yes", "no", "unknown")):
         return out
@@ -647,7 +651,9 @@ def _auto_reset_rule(rule):
     out.update({"auto_reset_decided_by": rule["decided_by"], "auto_reset_need": rule["need"],
                 "auto_reset_pressure": pressure if pressure == "all_at_limit" else number(pressure),
                 "auto_reset_value": number(rule.get("value")),
-                "auto_reset_hours_to_roll": number(rule.get("hours_to_roll"))})
+                "auto_reset_hours_to_roll": number(rule.get("hours_to_roll")),
+                # A Fable reset's decision whose week was read (§103).
+                "auto_reset_week_left": number(rule.get("week_left"))})
     return out
 
 
@@ -1091,7 +1097,8 @@ def _render_sections(rows, where, peer=False):
                          "auto = the last automatic reset decision (§93), at that time: would claim (shadow: real mode"
                          " would claim it now), claiming, claimed, CLAIM FAILED, MAY HAVE LANDED (only a reading settles"
                          " it), refused <1% (the owner's condition stopped it), held back (§94: the pool does not need"
-                         " it, or a claim adds under a quarter of a week, wk, before the roll), no claim; (expiry window)"
+                         " it, or a claim adds under a quarter of a week, wk, before the roll; §103: the roll is under"
+                         " 24h away, or a Fable reset's week has under 25% left), no claim; (expiry window)"
                          " or (last chance) = claimed at any value because the reset expires soon; usage-status has the"
                          " reason")
         end = ";" if extra else ")"
@@ -1154,6 +1161,8 @@ def _auto_reset_label(r):
         why = "(never twice)" if (r["auto_reset_reason"] or "").startswith("never twice") else ""
         if not why and by == "need" and r["auto_reset_need"] == "unknown":
             why = "(burn not known)"
+        if not why and by == "week_room":
+            why = "(week not read)"
         words = ["no claim", why, at]
     else:
         words = [{"would_claim": "would claim", "claimed": "claimed", "failed": "CLAIM FAILED",
@@ -1173,18 +1182,29 @@ def _reset_choice_label(r):
 
 def _held_back_why(r):
     """Why §94.2's rule held a claim back, in a few words: the pool does not
-    need the reset, with its pressure; or a claim adds too little before the
-    roll, with what it adds and the hours to the roll. "" when not published."""
+    need the reset, with its pressure; a claim adds too little before the
+    roll, with what it adds and the hours to the roll; the roll is under 24
+    hours away (§103's gate); or a Fable reset's account has under 25% of its
+    week left (§103's week room). "" when not published."""
     by = r["auto_reset_decided_by"]
+    hours = r["auto_reset_hours_to_roll"]
+    roll = "" if hours is None else f"{hours:.0f}h" if hours >= 1 else f"{hours * 60:.0f}m"
     if by == "need":
         pressure = r["auto_reset_pressure"]
         if isinstance(pressure, (int, float)):
             return f"(not needed, pressure {pressure:.2f})"
         return "(not needed)"
-    if by == "value" and r["auto_reset_value"] is not None and r["auto_reset_hours_to_roll"] is not None:
-        hours = r["auto_reset_hours_to_roll"]
-        roll = f"{hours:.0f}h" if hours >= 1 else f"{hours * 60:.0f}m"
+    if by == "value" and r["auto_reset_value"] is not None and roll:
         return f"(adds {r['auto_reset_value']:.2f} wk, rolls in {roll})"
+    if by == "roll_gate":
+        if hours is None:
+            return "(rolls in under 24h)"
+        # Whole hours down: hours_to_roll is rounded to a tenth, so a roll
+        # 23h57m away publishes 24.0 and would read "24h, under 24h".
+        return f"(rolls in {min(int(hours), 23)}h, under 24h)" if hours >= 1 else f"(rolls in {roll}, under 24h)"
+    if by == "week_room":
+        left = r["auto_reset_week_left"]
+        return f"(week {left * 100:.0f}% left, under 25%)" if left is not None else "(week under 25%)"
     return ""
 
 
@@ -2597,10 +2617,17 @@ def cmd_selftest(_argv):
 
     for verdict, kind, used, want in (
             ("held_back", "week", rule("need", "no", 0.7, 0.25, 60.0), f"auto=held back week (not needed, pressure 0.70) {at}"),
-            ("held_back", "week", rule("value", "yes", 1.2, 0.071, 10.0), f"auto=held back week (adds 0.07 wk, rolls in 10h) {at}"),
+            ("held_back", "week", rule("value", "yes", 1.2, 0.214, 30.0), f"auto=held back week (adds 0.21 wk, rolls in 30h) {at}"),
             ("held_back", "codex_credit", rule("value", "yes", 1.3, 0.179, 30.0),
              f"auto=held back credit (adds 0.18 wk, rolls in 30h) {at}"),
             ("held_back", "fable", rule("value", "yes", 1.2, 0.004, 0.2), f"auto=held back Fable (adds 0.00 wk, rolls in 12m) {at}"),
+            ("held_back", "fable", rule("roll_gate", "yes", 1.05, 0.269, 6.4), f"auto=held back Fable (rolls in 6h, under 24h) {at}"),
+            ("held_back", "week", rule("roll_gate", "yes", 1.2, 0.004, 0.2), f"auto=held back week (rolls in 12m, under 24h) {at}"),
+            ("held_back", "week", rule("roll_gate", "yes", 1.2, 0.3, 24.0), f"auto=held back week (rolls in 23h, under 24h) {at}"),
+            ("held_back", "week", rule("roll_gate", "yes", 1.2, 0.3, 23.6), f"auto=held back week (rolls in 23h, under 24h) {at}"),
+            ("held_back", "fable", {**rule("week_room", "yes", 1.2, 0.343, 48.0), "week_left": 0.03},
+             f"auto=held back Fable (week 3% left, under 25%) {at}"),
+            ("no_claim", None, rule("week_room", "yes", 1.2, 0.343, 48.0), f"auto=no claim (week not read) {at}"),
             ("would_claim", "week", rule("expiry_window", "no", 0.5, 0.179, 60.0), f"auto=would claim week (expiry window) {at}"),
             ("claimed", "week", rule("last_chance", "no", 0.7, 0.25, 60.0), f"auto=claimed week (last chance) {at}"),
             ("would_claim", "week", rule("value", "yes", 1.2, 0.429, 60.0), f"auto=would claim week {at}"),
@@ -2627,8 +2654,8 @@ def cmd_selftest(_argv):
           in rendered([summarize(worth_row(0, mode="off"))]))
     check("a held-back decision reads beside its account, and the legend explains it",
           f"  auto=held back week (not needed, pressure 0.70) {at}\n" in text
-          and "held back (§94: the pool does not need it, or a claim adds under a quarter of a week, wk, before the roll)"
-              in text
+          and "held back (§94: the pool does not need it, or a claim adds under a quarter of a week, wk, before the roll;"
+              " §103: the roll is under 24h away, or a Fable reset's week has under 25% left)" in text
           and "(expiry window) or (last chance) = claimed at any value because the reset expires soon" in text)
     check("peer: the peer's own held-back decision",
           f"  auto=held back week (not needed, pressure 0.70) {at}\n" in rendered([summarize(r) for r in held], peer=True))
@@ -2636,7 +2663,10 @@ def cmd_selftest(_argv):
     check("--json carries what the rule used",
           s["auto_reset_worth"] is True and s["auto_reset_verdict"] == "held_back" and s["auto_reset_decided_by"] == "need"
           and s["auto_reset_need"] == "no" and s["auto_reset_pressure"] == 0.7 and s["auto_reset_value"] == 0.25
-          and s["auto_reset_hours_to_roll"] == 60.0 and summarize(held[1])["auto_reset_decided_by"] is None
+          and s["auto_reset_hours_to_roll"] == 60.0 and s["auto_reset_week_left"] is None
+          and summarize(worth_row(0, verdict="held_back", kind="fable",
+                                  rule={**rule("week_room", "yes", 1.2, 0.343, 48.0), "week_left": 0.03}))["auto_reset_week_left"] == 0.03
+          and summarize(held[1])["auto_reset_decided_by"] is None
           and summarize(auto_row(0))["auto_reset_worth"] is None
           and summarize(worth_row(0, verdict="would_claim", kind="week",
                                   rule=rule("need", "yes", "all_at_limit", 1, 60.0)))["auto_reset_pressure"] == "all_at_limit")

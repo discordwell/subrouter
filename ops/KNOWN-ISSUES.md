@@ -384,6 +384,14 @@ A pre-§59 daemon (with §58) holds a turn whose lookup fails and retries the sa
 - **The follow-up waits for the saved resets, not for every meter.** A meter whose usage answer never carries it, on an account that takes no turn, stays named in `not_read_since_claim` until a probe or a reply measures it.
 - **Not measured:** how long Anthropic's usage endpoint holds a login off after a claim, what `Retry-After` it sends then, and whether a read at that deadline is answered.
 
+## Residual gaps §103 leaves open
+
+- **A hold at the claim's last check reads as a failed claim.** When §103's gate holds a real claim just before it sends (the roll came under 24 hours, or a Fable account's week fell under 25%), nothing is sent, but the decision's verdict is `failed` and `srq pool` shows `CLAIM FAILED`, as for the other last checks of §93.2. The reason says `nothing was sent: §103 holds it on the reading before the claim`.
+- **Last chance does not pass the Fable week room.** A Fable reset in its last chance on an account with under 25% of its week left is not claimed automatically, and can expire unused. The owner's rule says "never on one that is nearly out of week too"; Fable resets expire months out, so the case is rare. A claim by hand still can.
+- **§95 reads the week room now, not at the projected Fable wall.** Fable work spends the week too, so an account chosen with 30% of its week left can reach its Fable wall with under 25% and be held there. It is then dropped from the choice at the next pass.
+- **At a Fable wall the week comes from the account's last reading.** A reading older than 5 minutes counts as not read, so the decision at the wall claims nothing, and the next reading moment decides.
+- **`SUBROUTER_AUTO_RESET_WORTH=0` turns the gate off with §94's rule.** The gate is a step of that rule; with it off the decision is §93's again.
+
 ## Residual gaps §104 leaves open
 
 - **A Fable turn ranked across the peers alone does not load a peer's Fable choice.** §95.2 loads an account chosen for its Fable meter on the Fable pool, and a daemon honours a peer's choice. The ranking of the peers alone (the laptop's usual path, its own pool unable to serve) is still not scoped for a Fable turn, so there a Fable choice ranks as a steady account. Scoping it is one line in `peersOnlyScheduler`, but it moves the laptop's Fable sessions onto the chosen accounts at once, so it waits for the owner. An Opus or Sonnet turn is scoped since §104.

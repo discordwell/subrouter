@@ -88,7 +88,7 @@ func TestDocsSayHowAutomaticResetsDecideAndWhoSpends(t *testing.T) {
 // the rule reads pressure and not burn, how `srq pool` shows a held-back
 // decision and a claim the expiry decided, and the rule's fields on a
 // decision and on the health route.
-var worthViewNames = []string{"comes first", "Pressure, not burn", "auto=held back", "(not needed, pressure", "(adds 0.07 wk",
+var worthViewNames = []string{"comes first", "Pressure, not burn", "auto=held back", "(not needed, pressure", "(adds 0.21 wk",
 	"(expiry window)", "(last chance)", "decided_by", "hours_to_roll", "`worth`"}
 
 // What no doc but ops/PATCHES.md may still say since §94.2: that nothing
