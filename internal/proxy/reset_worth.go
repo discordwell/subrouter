@@ -492,6 +492,136 @@ func lastChance(expires, roll time.Time, rate claimRate) bool {
 	return expires.Before(next)
 }
 
+// laterWall is the same reset claimed at the account's next wall after its
+// roll (PATCHES §103).
+type laterWall struct {
+	// at is when the account, starting a fresh week at its roll, is at its
+	// limit again: the roll plus a week over the rate.
+	at time.Time
+	// value is what a claim there adds, as a share of a week.
+	value float64
+	// walls is how many walls the account can expect, one a week from at,
+	// before the reset expires or its expiry window opens; -1 when neither
+	// has a date.
+	walls int
+}
+
+// laterWallOf is the account's next wall after roll, at the rate a claim now
+// is valued at, and what the same reset adds there. A reset that keeps the
+// roll gives back the rate times the share of the week still ahead, min(1,
+// rate-1); one that restarts the seven days skips the rest of the week,
+// 1-1/rate. A pool all at its limit is at the wall at the roll, where either
+// gives back a week. False at a rate of 1 or under: no later wall is
+// expected.
+func laterWallOf(restarts accounts.ClockRestart, roll time.Time, rate claimRate) (laterWall, bool) {
+	restart, known := restarts.Restarts()
+	switch {
+	case !known || roll.IsZero():
+		return laterWall{}, false
+	case rate.unbounded:
+		return laterWall{at: roll, value: 1}, true
+	case rate.value <= 1:
+		return laterWall{}, false
+	}
+	later := laterWall{at: roll.Add(time.Duration(float64(usageMeterLength) / rate.value)).Round(time.Second)}
+	if restart {
+		later.value = roundBurn(1 - 1/rate.value)
+	} else {
+		later.value = roundBurn(min(1, rate.value-1))
+	}
+	return later, true
+}
+
+// resetWait is what §103's rule reads about a claim of one reset besides
+// what the claim adds now.
+type resetWait struct {
+	restarts accounts.ClockRestart
+	roll     time.Time
+	rate     claimRate
+	// expires is when the reset expires, zero for never; window is its expiry
+	// window, nil for none.
+	expires time.Time
+	window  *accounts.ResetExpiryWindow
+	// held is how many resets of the kind the account holds that expire no
+	// later than this one (heldThrough).
+	held int
+	// stood is a claim on this reset that passed the comparison before.
+	stood bool
+}
+
+// waitForBetter is the rule of PATCHES §103, once every check of §94 has
+// said claim: a claim that adds now under resetWaitShare of what the same
+// reset is expected to add at the account's next wall waits for that wall.
+// The later wall counts only while the reset is still there: before it
+// expires, and before its expiry window opens, where any value is claimed.
+// And only while the account can expect at least as many walls before then
+// as it holds resets of the kind: with more resets than walls, waiting would
+// let one expire. A claim that passed the comparison before keeps passing
+// down to resetStayShare of the bar, so a value near it does not turn the
+// decision back and forth. It returns the later wall, whether it counted, and
+// whether the claim waits for it.
+func waitForBetter(w resetWait, now float64) (later laterWall, counts, waits bool) {
+	later, ok := laterWallOf(w.restarts, w.roll, w.rate)
+	if !ok {
+		return later, false, false
+	}
+	limit := w.expires
+	if w.window != nil && (limit.IsZero() || w.window.OpensAt.Before(limit)) {
+		limit = w.window.OpensAt
+	}
+	later.walls = -1
+	if !limit.IsZero() {
+		// A later wall at or after the limit counts no wall at all.
+		later.walls = int(math.Ceil(float64(limit.Sub(later.at)) / float64(usageMeterLength)))
+		if max(w.held, 1) > later.walls {
+			return later, false, false
+		}
+	}
+	return later, true, now < roundBurn(waitBar(w.stood)*later.value)
+}
+
+// waitBar is the share of the later wall's value a claim must add now not to
+// wait: resetWaitShare, or resetStayShare of it for a claim that passed
+// before.
+func waitBar(stood bool) float64 {
+	if stood {
+		return roundBurn(resetWaitShare * resetStayShare)
+	}
+	return resetWaitShare
+}
+
+// heldThrough is how many resets of kind the list holds that expire no later
+// than expires, the reset itself among them: the ones that need a wall before
+// that date. At least 1.
+func heldThrough(list []accounts.HeldReset, kind accounts.ResetKind, expires time.Time) int {
+	held := 0
+	for _, entry := range list {
+		if at, dated := entry.Expires(); entry.Kind == kind && (expires.IsZero() || (dated && !at.After(expires))) {
+			held += entry.Count
+		}
+	}
+	return max(held, 1)
+}
+
+// laterWallWords says what a claim adds where it is weighed (when: "now", or
+// "there" at a projected wall) against the same reset at the account's next
+// wall, and how long the reset lasts.
+func laterWallWords(when string, now float64, later laterWall, w resetWait) string {
+	until := "the reset does not expire"
+	if !w.expires.IsZero() {
+		until = "the reset lasts until " + rfc3339(w.expires)
+	}
+	if later.walls > 0 {
+		before := "before then"
+		if w.window != nil && (w.expires.IsZero() || w.window.OpensAt.Before(w.expires)) {
+			before = "before its expiry window opens at " + rfc3339(w.window.OpensAt)
+		}
+		until += fmt.Sprintf(", and the account can expect %d %s %s", later.walls, plural(later.walls, "such wall", "such walls"), before)
+	}
+	return fmt.Sprintf("a claim adds %.2f of a week %s, and the same reset is expected to add %.2f at the account's next wall at %s, %s after its roll at %s (the rate is %s); %s",
+		now, when, later.value, rfc3339(later.at), shortDuration(later.at.Sub(w.roll)), rfc3339(w.roll), w.rate, until)
+}
+
 // resetDemand is the pool's present demand on one meter: its pressure over
 // the longest window that has one, and how many accounts that window counts.
 type resetDemand struct {
@@ -677,6 +807,10 @@ type resetPool struct {
 	now      time.Time
 	meters   map[string]UsagePoolMeter
 	holdings map[resetHoldingKey]resetHolding
+	// waitForBetter is SUBROUTER_AUTO_RESET_WAIT_FOR_BETTER as this pool was
+	// read: the decision and the choice that read the pool both follow §103's
+	// rule, or neither does.
+	waitForBetter bool
 }
 
 // resetPoolOf reads the pool at now from statuses, this daemon's own rows
@@ -686,7 +820,7 @@ type resetPool struct {
 // a peer. The background pass reads a peer again when that body is more than
 // resetPeerRefreshAge old (§95.1).
 func (s Server) resetPoolOf(statuses []AccountUsageStatus, now time.Time) resetPool {
-	pool := resetPool{now: now, meters: map[string]UsagePoolMeter{}}
+	pool := resetPool{now: now, meters: map[string]UsagePoolMeter{}, waitForBetter: AutoResetWaitForBetter()}
 	var rows []usageBurnAccount
 	var holders []resetHolder
 	for _, status := range statuses {

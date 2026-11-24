@@ -316,6 +316,22 @@ func autoResetWorthEnabled() (bool, error) {
 	return false, fmt.Errorf("SUBROUTER_AUTO_RESET_WORTH=%q: want 1 (the default) or 0", raw)
 }
 
+// autoResetWaitForBetterEnabled reads SUBROUTER_AUTO_RESET_WAIT_FOR_BETTER
+// (PATCHES §103): unset or 1, a claim §94's rule would make waits when the
+// same reset would be worth clearly more at the account's next wall, and the
+// choice of accounts follows; 0 goes back to §94's decision and §95's choice
+// exactly. Anything else is an error.
+func autoResetWaitForBetterEnabled() (bool, error) {
+	raw := os.Getenv("SUBROUTER_AUTO_RESET_WAIT_FOR_BETTER")
+	switch strings.TrimSpace(raw) {
+	case "", "1":
+		return true, nil
+	case "0":
+		return false, nil
+	}
+	return false, fmt.Errorf("SUBROUTER_AUTO_RESET_WAIT_FOR_BETTER=%q: want 1 (the default) or 0", raw)
+}
+
 // resetLoadingEnabled reads SUBROUTER_RESET_LOADING (PATCHES §95.1): unset
 // or 1, the daemon chooses the accounts to run to their limit for their saved
 // resets, in shadow or real mode; 0, it chooses none and ignores a peer's
@@ -1259,12 +1275,17 @@ func serve(args []string) error {
 	if err != nil {
 		return err
 	}
+	autoResetWaitForBetter, err := autoResetWaitForBetterEnabled()
+	if err != nil {
+		return err
+	}
 	resetLoading, err := resetLoadingEnabled()
 	if err != nil {
 		return err
 	}
 	proxy.SetAutoReset(autoReset, autoResetNearEmpty)
 	proxy.SetAutoResetWorth(autoResetWorth)
+	proxy.SetAutoResetWaitForBetter(autoResetWaitForBetter)
 	proxy.SetResetLoading(resetLoading)
 	if !resetLoading {
 		slog.Warn("SUBROUTER_RESET_LOADING=0: this daemon chooses no account to run to its limit for a saved reset, and ignores a peer's choice",
@@ -1277,6 +1298,10 @@ func serve(args []string) error {
 	if !autoResetWorth {
 		slog.Warn("SUBROUTER_AUTO_RESET_WORTH=0: an automatic claim follows §93's rule alone, at the limit with demand, whatever the pool's burn",
 			"reenable", "unset SUBROUTER_AUTO_RESET_WORTH and restart")
+	}
+	if !autoResetWaitForBetter {
+		slog.Warn("SUBROUTER_AUTO_RESET_WAIT_FOR_BETTER=0: a claim §94's rule would make is made even when the same reset would be worth clearly more at the account's next wall",
+			"reenable", "unset SUBROUTER_AUTO_RESET_WAIT_FOR_BETTER and restart")
 	}
 	switch {
 	case autoReset == proxy.AutoResetOff:

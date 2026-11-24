@@ -79,8 +79,10 @@ type resetCandidate struct {
 	// no saved reset. "" when it is weighed.
 	out string
 	// next is the provider's next reset on the account: the one a claim at
-	// its limit spends.
+	// its limit spends; held is how many of its kind the account holds
+	// through its expiry (heldThrough), which §103's rule reads.
 	next accounts.HeldReset
+	held int
 	// readings are its meters as its last reading gave them.
 	readings map[autoResetMeter]autoResetReading
 	// burn is its own figures, by meter.
@@ -114,6 +116,17 @@ type resetWeighing struct {
 	// (chooseAcrossGaps).
 	waiting bool
 	place   int
+	// standing is the verdict for an account chosen for the meter at the last
+	// pass, which keeps qualifying down to resetStayShare of the bars at its
+	// wall (PATCHES §103); nil with §103's rule off, or when the account
+	// stopped before the wall was weighed.
+	standing *resetStanding
+}
+
+// resetStanding is whether a chosen account keeps qualifying, and why.
+type resetStanding struct {
+	qualifies bool
+	why       string
 }
 
 const resetUnknownToRoll = time.Duration(-1 << 62)
@@ -207,12 +220,22 @@ func (p resetPool) weigh(c resetCandidate) resetWeighing {
 		w.onPool = true
 	case reading.roll.IsZero():
 		w.why = fmt.Sprintf("%s, but its roll is not read, so what a claim at its limit adds is not known", needs)
-	case value.value < resetValueFloor:
-		w.why = fmt.Sprintf("%s, but %s, and a claim there adds %.2f of a week, under the floor of %.2f (%s)",
-			needs, heading, value.value, resetValueFloor, value.why)
 	default:
-		w.qualifies = true
-		w.why = fmt.Sprintf("%s; %s, and a claim there adds %.2f of a week (%s)", needs, heading, value.value, value.why)
+		wait := resetWait{restarts: spec.RestartsClock, roll: reading.roll, rate: rate, expires: w.expires, held: c.held}
+		if window, ok := p.window(c.provider, c.next); ok {
+			wait.window = &window
+		}
+		w.qualifies, w.why = p.claimsAtTheWall(value, wait, needs, heading)
+		if p.waitForBetter {
+			wait.stood = true
+			standing := resetStanding{}
+			standing.qualifies, standing.why = p.claimsAtTheWall(value, wait, needs, heading)
+			if standing.qualifies && !w.qualifies {
+				standing.why += fmt.Sprintf("; it is chosen already, and an account chosen stays chosen until a claim at its wall adds under %.2f of a week or under %.2f of what the same reset adds at its next wall",
+					roundBurn(resetValueFloor*resetStayShare), waitBar(true))
+			}
+			w.standing = &standing
+		}
 	}
 	if w.qualifies && wallKnown && !w.expires.IsZero() && wall.After(w.expires) {
 		w.unused = true
@@ -220,6 +243,42 @@ func (p resetPool) weigh(c resetCandidate) resetWeighing {
 			kind, wall.UTC().Format(time.RFC3339), w.expires.UTC().Format(time.RFC3339))
 	}
 	return w
+}
+
+// claimsAtTheWall is whether §94's rule would claim at the wall an account
+// is heading for, where a claim adds value, and why: the claim adds at least
+// resetValueFloor, and with §103's rule on it would not wait for the
+// account's next wall, by the decision's own rule (waitForBetter). For an
+// account chosen at the last pass (wait.stood) each bar is resetStayShare of
+// what it is for one not chosen.
+func (p resetPool) claimsAtTheWall(value claimValue, wait resetWait, needs, heading string) (bool, string) {
+	floor, under := resetValueFloor, ""
+	if wait.stood {
+		floor = roundBurn(resetValueFloor * resetStayShare)
+		under = fmt.Sprintf(", where a chosen account stops, %.1f of the floor of %.2f", resetStayShare, resetValueFloor)
+	}
+	if value.value < floor {
+		if under == "" {
+			return false, fmt.Sprintf("%s, but %s, and a claim there adds %.2f of a week, under the floor of %.2f (%s)",
+				needs, heading, value.value, resetValueFloor, value.why)
+		}
+		return false, fmt.Sprintf("%s, but %s, and a claim there adds %.2f of a week, under %.2f%s (%s)",
+			needs, heading, value.value, floor, under, value.why)
+	}
+	claims := fmt.Sprintf("%s; %s, and a claim there adds %.2f of a week (%s)", needs, heading, value.value, value.why)
+	if !p.waitForBetter {
+		return true, claims
+	}
+	later, counts, waits := waitForBetter(wait, value.value)
+	switch {
+	case !counts:
+		return true, claims
+	case waits:
+		return false, fmt.Sprintf("%s, but %s, where a claim would wait for the account's next wall, under %.2f of what it adds there: %s",
+			needs, heading, waitBar(wait.stood), laterWallWords("there", value.value, later, wait))
+	}
+	return true, claims + fmt.Sprintf("; at its next wall at %s the same reset is expected to add %.2f, and %.2f there is not under %.2f of that",
+		rfc3339(later.at), later.value, value.value, waitBar(wait.stood))
 }
 
 // resetCodexHold is the Codex account this daemon loads now, one at a time,
@@ -368,8 +427,9 @@ type resetGap struct {
 // while it waits, so nothing publishes or ranks it, and a Codex hold on it
 // stands. When it qualifies again before its time is up it takes its old order
 // back, ahead of any account chosen afresh, until that time. A choice that
-// stops for any other reason is dropped at once. It returns the choice and the
-// gaps to keep.
+// stops for any other reason is dropped at once. With §103's rule on, an
+// account chosen at the last pass is weighed at its wall on the lower bars
+// that keep a choice standing. It returns the choice and the gaps to keep.
 func chooseAcrossGaps(weighed []resetWeighing, before map[string]resetChosen, gaps map[string]resetGap,
 	hold resetCodexHold, now time.Time) (resetChoosing, map[string]resetGap) {
 	kept := map[string]resetGap{}
@@ -379,6 +439,11 @@ func chooseAcrossGaps(weighed []resetWeighing, before map[string]resetChosen, ga
 		gap, open := gaps[key]
 		open = open && now.Sub(gap.since) <= resetChoiceGap
 		was, chosen := before[key]
+		if chosen && w.standing != nil && was.choice.Meter == w.meter {
+			// Chosen for this meter at the last pass: it keeps qualifying
+			// down to the lower bars (§103).
+			w.qualifies, w.why = w.standing.qualifies, w.standing.why
+		}
 		switch {
 		case w.qualifies && open && gap.chosen.choice.Meter == w.meter:
 			w.place = gap.chosen.choice.Order
@@ -502,6 +567,8 @@ func (s Server) resetCandidateOf(row *AccountUsageStatus, scheduler selectacct.S
 	c := resetCandidate{key: autoResetKey(account), provider: string(provider), id: account.ID, label: autoResetLabel(row, account.ID),
 		readings: autoResetReadingsOf(row), burn: row.Burn}
 	next, held := s.nextHeldReset(account, row)
+	expires, _ := next.Expires()
+	c.held = heldThrough(row.Resets, next.Kind, expires)
 	score, _ := scheduler.KnownScore(schedulerAccountProvider(provider), account.ID)
 	unsettled := s.autoResetUnsettledClaim(c.key, c.readings)
 	switch dead := s.autoResetDeadCredential(account); {

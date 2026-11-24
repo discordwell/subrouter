@@ -121,6 +121,20 @@ func SetAutoResetWorth(on bool) { autoResetWorthOn.Store(on) }
 // AutoResetWorth reports whether §94.2's rule decides.
 func AutoResetWorth() bool { return autoResetWorthOn.Load() }
 
+// autoResetWaitOn is SUBROUTER_AUTO_RESET_WAIT_FOR_BETTER (PATCHES §103): on,
+// a claim §94's rule would make waits when the same reset would be worth
+// clearly more at the account's next wall, and §95's choice follows; off,
+// §94's decision and §95's choice are exactly as they were. Never set, it is
+// off, so a Server that serve did not set up decides and chooses as before;
+// serve sets it on unless the switch says 0.
+var autoResetWaitOn atomic.Bool
+
+// SetAutoResetWaitForBetter turns §103's rule on or off for the process.
+func SetAutoResetWaitForBetter(on bool) { autoResetWaitOn.Store(on) }
+
+// AutoResetWaitForBetter reports whether §103's rule decides.
+func AutoResetWaitForBetter() bool { return autoResetWaitOn.Load() }
+
 // autoResetFoldsOlderSpenders reports real mode, in which the one decision
 // spends Codex credits and the two older automatic paths spend none
 // (§94.2): the failover redeem of SUBROUTER_CODEX_AUTO_RATE_LIMIT_RESET, and
@@ -259,6 +273,11 @@ type AutoResetRule struct {
 	// known. HoursToRoll is null when the account's roll was not read.
 	Value       *float64 `json:"value"`
 	HoursToRoll *float64 `json:"hours_to_roll"`
+	// LaterValue is what the same reset is expected to add at the account's
+	// next wall, and LaterWallAt when that is; both absent unless §103's rule
+	// compared the claim with that wall.
+	LaterValue  *float64   `json:"later_value,omitempty"`
+	LaterWallAt *time.Time `json:"later_wall_at,omitempty"`
 }
 
 // AutoResetRuleStep is where §94.2's rule decided, in its order.
@@ -279,6 +298,9 @@ const (
 	// AutoResetByValue is what a claim adds: held back under the floor,
 	// claimed at or above it.
 	AutoResetByValue AutoResetRuleStep = "value"
+	// AutoResetByLaterWall is held back by §103: the same reset is expected
+	// to add clearly more at the account's next wall.
+	AutoResetByLaterWall AutoResetRuleStep = "later_wall"
 )
 
 // autoResetNext is the provider's next reset: the one a claim would spend.
@@ -338,11 +360,30 @@ type autoResetWorth struct {
 	expires time.Time
 	// window is the kind and date's expiry window (§94.1); nil without one.
 	window *accounts.ResetExpiryWindow
+	// waitForBetter turns on §103's rule, which reads held, how many resets
+	// of the kind the account holds through this one's expiry, and stood, a
+	// claim on this reset that passed the rule at the last decision.
+	waitForBetter bool
+	held          int
+	stood         bool
 }
 
 // resetValueFloor is the least share of a week a claim must add, outside
 // the expiry window and last chance: a claim worth less is held back.
 const resetValueFloor = 0.25
+
+// resetWaitShare is the bar of PATCHES §103: a claim that adds now less than
+// this share of what the same reset is expected to add at the account's next
+// wall waits for that wall. It is under 1 because that wall is a forecast:
+// the account may reach it later than its rate says, and the pool may not
+// need the reset then.
+const resetWaitShare = 0.8
+
+// resetStayShare is how far under its bar a choice, or a claim that passed
+// §103's comparison, keeps standing (§103): an account chosen stays chosen
+// down to this share of resetValueFloor and of resetWaitShare's bar, so
+// neither turns on a change in the third decimal.
+const resetStayShare = 0.8
 
 // decideAutoReset is the one decision (PATCHES §93.1, §94.2), for an account
 // this daemon holds (only such an account ever has a moment): claim when a
@@ -444,8 +485,24 @@ func decideWorth(w autoResetWorth, now time.Time, reason string) (AutoResetVerdi
 		return AutoResetHeldBack, fmt.Sprintf("%s; held back: the roll is %s away, and a claim would add %.2f of a week, under the floor of %.2f (%s)",
 			reason, shortDuration(max(w.roll.Sub(now), 0)), value.value, resetValueFloor, value.why), by(AutoResetByValue)
 	}
-	return AutoResetWouldClaim, fmt.Sprintf("%s; the pool needs its saved resets on the %s (%s), and a claim adds %.2f of a week (%s)",
-		reason, w.label, w.need.Why, value.value, value.why), by(AutoResetByValue)
+	claim := fmt.Sprintf("%s; the pool needs its saved resets on the %s (%s), and a claim adds %.2f of a week (%s)",
+		reason, w.label, w.need.Why, value.value, value.why)
+	if !w.waitForBetter {
+		return AutoResetWouldClaim, claim, by(AutoResetByValue)
+	}
+	wait := resetWait{restarts: w.restarts, roll: w.roll, rate: rate, expires: w.expires, window: w.window, held: w.held, stood: w.stood}
+	later, counts, waits := waitForBetter(wait, value.value)
+	if !counts {
+		return AutoResetWouldClaim, claim, by(AutoResetByValue)
+	}
+	at := later.at.UTC()
+	used.LaterValue, used.LaterWallAt = &later.value, &at
+	if waits {
+		return AutoResetHeldBack, fmt.Sprintf("%s; held back: %s, so it waits for that wall", reason, laterWallWords("now", value.value, later, wait)),
+			by(AutoResetByLaterWall)
+	}
+	return AutoResetWouldClaim, fmt.Sprintf("%s; at the account's next wall at %s the same reset is expected to add %.2f, and %.2f now is not under %.2f of that",
+		claim, rfc3339(later.at), later.value, value.value, waitBar(w.stood)), by(AutoResetByValue)
 }
 
 // autoResetMeterLeft is how much meter has left: nothing, when the wall's
@@ -548,6 +605,18 @@ func (m *autoResets) record(key string, d AutoResetDecision) bool {
 	}
 	m.lines[lineKey] = d.At
 	return true
+}
+
+// passedTheLaterWall reports whether key's last decision, on the same reset,
+// compared a claim with the account's next wall and let it through (§103):
+// the next decision on it then keeps letting it through down to
+// resetStayShare of the bar.
+func (m *autoResets) passedTheLaterWall(key string, next autoResetNext) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	last, ok := m.last[key]
+	return ok && next.id != "" && last.Reset == next.id && last.Kind == string(next.kind) &&
+		last.Rule != nil && last.Rule.LaterValue != nil && last.Rule.DecidedBy != AutoResetByLaterWall
 }
 
 // firstLook reports whether the reading measured at is newer than the last
@@ -860,21 +929,23 @@ func (s Server) autoResetWorthFor(account accounts.Account, f autoResetFacts) *a
 	pool := s.resetPoolOf(rows, f.now)
 	meter := pool.meter(provider, spec.Meter)
 	w := &autoResetWorth{label: meter.Label, need: needOf(nil, nil), restarts: spec.RestartsClock,
-		roll: f.readings[f.next.kind.meter()].roll}
+		roll: f.readings[f.next.kind.meter()].roll, waitForBetter: pool.waitForBetter}
 	if meter.Need != nil {
 		w.need = *meter.Need
-	}
-	for _, row := range rows {
-		if row.ID == account.ID && usageHistoryProvider(accounts.Account{ID: row.ID, Provider: row.Provider}) == provider {
-			w.own = row.Burn[string(spec.Meter)]
-			break
-		}
 	}
 	reset := accounts.HeldReset{Kind: spec.Kind, Count: 1, ExpiresAt: f.next.expiresAt}
 	w.expires, _ = reset.Expires()
 	if window, ok := pool.window(provider, reset); ok {
 		w.window = &window
 	}
+	for _, row := range rows {
+		if row.ID == account.ID && usageHistoryProvider(accounts.Account{ID: row.ID, Provider: row.Provider}) == provider {
+			w.own = row.Burn[string(spec.Meter)]
+			w.held = heldThrough(row.Resets, spec.Kind, w.expires)
+			break
+		}
+	}
+	w.stood = s.AccountRef.sharedAutoResets().passedTheLaterWall(autoResetKey(account), f.next)
 	return w
 }
 
