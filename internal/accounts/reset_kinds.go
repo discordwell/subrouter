@@ -23,7 +23,8 @@ const (
 	// ResetKindClaudeWeek is a Claude grant that refills the general week.
 	ResetKindClaudeWeek ResetKind = "week"
 	// ResetKindClaudeFable is a Claude grant that clears the Fable limit and
-	// not the week (PATCHES §64).
+	// does not refill the week (PATCHES §64); it gives back the part of the
+	// week the Fable meter had counted (§103).
 	ResetKindClaudeFable ResetKind = "fable"
 	// ResetKindCodexRateLimits is a Codex rate-limit reset credit.
 	ResetKindCodexRateLimits ResetKind = "codex_rate_limits"
@@ -44,7 +45,8 @@ const (
 	ClockRestartAssumedYes ClockRestart = "assumed_yes"
 	ClockRestartAssumedNo  ClockRestart = "assumed_no"
 	// ClockRestartMeasuredNo is a kind a claim was seen not to restart: the
-	// account's roll was the same instant before and after (PATCHES §94.1).
+	// account's roll was the same instant before and after (PATCHES §94.1,
+	// §103).
 	ClockRestartMeasuredNo ClockRestart = "measured_no"
 	ClockRestartUnknown    ClockRestart = "unknown"
 )
@@ -119,7 +121,9 @@ var defaultResetKinds = []ResetKindSpec{
 		Meter:     ResetMeterWeek,
 		// Measured 2026-11-23 (PATCHES §94.1): a week reset claimed by hand
 		// at 100% used left the week's roll the same instant, and gave back
-		// the week and the Fable meter.
+		// the week and the Fable meter. Seen five times by 2026-11-24, two by
+		// hand and three automatic (§103): the roll never moved, and the week
+		// and the Fable meter both went to 0.
 		RestartsClock: ClockRestartMeasuredNo,
 		NeedsLimit:    true,
 		// The owner, 2026-11-22: the provider uses the week reset first, then
@@ -132,9 +136,12 @@ var defaultResetKinds = []ResetKindSpec{
 		Matches: func(r ResetReading) bool {
 			return slices.Contains(r.Clears, "seven_day_overage_included") && !slices.Contains(r.Clears, "seven_day")
 		},
-		GivesBack:     []string{"seven_day_overage_included"},
-		Meter:         ResetMeterFable,
-		RestartsClock: ClockRestartAssumedNo,
+		GivesBack: []string{"seven_day_overage_included"},
+		Meter:     ResetMeterFable,
+		// Measured 2026-11-24 (PATCHES §103): one automatic claim of a Fable
+		// reset left the week's roll the same instant, took the Fable meter
+		// from 100% to 0, and the week from 97% to 47%.
+		RestartsClock: ClockRestartMeasuredNo,
 		NeedsLimit:    true,
 		UseOrder:      2,
 	},

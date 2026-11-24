@@ -71,8 +71,8 @@ func TestHeldResetsListsEachKindAndExpiryInTheProvidersOrder(t *testing.T) {
 	}, now)
 	want := `[` +
 		`{"kind":"week","count":1,"expires_at":"2026-12-10T22:00:00Z","expiry":"read","gives_back":["seven_day","seven_day_overage_included"],"restarts_clock":"measured_no","needs_limit":true,"order":1},` +
-		`{"kind":"fable","count":1,"expires_at":"2027-01-15T00:00:00Z","expiry":"read","gives_back":["seven_day_overage_included"],"restarts_clock":"assumed_no","needs_limit":true,"order":2},` +
-		`{"kind":"fable","count":2,"expires_at":"2027-03-09T07:59:00Z","expiry":"read","gives_back":["seven_day_overage_included"],"restarts_clock":"assumed_no","needs_limit":true,"order":3},` +
+		`{"kind":"fable","count":1,"expires_at":"2027-01-15T00:00:00Z","expiry":"read","gives_back":["seven_day_overage_included"],"restarts_clock":"measured_no","needs_limit":true,"order":2},` +
+		`{"kind":"fable","count":2,"expires_at":"2027-03-09T07:59:00Z","expiry":"read","gives_back":["seven_day_overage_included"],"restarts_clock":"measured_no","needs_limit":true,"order":3},` +
 		`{"kind":"unknown","count":1,"expires_at":"2026-12-01T00:00:00Z","expiry":"read","gives_back":["five_hour"],"restarts_clock":"unknown","needs_limit":true,"manual_only":true}` +
 		`]`
 	if got := publishedHeld(t, held); got != want {
