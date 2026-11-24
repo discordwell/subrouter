@@ -21,9 +21,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
-	"github.com/manaflow-ai/subrouter/internal/tailnet"
-	"github.com/manaflow-ai/subrouter/session"
+	"github.com/discordwell/subrouter/internal/accounts"
+	"github.com/discordwell/subrouter/internal/tailnet"
+	"github.com/discordwell/subrouter/session"
 )
 
 // Token usage accounting counts, per hour, how many tokens each client spent

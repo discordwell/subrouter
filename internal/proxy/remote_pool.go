@@ -23,10 +23,10 @@ import (
 
 	"github.com/gorilla/websocket"
 
-	"github.com/manaflow-ai/subrouter/account"
-	"github.com/manaflow-ai/subrouter/internal/accounts"
-	"github.com/manaflow-ai/subrouter/selectacct"
-	"github.com/manaflow-ai/subrouter/session"
+	"github.com/discordwell/subrouter/account"
+	"github.com/discordwell/subrouter/internal/accounts"
+	"github.com/discordwell/subrouter/selectacct"
+	"github.com/discordwell/subrouter/session"
 )
 
 // Remote pool fallthrough: when this daemon's own pool cannot serve, hand the

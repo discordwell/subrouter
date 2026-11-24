@@ -12,7 +12,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/discordwell/subrouter/internal/accounts"
 )
 
 var antigravityProjectStore struct {

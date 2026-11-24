@@ -4,8 +4,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/manaflow-ai/subrouter/internal/proxy"
-	"github.com/manaflow-ai/subrouter/selectacct"
+	"github.com/discordwell/subrouter/internal/proxy"
+	"github.com/discordwell/subrouter/selectacct"
 )
 
 // PATCHES §86's kill switch reads exactly like §65's: unset is on, only an

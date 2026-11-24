@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/discordwell/subrouter/internal/accounts"
 )
 
 // A Codex 429 fails over request-scoped, so a successful failover used to hide

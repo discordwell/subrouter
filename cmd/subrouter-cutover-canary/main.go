@@ -10,7 +10,7 @@ import (
 	"os/signal"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/cutovercanary"
+	"github.com/discordwell/subrouter/internal/cutovercanary"
 )
 
 func main() {

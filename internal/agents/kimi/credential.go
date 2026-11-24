@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/credshape"
+	"github.com/discordwell/subrouter/internal/credshape"
 )
 
 // CredentialInfo is the Kimi Code CLI's OAuth credential.

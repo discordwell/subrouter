@@ -3,7 +3,7 @@ package selectacct
 import (
 	"time"
 
-	"github.com/manaflow-ai/subrouter/account"
+	"github.com/discordwell/subrouter/account"
 )
 
 // Loading the accounts chosen for a reset (PATCHES §95.2). The daemon that

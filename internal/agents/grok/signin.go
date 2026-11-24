@@ -7,7 +7,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/oauthdevice"
+	"github.com/discordwell/subrouter/internal/oauthdevice"
 )
 
 // Authorize runs the OAuth device-authorization grant interactively without

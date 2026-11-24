@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/session"
+	"github.com/discordwell/subrouter/session"
 )
 
 // An incrementally gzip-flushed SSE (as a compressing edge streams it)

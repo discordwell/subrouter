@@ -21,8 +21,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/broker"
-	"github.com/manaflow-ai/subrouter/internal/buildversion"
+	"github.com/discordwell/subrouter/internal/broker"
+	"github.com/discordwell/subrouter/internal/buildversion"
 )
 
 // sr host makes another machine of mine use this machine's pool. The host
@@ -49,7 +49,7 @@ const (
 const (
 	hostBinDir        = "$HOME/.local/bin"
 	hostVersionMarker = "$HOME/.local/share/subrouter/host-version"
-	hostModulePath    = "github.com/manaflow-ai/subrouter/cmd/subrouter"
+	hostModulePath    = "github.com/discordwell/subrouter/cmd/subrouter"
 	hostDefaultPort   = 31415
 	hostTunnelPrefix  = "ai.manaflow.subrouter.host."
 )

@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/discordwell/subrouter/internal/accounts"
 )
 
 // A rejected upload used to surface as a bare "400 Bad Request". The server's

@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	frontproxy "github.com/manaflow-ai/subrouter/internal/front"
+	frontproxy "github.com/discordwell/subrouter/internal/front"
 )
 
 func TestFrontSwitchPreservesPinnedStreamAndProxyAddresses(t *testing.T) {

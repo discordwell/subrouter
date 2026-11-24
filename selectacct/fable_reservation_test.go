@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/account"
+	"github.com/discordwell/subrouter/account"
 )
 
 // PATCHES §57: the Fable reservation is off unless SUBROUTER_FABLE_RESERVATION

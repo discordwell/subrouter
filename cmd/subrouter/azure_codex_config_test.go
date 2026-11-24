@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/manaflow-ai/subrouter/internal/proxy"
+	"github.com/discordwell/subrouter/internal/proxy"
 )
 
 func TestAzureCodexBaseURLNormalization(t *testing.T) {

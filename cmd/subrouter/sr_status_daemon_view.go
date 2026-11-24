@@ -6,8 +6,8 @@ import (
 	"io"
 	"strings"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
-	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
+	"github.com/discordwell/subrouter/internal/accounts"
+	agentclaude "github.com/discordwell/subrouter/internal/agents/claude"
 )
 
 // The local table from this machine's daemon, for a shell that cannot use

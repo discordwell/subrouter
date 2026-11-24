@@ -22,15 +22,15 @@ import (
 	"testing"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
-	agentantigravity "github.com/manaflow-ai/subrouter/internal/agents/antigravity"
-	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
-	agentkimi "github.com/manaflow-ai/subrouter/internal/agents/kimi"
-	agentqwen "github.com/manaflow-ai/subrouter/internal/agents/qwen"
-	"github.com/manaflow-ai/subrouter/internal/stackauth"
-	"github.com/manaflow-ai/subrouter/internal/tenant"
-	"github.com/manaflow-ai/subrouter/selectacct"
-	"github.com/manaflow-ai/subrouter/session"
+	"github.com/discordwell/subrouter/internal/accounts"
+	agentantigravity "github.com/discordwell/subrouter/internal/agents/antigravity"
+	agentclaude "github.com/discordwell/subrouter/internal/agents/claude"
+	agentkimi "github.com/discordwell/subrouter/internal/agents/kimi"
+	agentqwen "github.com/discordwell/subrouter/internal/agents/qwen"
+	"github.com/discordwell/subrouter/internal/stackauth"
+	"github.com/discordwell/subrouter/internal/tenant"
+	"github.com/discordwell/subrouter/selectacct"
+	"github.com/discordwell/subrouter/session"
 )
 
 type fakeStackVerifier struct {

@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/session"
+	"github.com/discordwell/subrouter/session"
 )
 
 // PATCHES §67 under fault injection, end to end on the e2eLaptop/e2eBox

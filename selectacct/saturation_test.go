@@ -4,7 +4,7 @@ import (
 	"math"
 	"testing"
 
-	"github.com/manaflow-ai/subrouter/account"
+	"github.com/discordwell/subrouter/account"
 )
 
 type simulatedAccount struct {

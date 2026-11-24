@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/session"
+	"github.com/discordwell/subrouter/session"
 )
 
 // A session held on the peer re-ranks on the same idle bound that holds one on

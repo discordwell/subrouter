@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/account"
+	"github.com/discordwell/subrouter/account"
 )
 
 // A single shared deadline, so the three paces differ only by the headroom

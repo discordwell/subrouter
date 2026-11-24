@@ -3,7 +3,7 @@ package selectacct
 import (
 	"testing"
 
-	"github.com/manaflow-ai/subrouter/account"
+	"github.com/discordwell/subrouter/account"
 )
 
 // Live debits floor headroom at 0.01, well under every retention threshold.

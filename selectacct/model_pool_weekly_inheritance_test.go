@@ -3,7 +3,7 @@ package selectacct
 import (
 	"testing"
 
-	"github.com/manaflow-ai/subrouter/account"
+	"github.com/discordwell/subrouter/account"
 )
 
 // Production publishes per-model weekly windows with NO reset time. Every live

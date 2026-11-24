@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
-	agentqwen "github.com/manaflow-ai/subrouter/internal/agents/qwen"
+	"github.com/discordwell/subrouter/internal/accounts"
+	agentqwen "github.com/discordwell/subrouter/internal/agents/qwen"
 )
 
 type qwenConsoleRoundTripFunc func(*http.Request) (*http.Response, error)

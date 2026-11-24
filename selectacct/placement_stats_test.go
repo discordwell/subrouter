@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/account"
+	"github.com/discordwell/subrouter/account"
 )
 
 func poolStats(t *testing.T, snapshot PlacementStatsSnapshot, provider account.Provider, pool string) PoolPlacementStats {

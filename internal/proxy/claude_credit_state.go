@@ -13,7 +13,7 @@ import (
 	"sync"
 	"time"
 
-	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
+	agentclaude "github.com/discordwell/subrouter/internal/agents/claude"
 )
 
 // Claude API-credit and revocation state.

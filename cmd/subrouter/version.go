@@ -5,7 +5,7 @@ import (
 	"io"
 	"os"
 
-	"github.com/manaflow-ai/subrouter/internal/buildversion"
+	"github.com/discordwell/subrouter/internal/buildversion"
 )
 
 // versionOut is where `<program> version` prints; tests replace it.

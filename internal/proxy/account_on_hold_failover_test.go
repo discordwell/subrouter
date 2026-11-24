@@ -10,8 +10,8 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
-	"github.com/manaflow-ai/subrouter/selectacct"
+	"github.com/discordwell/subrouter/internal/accounts"
+	"github.com/discordwell/subrouter/selectacct"
 )
 
 // An UNPINNED request whose account refreshes to Anthropic's account_on_hold

@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/discordwell/subrouter/internal/accounts"
 )
 
 func minuteBucket(t *testing.T, report admissionMinuteReport, key admissionKey) admissionMinuteBucket {

@@ -8,8 +8,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/manaflow-ai/subrouter/internal/transcript"
-	"github.com/manaflow-ai/subrouter/session"
+	"github.com/discordwell/subrouter/internal/transcript"
+	"github.com/discordwell/subrouter/session"
 )
 
 func TestDashboardAndTranscriptEndpoints(t *testing.T) {

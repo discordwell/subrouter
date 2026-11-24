@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/discordwell/subrouter/internal/accounts"
 )
 
 // The cedar_ember block as Anthropic answered it on 2026-09-29 (read-only,

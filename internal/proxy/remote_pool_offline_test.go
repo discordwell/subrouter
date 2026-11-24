@@ -14,7 +14,7 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/manaflow-ai/subrouter/session"
+	"github.com/discordwell/subrouter/session"
 )
 
 // PATCHES §54: a breaker that opens while this machine itself is offline

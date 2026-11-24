@@ -17,9 +17,9 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/discordwell/subrouter/internal/accounts"
+	"github.com/discordwell/subrouter/session"
 	"github.com/gorilla/websocket"
-	"github.com/manaflow-ai/subrouter/internal/accounts"
-	"github.com/manaflow-ai/subrouter/session"
 )
 
 // Hold and retry (PATCHES §58).

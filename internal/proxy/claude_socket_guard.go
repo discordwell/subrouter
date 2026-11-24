@@ -14,8 +14,8 @@ import (
 	"sync"
 	"sync/atomic"
 
-	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
-	"github.com/manaflow-ai/subrouter/session"
+	agentclaude "github.com/discordwell/subrouter/internal/agents/claude"
+	"github.com/discordwell/subrouter/session"
 )
 
 // The Claude socket's guard: no refusal Claude Code answers with the human's

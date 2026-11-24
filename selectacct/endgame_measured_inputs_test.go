@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/account"
+	"github.com/discordwell/subrouter/account"
 )
 
 // PATCHES §55: for a local, unreserved Claude account the drain's session cap,

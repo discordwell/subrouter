@@ -10,8 +10,8 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/proxy"
-	"github.com/manaflow-ai/subrouter/selectacct"
+	"github.com/discordwell/subrouter/internal/proxy"
+	"github.com/discordwell/subrouter/selectacct"
 )
 
 // placementStatusLines renders the daemon's placement counters as a compact

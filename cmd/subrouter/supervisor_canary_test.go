@@ -15,8 +15,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/front"
-	"github.com/manaflow-ai/subrouter/session"
+	"github.com/discordwell/subrouter/internal/front"
+	"github.com/discordwell/subrouter/session"
 )
 
 type canaryTestHost struct {

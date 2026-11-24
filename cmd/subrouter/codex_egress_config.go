@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/proxy"
+	"github.com/discordwell/subrouter/internal/proxy"
 )
 
 // codexEgressConfigFromEnvironment reads SUBROUTER_CODEX_EGRESS_PROXIES, a

@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/manaflow-ai/subrouter/internal/broker"
+	"github.com/discordwell/subrouter/internal/broker"
 )
 
 // A first run must not hand OAuth refresh tokens to a remote vault. The upload

@@ -14,8 +14,8 @@ import (
 	"strings"
 	"sync/atomic"
 
-	"github.com/manaflow-ai/subrouter/internal/proxy"
-	"github.com/manaflow-ai/subrouter/session"
+	"github.com/discordwell/subrouter/internal/proxy"
+	"github.com/discordwell/subrouter/session"
 )
 
 // retryAfterSeconds is the Retry-After of a 503 that names none, the stand-in's

@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/discordwell/subrouter/internal/accounts"
 )
 
 // `sr setup junk --plan` used to stop parsing at "junk", so --plan -- the flag

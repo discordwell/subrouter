@@ -4,8 +4,8 @@ import (
 	"context"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
-	"github.com/manaflow-ai/subrouter/selectacct"
+	"github.com/discordwell/subrouter/internal/accounts"
+	"github.com/discordwell/subrouter/selectacct"
 )
 
 // knownAccountWideQuotaReset returns a provider-measured recovery deadline

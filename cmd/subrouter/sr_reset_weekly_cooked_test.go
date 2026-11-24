@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/discordwell/subrouter/internal/accounts"
 )
 
 // localResetWham is a fake of the three wham endpoints `sr reset` touches in

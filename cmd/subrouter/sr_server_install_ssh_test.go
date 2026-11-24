@@ -8,7 +8,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/discordwell/subrouter/internal/accounts"
 )
 
 // stdinCapturingRunner records commands with their standard input, so a test

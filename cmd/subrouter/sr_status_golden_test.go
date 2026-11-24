@@ -11,7 +11,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/discordwell/subrouter/internal/accounts"
 )
 
 var updateStatusGolden = flag.Bool("update-status-golden", false, "rewrite testdata/sr_status_text.golden from the current renderer")

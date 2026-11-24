@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/discordwell/subrouter/internal/accounts"
 )
 
 // Ported from upstream manaflow-ai/subrouter #370 (6bcbcbd), adapted to this

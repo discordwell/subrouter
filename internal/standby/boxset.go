@@ -21,8 +21,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/proxy"
-	"github.com/manaflow-ai/subrouter/session"
+	"github.com/discordwell/subrouter/internal/proxy"
+	"github.com/discordwell/subrouter/session"
 )
 
 // The box set's clocks (PATCHES §79.2).

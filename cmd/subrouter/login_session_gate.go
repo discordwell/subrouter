@@ -6,7 +6,7 @@ import (
 	"io"
 	"strings"
 
-	"github.com/manaflow-ai/subrouter/internal/broker"
+	"github.com/discordwell/subrouter/internal/broker"
 )
 
 // The gate in front of every verb when this process cannot use macOS login

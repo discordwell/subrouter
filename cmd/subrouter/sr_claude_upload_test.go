@@ -15,7 +15,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/agents/claude"
+	"github.com/discordwell/subrouter/internal/agents/claude"
 )
 
 func TestUploadServerClaudeProfileUsesProtectedHTTPOnly(t *testing.T) {

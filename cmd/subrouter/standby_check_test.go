@@ -17,7 +17,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/storepath"
+	"github.com/discordwell/subrouter/internal/storepath"
 )
 
 // PATCHES section 79.5. The install script asks `subrouter standby --check`

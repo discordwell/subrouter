@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/account"
+	"github.com/discordwell/subrouter/account"
 )
 
 // reservationTestScheduler returns two equal accounts so reservation tests

@@ -3,8 +3,8 @@ package proxy
 import (
 	"net/http"
 
-	"github.com/manaflow-ai/subrouter/selectacct"
-	"github.com/manaflow-ai/subrouter/session"
+	"github.com/discordwell/subrouter/selectacct"
+	"github.com/discordwell/subrouter/session"
 )
 
 // The overload failover's size cap, ported from upstream manaflow-ai/subrouter

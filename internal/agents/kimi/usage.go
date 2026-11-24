@@ -10,8 +10,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/account"
-	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/discordwell/subrouter/account"
+	"github.com/discordwell/subrouter/internal/accounts"
 )
 
 const defaultUsageURL = "https://api.kimi.com/coding/v1/usages"

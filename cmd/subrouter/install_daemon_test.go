@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/manaflow-ai/subrouter/internal/broker"
+	"github.com/discordwell/subrouter/internal/broker"
 )
 
 func TestLaunchAgentPlistUsesMacOSLocalDefaults(t *testing.T) {

@@ -8,8 +8,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/account"
-	"github.com/manaflow-ai/subrouter/internal/oauthdevice"
+	"github.com/discordwell/subrouter/account"
+	"github.com/discordwell/subrouter/internal/oauthdevice"
 )
 
 // SignInManaged runs Kimi's public device-authorization flow and stores the

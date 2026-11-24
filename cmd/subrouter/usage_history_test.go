@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/proxy"
+	"github.com/discordwell/subrouter/internal/proxy"
 )
 
 // PATCHES §92.1's switch reads like §90's: unset is on, only an explicit

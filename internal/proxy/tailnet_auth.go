@@ -4,7 +4,7 @@ import (
 	"context"
 	"net/http"
 
-	"github.com/manaflow-ai/subrouter/internal/tailnet"
+	"github.com/discordwell/subrouter/internal/tailnet"
 )
 
 // TailnetAuthorizer resolves the tailnet principal behind a request. It is an

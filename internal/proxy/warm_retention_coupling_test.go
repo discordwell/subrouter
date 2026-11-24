@@ -3,7 +3,7 @@ package proxy
 import (
 	"testing"
 
-	"github.com/manaflow-ai/subrouter/session"
+	"github.com/discordwell/subrouter/session"
 )
 
 // The session store's size prune spares every assignment younger than

@@ -5,7 +5,7 @@ import (
 	"net/http"
 	"strings"
 
-	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
+	agentclaude "github.com/discordwell/subrouter/internal/agents/claude"
 )
 
 // Forced versus transient (PATCHES §31, D4b; owner rule P8).

@@ -1,9 +1,9 @@
 package main
 
 import (
-	"github.com/manaflow-ai/subrouter/internal/accounts"
-	"github.com/manaflow-ai/subrouter/internal/agents/opencode"
-	"github.com/manaflow-ai/subrouter/internal/agents/pi"
+	"github.com/discordwell/subrouter/internal/accounts"
+	"github.com/discordwell/subrouter/internal/agents/opencode"
+	"github.com/discordwell/subrouter/internal/agents/pi"
 )
 
 type srCompatSyncResult struct {

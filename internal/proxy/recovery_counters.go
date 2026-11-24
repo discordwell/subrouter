@@ -4,7 +4,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/discordwell/subrouter/internal/accounts"
 )
 
 // RecoveryCounters is the rolling one-hour view of capacity and retry recovery

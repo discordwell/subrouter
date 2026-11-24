@@ -24,7 +24,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
-	"github.com/manaflow-ai/subrouter/internal/front"
+	"github.com/discordwell/subrouter/internal/front"
 )
 
 // PATCHES section 77.1. These tests drive a real supervisor with a real worker

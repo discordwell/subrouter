@@ -12,9 +12,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
-	"github.com/manaflow-ai/subrouter/internal/tenant"
-	"github.com/manaflow-ai/subrouter/session"
+	"github.com/discordwell/subrouter/internal/accounts"
+	"github.com/discordwell/subrouter/internal/tenant"
+	"github.com/discordwell/subrouter/session"
 )
 
 // Ported from upstream manaflow-ai/subrouter #374 (f4c6f99), adapted to this

@@ -15,10 +15,10 @@ import (
 	"time"
 	"unicode"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
-	agentantigravity "github.com/manaflow-ai/subrouter/internal/agents/antigravity"
-	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
-	agentkimi "github.com/manaflow-ai/subrouter/internal/agents/kimi"
+	"github.com/discordwell/subrouter/internal/accounts"
+	agentantigravity "github.com/discordwell/subrouter/internal/agents/antigravity"
+	agentclaude "github.com/discordwell/subrouter/internal/agents/claude"
+	agentkimi "github.com/discordwell/subrouter/internal/agents/kimi"
 )
 
 const serverAccountImportPath = "/_subrouter/account-import"

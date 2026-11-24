@@ -8,7 +8,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/discordwell/subrouter/internal/accounts"
 )
 
 // A pinned account whose credential is dead (PATCHES section 28, from upstream

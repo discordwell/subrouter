@@ -1,6 +1,6 @@
 package proxy
 
-import "github.com/manaflow-ai/subrouter/internal/accounts"
+import "github.com/discordwell/subrouter/internal/accounts"
 
 // PATCHES §93.3: what the views read of automatic resets. Each usage-status
 // row of an account this daemon holds carries the daemon's mode, the owner's

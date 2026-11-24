@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/manaflow-ai/subrouter/internal/buildversion"
+	"github.com/discordwell/subrouter/internal/buildversion"
 )
 
 func TestVersionCommandPrintsBuildIdentity(t *testing.T) {

@@ -18,17 +18,17 @@ import (
 	"time"
 	"unicode"
 
-	baseaccount "github.com/manaflow-ai/subrouter/account"
-	"github.com/manaflow-ai/subrouter/internal/accounts"
-	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
-	agentgrok "github.com/manaflow-ai/subrouter/internal/agents/grok"
-	agentkimi "github.com/manaflow-ai/subrouter/internal/agents/kimi"
-	agentqwen "github.com/manaflow-ai/subrouter/internal/agents/qwen"
-	"github.com/manaflow-ai/subrouter/internal/broker"
-	"github.com/manaflow-ai/subrouter/internal/proxy"
-	"github.com/manaflow-ai/subrouter/internal/storepath"
-	"github.com/manaflow-ai/subrouter/selectacct"
-	"github.com/manaflow-ai/subrouter/session"
+	baseaccount "github.com/discordwell/subrouter/account"
+	"github.com/discordwell/subrouter/internal/accounts"
+	agentclaude "github.com/discordwell/subrouter/internal/agents/claude"
+	agentgrok "github.com/discordwell/subrouter/internal/agents/grok"
+	agentkimi "github.com/discordwell/subrouter/internal/agents/kimi"
+	agentqwen "github.com/discordwell/subrouter/internal/agents/qwen"
+	"github.com/discordwell/subrouter/internal/broker"
+	"github.com/discordwell/subrouter/internal/proxy"
+	"github.com/discordwell/subrouter/internal/storepath"
+	"github.com/discordwell/subrouter/selectacct"
+	"github.com/discordwell/subrouter/session"
 	"github.com/mattn/go-runewidth"
 	"golang.org/x/term"
 )
@@ -709,10 +709,10 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 	case "server", "servers":
 		return r.server(ctx, args[1:])
 	// Upstream's `sr host attach|status|watch|detach` (#437, #440) is not
-	// dispatched: attach installs upstream's release binary (or a
-	// github.com/manaflow-ai build) on the other machine and points it at this
-	// pool -- the release-binary path PATCHES 37.3 refuses for `sr server
-	// install`, and a remote surface outside the PATCHES 17 gate.
+	// dispatched: attach installs upstream's release binary (or a `go install`
+	// build of this module) on the other machine and points it at this pool --
+	// the release-binary path PATCHES 37.3 refuses for `sr server install`, and
+	// a remote surface outside the PATCHES 17 gate.
 	case "remote", "remotes":
 		return r.remote(ctx, args[1:])
 	case "tenant", "tenants":

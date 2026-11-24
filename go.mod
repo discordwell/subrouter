@@ -1,4 +1,4 @@
-module github.com/manaflow-ai/subrouter
+module github.com/discordwell/subrouter
 
 go 1.26.0
 

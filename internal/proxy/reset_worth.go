@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/discordwell/subrouter/internal/accounts"
 )
 
 // When an automatic claim is worth making (PATCHES §94.1): each meter's pool

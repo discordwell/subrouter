@@ -8,8 +8,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/account"
-	"github.com/manaflow-ai/subrouter/selectacct"
+	"github.com/discordwell/subrouter/account"
+	"github.com/discordwell/subrouter/selectacct"
 )
 
 // Machine-sharing policy: how many distinct machines may use one account, and

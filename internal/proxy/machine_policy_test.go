@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/account"
-	"github.com/manaflow-ai/subrouter/selectacct"
+	"github.com/discordwell/subrouter/account"
+	"github.com/discordwell/subrouter/selectacct"
 )
 
 func TestNoteCreatesABindingOnceAndRenewsAfter(t *testing.T) {

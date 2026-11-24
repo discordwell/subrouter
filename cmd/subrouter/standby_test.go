@@ -36,7 +36,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/storepath"
+	"github.com/discordwell/subrouter/internal/storepath"
 )
 
 // PATCHES section 79.3. These tests run a stand-in beside a real supervisor

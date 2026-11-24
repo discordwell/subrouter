@@ -7,7 +7,7 @@ import (
 	"log/slog"
 	"strings"
 
-	"github.com/manaflow-ai/subrouter/internal/standby"
+	"github.com/discordwell/subrouter/internal/standby"
 )
 
 // checkStandby is `subrouter standby --check` (PATCHES §79.5): the look a

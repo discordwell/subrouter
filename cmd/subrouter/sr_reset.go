@@ -18,7 +18,7 @@ import (
 
 	"golang.org/x/term"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/discordwell/subrouter/internal/accounts"
 )
 
 // reset implements `subrouter reset`: redeem a ChatGPT Pro rate-limit reset

@@ -6,8 +6,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/manaflow-ai/subrouter/internal/broker"
-	"github.com/manaflow-ai/subrouter/internal/storepath"
+	"github.com/discordwell/subrouter/internal/broker"
+	"github.com/discordwell/subrouter/internal/storepath"
 )
 
 // TestDockerHarnessCanaryResolvesEveryConfigSurfaceUnderTheAgentHome is the

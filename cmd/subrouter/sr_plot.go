@@ -18,7 +18,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/burnpace"
+	"github.com/discordwell/subrouter/internal/burnpace"
 )
 
 // `sr plot` holds no rule of the read-out here: every rule, and every word of

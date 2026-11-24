@@ -10,7 +10,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/discordwell/subrouter/internal/accounts"
 )
 
 // claudeWebBalanceTTL bounds how long a pushed prepaid balance is served.

@@ -13,8 +13,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
-	"github.com/manaflow-ai/subrouter/internal/buildversion"
+	"github.com/discordwell/subrouter/internal/accounts"
+	"github.com/discordwell/subrouter/internal/buildversion"
 )
 
 // hostFakeHost plays the SSH host and launchctl for sr host tests.
@@ -162,9 +162,9 @@ func setupHostTest(t *testing.T, serverURL string) (srRunner, *hostFakeHost, *by
 }
 
 // Upstream merge 2026-11: `sr host` (#437/#440) is not dispatched in this fork.
-// attach installs upstream's release (or a github.com/manaflow-ai build) on the
-// other machine and writes a reverse-tunnel LaunchAgent here, outside the
-// PATCHES 17 gate -- the same reason §37.3 refuses `sr server install`'s
+// attach installs upstream's release (or a `go install` build of this module)
+// on the other machine and writes a reverse-tunnel LaunchAgent here, outside
+// the PATCHES 17 gate -- the same reason §37.3 refuses `sr server install`'s
 // release. The file stays for serverHeading and the attach marker, so the
 // tests below drive runner.host directly; this one pins that the verb is
 // unreachable from the command line and touches nothing.
@@ -462,7 +462,7 @@ mkdir -p "$GOBIN"; printf x > "$GOBIN/subrouter"; chmod +x "$GOBIN/subrouter"
 	if got := run(hostInstallSpec{"auto-source", "a6cf5e87a63f"}); !strings.Contains(got, "already installed") {
 		t.Fatalf("second source install: %s", got)
 	}
-	if n := strings.Count(calls(), "go install github.com/manaflow-ai/subrouter/cmd/subrouter@a6cf5e87a63f"); n != 1 {
+	if n := strings.Count(calls(), "go install github.com/discordwell/subrouter/cmd/subrouter@a6cf5e87a63f"); n != 1 {
 		t.Fatalf("go install ran %d times:\n%s", n, calls())
 	}
 	if target, err := os.Readlink(filepath.Join(home, ".local", "bin", "sr")); err != nil || target != "subrouter" {

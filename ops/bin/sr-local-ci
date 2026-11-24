@@ -1529,7 +1529,7 @@ EOF
 excerpt() { # <excerpts file> <pkg> <test> -> indented last lines
   awk -F'\t' -v p="$2" -v t="$3" '$1 == p && $2 == t { sub(/^[^\t]*\t[^\t]*\t/, ""); print "      | " $0 }' "$1" | tail -8
 }
-short() { printf '%s' "$1" | sed 's#^github.com/manaflow-ai/subrouter/##'; }
+short() { printf '%s' "$1" | sed 's#^github.com/discordwell/subrouter/##'; }
 
 # Packages that failed as a whole: a build failure, or a run that ended early
 # (a panic, a timeout, os.Exit) -- the tests after that point never ran.

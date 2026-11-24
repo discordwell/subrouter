@@ -6,7 +6,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/proxy"
+	"github.com/discordwell/subrouter/internal/proxy"
 )
 
 // The hold (PATCHES §58) is configured by these variables, or by the matching

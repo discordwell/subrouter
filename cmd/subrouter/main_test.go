@@ -14,10 +14,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
-	"github.com/manaflow-ai/subrouter/internal/broker"
-	"github.com/manaflow-ai/subrouter/internal/proxy"
-	"github.com/manaflow-ai/subrouter/selectacct"
+	"github.com/discordwell/subrouter/internal/accounts"
+	"github.com/discordwell/subrouter/internal/broker"
+	"github.com/discordwell/subrouter/internal/proxy"
+	"github.com/discordwell/subrouter/selectacct"
 )
 
 func TestStandaloneUsageFetchOnlyRunsWhenAutoSwitchIsDisabled(t *testing.T) {

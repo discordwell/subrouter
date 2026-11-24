@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/session"
+	"github.com/discordwell/subrouter/session"
 )
 
 // A stranded chat waits. A warm session whose account cannot be reached

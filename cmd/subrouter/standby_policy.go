@@ -13,9 +13,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
-	"github.com/manaflow-ai/subrouter/internal/fsutil"
-	"github.com/manaflow-ai/subrouter/internal/standby"
+	agentclaude "github.com/discordwell/subrouter/internal/agents/claude"
+	"github.com/discordwell/subrouter/internal/fsutil"
+	"github.com/discordwell/subrouter/internal/standby"
 )
 
 // PATCHES section 79.4. A Claude Code session that starts without a 200 on

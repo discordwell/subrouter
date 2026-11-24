@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/manaflow-ai/subrouter/internal/cutovercanary"
+	"github.com/discordwell/subrouter/internal/cutovercanary"
 )
 
 func TestPeerProbeSubcommandPrintsBoundedContract(t *testing.T) {

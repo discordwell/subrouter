@@ -13,8 +13,8 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/accesstoken"
-	"github.com/manaflow-ai/subrouter/session"
+	"github.com/discordwell/subrouter/internal/accesstoken"
+	"github.com/discordwell/subrouter/session"
 )
 
 // defaultTokenExpiry is how long a token lives when --expires is not given.

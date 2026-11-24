@@ -1,6 +1,6 @@
 package claude
 
-import "github.com/manaflow-ai/subrouter/internal/credshape"
+import "github.com/discordwell/subrouter/internal/credshape"
 
 // unreadableCredentialPhrase appears in every credential-decode error. A
 // credential that will not parse cannot be refreshed without re-auth, so the

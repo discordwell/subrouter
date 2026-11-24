@@ -6,7 +6,7 @@ import (
 	"sync"
 	"time"
 
-	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
+	agentclaude "github.com/discordwell/subrouter/internal/agents/claude"
 )
 
 // fableMeterWarnEvery bounds the disagreement log to one line per account an

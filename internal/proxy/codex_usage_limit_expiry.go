@@ -6,7 +6,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/discordwell/subrouter/internal/accounts"
 )
 
 // codexWorkspaceExhaustionTTL holds out an account whose usage_limit_reached

@@ -4,8 +4,8 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
-	"github.com/manaflow-ai/subrouter/selectacct"
+	"github.com/discordwell/subrouter/internal/accounts"
+	"github.com/discordwell/subrouter/selectacct"
 )
 
 func claudePickRow(email string, headroom, short float64) srUsageRow {

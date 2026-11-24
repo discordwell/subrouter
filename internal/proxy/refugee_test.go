@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/session"
+	"github.com/discordwell/subrouter/session"
 )
 
 // Refugee placement (PATCHES §67). A chat held on a box found down is a

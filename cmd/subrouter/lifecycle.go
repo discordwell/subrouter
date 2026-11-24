@@ -11,8 +11,8 @@ import (
 	"runtime"
 	"strings"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
-	"github.com/manaflow-ai/subrouter/internal/broker"
+	"github.com/discordwell/subrouter/internal/accounts"
+	"github.com/discordwell/subrouter/internal/broker"
 )
 
 // serviceController starts, stops and inspects the installed local daemon. The

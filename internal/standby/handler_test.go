@@ -29,7 +29,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/standby"
+	"github.com/discordwell/subrouter/internal/standby"
 )
 
 const testSessionID = "3f1c9a52-7d0e-4b8a-9c61-2e5f0a7b4d19"

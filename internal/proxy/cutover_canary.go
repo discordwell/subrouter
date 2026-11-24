@@ -11,7 +11,7 @@ import (
 	"time"
 	"unicode"
 
-	"github.com/manaflow-ai/subrouter/session"
+	"github.com/discordwell/subrouter/session"
 )
 
 const (

@@ -17,9 +17,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
-	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
-	agentkimi "github.com/manaflow-ai/subrouter/internal/agents/kimi"
+	"github.com/discordwell/subrouter/internal/accounts"
+	agentclaude "github.com/discordwell/subrouter/internal/agents/claude"
+	agentkimi "github.com/discordwell/subrouter/internal/agents/kimi"
 )
 
 type failingAccountInventorySource struct {

@@ -7,7 +7,7 @@ import (
 	"sort"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/storepath"
+	"github.com/discordwell/subrouter/internal/storepath"
 )
 
 type Store struct {

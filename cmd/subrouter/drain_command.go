@@ -20,7 +20,7 @@ import (
 	"unicode/utf16"
 	"unicode/utf8"
 
-	"github.com/manaflow-ai/subrouter/internal/storepath"
+	"github.com/discordwell/subrouter/internal/storepath"
 )
 
 // systemdServiceHome is install-systemd's default --home, the state directory

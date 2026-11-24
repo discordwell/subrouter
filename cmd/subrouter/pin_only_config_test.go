@@ -5,8 +5,8 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
-	"github.com/manaflow-ai/subrouter/selectacct"
+	"github.com/discordwell/subrouter/internal/accounts"
+	"github.com/discordwell/subrouter/selectacct"
 )
 
 // PATCHES §98: SUBROUTER_PIN_ONLY_ACCOUNTS is a comma-separated list of

@@ -9,7 +9,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/manaflow-ai/subrouter/internal/proxy"
+	"github.com/discordwell/subrouter/internal/proxy"
 )
 
 // azureCodexFile is the on-disk form of the Codex Azure fallback, for the case

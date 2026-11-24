@@ -24,11 +24,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/internal/accounts"
-	"github.com/manaflow-ai/subrouter/internal/buildversion"
-	"github.com/manaflow-ai/subrouter/internal/front"
-	"github.com/manaflow-ai/subrouter/internal/proxy"
-	"github.com/manaflow-ai/subrouter/internal/testenv"
+	"github.com/discordwell/subrouter/internal/accounts"
+	"github.com/discordwell/subrouter/internal/buildversion"
+	"github.com/discordwell/subrouter/internal/front"
+	"github.com/discordwell/subrouter/internal/proxy"
+	"github.com/discordwell/subrouter/internal/testenv"
 )
 
 func privateSocketTempRoot(t *testing.T) string {

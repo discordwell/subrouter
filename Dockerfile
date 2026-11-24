@@ -14,7 +14,7 @@ ARG SUBROUTER_BUILD_COMMIT=unknown
 ARG SUBROUTER_BUILD_DATE=unknown
 ARG SUBROUTER_BUILD_MAINLINE=local-build
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
-    go build -trimpath -ldflags="-s -w -X github.com/manaflow-ai/subrouter/internal/buildversion.version=${SUBROUTER_BUILD_VERSION} -X github.com/manaflow-ai/subrouter/internal/buildversion.commit=${SUBROUTER_BUILD_COMMIT} -X github.com/manaflow-ai/subrouter/internal/buildversion.buildDate=${SUBROUTER_BUILD_DATE} -X github.com/manaflow-ai/subrouter/internal/buildversion.mainline=${SUBROUTER_BUILD_MAINLINE}" -o /out/subrouter ./cmd/subrouter && \
+    go build -trimpath -ldflags="-s -w -X github.com/discordwell/subrouter/internal/buildversion.version=${SUBROUTER_BUILD_VERSION} -X github.com/discordwell/subrouter/internal/buildversion.commit=${SUBROUTER_BUILD_COMMIT} -X github.com/discordwell/subrouter/internal/buildversion.buildDate=${SUBROUTER_BUILD_DATE} -X github.com/discordwell/subrouter/internal/buildversion.mainline=${SUBROUTER_BUILD_MAINLINE}" -o /out/subrouter ./cmd/subrouter && \
     mkdir -p /out/state
 
 # Test harness stage: `deploy/docker/test.sh` (or `make docker-test`) runs the

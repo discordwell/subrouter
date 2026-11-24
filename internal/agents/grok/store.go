@@ -14,9 +14,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/manaflow-ai/subrouter/account"
-	"github.com/manaflow-ai/subrouter/internal/oauthdevice"
-	"github.com/manaflow-ai/subrouter/internal/storepath"
+	"github.com/discordwell/subrouter/account"
+	"github.com/discordwell/subrouter/internal/oauthdevice"
+	"github.com/discordwell/subrouter/internal/storepath"
 )
 
 // OAuth constants for the Grok CLI's installed-app client, matching what the
