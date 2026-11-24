@@ -503,27 +503,6 @@ func lastChance(expires, roll time.Time, rate claimRate) bool {
 // with under 24 hours left". Only a reset's last chance is still claimed.
 const ResetRollWaste = 24 * time.Hour
 
-// resetFableWeekRoom is the least share of its week an account must have left
-// for its Fable reset to be claimed automatically, or for §95 to load it toward
-// that claim (§103). A Fable reset keeps for months, so it waits for an account
-// out of Fable that can still serve other models on its week. One value for
-// the decision, the choice and the claim's last check.
-//
-// 2026-11-24 owner: a Fable reset is claimed automatically only on an account
-// whose Fable meter is out but whose week still has real room, never on one
-// nearly out of its week too: "because we have more time to use those, we
-// should be prioritizing chats where we're out of Fable but still have some
-// Opus".
-const resetFableWeekRoom = 0.25
-
-// resetWeek is an account's week as §103's week room reads it: what is left,
-// or why that is not known.
-type resetWeek struct {
-	left  float64
-	known bool
-	why   string
-}
-
 // resetHold is what §103's gate holds an automatic claim back by: the rule's
 // step, the verdict and why. by is "" when nothing holds the claim.
 type resetHold struct {
@@ -536,14 +515,17 @@ type resetHold struct {
 // meter: the one predicate the decision (decideWorth), §95's choice (weigh)
 // and a real claim's last check before it sends (autoResetFacts.holdBeforeSend)
 // go by. toRoll is from the account's limit to the meter's roll, and rollRead
-// false when the roll is not read; last is the reset's last chance; week is the
-// account's week. The expiry window passes none of it. It holds, in order:
+// false when the roll is not read; last is the reset's last chance. The expiry
+// window passes none of it. It holds, in order:
 //   - a roll not read: no claim, since nothing says the roll is a day away;
 //   - a roll under ResetRollWaste away, or none past the limit: held back,
-//     unless it is the reset's last chance;
-//   - a Fable reset on an account whose week has under resetFableWeekRoom
-//     left: held back; with its week not read, no claim.
-func resetHoldOf(meter autoResetMeter, toRoll time.Duration, rollRead, last bool, week resetWeek) resetHold {
+//     unless it is the reset's last chance.
+//
+// The account's week does not enter it (§105): a Fable reset is claimed on an
+// account out of Fable however much of its week is left.
+//
+// 2026-11-24 owner: a Fable reset does not wait on the week: "it should not matter how much Opus is left. It's just: do we have a Fable reset, is Fable out, and is the week in a reasonable time?"
+func resetHoldOf(meter autoResetMeter, toRoll time.Duration, rollRead, last bool) resetHold {
 	switch {
 	case !rollRead:
 		return resetHold{by: AutoResetByRollUnread, verdict: AutoResetNoClaim,
@@ -555,16 +537,6 @@ func resetHoldOf(meter autoResetMeter, toRoll time.Duration, rollRead, last bool
 		return resetHold{by: AutoResetByRollGate, verdict: AutoResetHeldBack,
 			why: fmt.Sprintf("%s rolls in %s, under %s, and gives itself back then; that near the roll only a reset's last chance is claimed",
 				meter.words(), shortDuration(toRoll), shortDuration(ResetRollWaste))}
-	case meter != autoResetFable:
-		return resetHold{}
-	case !week.known:
-		return resetHold{by: AutoResetByWeekRoom, verdict: AutoResetNoClaim,
-			why: fmt.Sprintf("%s, and a Fable reset is claimed only on an account whose week is read and has at least %.0f%% left",
-				week.why, resetFableWeekRoom*100)}
-	case week.left < resetFableWeekRoom:
-		return resetHold{by: AutoResetByWeekRoom, verdict: AutoResetHeldBack,
-			why: fmt.Sprintf("the week has %.1f%% left, under %.0f%%: a Fable reset is claimed only on an account out of Fable that still has week left",
-				week.left*100, resetFableWeekRoom*100)}
 	}
 	return resetHold{}
 }
