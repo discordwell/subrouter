@@ -35,14 +35,14 @@ func TestResetInfoListsEveryResetByKindAndExpiry(t *testing.T) {
 	week := grant("week_reset", []string{"seven_day", "seven_day_overage_included"}, 1, "2026-12-10T22:00:00Z")
 	want := `[` +
 		`{"kind":"week","count":1,"expires_at":"2026-12-10T22:00:00Z","expiry":"read","gives_back":["seven_day","seven_day_overage_included"],"restarts_clock":"measured_no","needs_limit":true,"order":1},` +
-		`{"kind":"fable","count":2,"expires_at":"2027-03-09T07:59:00Z","expiry":"read","gives_back":["seven_day_overage_included"],"restarts_clock":"assumed_no","needs_limit":true,"order":2}` +
+		`{"kind":"fable","count":2,"expires_at":"2027-03-09T07:59:00Z","expiry":"read","gives_back":["seven_day_overage_included"],"restarts_clock":"measured_no","needs_limit":true,"order":2}` +
 		`]`
 	if got := string(read(t, fable, week)); got != want {
 		t.Fatalf("a week reset and two Fable resets\n got %s\nwant %s", got, want)
 	}
 	spent := grant("week_reset", []string{"seven_day"}, 0, "2026-12-10T22:00:00Z")
 	lapsed := grant("october", []string{"five_hour", "seven_day", "seven_day_overage_included"}, 1, "2026-10-22T16:00:00Z")
-	want = `[{"kind":"fable","count":2,"expires_at":"2027-03-09T07:59:00Z","expiry":"read","gives_back":["seven_day_overage_included"],"restarts_clock":"assumed_no","needs_limit":true,"order":1}]`
+	want = `[{"kind":"fable","count":2,"expires_at":"2027-03-09T07:59:00Z","expiry":"read","gives_back":["seven_day_overage_included"],"restarts_clock":"measured_no","needs_limit":true,"order":1}]`
 	if got := string(read(t, spent, lapsed, fable)); got != want {
 		t.Fatalf("a spent and a lapsed grant beside Fable resets\n got %s\nwant %s", got, want)
 	}
