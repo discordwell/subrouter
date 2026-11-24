@@ -251,10 +251,10 @@ func TestNoClaimGoesByTheBlockAClaimLeft(t *testing.T) {
 // 4, Codex. Nothing claims on the block a redeem left either, and for Codex
 // that rule alone stops a claim on a row that still lists a credit. After a
 // redeem by hand whose read is refused, the daemon's snapshot holds the row its
-// last sweep read before the redeem, with two credits, as a redeem that leaves
-// the snapshot in place does (the failover's). A wall on the account decides
-// no claim, says its saved resets were last known from the claim, and sends
-// no second consume.
+// last sweep read before the redeem, with two credits, as the failover's
+// redeem leaves it. The failover does not redeem in real mode, so the test puts
+// that snapshot back by hand. A wall on the account decides no claim, says its
+// saved resets were last known from the claim, and sends no second consume.
 func TestNoCodexClaimGoesByTheBlockARedeemLeft(t *testing.T) {
 	setAutoResetForTest(t, AutoResetReal, true)
 	f := newCodexClaimFake(t, map[string]*codexClaimAccount{
@@ -288,6 +288,46 @@ func TestNoCodexClaimGoesByTheBlockARedeemLeft(t *testing.T) {
 		!strings.Contains(decision.Reason, ", not from a reading") {
 		t.Fatalf("a wall on the block the redeem left: %d consumes, decision %+v; want no second consume, saying the credits are known from the claim",
 			consumes, decision)
+	}
+}
+
+// 4, Codex, after a reading. A redeem whose own read after the consume is
+// answered leaves that reading for the decision, not the snapshot read before
+// the redeem: on the same snapshot as above, now listing the one credit the
+// redeem spent, a wall on the account decides by the reading that it holds
+// none, and lists no credits to find out.
+func TestACodexDecisionAfterARedeemGoesByItsReading(t *testing.T) {
+	setAutoResetForTest(t, AutoResetReal, true)
+	f := newCodexClaimFake(t, map[string]*codexClaimAccount{
+		heldCodex:  {used: 90, credits: heldCodexCredits("credit-soon")},
+		spareCodex: {used: 30},
+	})
+	readBefore, ok := f.server.AccountRef.UsageStatusSnapshot()
+	if !ok {
+		t.Fatal("calibration: no sweep before the redeem")
+	}
+	recorder := httptest.NewRecorder()
+	f.server.Handler().ServeHTTP(recorder, loopbackAdminRequest(http.MethodPost, "/_subrouter/rate-limit-reset?email="+heldCodex+"&anytime=true", nil))
+	if consumes, _ := f.counts(); recorder.Code != http.StatusOK || consumes != 1 {
+		t.Fatalf("calibration: the redeem by hand answered %d %s with %d consumes", recorder.Code, recorder.Body.String(), consumes)
+	}
+	ref := f.server.AccountRef
+	ref.usageStatusMu.Lock()
+	ref.usageStatusCache, ref.usageStatusAt = readBefore, time.Now()
+	ref.usageStatusMu.Unlock()
+	f.mu.Lock()
+	lists := f.creditLists
+	f.mu.Unlock()
+	f.pinSession("conversation", heldCodex)
+	f.set(heldCodex, func(a *codexClaimAccount) { a.used = 100 })
+	f.post("conversation")
+	decision := f.decision(heldCodex)
+	f.mu.Lock()
+	listed, consumes := f.creditLists-lists, f.consumes
+	f.mu.Unlock()
+	if consumes != 1 || listed != 0 || decision.Verdict != AutoResetNoClaim || decision.Reason != "the account holds no reset credit" {
+		t.Fatalf("a wall after the redeem's reading: %d consumes, %d credit list reads, decision %+v; want no second consume, no list read, and the reading's no credit",
+			consumes, listed, decision)
 	}
 }
 

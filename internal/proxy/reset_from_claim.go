@@ -311,12 +311,32 @@ func claimedLeft(block *accounts.ComplimentaryResetInfo, kind string) int {
 	return *block.Remaining
 }
 
+// blockOn is the block c sets on row, an account's usage row (nil when the
+// account has none), and whether it is the block from the claim: that block
+// until a reading replaces it, then, for Codex, the reading on a row that no
+// read since the claim measured. A Codex row's count comes only from the
+// sweep's own read, so such a row (the snapshot a failover redeem leaves, a
+// refused sweep's) carries a count from before the claim, while the redeem's
+// own read after the consume holds the count since (§102.2, part I). A Claude
+// claim's read reaches the row through the usage cache the sweep serves. Nil
+// when the row's own block stands.
+func (c *claimedReset) blockOn(row *AccountUsageStatus) (*accounts.ComplimentaryResetInfo, bool) {
+	if c.block != nil {
+		return c.block, true
+	}
+	if c.read == nil || c.provider != accounts.ProviderCodex || (row != nil && row.UsageMeasuredAt.After(c.at)) {
+		return nil, false
+	}
+	return c.read, false
+}
+
 // withResetsFromClaims puts on each row of an account whose last landed
 // claim no reading has replaced yet the block that claim left, marked
-// (resets_from_claim), and names each meter the claim gave back that no
-// figure measured after it shows yet (not_read_since_claim). A row read
-// before the claim shows no figure for those meters. Once a reading has
-// replaced the block and every meter has a figure again, the claim is
+// (resets_from_claim), and on a Codex row read before the claim the reading
+// that replaced it, unmarked (blockOn). It names each meter the claim gave
+// back that no figure measured after it shows yet (not_read_since_claim). A
+// row read before the claim shows no figure for those meters. Once a reading
+// has replaced the block and every meter has a figure again, the claim is
 // forgotten. The input may be the shared snapshot: rows are changed in the
 // copy the caller made.
 func (s Server) withResetsFromClaims(rows []AccountUsageStatus) {
@@ -333,10 +353,10 @@ func (s Server) withResetsFromClaims(rows []AccountUsageStatus) {
 		if !ok || row.AuthMode != accounts.AuthModeOAuth {
 			continue
 		}
-		if claim.block != nil {
-			row.ComplimentaryReset = cloneResetInfo(claim.block)
-			row.ComplimentaryReset.Held = slices.Clone(claim.block.Held)
-			row.ResetsFromClaim = true
+		if block, fromClaim := claim.blockOn(row); block != nil {
+			row.ComplimentaryReset = cloneResetInfo(block)
+			row.ComplimentaryReset.Held = slices.Clone(block.Held)
+			row.ResetsFromClaim = fromClaim
 		}
 		if !row.UsageMeasuredAt.IsZero() && row.UsageMeasuredAt.Before(claim.at) {
 			row.Windows = claim.withoutMeters(row.Windows)
