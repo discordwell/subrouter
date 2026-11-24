@@ -629,13 +629,33 @@ func TestACodexFollowUpReadsTheUsageAndTheCreditListAtOnce(t *testing.T) {
 	}
 }
 
+// wantCodexReading checks held's row against the reading after a redeem of
+// credit-soon: one credit, credit-late with its date, not marked as known
+// from the claim.
+func wantCodexReading(t *testing.T, when string, row claimRow, late string) {
+	t.Helper()
+	if left := codexLeft(row); row.ResetsFromClaim || left != "1 left" ||
+		len(row.Resets) != 1 || row.Resets[0].ExpiresAt != late || row.Resets[0].Expiry != accounts.ResetExpiryRead {
+		t.Errorf("%s held's row carries %s (from the claim: %v) and lists %+v; want the reading's one credit, credit-late with its date",
+			when, left, row.ResetsFromClaim, row.Resets)
+	}
+}
+
+// codexLeft is a Codex row's credit count as a reader says it.
+func codexLeft(row claimRow) string {
+	if row.ComplimentaryReset == nil || row.ComplimentaryReset.Remaining == nil {
+		return "no count"
+	}
+	return strconv.Itoa(*row.ComplimentaryReset.Remaining) + " left"
+}
+
 // Part I, the second finding. A Codex redeem whose own read after the
 // consume is answered takes the reading there, as the claim path's read does
 // for Claude. The provider then refuses the account's reads, yet at once the
-// row is not marked as known from the claim, no follow-up reads the account,
-// and one Info line names the redeem's own read. The next answered sweep
-// shows the reading's count and list. The provider gets the requests it got
-// before: the reading is the read the redeem made anyway.
+// row is the reading's, unmarked, no follow-up reads the account, and one
+// Info line names the redeem's own read. The next answered sweep shows the
+// same. The provider gets the requests it got before: the reading is the read
+// the redeem made anyway.
 func TestACodexRedeemsOwnReadAfterIsTheReading(t *testing.T) {
 	setAutoResetForTest(t, AutoResetShadow, true)
 	credits := heldCodexCredits("credit-soon", "credit-late")
@@ -661,21 +681,14 @@ func TestACodexRedeemsOwnReadAfterIsTheReading(t *testing.T) {
 	reads.mu.Lock()
 	reads.refuse = true
 	reads.mu.Unlock()
-	if row := claimRows(t, f.server)[heldCodex]; row.ResetsFromClaim {
-		t.Errorf("after the redeem's own reading held's row is still marked as known from the claim: %+v", row.ComplimentaryReset)
-	}
+	wantCodexReading(t, "at once, from a sweep the provider refused,", claimRows(t, f.server)[heldCodex], late)
 	followUpPassAt(t, f.server, 30*time.Second)
 	followUpPassAt(t, f.server, 100*time.Second)
 	reads.mu.Lock()
 	reads.refuse = false
 	reads.mu.Unlock()
 	f.server.AccountRef.InvalidateUsageStatusCache()
-	row := claimRows(t, f.server)[heldCodex]
-	if row.ResetsFromClaim || row.ComplimentaryReset == nil || row.ComplimentaryReset.Remaining == nil || *row.ComplimentaryReset.Remaining != 1 ||
-		len(row.Resets) != 1 || row.Resets[0].ExpiresAt != late || row.Resets[0].Expiry != accounts.ResetExpiryRead {
-		t.Errorf("after an answered sweep held's row carries %+v (from the claim: %v) and lists %+v; want the reading's one credit, credit-late with its date",
-			row.ComplimentaryReset, row.ResetsFromClaim, row.Resets)
-	}
+	wantCodexReading(t, "after an answered sweep", claimRows(t, f.server)[heldCodex], late)
 	lines := jsonLogLines(f.logs, firstReadingAfterClaimMessage)
 	seconds := -1.0
 	if len(lines) == 1 {
@@ -691,6 +704,56 @@ func TestACodexRedeemsOwnReadAfterIsTheReading(t *testing.T) {
 	if reads.count() != 3 || listed != 0 || consumes != 1 {
 		t.Fatalf("%d usage reads of held after the consume, %d credit list reads and %d consumes; want the redeem's own read and two sweeps', no list read, one consume",
 			reads.count(), listed, consumes)
+	}
+}
+
+// Part I, the failover. Its redeem leaves the usage-status snapshot read
+// before the redeem in place, with two credits; its own read after the
+// consume is answered, and at once held's row is that reading's.
+func TestAFailoverRedeemsReadingIsOnTheRowAtOnce(t *testing.T) {
+	setAutoResetForTest(t, AutoResetShadow, true)
+	credits := heldCodexCredits("credit-soon", "credit-late")
+	late := credits[1].ExpiresAt
+	f := newCodexClaimFake(t, map[string]*codexClaimAccount{
+		heldCodex:  {used: 100, credits: credits},
+		spareCodex: {used: 30},
+	})
+	memory := f.server.AccountRef.sharedHeldResets()
+	f.server.readCodexResetExpiries(context.Background(), memory, time.Now())
+	memory.reads.Wait()
+	if before := claimRows(t, f.server)[heldCodex]; len(before.Resets) != 2 {
+		t.Fatalf("calibration: before the redeem held lists %+v, want both credits", before.Resets)
+	}
+	f.server.AutoRedeemRateLimitReset = true
+	redeemed, ok := f.server.redeemForFailover(context.Background(), accounts.ProviderCodex, "codex", "s1", "", nil)
+	if consumes, _ := f.counts(); !ok || redeemed.ID != heldCodex || consumes != 1 {
+		t.Fatalf("calibration: the failover redeemed %q (%v) with %d consumes, want held once", redeemed.ID, ok, consumes)
+	}
+	wantCodexReading(t, "at once after the failover's redeem", claimRows(t, f.server)[heldCodex], late)
+}
+
+// Part I: the redeem's reading stands only on a row read before the redeem.
+// A credit is granted after it, and the next sweep's own reading, two
+// credits, is the row's.
+func TestASweepsReadingAfterARedeemIsTheRows(t *testing.T) {
+	setAutoResetForTest(t, AutoResetShadow, true)
+	f := newCodexClaimFake(t, map[string]*codexClaimAccount{
+		heldCodex:  {used: 100, credits: heldCodexCredits("credit-soon", "credit-late")},
+		spareCodex: {used: 30},
+	})
+	recorder := httptest.NewRecorder()
+	f.server.Handler().ServeHTTP(recorder, loopbackAdminRequest(http.MethodPost, "/_subrouter/rate-limit-reset?email="+heldCodex+"&anytime=true", nil))
+	if consumes, _ := f.counts(); recorder.Code != http.StatusOK || consumes != 1 {
+		t.Fatalf("calibration: the redeem by hand answered %d %s with %d consumes", recorder.Code, recorder.Body.String(), consumes)
+	}
+	f.set(heldCodex, func(a *codexClaimAccount) {
+		a.credits = append(a.credits, autoResetTestCredit("credit-granted", 9*24*time.Hour))
+	})
+	f.server.AccountRef.InvalidateUsageStatusCache()
+	row := claimRows(t, f.server)[heldCodex]
+	if left := codexLeft(row); row.ResetsFromClaim || left != "2 left" {
+		t.Fatalf("after a sweep read two credits held's row carries %s (from the claim: %v), want the sweep's two credits, unmarked",
+			left, row.ResetsFromClaim)
 	}
 }
 

@@ -7076,7 +7076,8 @@ func (s Server) redeemAccountChecked(ctx context.Context, account accounts.Accou
 	}
 	history.observe(account, after.Windows, afterAt)
 	// The read after the consume is a reading of the credits, as a sweep's
-	// read is: its count replaces the block the redeem left (§102.2, part I).
+	// read is: its count replaces the block the redeem left, on every row
+	// read before the redeem (blockOn, §102.2, part I).
 	s.AccountRef.noteResetBlockRead(accounts.ProviderCodex, account.ID, after.ComplimentaryReset, afterAt, readByClaim)
 	result.WindowsAfter = after.Windows
 	return result
