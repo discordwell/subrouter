@@ -456,6 +456,9 @@ func (s Score) FableSpentFactor() float64 {
 // Fable-spent factor, which stacks on either. Each is a factor on one score's
 // own pace, so the comparator stays a strict weak ordering.
 func (s Scheduler) rankingPace(score Score, pace float64, now time.Time) float64 {
+	// 2026-11-24 owner: route Opus and other non-Fable sessions onto accounts
+	// that are out of Fable but still have week left, so Fable headroom
+	// elsewhere is kept for Fable sessions (PATCHES §65, §104).
 	// An account chosen for its Fable meter is not ranked up for the Opus or
 	// Sonnet work that would eat the week under its reset (PATCHES §95.2).
 	if s.nonFableClaudeTurn && score.ResetChoice.Meter != ResetChoiceFable {
