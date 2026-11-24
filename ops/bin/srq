@@ -591,8 +591,9 @@ def _self_start(norm):
 AUTO_RESET_VERDICTS = ("would_claim", "refused_by_condition", "held_back", "no_claim", "claimed", "failed",
                        "may_have_landed")
 AUTO_RESET_KINDS = {"week": "week", "fable": "Fable", "codex_credit": "credit"}
-# The steps of §94.2's rule a decision can stop at (PATCHES §94.3).
-AUTO_RESET_RULE_STEPS = ("unknown_clock", "expiry_window", "last_chance", "need", "roll_unread", "value")
+# The steps of §94.2's rule a decision can stop at (PATCHES §94.3), and
+# §103's: the same reset is worth clearly more at the account's next wall.
+AUTO_RESET_RULE_STEPS = ("unknown_clock", "expiry_window", "last_chance", "need", "roll_unread", "value", "later_wall")
 
 
 def _auto_reset(row):
@@ -631,10 +632,13 @@ def _auto_reset(row):
 def _auto_reset_rule(rule):
     """What §94.2's rule used for a decision, flattened: the step it stopped
     at, the pool's need and pressure, what a claim adds as a share of a week,
-    and the hours to the roll. All None for a decision the rule did not make,
-    a daemon before §94, or a malformed rule (PATCHES §94.3)."""
+    and the hours to the roll; and since §103, what the same reset is
+    expected to add at the account's next wall, and when that is. All None for
+    a decision the rule did not make, a daemon before §94, or a malformed rule
+    (PATCHES §94.3)."""
     out = {"auto_reset_decided_by": None, "auto_reset_need": None, "auto_reset_pressure": None,
-           "auto_reset_value": None, "auto_reset_hours_to_roll": None}
+           "auto_reset_value": None, "auto_reset_hours_to_roll": None, "auto_reset_later_value": None,
+           "auto_reset_later_wall_at": None}
     if (not isinstance(rule, dict) or rule.get("decided_by") not in AUTO_RESET_RULE_STEPS
             or rule.get("need") not in ("yes", "no", "unknown")):
         return out
@@ -647,7 +651,9 @@ def _auto_reset_rule(rule):
     out.update({"auto_reset_decided_by": rule["decided_by"], "auto_reset_need": rule["need"],
                 "auto_reset_pressure": pressure if pressure == "all_at_limit" else number(pressure),
                 "auto_reset_value": number(rule.get("value")),
-                "auto_reset_hours_to_roll": number(rule.get("hours_to_roll"))})
+                "auto_reset_hours_to_roll": number(rule.get("hours_to_roll")),
+                "auto_reset_later_value": number(rule.get("later_value")),
+                "auto_reset_later_wall_at": rule["later_wall_at"] if _instant(rule.get("later_wall_at")) else None})
     return out
 
 
@@ -1091,7 +1097,9 @@ def _render_sections(rows, where, peer=False):
                          "auto = the last automatic reset decision (§93), at that time: would claim (shadow: real mode"
                          " would claim it now), claiming, claimed, CLAIM FAILED, MAY HAVE LANDED (only a reading settles"
                          " it), refused <1% (the owner's condition stopped it), held back (§94: the pool does not need"
-                         " it, or a claim adds under a quarter of a week, wk, before the roll), no claim; (expiry window)"
+                         " it, or a claim adds under a quarter of a week, wk, before the roll), held back (... at its next"
+                         " wall) (§103: the same reset adds clearly more at the account's next wall, so it waits for that"
+                         " wall), no claim; (expiry window)"
                          " or (last chance) = claimed at any value because the reset expires soon; usage-status has the"
                          " reason")
         end = ";" if extra else ")"
@@ -1174,8 +1182,15 @@ def _reset_choice_label(r):
 def _held_back_why(r):
     """Why §94.2's rule held a claim back, in a few words: the pool does not
     need the reset, with its pressure; or a claim adds too little before the
-    roll, with what it adds and the hours to the roll. "" when not published."""
+    roll, with what it adds and the hours to the roll; or the same reset adds
+    clearly more at the account's next wall (§103), with both values and that
+    wall's time in this machine's time. "" when not published."""
     by = r["auto_reset_decided_by"]
+    if by == "later_wall" and r["auto_reset_value"] is not None and r["auto_reset_later_value"] is not None \
+            and r["auto_reset_later_wall_at"]:
+        wall = _instant(r["auto_reset_later_wall_at"])
+        return (f"({r['auto_reset_value']:.2f} wk now, {r['auto_reset_later_value']:.2f} at its next wall"
+                f" {_month_day(wall)} {wall.astimezone():%H:%M})")
     if by == "need":
         pressure = r["auto_reset_pressure"]
         if isinstance(pressure, (int, float)):
@@ -2649,6 +2664,39 @@ def cmd_selftest(_argv):
           and summarize(worth_row(0, verdict="held_back", kind="week",
                                   rule={**rule("value", "yes", True, "0.07", False)}))["auto_reset_value"] is None
           and summarize({**claude_row(0, True, "eligible"), "auto_reset": {"mode": "shadow", "worth": "yes"}})["auto_reset_worth"] is None)
+
+    print("automatic resets: a claim held back for the account's next wall (PATCHES §103)")
+    later_at = "2026-11-24T18:08:45Z"
+    later_local = _instant(later_at)
+    later_words = f"{_month_day(later_local)} {later_local.astimezone():%H:%M}"
+    waits = {**rule("later_wall", "yes", 1.2, 0.269, 6.4), "later_value": 1, "later_wall_at": later_at}
+    waiting_row = worth_row(0, mode="real", verdict="held_back", kind="fable", rule=waits,
+                            reason="...; held back: a claim adds 0.27 of a week now, and the same reset is expected to add 1.00"
+                                   " at the account's next wall ..., so it waits for that wall")
+    check("a claim that waits for the next wall reads both values and that wall's time",
+          _auto_reset_label(summarize(waiting_row)) == f"auto=held back Fable (0.27 wk now, 1.00 at its next wall {later_words}) {at}")
+    text = rendered([summarize(waiting_row), summarize(worth_row(1))])
+    check("it reads beside its account, and the legend explains it",
+          f"  auto=held back Fable (0.27 wk now, 1.00 at its next wall {later_words}) {at}\n" in text
+          and "held back (... at its next wall) (§103: the same reset adds clearly more at the account's next wall, so it"
+              " waits for that wall)" in text)
+    check("peer: the peer's own decision that waits",
+          f"  auto=held back Fable (0.27 wk now, 1.00 at its next wall {later_words}) {at}\n"
+          in rendered([summarize(waiting_row)], peer=True))
+    s = summarize(waiting_row)
+    check("--json carries the later value and the later wall's time",
+          s["auto_reset_decided_by"] == "later_wall" and s["auto_reset_later_value"] == 1
+          and s["auto_reset_later_wall_at"] == later_at and s["auto_reset_value"] == 0.269
+          and summarize(held[0])["auto_reset_later_value"] is None and summarize(held[0])["auto_reset_later_wall_at"] is None)
+    passed = {**rule("value", "yes", 1.2, 0.85, 20.4), "later_value": 1, "later_wall_at": later_at}
+    check("a claim that passed the comparison reads as a claim",
+          _auto_reset_label(summarize(worth_row(0, verdict="would_claim", kind="fable", rule=passed))) == f"auto=would claim Fable {at}"
+          and summarize(worth_row(0, verdict="would_claim", kind="fable", rule=passed))["auto_reset_later_value"] == 1)
+    check("a malformed later wall reads as none",
+          summarize(worth_row(0, verdict="held_back", kind="fable", rule={**waits, "later_value": "1"}))["auto_reset_later_value"] is None
+          and summarize(worth_row(0, verdict="held_back", kind="fable", rule={**waits, "later_wall_at": "tomorrow"}))["auto_reset_later_wall_at"] is None
+          and _auto_reset_label(summarize(worth_row(0, verdict="held_back", kind="fable", rule={**waits, "later_value": True})))
+          == f"auto=held back Fable {at}")
 
     print("reauth: the dir comes from the DAEMON, never from `sr claude env`")
     rows = [{"id": "main", "source": "/x/_p1787439913450"},
