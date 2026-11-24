@@ -179,9 +179,9 @@ func TestAWeekHolderIsChosenWhenThePoolNeedsItsResets(t *testing.T) {
 
 // 2. Three week holders with 150, 90 and 40 hours to their rolls and the
 // same headroom are ordered 1, 2, 3: the one with the most time left to its
-// roll first. A fourth with 20 hours, whose claim at its wall would add 0.16
-// of a week and whose reset is neither in its last chance nor in its expiry
-// window, is not chosen.
+// roll first. A fourth with 20 hours, whose roll is 18 hours past its wall
+// and whose reset is neither in its last chance nor in its expiry window, is
+// not chosen: a claim there is under a day from the roll (§103).
 func TestWeekHoldersAreOrderedByTheValueAtTheirWall(t *testing.T) {
 	var list []choiceAccount
 	for _, hours := range []int{40, 150, 20, 90} {
@@ -190,7 +190,7 @@ func TestWeekHoldersAreOrderedByTheValueAtTheirWall(t *testing.T) {
 	}
 	got := choose(choiceNow, resetCodexHold{}, append(list, spares(1.5, 2)...)...)
 	wantChosen(t, "three holders", got, selectacct.ResetChoiceWeek, "h150", "h90", "h40")
-	wantWords(t, "under the floor", got.why["h20"], "a claim there adds 0.16 of a week, under the floor of 0.25")
+	wantWords(t, "under a day from the roll", got.why["h20"], "would be held: the week rolls in 18h8m, under 24h")
 }
 
 // 3. An account whose next reset is a Fable reset, in a pool whose Fable

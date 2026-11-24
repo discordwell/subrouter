@@ -107,11 +107,12 @@ type ClaudeResetRequest struct {
 	// when none of the limits the grant clears is exhausted (the answer
 	// says so after the fact, EarlyUse).
 	Early bool `json:"early,omitempty"`
-	// liveCheck, set only by an automatic claim at a reading moment
-	// (§94.2), makes the call read the account live, never from the cache,
-	// and judge the meters of that read before anything is sent: an error
-	// is the refusal.
-	liveCheck func(windows []accounts.UsageWindow, at time.Time) error
+	// check, set only by an automatic claim (§93.2), judges the meters of the
+	// read the call goes by, after its reads and waits and before anything is
+	// sent: an error is the refusal. readLive, set with it at a reading moment
+	// (§94.2), makes that read a live one, never the cache.
+	check    func(windows []accounts.UsageWindow, at time.Time) error
+	readLive bool
 }
 
 // ClaudeResetResponse is what one call found and, for a claim, what came
@@ -424,7 +425,7 @@ func (s Server) claudeReset(work, caller context.Context, request ClaudeResetReq
 	var state claudeResetState
 	var grant *agentclaude.ResetGrant
 	refusal := ""
-	if cached.status != nil && now.Sub(cached.at) < claudeResetCacheFresh && request.liveCheck == nil {
+	if cached.status != nil && now.Sub(cached.at) < claudeResetCacheFresh && !request.readLive {
 		if g, why := chooseClaudeResetGrant(cached.status, request.GrantID, now); why == "" {
 			state, grant = cached, g
 		}
@@ -438,7 +439,7 @@ func (s Server) claudeReset(work, caller context.Context, request ClaudeResetReq
 			response.HTTPStatus = httpErr.StatusCode
 			response.Error = fmt.Sprintf("Anthropic answered %s to the reset status read; the daemon did not refresh or retry", httpErr.Status)
 			return response, http.StatusOK
-		case err != nil && request.liveCheck != nil:
+		case err != nil && request.readLive:
 			response.Refusal = "the live reading before the claim failed: " + err.Error()
 			return response, http.StatusOK
 		case err != nil && cached.status != nil && time.Since(cached.at) < claudeResetCacheFallback:
@@ -466,8 +467,8 @@ func (s Server) claudeReset(work, caller context.Context, request ClaudeResetReq
 		response.StatusAgeSeconds = int64(time.Since(state.at) / time.Second)
 	}
 	response.Windows = state.windows
-	if request.liveCheck != nil {
-		if err := request.liveCheck(state.windows, state.at); err != nil {
+	if request.check != nil {
+		if err := request.check(state.windows, state.at); err != nil {
 			response.Refusal = err.Error()
 			return response, http.StatusOK
 		}

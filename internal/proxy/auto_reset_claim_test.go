@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -56,6 +57,8 @@ type claudeClaimProfile struct {
 	reorderAtLimit bool
 	// usableEarly lists the grants usable now before any limit is reached.
 	usableEarly bool
+	// roll is how far ahead both meters roll; 0 is three days.
+	roll time.Duration
 }
 
 // claudeClaimFake is a fake Anthropic shared by every daemon that holds its
@@ -140,7 +143,11 @@ func (f *claudeClaimFake) anthropic(req *http.Request) (*http.Response, error) {
 		if len(grants) > 0 {
 			block["next_grant_id"] = grants[0].(map[string]any)["id"]
 		}
-		week := time.Now().Add(3 * 24 * time.Hour).UTC().Format(time.RFC3339)
+		roll := 3 * 24 * time.Hour
+		if p.roll > 0 {
+			roll = p.roll
+		}
+		week := time.Now().Add(roll).UTC().Format(time.RFC3339)
 		body, _ := json.Marshal(map[string]any{"seven_day": map[string]any{"utilization": p.week, "resets_at": week},
 			"seven_day_oauth_apps": map[string]any{"utilization": p.fable, "resets_at": week}, "cedar_ember": block})
 		return respond(http.StatusOK, string(body))
@@ -437,6 +444,8 @@ func TestTurnsThatArriveWhileTheClaimRunsWaitOnTheSameAccount(t *testing.T) {
 type codexClaimAccount struct {
 	used    float64
 	credits []accounts.RateLimitResetCredit
+	// resetAfter is the seconds to the week's roll; 0 is six days.
+	resetAfter int64
 }
 
 // codexClaimFake is a fake ChatGPT whose accounts spend: a turn meets the
@@ -580,9 +589,10 @@ func (f *codexClaimFake) chatgpt(req *http.Request) (*http.Response, error) {
 	}
 	switch req.URL.Path {
 	case "/backend-api/wham/usage":
+		resetAfter := cmp.Or(account.resetAfter, 518400)
 		body, _ := json.Marshal(map[string]any{"plan_type": "pro",
 			"rate_limit": map[string]any{"limit_reached": account.used >= 100, "primary_window": map[string]any{
-				"used_percent": account.used, "limit_window_seconds": 604800, "reset_after_seconds": 518400}},
+				"used_percent": account.used, "limit_window_seconds": 604800, "reset_after_seconds": resetAfter}},
 			"rate_limit_reset_credits": map[string]any{"available_count": available}})
 		return respond(http.StatusOK, body)
 	case "/backend-api/wham/rate-limit-reset-credits":

@@ -46,10 +46,6 @@ import (
 	"github.com/manaflow-ai/subrouter/internal/proxy"
 )
 
-// providerResetWeeklyWaste is how close a weekly roll makes a reset mostly
-// wasted: the roll would clear the week soon anyway.
-const providerResetWeeklyWaste = 24 * time.Hour
-
 // providerResetAskHeadroom is the weekly headroom, in percent, above which a
 // reset asks first: the week still has that much left to spend.
 const providerResetAskHeadroom = 10.0
@@ -519,7 +515,8 @@ func (r srRunner) providerReset(ctx context.Context, provider accounts.Provider,
 // resetWasteReasons says why a reset of this row now would be partly wasted
 // (the owner's rule, 2026-10-01, §46.11): its week has more than
 // providerResetAskHeadroom left, or rolls on its own within
-// providerResetWeeklyWaste. An unread weekly meter is a reason too: nothing
+// proxy.ResetRollWaste (inside which no automatic claim is made either,
+// §103). An unread weekly meter is a reason too: nothing
 // says the reset is needed. Empty means just do it.
 func resetWasteReasons(provider accounts.Provider, windows []accounts.UsageWindow) []string {
 	var week *accounts.UsageWindow
@@ -542,7 +539,7 @@ func resetWasteReasons(provider accounts.Provider, windows []accounts.UsageWindo
 	if left := 100 - week.UsedPercent; left > providerResetAskHeadroom {
 		reasons = append(reasons, fmt.Sprintf("its week is %g%% used (%g%% left)", week.UsedPercent, left))
 	}
-	if roll := time.Duration(week.ResetAfterSeconds) * time.Second; roll > 0 && roll < providerResetWeeklyWaste {
+	if roll := time.Duration(week.ResetAfterSeconds) * time.Second; roll > 0 && roll < proxy.ResetRollWaste {
 		reasons = append(reasons, "its week rolls on its own in "+formatDuration(week.ResetAfterSeconds))
 	}
 	return reasons
@@ -770,7 +767,7 @@ func printClaudeResetPreview(out io.Writer, holder resetHolder, preview proxy.Cl
 	if preview.EarlyUse && preview.Claimable {
 		fmt.Fprintln(out, "  ! Early use: none of the limits this reset clears is exhausted, so a claim now spends it before it is needed.")
 	}
-	if roll, ok := claudeWeeklyRoll(preview, now); ok && roll < providerResetWeeklyWaste {
+	if roll, ok := claudeWeeklyRoll(preview, now); ok && roll < proxy.ResetRollWaste {
 		fmt.Fprintf(out, "  ! The weekly window rolls in %s: a reset now would mostly be wasted.\n", formatDuration(int64(roll/time.Second)))
 	}
 	if wait, ok := claudeShortWindowOnlyWait(preview); ok && wait <= providerResetShortWaste {
