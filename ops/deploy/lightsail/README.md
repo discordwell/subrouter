@@ -8,7 +8,7 @@ A box is a second subrouter daemon on a small Linux machine that stays on while 
 | `bootstrap.sh` | the box | Installs Tailscale and the daemon, keeps or mints its three tokens, and prints the laptop's configuration. |
 | `deploy-box.sh` | the box | Swaps in a new build, verifies both listeners, and rolls back on a failed check. |
 
-Upstream's remote installer, `sr server install`, installs upstream's release, which this fork refuses (PATCHES §37.3). `bootstrap.sh` adapts the same recipe, and its header names the two differences.
+`sr server install` installs the release and then runs `install-systemd` on the host. `bootstrap.sh` adapts the same recipe, and its header names the two differences.
 
 ## Read this before you move an account
 

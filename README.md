@@ -15,9 +15,19 @@ Subrouter is a local AI coding-agent proxy. It routes traffic across Codex accou
 
 ## Install
 
+### Install the release
+
+On macOS, Linux or a BSD:
+
+```bash
+curl -fsSL https://github.com/discordwell/subrouter/releases/latest/download/install.sh | sh
+```
+
+The script downloads the latest release of this fork, checks it against the release's `SHA256SUMS`, and installs `subrouter` to `~/bin` (`/usr/local/bin` as root) with `sr` and `cx` linked to it. It installs no daemon. `SUBROUTER_VERSION=0.2.0` installs that release, and `SUBROUTER_INSTALL_DIR` changes the directory. Windows binaries are on the [releases page](https://github.com/discordwell/subrouter/releases).
+
 ### Build from source
 
-This fork publishes no release. On a Mac:
+On a Mac:
 
 ```bash
 git clone https://github.com/discordwell/subrouter.git
@@ -29,7 +39,7 @@ make build
 
 ### Updating and rolling back
 
-This fork has no `sr update` or `sr rollback`, no `sr doctor` version check, and no `subrouter-deploy.sh`. Upstream's versions of all of them install upstream's release binary in place of this fork's, which drops every fork patch (`ops/PATCHES.md` §23; §37.3 refuses the same binary in `sr server install`). `ops/deploy/macos/deploy-laptop.sh` deploys a build to the laptop, and `ops/deploy/lightsail/deploy-box.sh` to the box. A `make build` binary reports its mainline as `local-build`. See [docs/upgrades.md](docs/upgrades.md).
+This fork has no `sr update` or `sr rollback`, no `sr doctor` version check, and no `subrouter-deploy.sh` (`ops/PATCHES.md` §23). To update a release install, run the install command again. `ops/deploy/macos/deploy-laptop.sh` deploys a build to the laptop, and `ops/deploy/lightsail/deploy-box.sh` to the box. A `make build` binary reports its mainline as `local-build`. See [docs/upgrades.md](docs/upgrades.md).
 
 ### Local macOS daemon
 
@@ -141,8 +151,6 @@ Enabling it closes the unsecured legacy default: a caller the tailnet does not r
 sr server add mac-mini --url http://100.64.0.9:31415 --ssh-host worker@mac-mini
 sr server install mac-mini
 ```
-
-On this fork that command refuses: it installs upstream's public release binary before provisioning, which would replace this fork's. This fork deploys its own hosts from a source build instead.
 
 On the host that resolves to `sudo sr install-systemd` on Linux and `sudo sr install-launchd` on macOS. `install-launchd` provisions credentials into an existing LaunchDaemon rather than creating the service: it writes the tokens to 0600 files owned by the service user, points `SUBROUTER_ADMIN_TOKEN_FILE` and `SUBROUTER_ACCOUNT_IMPORT_TOKEN_FILE` at them, and reloads the job. Every other key in the plist is left alone, so a host keeps its supervisor layout, service user, and per-host flags across a credential rotation. Build the service itself with [deploy/macos/migrate-launchdaemon-to-supervisor.sh](deploy/macos/migrate-launchdaemon-to-supervisor.sh) first.
 

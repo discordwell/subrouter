@@ -3,7 +3,7 @@
 # after its release checksum matches.
 set -euo pipefail
 
-REPO="${SUBROUTER_REPO:-manaflow-ai/subrouter}"
+REPO="${SUBROUTER_REPO:-discordwell/subrouter}"
 RELEASE_TAG="${SUBROUTER_RELEASE_TAG:?set SUBROUTER_RELEASE_TAG to an explicit version tag such as v0.1.52}"
 RELEASE_ARCH="${SUBROUTER_RELEASE_ARCH:-amd64}"
 OUTPUT="${SUBROUTER_RELEASE_OUTPUT:?set SUBROUTER_RELEASE_OUTPUT}"

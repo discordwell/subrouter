@@ -45,7 +45,7 @@ repo="$(jq -r '.repository // empty' "${metadata_file}")"
 release_tag="$(jq -r '.release_tag // empty' "${metadata_file}")"
 release_revision="$(jq -r '.source_revision // empty' "${metadata_file}")"
 verification_sha256="$(jq -r '.verification_evidence_sha256 // empty' "${metadata_file}")"
-if [[ "${repo}" != manaflow-ai/subrouter ]]; then
+if [[ "${repo}" != discordwell/subrouter ]]; then
   echo "startup: release metadata repository is not trusted" >&2
   exit 1
 fi
@@ -62,7 +62,7 @@ binary_asset="subrouter_${version}_linux_amd64"
 required_assets=(SHA256SUMS SOURCE_PROVENANCE.json deployment-contract.py install.sh install-front-slots.sh "${binary_asset}")
 jq -e --arg binary "${binary_asset}" '
   .schema == "subrouter.gcp.vm-release-metadata/v1" and
-  .repository == "manaflow-ai/subrouter" and
+  .repository == "discordwell/subrouter" and
   .tag_on_main == true and .release_immutable == true and
   .strict_build_attestation_verified == true and .asset_digest_verified == true and
   .provenance_verified == true and .embedded_revision_verified == true and

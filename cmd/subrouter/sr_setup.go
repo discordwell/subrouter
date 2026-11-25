@@ -398,10 +398,9 @@ func runDoctorWith(ctx context.Context, controller serviceController, controller
 		checks = append(checks, doctorCheck{"warn", "local daemon", fmt.Sprintf("%s is not answering; run '%s daemon start'", local, programBase())})
 	}
 	// Upstream's doctorVersionChecks (sr_doctor_version.go) are not wired:
-	// every remedy they print is upstream's release installer ('sr update',
-	// subrouter-deploy.sh install-release), which this fork refuses
-	// (PATCHES §23, §37.3), and an unstamped fork build would always read
-	// as a provenance warning.
+	// every remedy they print ('sr update', subrouter-deploy.sh
+	// install-release) is one this fork does not carry (PATCHES §23), and an
+	// unstamped fork build would always read as a provenance warning.
 
 	if teamReady {
 		if localOK {

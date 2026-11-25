@@ -54,7 +54,7 @@ func TestServerInstallWithoutAnyTargetNamesBothOptions(t *testing.T) {
 
 	var out bytes.Buffer
 	runner := srRunner{program: "sr", store: store, in: strings.NewReader(""), out: &out, errOut: &out}
-	err := runner.run(context.Background(), []string{"server", "install", "mac-mini", "--allow-upstream-release"})
+	err := runner.run(context.Background(), []string{"server", "install", "mac-mini"})
 	if err == nil {
 		t.Fatal("expected install to fail without a target")
 	}
@@ -82,7 +82,7 @@ func TestServerInstallOverSSHSendsTokensOnStdin(t *testing.T) {
 	var out bytes.Buffer
 	fake := &stdinCapturingRunner{}
 	runner := srRunner{program: "sr", store: store, in: strings.NewReader(""), out: &out, errOut: &out, cmd: fake}
-	if err := runner.run(context.Background(), []string{"server", "install", "mac-mini", "--allow-upstream-release"}); err != nil {
+	if err := runner.run(context.Background(), []string{"server", "install", "mac-mini"}); err != nil {
 		t.Fatal(err)
 	}
 

@@ -595,10 +595,10 @@ func runForProgram(program string, args []string) error {
 		return nil
 	}
 	// Upstream's `update` / `rollback` verbs and the once-a-day background
-	// `update --auto` (maybeStartAutoUpdate, #381 and #623) are not taken:
-	// each installs upstream's release binary over this fork's build. No
-	// upstream release binary is installed over the fork (PATCHES 23, 29,
-	// 37.3); this fork is deployed from source.
+	// `update --auto` (maybeStartAutoUpdate, #381 and #623) are not taken
+	// (PATCHES 23, 29): each replaces the binary outside this fork's deploy
+	// scripts. sr_update.go names this fork's releases (PATCHES 107), but
+	// nothing calls it.
 
 	// A spelling the 2026-09 grammar pass retired prints one line naming its
 	// replacement. Here, not only in srRunner.run, because several of them
@@ -1940,8 +1940,8 @@ func serve(args []string) error {
 	if !*multiTenant && server.AccountImportState() == proxy.AccountImportDisabled {
 		slog.Warn(
 			"account import is disabled: no admin or account-import credential is configured, so this server rejects every sr add",
-			// Not `sr server install`: that path installs the upstream release
-			// binary over this fork. Our deploy scripts set the token files.
+			// Not `sr server install`: it rewrites the unit or plist that this
+			// fork's deploy scripts write, and those scripts set the token files.
 			"fix", "set SUBROUTER_ACCOUNT_IMPORT_TOKEN_FILE and SUBROUTER_ADMIN_TOKEN_FILE",
 		)
 	}

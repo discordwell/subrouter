@@ -9,7 +9,7 @@ SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 # shellcheck disable=SC1091
 . "$SCRIPT_DIR/mutation-lease-lib.sh"
 
-REPO="${SUBROUTER_REPO:-manaflow-ai/subrouter}"
+REPO="${SUBROUTER_REPO:-discordwell/subrouter}"
 BIN="${SUBROUTER_BIN:-/usr/local/bin/subrouter}"
 VERSION_FILE="${SUBROUTER_VERSION_FILE:-/etc/subrouter-version}"
 LABEL="${SUBROUTER_LABEL:-ai.manaflow.subrouter-team}"

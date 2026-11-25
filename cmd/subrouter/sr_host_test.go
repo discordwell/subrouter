@@ -162,10 +162,9 @@ func setupHostTest(t *testing.T, serverURL string) (srRunner, *hostFakeHost, *by
 }
 
 // Upstream merge 2026-11: `sr host` (#437/#440) is not dispatched in this fork.
-// attach installs upstream's release (or a `go install` build of this module)
-// on the other machine and writes a reverse-tunnel LaunchAgent here, outside
-// the PATCHES 17 gate -- the same reason §37.3 refuses `sr server install`'s
-// release. The file stays for serverHeading and the attach marker, so the
+// attach installs a release (or a `go install` build of this module) on the
+// other machine and writes a reverse-tunnel LaunchAgent here, outside the
+// PATCHES 17 gate. The file stays for serverHeading and the attach marker, so the
 // tests below drive runner.host directly; this one pins that the verb is
 // unreachable from the command line and touches nothing.
 func TestSRHostIsNotDispatched(t *testing.T) {
@@ -423,7 +422,7 @@ func TestHostInstallScriptIsIdempotent(t *testing.T) {
 	curl := `#!/bin/sh
 echo "curl $*" >> ` + shellQuote(log) + `
 case "$*" in
-  *url_effective*) printf 'https://github.com/manaflow-ai/subrouter/releases/tag/v0.1.133' ;;
+  *url_effective*) printf 'https://github.com/discordwell/subrouter/releases/tag/v0.1.133' ;;
   *install.sh*) printf '%s\n' 'mkdir -p "$SUBROUTER_INSTALL_DIR"; printf x > "$SUBROUTER_INSTALL_DIR/subrouter"; chmod +x "$SUBROUTER_INSTALL_DIR/subrouter"; echo "installed $SUBROUTER_VERSION"' ;;
 esac
 `
@@ -456,6 +455,18 @@ mkdir -p "$GOBIN"; printf x > "$GOBIN/subrouter"; chmod +x "$GOBIN/subrouter"
 	}
 	if n := strings.Count(calls(), "install.sh"); n != 1 {
 		t.Fatalf("install.sh fetched %d times:\n%s", n, calls())
+	}
+	// Both the latest tag and install.sh come from this fork's releases.
+	for _, want := range []string{
+		"https://github.com/discordwell/subrouter/releases/latest\n",
+		"https://github.com/discordwell/subrouter/releases/latest/download/install.sh",
+	} {
+		if !strings.Contains(calls(), want) {
+			t.Fatalf("no curl of %s:\n%s", want, calls())
+		}
+	}
+	if got := run(hostInstallSpec{"release", "v0.2.0"}); !strings.Contains(got, "installed 0.2.0") {
+		t.Fatalf("tag install: %s", got)
 	}
 
 	run(hostInstallSpec{"auto-source", "a6cf5e87a63f"})

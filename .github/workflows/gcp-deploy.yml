@@ -90,10 +90,10 @@ jobs:
           for asset in "${required_assets[@]}"; do
             download_args+=(--pattern "${asset}")
           done
-          gh release download "${SUBROUTER_RELEASE_TAG}" --repo manaflow-ai/subrouter \
+          gh release download "${SUBROUTER_RELEASE_TAG}" --repo discordwell/subrouter \
             --dir "${release_asset_dir}" "${download_args[@]}"
           release_state="${GITHUB_WORKSPACE}/artifacts/build-provenance/release-state.json"
-          gh release view "${SUBROUTER_RELEASE_TAG}" --repo manaflow-ai/subrouter \
+          gh release view "${SUBROUTER_RELEASE_TAG}" --repo discordwell/subrouter \
             --json isDraft,isImmutable,tagName,targetCommitish,assets >"${release_state}"
           jq -e --arg tag "${SUBROUTER_RELEASE_TAG}" \
             '.tagName == $tag and (.isDraft | not) and .isImmutable' "${release_state}" >/dev/null
@@ -117,10 +117,10 @@ jobs:
               '[.assets[]? | select(.name == $asset and .digest == $digest)] | length == 1' \
               "${release_state}" >/dev/null
             gh release verify-asset "${SUBROUTER_RELEASE_TAG}" "${path}" \
-              --repo manaflow-ai/subrouter --format json >/dev/null
+              --repo discordwell/subrouter --format json >/dev/null
             gh attestation verify "${path}" \
-              --repo manaflow-ai/subrouter \
-              --signer-workflow manaflow-ai/subrouter/.github/workflows/release.yml \
+              --repo discordwell/subrouter \
+              --signer-workflow discordwell/subrouter/.github/workflows/release.yml \
               --source-ref "refs/tags/${SUBROUTER_RELEASE_TAG}" \
               --source-digest "${release_commit}" \
               --deny-self-hosted-runners --format json \

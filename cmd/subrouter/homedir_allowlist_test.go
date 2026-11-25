@@ -38,14 +38,15 @@ var homeDirCallers = map[string]bool{
 	// recover`.
 	"cmd/subrouter/recovery.go": true,
 	// Upstream merge 2026-11. `sr host` is not dispatched in this fork (it
-	// installs upstream's release on another machine); the file stays for
-	// serverHeading. Its LaunchAgents/Logs paths are test seams.
+	// installs a release on another machine, outside the PATCHES §17 gate);
+	// the file stays for serverHeading. Its LaunchAgents/Logs paths are test
+	// seams.
 	"cmd/subrouter/sr_host.go": true,
 	// Upstream merge 2026-11 (#429). The status-line hook honours
 	// CLAUDE_CONFIG_DIR first and only reads settings.json.
 	"cmd/subrouter/sr_session_status.go": true,
 	// Upstream merge 2026-11. `sr update`, `sr rollback` and the auto-update
-	// trigger are not dispatched in this fork (PATCHES §23, §37.3); the files
+	// trigger are not dispatched in this fork (PATCHES §23); the files
 	// are kept unwired, like the installers §23 merged.
 	"cmd/subrouter/sr_update.go":        true,
 	"cmd/subrouter/sr_update_auto.go":   true,

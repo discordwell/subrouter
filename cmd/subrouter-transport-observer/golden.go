@@ -1966,8 +1966,8 @@ func acquireReleasedClient(ctx context.Context, options goldenOptions, privateRo
 		}, nil
 	}
 	httpClient := &http.Client{Timeout: 30 * time.Second}
-	latestURL := "https://api.github.com/repos/manaflow-ai/subrouter/releases/latest"
-	downloadRoot := "https://github.com/manaflow-ai/subrouter/releases/download"
+	latestURL := "https://api.github.com/repos/discordwell/subrouter/releases/latest"
+	downloadRoot := "https://github.com/discordwell/subrouter/releases/download"
 	if testMode {
 		if override := strings.TrimSpace(goldenTestHooks.releaseAPI); override != "" {
 			latestURL = override
@@ -2074,7 +2074,7 @@ func verifyGoldenPredecessorProvenance(
 		SHA string `json:"sha"`
 	}
 	if err := getGoldenGitHubJSON(ctx, httpClient,
-		"https://api.github.com/repos/manaflow-ai/subrouter/commits/v"+version, &tagged); err != nil || tagged.SHA != revision {
+		"https://api.github.com/repos/discordwell/subrouter/commits/v"+version, &tagged); err != nil || tagged.SHA != revision {
 		return "", false, failGolden("predecessor_tag_mismatch")
 	}
 	var comparison struct {
@@ -2095,7 +2095,7 @@ func goldenGitHubComparisonURL(revision string) string {
 	comparison := url.URL{
 		Scheme: "https",
 		Host:   "api.github.com",
-		Path:   "/repos/manaflow-ai/subrouter/compare/" + revision + "...main",
+		Path:   "/repos/discordwell/subrouter/compare/" + revision + "...main",
 	}
 	query := comparison.Query()
 	// GitHub includes every changed file only on page one. The ancestry fields
