@@ -2586,9 +2586,9 @@ if begin laptop-check-ok; then
 fi
 
 if begin laptop-installs-where-the-job-runs-not-subrouter-bin; then
-  # SUBROUTER_BIN is the npm and Python wrappers' knob. The deploy installed
-  # there, restarted a job that runs ~/bin/subrouter, and printed DEPLOY OK
-  # on the old build.
+  # SUBROUTER_BIN was the knob of the npm and Python wrappers (removed in
+  # PATCHES 107). The deploy installed there, restarted a job that runs
+  # ~/bin/subrouter, and printed DEPLOY OK on the old build.
   laptop_setup post post; mkdir -p "$H/other"; make_build "$H/other/subrouter" post elsewhere
   run_laptop SUBROUTER_BIN="$H/other/subrouter"
   expect_rc 0; expect_out "DEPLOY OK"; expect_build "$CUR" new; expect_running new

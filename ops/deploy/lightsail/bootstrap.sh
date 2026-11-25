@@ -28,10 +28,11 @@
 #
 # Adapted from the recipe `sr server install` generates (cmd/subrouter/sr_server.go),
 # with two deliberate changes:
-#   1. The binary is uploaded, NOT fetched from the public install script. That
-#      script installs UPSTREAM, which lacks the startup guard that makes a
-#      non-loopback bind refuse rather than serve unauthenticated (PATCHES §12;
-#      §37.3 refuses the script).
+#   1. The binary is uploaded, NOT fetched from the public install script, so
+#      the box runs the build push-box.sh sends. Before PATCHES §107 that
+#      script installed UPSTREAM's release, which lacks the startup guard that
+#      makes a non-loopback bind refuse rather than serve unauthenticated
+#      (PATCHES §12).
 #   2. Health is polled on the tailnet address, not 127.0.0.1. With a tailnet
 #      bind there is no loopback listener, so the upstream poll would hang.
 

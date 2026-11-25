@@ -28,16 +28,16 @@ import (
 
 // `sr update` and `sr rollback` replace the binary a non-team install runs,
 // using the same release source, asset names and SHA256SUMS verification as
-// install.sh and the npm/pip wrappers. Every replacement keeps the outgoing
-// binary as a versioned backup and puts it back by itself when the restarted
-// daemon does not answer health with the version that was just installed.
+// install.sh. Every replacement keeps the outgoing binary as a versioned
+// backup and puts it back by itself when the restarted daemon does not answer
+// health with the version that was just installed.
 //
 // Team hosts (the supervised LaunchDaemon, GCP front slots) and package
 // manager wrappers own their binary through another path, so both commands
 // refuse there and name the command that does own it.
 
 const (
-	updateReleaseRepo    = "manaflow-ai/subrouter"
+	updateReleaseRepo    = "discordwell/subrouter"
 	updateBackupDirName  = ".subrouter-backups"
 	updateKeepBackups    = 3
 	updateMaxAssetBytes  = 512 << 20

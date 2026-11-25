@@ -8,7 +8,7 @@
 # itself is delegated to install.sh, which verifies the release checksum.
 set -euo pipefail
 
-REPO="${SUBROUTER_REPO:-manaflow-ai/subrouter}"
+REPO="${SUBROUTER_REPO:-discordwell/subrouter}"
 INSTALL_DIR="${SUBROUTER_INSTALL_DIR:-$HOME/bin}"
 VERSION_FILE="${SUBROUTER_VERSION_FILE:-$HOME/.subrouter/cli-version}"
 INSTALL_URL="${SUBROUTER_INSTALL_URL:-https://raw.githubusercontent.com/$REPO/main/install.sh}"

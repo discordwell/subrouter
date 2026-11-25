@@ -49,7 +49,7 @@ fi
 
 if ! command -v "${sr_bin}" >/dev/null 2>&1; then
   echo "sr is required. Install it with:" >&2
-  echo "  curl -fsSL https://github.com/manaflow-ai/subrouter/releases/latest/download/install.sh | sh" >&2
+  echo "  curl -fsSL https://github.com/discordwell/subrouter/releases/latest/download/install.sh | sh" >&2
   exit 1
 fi
 
@@ -207,10 +207,7 @@ fi
   --gcp-project "${project_id}" \
   --default
 
-# This script installs upstream's tagged release by design, so it names that
-# outcome: `sr server install` refuses it otherwise (the fork's PATCHES 37).
 "${sr_bin}" server install "${server_name}" \
-  --allow-upstream-release \
   --version "${subrouter_version}"
 
 if [[ "${topology}" == "fresh-prepared" ]]; then

@@ -620,7 +620,7 @@ Now both installers carry every entry they do not write, verbatim, and a second 
 
 §37.2 The box's bootstrap script binds `subrouter.socket` to the box's tailnet address (`ListenStream=100.x.y.z:31415`), which does not exist yet when socket units start. After a reboot the bind failed with `EADDRNOTAVAIL`, systemd never retried a failed socket, and the box stayed down. `systemdSocketTemplate` now sets `FreeBind=true`. `After=tailscaled.service` was rejected: it is an ordering cycle with `sockets.target`, and `tailscaled` running does not mean the address is up. The box's deploy script never re-renders units, so the live box needs a bootstrap re-run or a drop-in. No test boots a box. Confirm it on the next planned reboot.
 
-§37.3 `sr server install` piped upstream's `install.sh`, which replaced this fork's binary with upstream's release while the host reported healthy. The fork publishes no release of its own. The command now refuses without `--allow-upstream-release`, before it looks up the server or mints a token. The message says this fork deploys a Linux box from a source build and has no remote macOS deploy. Usage, `sr help` and the README omit the flag, so a copied command does not carry it. `sr server sync` and `diff` now tell the user to upgrade an old server from source. Upstream's `deploy/gcp/publish-subrouter.sh` installs upstream's release by design, so it passes the flag.
+§37.3 `sr server install` piped upstream's `install.sh`, which replaced this fork's binary with upstream's release while the host reported healthy. The fork publishes no release of its own. The command now refuses without `--allow-upstream-release`, before it looks up the server or mints a token. The message says this fork deploys a Linux box from a source build and has no remote macOS deploy. Usage, `sr help` and the README omit the flag, so a copied command does not carry it. `sr server sync` and `diff` now tell the user to upgrade an old server from source. Upstream's `deploy/gcp/publish-subrouter.sh` installs upstream's release by design, so it passes the flag. Removed by §107, when the fork began to publish its own releases.
 
 Residual risks. `install-daemon` still re-renders `ProgramArguments` and the working directory; upgrades go through `deploy-laptop.sh`, which touches neither. A pre-§37 binary (the upstream rollback recipe runs one) still drops the keys. The box's bootstrap script still replaces the box's `*_TOKEN_FILE` keys with inline tokens on every run, so the box's tokens stay inline. `install-systemd` does not check a kept `*_TOKEN_FILE`, because it runs as root, and a check that passes as root would not show that the service user cannot read the file.
 
@@ -4675,7 +4675,7 @@ The owner, 2026-11-24: agents and Go tooling that look for subrouter should land
 
 §106.2 What did not change.
 
-- What names upstream itself: the README's link to the project this forks, this file's history, the comments on ported upstream code, and the code and scripts that fetch or verify upstream's releases (`install.sh`, `npm/`, `subrouter_cli/`, `package.json`, `pyproject.toml`, `deploy/gcp/`, `deploy/macos/*autoupdate*.sh`, `.github/workflows/gcp-deploy.yml`, `sr update`'s release repository, `sr server install`'s refusal, the transport observer's golden predecessor).
+- What names upstream itself: the README's link to the project this forks, this file's history, and the comments on ported upstream code. The code and scripts that fetched or verified upstream's releases kept upstream's name until §107 pointed them at this fork's releases and deleted the npm and PyPI wrappers.
 - The launchd labels, `ai.manaflow.subrouter` and the rest.
 
 §106.3 Merging upstream after this.
@@ -4691,3 +4691,29 @@ Then check `git grep 'github.com/manaflow-ai/subrouter/' -- '*.go'`. What may st
 - Code: `go.mod`, `cmd/subrouter/install_daemon.go` (`subrouterMainPackage`, `preRenameMainPackage`, `isSubrouterMainPackage`), `cmd/subrouter/sr_host.go` (`hostModulePath`), `Dockerfile`, `scripts/build-release.sh`, `ops/bin/sr-local-ci`
 - Tests: `cmd/subrouter/install_alias_test.go` (`TestSubrouterMainPackageMatchesThisPackage`, `TestPreRenameBuildIsSubrouters`), `cmd/subrouter/sr_host_test.go`
 - Docs: `AGENTS.md`, `README.md`, `ops/LAPTOP.md`
+
+## 107. The fork publishes its own releases, and every install or update path fetches them
+
+The owner, 2026-11-25: the fork publishes its own GitHub releases, so anyone can install it without Go, and every install or update path in the fork fetches the fork's releases, never upstream's. Upstream's releases carry none of the fork's patches. This change makes a release possible and creates none; the owner tags the first one, `v0.2.0`, after it merges.
+
+§107.1 What changed.
+
+- `install.sh` fetches from `https://github.com/discordwell/subrouter/releases`. `SUBROUTER_DOWNLOAD_BASE`, `SUBROUTER_VERSION` and `SUBROUTER_INSTALL_DIR` still override it. The README's install section leads with `curl -fsSL https://github.com/discordwell/subrouter/releases/latest/download/install.sh | sh`, then the build from source.
+- `sr server install` pipes the fork's `install.sh` (`publicInstallScriptURL`, from `releasesURL`). §37.3's refusal, `errUpstreamReleaseInstall` and `--allow-upstream-release` are gone, because their premise, that the fork publishes no release, is gone. `deploy/gcp/publish-subrouter.sh` no longer passes the flag. Agents still do not run the command on the owner's hosts: it rewrites the unit or plist that the scripts in `ops/deploy/` write (`ops/skills/subrouter/SKILL.md`).
+- `sr host attach`'s install script resolves `latest` from the fork's releases, and `sr update`'s release repository (`updateReleaseRepo`) is the fork's. Neither verb is dispatched.
+- The transport observer's latest-release, tag and compare URLs name the fork. Its pinned predecessor (`v0.1.60`) and bootstrap (`v0.1.63`), and the same pins in `deploy/gcp/golden-local-mac-production-continuity.sh`, are upstream tags that the fork has not released, so a pinned golden run fails its tag check until they are re-pinned to fork releases.
+- `deploy/macos/*autoupdate*.sh`, `deploy/macos/install-cli-autoupdate.sh`, the `deploy/gcp/` scripts (`fetch-release.sh`, `subrouter-autoupdate.sh`, `create-subrouter-vm.sh`, `startup.sh`'s trusted repository, the golden harness, the install hints in `publish-subrouter.sh` and `upload-codex-accounts.sh`) and `.github/workflows/gcp-deploy.yml` default to `discordwell/subrouter`, and verify attestations signed by its `release.yml`. `release.yml` still copies `install.sh`, `install-front-slots.sh` and `deployment-contract.py` into each release, which the GCP scripts read.
+- Deleted: `npm/`, `subrouter_cli/`, `package.json`, `pyproject.toml`, `release.yml`'s `npm-publish` and `pypi-publish` jobs, its `workflow_dispatch` inputs and its `pyproject.toml` version fallback, and the `.gitignore` lines for them. The wrappers downloaded upstream's release, and the package name `subrouter` on npm and PyPI is upstream's (both at 0.1.16), so the fork cannot publish them. `release.yml` now runs only on a pushed `v*` tag.
+- A release's title and notes are both `Subrouter v<version>` (`scripts/publish-github-release.sh`). The script requires the repository's release immutability setting.
+- `ops/publiccheck/upstream_release_test.go` fails on a release, API or raw-file URL for `manaflow-ai/subrouter` in any tracked file, and on the bare slug in a line of code that is not a comment, which is how a script or Go names a default release repository. This file and `ops/publiccheck/` are exempt. So are comment lines, which credit ported code, and quoted Go import paths, such as `preRenameMainPackage` (§106). On the tree before this change it reports 51 lines.
+
+§107.2 What did not change.
+
+- `sr update`, `sr rollback` and the background `update --auto` stay unwired (§23, §29).
+- The laptop and the box still deploy from a source build through `ops/deploy/`.
+- The Cloudflare workflow and `cloudflare/`, the launchd labels, the README's link to upstream and the comments on ported upstream code.
+
+- Code: `install.sh`, `cmd/subrouter/sr_server.go` (`releasesURL`, `publicInstallScriptURL`, `serverInstall`), `cmd/subrouter/sr_host.go` (`hostInstallScript`), `cmd/subrouter/sr_update.go` (`updateReleaseRepo`), `cmd/subrouter-transport-observer/golden.go`, `deploy/gcp/`, `deploy/macos/`, `.github/workflows/release.yml`, `.github/workflows/gcp-deploy.yml`
+- Tests: `ops/publiccheck/upstream_release_test.go` (`TestUpstreamFindings`, `TestNoUpstreamReleaseFetch`), `cmd/subrouter/installer_lifecycle_test.go` (`TestServerInstallPipesThisForksRelease`), `cmd/subrouter/sr_host_test.go` (`TestHostInstallScriptIsIdempotent`), `cmd/subrouter/deploy_scripts_test.go`, `cmd/subrouter/release_publish_test.go`, `cmd/subrouter-transport-observer/golden_options_test.go`
+- Docs: `README.md`, `ops/GETTING-STARTED.md`, `ops/OPERATING.md`, `ops/skills/subrouter/SKILL.md`, `docs/production.md`, `docs/upgrades.md`, `deploy/gcp/README.md`, `ops/deploy/lightsail/README.md`
+- Related: removes §37.3's refusal; amends §106.2.

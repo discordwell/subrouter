@@ -1,26 +1,12 @@
 name: Release
 
-# A pushed tag builds and tests, then publishes the immutable binaries consumed
-# by protected GCP deploys. The legacy pre-front updater reads the same release.
-# npm/PyPI are not published on a tag; they are manual opt-in only through the
-# workflow_dispatch toggles below.
+# A pushed tag builds and tests, then publishes the immutable binaries that
+# install.sh, `sr server install` and the GCP deploys fetch.
 
 on:
   push:
     tags:
       - "v*"
-  workflow_dispatch:
-    inputs:
-      publish_npm:
-        description: "Also publish to npm (manual opt-in)"
-        required: true
-        type: boolean
-        default: false
-      publish_pypi:
-        description: "Also publish to PyPI (manual opt-in)"
-        required: true
-        type: boolean
-        default: false
 
 permissions:
   contents: read
@@ -35,7 +21,6 @@ concurrency:
 jobs:
   build:
     name: Build and verify artifacts
-    if: ${{ github.event_name == 'push' && github.ref_type == 'tag' }}
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
@@ -60,15 +45,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
-            [[ "${GITHUB_REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] || {
-              echo "release tag must be versioned, for example v0.1.52" >&2
-              exit 1
-            }
-            version="${GITHUB_REF_NAME#v}"
-          else
-            version="$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
-          fi
+          [[ "${GITHUB_REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] || {
+            echo "release tag must be versioned, for example v0.1.52" >&2
+            exit 1
+          }
+          version="${GITHUB_REF_NAME#v}"
           echo "version=${version}" >> "${GITHUB_OUTPUT}"
           source_commit="$(git rev-parse "${GITHUB_REF}^{commit}")"
           echo "source_commit=${source_commit}" >> "${GITHUB_OUTPUT}"
@@ -125,7 +106,6 @@ jobs:
     name: Publish GitHub release
     needs: build
     runs-on: ubuntu-latest
-    if: ${{ github.event_name == 'push' && github.ref_type == 'tag' }}
     permissions:
       contents: write
       attestations: read
@@ -146,52 +126,3 @@ jobs:
           TAG_NAME: v${{ needs.build.outputs.version }}
           SOURCE_COMMIT: ${{ needs.build.outputs.source_commit }}
         run: bash scripts/publish-github-release.sh dist/release
-
-  # Manual opt-in only. These never run on a tag push; trigger this workflow via
-  # the Actions "Run workflow" button with the toggle enabled to publish.
-  npm-publish:
-    name: Publish npm package (manual)
-    runs-on: ubuntu-latest
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_npm }}
-    environment: npm
-    permissions:
-      contents: read
-      id-token: write
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v6
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v6
-        with:
-          node-version: "24"
-          registry-url: "https://registry.npmjs.org"
-
-      - name: Publish to npm
-        run: npm publish --access public
-
-  pypi-publish:
-    name: Publish PyPI package (manual)
-    runs-on: ubuntu-latest
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_pypi }}
-    environment: pypi
-    permissions:
-      contents: read
-      id-token: write
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v6
-
-      - name: Set up Python
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.12"
-
-      - name: Build Python package
-        run: |
-          python -m pip install --upgrade build twine
-          python -m build
-          python -m twine check dist/subrouter-*.tar.gz dist/subrouter-*.whl
-
-      - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1

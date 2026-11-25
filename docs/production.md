@@ -34,7 +34,7 @@ sr server add team \
 
 `install-systemd` preserves the existing admin, account-import and proxy tokens, the listen address (`--addr`), the switch interval, the session store and `--extra-args` whenever their flags are omitted, so a credential rotation or binary upgrade does not rebind the service to `0.0.0.0:31415`. Pass a flag to change its value, including `--extra-args ""` to clear it. When a reinstall changes the listen address, it restarts `subrouter.socket` as well as the service, because an active socket keeps its old address until the socket unit itself restarts. Every other line of `/etc/default/subrouter` that sets a key it does not write (a hand-set `CODEX_HOME`, a reservation) is carried over as written. A token it writes non-empty, whether passed or preserved, replaces that token's `_FILE` key, since `serve` refuses both; a `*_TOKEN_FILE` survives only a run that leaves that token empty. `/etc/default/subrouter` is written with mode `0600`.
 
-`sr server install` forwards only the `--addr`, `--sr-switch-interval` and `--extra-args` values you pass, so the host keeps its own configuration for the rest. Over SSH those flags are refused; configure them on the host. It installs upstream's public release binary, so this fork refuses it unless you pass `--allow-upstream-release`; this fork deploys its own hosts from a source build.
+`sr server install` forwards only the `--addr`, `--sr-switch-interval` and `--extra-args` values you pass, so the host keeps its own configuration for the rest. Over SSH those flags are refused; configure them on the host. It installs this fork's release from `https://github.com/discordwell/subrouter/releases`: the latest, or the one `--version` names.
 
 ## Codex account host claims
 
@@ -113,10 +113,10 @@ These client-side checks are the launch gate. Infrastructure operators can inspe
 `/_subrouter/health` includes a `build` object (version, commit, build time, and
 link-time provenance), the current `release` rollout state, and hourly
 `recovery_counters` per provider. Release builds stamp `origin/main`; binaries
-built from a checkout report `local-build`, and this fork's are all built from a
-checkout. Upstream's `sr status` rollout and version-warning block and `sr
-doctor` version and provenance checks are not carried in this fork: every remedy
-they print is `sr update` or `subrouter-deploy.sh install-release`, which install
-upstream's release binary over this fork's (`ops/PATCHES.md` §23,
-§37.3), and a fork build would always read as provenance drift. Compare
-`/_subrouter/health`'s `build` with the CLI's `sr version` by hand.
+built from a checkout report `local-build`. Upstream's `sr status` rollout and
+version-warning block and `sr doctor` version and provenance checks are not
+carried in this fork: every remedy they print is `sr update` or
+`subrouter-deploy.sh install-release`, which this fork does not carry
+(`ops/PATCHES.md` §23), and a local build would always read as provenance
+drift. Compare `/_subrouter/health`'s `build` with the CLI's `sr version` by
+hand.

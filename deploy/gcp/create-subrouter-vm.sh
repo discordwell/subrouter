@@ -126,12 +126,12 @@ bash "${script_dir}/verify-go-release-binary.sh" "${asset_dir}/${binary_asset}" 
 
 # Re-run the remote release and strict attestation checks here so VM creation
 # cannot trust a caller-authored boolean-only verification document.
-if ! gh release view "${release_tag}" --repo manaflow-ai/subrouter --json isDraft,isImmutable,tagName \
+if ! gh release view "${release_tag}" --repo discordwell/subrouter --json isDraft,isImmutable,tagName \
     | jq -e --arg tag "${release_tag}" \
       '.tagName == $tag and (.isDraft | not) and .isImmutable' >/dev/null; then
   die "release is missing, draft, or mutable"
 fi
-if ! gh api "repos/manaflow-ai/subrouter/compare/${release_revision}...main" \
+if ! gh api "repos/discordwell/subrouter/compare/${release_revision}...main" \
     | jq -e --arg revision "${release_revision}" \
       '.merge_base_commit.sha == $revision and (.status == "ahead" or .status == "identical")' \
       >/dev/null; then
@@ -139,10 +139,10 @@ if ! gh api "repos/manaflow-ai/subrouter/compare/${release_revision}...main" \
 fi
 for asset in "${required_assets[@]}"; do
   path="${asset_dir}/${asset}"
-  gh release verify-asset "${release_tag}" "${path}" --repo manaflow-ai/subrouter --format json >/dev/null \
+  gh release verify-asset "${release_tag}" "${path}" --repo discordwell/subrouter --format json >/dev/null \
     || die "immutable release asset verification failed: ${asset}"
-  if ! gh attestation verify "${path}" --repo manaflow-ai/subrouter \
-      --signer-workflow manaflow-ai/subrouter/.github/workflows/release.yml \
+  if ! gh attestation verify "${path}" --repo discordwell/subrouter \
+      --signer-workflow discordwell/subrouter/.github/workflows/release.yml \
       --source-ref "refs/tags/${release_tag}" --source-digest "${release_revision}" \
       --deny-self-hosted-runners --format json \
       | jq -e 'length > 0' >/dev/null; then
@@ -163,7 +163,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 jq -S -n --arg schema 'subrouter.gcp.vm-release-metadata/v1' \
-  --arg repository manaflow-ai/subrouter --arg tag "${release_tag}" \
+  --arg repository discordwell/subrouter --arg tag "${release_tag}" \
   --arg revision "${release_revision}" --arg verification_sha "${verification_sha256}" \
   --argjson assets "$(jq -S '.assets' "${verification_json}")" \
   '{schema:$schema,repository:$repository,release_tag:$tag,source_revision:$revision,

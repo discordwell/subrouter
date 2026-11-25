@@ -29,7 +29,7 @@ func TestSRServerInstallUsesIAPWithoutTailscale(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := runner.run(context.Background(), []string{"server", "install", "community", "--allow-upstream-release"}); err != nil {
+	if err := runner.run(context.Background(), []string{"server", "install", "community"}); err != nil {
 		t.Fatal(err)
 	}
 

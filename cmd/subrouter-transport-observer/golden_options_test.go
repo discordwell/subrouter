@@ -233,7 +233,7 @@ func TestGoldenGitHubJSONUsesLocalGitHubAuthentication(t *testing.T) {
 	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 	client := &http.Client{Transport: goldenRoundTripFunc(func(request *http.Request) (*http.Response, error) {
-		if request.URL.String() != "https://api.github.com/repos/manaflow-ai/subrouter/commits/v0.1.60" {
+		if request.URL.String() != "https://api.github.com/repos/discordwell/subrouter/commits/v0.1.60" {
 			t.Fatalf("request URL = %q", request.URL.String())
 		}
 		if request.Header.Get("Authorization") != "Bearer golden-test-token" {
@@ -250,7 +250,7 @@ func TestGoldenGitHubJSONUsesLocalGitHubAuthentication(t *testing.T) {
 	var response struct {
 		SHA string `json:"sha"`
 	}
-	if err := getGoldenGitHubJSON(context.Background(), client, "https://api.github.com/repos/manaflow-ai/subrouter/commits/v0.1.60", &response); err != nil {
+	if err := getGoldenGitHubJSON(context.Background(), client, "https://api.github.com/repos/discordwell/subrouter/commits/v0.1.60", &response); err != nil {
 		t.Fatalf("authenticated GitHub request failed: %v", err)
 	}
 	if response.SHA != "authenticated" {
@@ -287,7 +287,7 @@ func TestGoldenGitHubComparisonURLRequestsMetadataOnlyPage(t *testing.T) {
 		t.Fatal(err)
 	}
 	if comparisonURL.Scheme != "https" || comparisonURL.Host != "api.github.com" ||
-		comparisonURL.Path != "/repos/manaflow-ai/subrouter/compare/"+revision+"...main" {
+		comparisonURL.Path != "/repos/discordwell/subrouter/compare/"+revision+"...main" {
 		t.Fatalf("comparison URL target = %q", comparisonURL.String())
 	}
 	query := comparisonURL.Query()

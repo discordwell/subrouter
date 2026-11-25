@@ -21,7 +21,7 @@ You need these:
 
 ## Build subrouter
 
-This fork publishes no release, so we build it from source:
+We build from source, because later steps run tools from this clone's `ops/bin`:
 
 ```bash
 git clone https://github.com/discordwell/subrouter.git
@@ -31,7 +31,7 @@ make build
 
 `make build` writes `bin/subrouter` and signs it ad hoc. Stay in this directory. Every later command runs from the root of this clone.
 
-Do not install upstream's release with `install.sh`, npm, pipx, or the CLI autoupdater. Each one puts the `manaflow-ai/subrouter` binary in place of this fork's, which drops every fork patch.
+To install only the binaries, without the clone, run `curl -fsSL https://github.com/discordwell/subrouter/releases/latest/download/install.sh | sh`. It installs this fork's latest release to `~/bin`. The `subrouter` packages on npm and PyPI install upstream's build, not this fork's.
 
 ## Start the daemon
 

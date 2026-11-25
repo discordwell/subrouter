@@ -134,7 +134,7 @@ esac
 			command := exec.Command(mustLookPath(t, "bash"), script, assetDir)
 			command.Env = append(os.Environ(),
 				"PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"),
-				"GH_REPO=manaflow-ai/subrouter",
+				"GH_REPO=discordwell/subrouter",
 				"TAG_NAME=v0.1.52",
 				"SOURCE_COMMIT="+strings.Repeat("b", 40),
 				"FAKE_ASSET_DIR="+assetDir,
@@ -189,7 +189,7 @@ func TestGitHubReleasePublisherRejectsPublishedMutableRelease(t *testing.T) {
 	command := exec.Command(mustLookPath(t, "bash"), script, assetDir)
 	command.Env = append(os.Environ(),
 		"PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"),
-		"GH_REPO=manaflow-ai/subrouter",
+		"GH_REPO=discordwell/subrouter",
 		"TAG_NAME=v0.1.52",
 		"SOURCE_COMMIT="+strings.Repeat("b", 40),
 	)
@@ -226,7 +226,7 @@ exit 97
 	command := exec.Command(mustLookPath(t, "bash"), script, assetDir)
 	command.Env = append(os.Environ(),
 		"PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"),
-		"GH_REPO=manaflow-ai/subrouter",
+		"GH_REPO=discordwell/subrouter",
 		"TAG_NAME=v0.1.52",
 		"SOURCE_COMMIT="+strings.Repeat("b", 40),
 		"FAKE_GH_LOG="+logPath,

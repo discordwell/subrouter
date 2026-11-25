@@ -709,10 +709,9 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 	case "server", "servers":
 		return r.server(ctx, args[1:])
 	// Upstream's `sr host attach|status|watch|detach` (#437, #440) is not
-	// dispatched: attach installs upstream's release binary (or a `go install`
-	// build of this module) on the other machine and points it at this pool --
-	// the release-binary path PATCHES 37.3 refuses for `sr server install`, and
-	// a remote surface outside the PATCHES 17 gate.
+	// dispatched: attach installs a release binary (or a `go install` build of
+	// this module) on the other machine and points it at this pool, a remote
+	// surface outside the PATCHES 17 gate.
 	case "remote", "remotes":
 		return r.remote(ctx, args[1:])
 	case "tenant", "tenants":

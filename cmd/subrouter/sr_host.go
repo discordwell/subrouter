@@ -855,7 +855,7 @@ func hostInstallScript(spec hostInstallSpec) string {
 		`install_release() {`,
 		`  v="$1"`,
 		`  if [ "$v" = latest ]; then`,
-		`    v="$(curl -fsSIL -o /dev/null -w '%{url_effective}' https://github.com/manaflow-ai/subrouter/releases/latest | sed -n 's#.*/tag/\(v\{0,1\}[^/?#]*\).*#\1#p' | head -n 1)"`,
+		`    v="$(curl -fsSIL -o /dev/null -w '%{url_effective}' ` + releasesURL + `/latest | sed -n 's#.*/tag/\(v\{0,1\}[^/?#]*\).*#\1#p' | head -n 1)"`,
 		`    [ -n "$v" ] || { echo "could not resolve the latest Subrouter release" >&2; return 1; }`,
 		`  fi`,
 		`  v="v${v#v}"`,

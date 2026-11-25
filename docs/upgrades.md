@@ -11,8 +11,7 @@
 > installers and GCP procedures below are not used here. Do not run
 > `migrate-*-to-supervisor.sh`, any `*-autoupdate.sh`, or `sr server install`
 > against the laptop or the box. They rewrite the plist or unit that this
-> fork's deploy scripts write, or install an upstream release binary in place
-> of this fork's.
+> fork's deploy scripts write, or replace the binary those scripts installed.
 > `deploy/run-shadow-rehearsal.py` is not carried in this fork. The
 > [credential-origin rollback boundary](#credential-origin-rollback-boundary)
 > does apply here.

@@ -41,8 +41,8 @@ These commands rewrite the files that every local agent authenticates through (`
 - `sr setup`, `sr storage`, `sr login`, `sr logout`, `sr server add`, `sr server use`, and `subrouter serve`.
 - `sr switch`, `sr use`, `sr g`, and `sr pick` on a Codex pool account (above).
 - `codex login` or `codex logout` with `CODEX_HOME` pointing at a pool store. Either one kills that account's chain.
-- `sr server install`. Upstream's version installs upstream's release binary on the box, and this fork's refuses unless forced (§37.3).
-- Upstream's `deploy/macos/*autoupdate*.sh` and `deploy/macos/migrate-*-to-supervisor.sh`. They install upstream's release or rewrite the plist that this fork's supervisor runs from (§69).
+- `sr server install`. It rewrites the unit and plist that the deploy scripts in `ops/deploy/` assume (§107).
+- Upstream's `deploy/macos/*autoupdate*.sh` and `deploy/macos/migrate-*-to-supervisor.sh`. They replace the binary outside `deploy-laptop.sh` or rewrite the plist that this fork's supervisor runs from (§69).
 - Any script under `ops/deploy/` against the live machine, unless the operator asks for that deploy. `ops/LAPTOP.md` describes the laptop scripts.
 
 To check a command's usage or plan, build the tree and run it with every store path moved. An exported store variable overrides `HOME`, so unset each one:

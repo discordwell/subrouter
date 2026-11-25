@@ -104,7 +104,7 @@ Named servers:
   %[1]s status <name>            Usage for a named remote server
   %[1]s set-public <name> [--url <https-url>] [--fingerprint <hex>] [--token-file <path|->] [--keep-token] [--clear]
                                  Public admin path for when <name>'s private URL is out of reach, and for Claude uploads and Codex login uploads to an unpinned plain-http entry (a named admin token, piped in, never printed)
-  %[1]s install <name> [--version latest]   Install or rotate credentials over gcloud or --ssh-host (refused on this fork: it installs upstream's release)
+  %[1]s install <name> [--version latest]   Install or rotate credentials over gcloud or --ssh-host
   %[1]s login <name> [--device-auth]
   %[1]s sync <name> [--device-auth] [--all] [--email <email>] [--dry-run] [--yes]
 
@@ -127,7 +127,11 @@ cmux and cmux-local are built in and become usable after 'sr login'.
 `, command)
 }
 
-const publicInstallScriptURL = "https://github.com/manaflow-ai/subrouter/releases/latest/download/install.sh"
+// releasesURL is where `sr server install` and `sr host attach` fetch this
+// fork's releases (PATCHES 107).
+const releasesURL = "https://github.com/discordwell/subrouter/releases"
+
+const publicInstallScriptURL = releasesURL + "/latest/download/install.sh"
 
 type srServerStore struct {
 	Path string
@@ -1844,8 +1848,8 @@ func (r srRunner) serverHeadingVia(server srServerConfig, via serverAdminVia) st
 // read routes the box never serves on its public listener, so they are
 // skipped when the public admin path answered: the private URL was just
 // found out of reach (PATCHES 43.2). Upstream's deployment block is not
-// here: its warning tells the operator to run `sr update`, which installs
-// upstream's release over this fork's binary (PATCHES 37.3).
+// here: its warning tells the operator to run `sr update`, which this fork
+// does not wire (PATCHES 23).
 func serverStatusSectionPrinters(via serverAdminVia) []func(srRunner, context.Context, srServerConfig) {
 	printers := []func(srRunner, context.Context, srServerConfig){
 		srRunner.printBedrockStatus,
@@ -2062,15 +2066,6 @@ func (r srRunner) pushClaudeWebBalances(ctx context.Context, server srServerConf
 	}
 }
 
-// errUpstreamReleaseInstall is why `server install` refuses by default. Both of
-// its paths pipe publicInstallScriptURL, upstream's install.sh, which puts
-// upstream's release binary at /usr/local/bin/subrouter in place of this
-// fork's and then runs that binary's installer: the host loses every patch in
-// ops/PATCHES.md, and reports healthy. This fork publishes no release of its
-// own to point the script at; its hosts are deployed from a source build.
-// PATCHES section 37.
-var errUpstreamReleaseInstall = errors.New("it pipes upstream's install.sh, which replaces this fork's binary with upstream's release (manaflow-ai/subrouter) and none of this fork's patches")
-
 func (r srRunner) serverInstall(ctx context.Context, store srServerStore, args []string) error {
 	command := r.serverCommand()
 	usage := fmt.Errorf("usage: %s install <name> [--version latest]", command)
@@ -2079,7 +2074,6 @@ func (r srRunner) serverInstall(ctx context.Context, store srServerStore, args [
 	}
 	flags := flag.NewFlagSet(command+" install", flag.ContinueOnError)
 	flags.SetOutput(r.errOut)
-	allowUpstream := flags.Bool("allow-upstream-release", false, "install upstream's public release binary (manaflow-ai/subrouter) over the host's. Not for this fork's hosts: it removes every fork patch")
 	version := flags.String("version", "latest", "Subrouter release version to install")
 	addr := flags.String("addr", "0.0.0.0:31415", "server listen address")
 	srSwitchInterval := "10m"
@@ -2089,17 +2083,6 @@ func (r srRunner) serverInstall(ctx context.Context, store srServerStore, args [
 	name, err := parseFlagsOneName(flags, args, usage)
 	if err != nil {
 		return err
-	}
-	// Before anything else, and in particular before ensureServerControlTokens
-	// mints and saves tokens: a refused install changes nothing. The server is
-	// not looked up yet, so the message covers both kinds of host. The
-	// override is named, since upstream's own callers (deploy/gcp) need it,
-	// but not offered as the way forward.
-	if !*allowUpstream {
-		return fmt.Errorf(
-			"refusing to install %s: %w. This fork deploys a Linux box from a source build and has no remote macOS deploy (ops/deploy/macos/deploy-laptop.sh upgrades only the Mac it runs on). --allow-upstream-release is only for a host meant to run upstream's release instead of this fork",
-			name, errUpstreamReleaseInstall,
-		)
 	}
 	server, ok, err := store.find(name)
 	if err != nil {
@@ -2363,8 +2346,8 @@ func (r srRunner) serverSync(ctx context.Context, store srServerStore, args []st
 
 	fmt.Fprintln(r.out, r.serverHeading(server))
 	if !statusAvailable {
-		// Not `sr server install`: on this fork that is refused, and its
-		// override installs upstream's release over the server (PATCHES 37).
+		// Not `sr server install`: it rewrites the unit or plist that this
+		// fork's deploy scripts write (PATCHES 107).
 		fmt.Fprintln(r.out, "Account status: unavailable on this server version; upgrade "+server.Name+" to a current build to enable refresh-token checks (this fork deploys from source).")
 	}
 	printEmailGroup(r.out, "Missing on server", missing)

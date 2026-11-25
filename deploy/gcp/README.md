@@ -29,7 +29,7 @@ gcloud config set project <project-id>
 Install `sr` locally:
 
 ```bash
-curl -fsSL https://github.com/manaflow-ai/subrouter/releases/latest/download/install.sh | sh
+curl -fsSL https://github.com/discordwell/subrouter/releases/latest/download/install.sh | sh
 ```
 
 Choose an existing release tag and create the VM with that exact release:
@@ -87,8 +87,7 @@ credentials are never part of the workflow; account import remains the
 authenticated HTTP `POST` flow described below.
 
 The publish script configures the server with `sr server add`, then runs
-`sr server install --allow-upstream-release` for the explicit tag (the flag
-names that it installs the upstream release; without it the command refuses). The installer generates distinct
+`sr server install` for the explicit tag. The installer generates distinct
 admin and account-import tokens, sends them over IAP standard input, and stores
 both in the private local server configuration. Status uses the admin token;
 account onboarding uses the narrower import token. Neither token is printed or

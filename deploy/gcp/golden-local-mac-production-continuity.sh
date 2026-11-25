@@ -6,7 +6,7 @@ umask 077
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 deployment_contract="${root}/deploy/gcp/deployment-contract.py"
-repository="manaflow-ai/subrouter"
+repository="discordwell/subrouter"
 predecessor_tag="v0.1.60"
 predecessor_version="0.1.60"
 predecessor_revision="e169e94f2bea9a0455a5831631fcbac220bd65f2"

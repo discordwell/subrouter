@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-repo="manaflow-ai/subrouter"
+repo="discordwell/subrouter"
 version="${SUBROUTER_VERSION:-latest}"
 install_dir="${SUBROUTER_INSTALL_DIR:-}"
 install_aliases="${SUBROUTER_INSTALL_ALIASES:-1}"

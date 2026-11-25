@@ -1812,7 +1812,7 @@ func TestSRServerInstallUsesPublicInstallerAndSystemdCommand(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := runner.run(context.Background(), []string{"server", "install", "community", "--allow-upstream-release", "--version", "0.1.2"}); err != nil {
+	if err := runner.run(context.Background(), []string{"server", "install", "community", "--version", "0.1.2"}); err != nil {
 		t.Fatal(err)
 	}
 

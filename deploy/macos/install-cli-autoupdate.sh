@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # Install the per-user CLI updater as a LaunchAgent. Run once per machine:
 #
-#   curl -fsSL https://raw.githubusercontent.com/manaflow-ai/subrouter/main/deploy/macos/install-cli-autoupdate.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/discordwell/subrouter/main/deploy/macos/install-cli-autoupdate.sh | bash
 #
 # After this the machine keeps its own `sr` current, so nobody has to remember
 # to reinstall after a release.
 set -euo pipefail
 
-REPO="${SUBROUTER_REPO:-manaflow-ai/subrouter}"
+REPO="${SUBROUTER_REPO:-discordwell/subrouter}"
 LABEL="${SUBROUTER_CLI_UPDATE_LABEL:-ai.manaflow.subrouter-cli-autoupdate}"
 SCRIPT_PATH="${SUBROUTER_CLI_UPDATE_SCRIPT:-$HOME/.subrouter/bin/subrouter-cli-autoupdate.sh}"
 PLIST="$HOME/Library/LaunchAgents/${LABEL}.plist"

@@ -21,9 +21,7 @@ import (
 // fork: the extra-args explicit/empty distinction (install-systemd's
 // ExtraArgsExplicit) rides the same flag.Visit, and `sr server install` sits
 // behind the remote gate (PATCHES 17), so the server-install tests unlock it --
-// without that the SSH refusal test would pass on the gate's own error. They
-// also pass --allow-upstream-release, since the command refuses upstream's
-// release binary without it (PATCHES 37), for the same reason.
+// without that the SSH refusal test would pass on the gate's own error.
 
 // useTempSystemdEtc points the systemd installer and controller at a scratch
 // /etc so tests never read or write the host's configuration.
@@ -799,7 +797,7 @@ func TestServerInstallGCPForwardsOnlyExplicitFlags(t *testing.T) {
 	var out bytes.Buffer
 	fake := &stdinCapturingRunner{}
 	runner := srRunner{program: "sr", store: store, in: strings.NewReader(""), out: &out, errOut: &out, cmd: fake}
-	if err := runner.run(context.Background(), []string{"server", "install", "prod", "--allow-upstream-release"}); err != nil {
+	if err := runner.run(context.Background(), []string{"server", "install", "prod"}); err != nil {
 		t.Fatal(err)
 	}
 	if len(fake.commands) != 1 || fake.commands[0][0] != "gcloud" {
@@ -818,7 +816,7 @@ func TestServerInstallGCPForwardsOnlyExplicitFlags(t *testing.T) {
 	fake = &stdinCapturingRunner{}
 	runner.cmd = fake
 	if err := runner.run(context.Background(), []string{
-		"server", "install", "prod", "--allow-upstream-release",
+		"server", "install", "prod",
 		"--addr", "10.0.0.5:31415", "--sr-switch-interval", "0", "--extra-args", "--fetch-usage=false",
 	}); err != nil {
 		t.Fatal(err)
@@ -854,7 +852,7 @@ func TestServerInstallOverSSHRejectsUnforwardedFlags(t *testing.T) {
 
 	// Control: without the flags the same setup reaches ssh.
 	runner, fake := newRunner(t)
-	if err := runner.run(context.Background(), []string{"server", "install", "mac-mini", "--allow-upstream-release"}); err != nil {
+	if err := runner.run(context.Background(), []string{"server", "install", "mac-mini"}); err != nil {
 		t.Fatalf("plain SSH install failed, so the refusals below prove nothing: %v", err)
 	}
 	if len(fake.commands) != 1 || fake.commands[0][0] != "ssh" {
@@ -868,7 +866,7 @@ func TestServerInstallOverSSHRejectsUnforwardedFlags(t *testing.T) {
 		{"--extra-args", "--fetch-usage=false"},
 	} {
 		runner, fake := newRunner(t)
-		err := runner.run(context.Background(), append([]string{"server", "install", "mac-mini", "--allow-upstream-release"}, args...))
+		err := runner.run(context.Background(), append([]string{"server", "install", "mac-mini"}, args...))
 		if err == nil {
 			t.Fatalf("%v was silently ignored on the SSH path", args)
 		}
@@ -881,54 +879,46 @@ func TestServerInstallOverSSHRejectsUnforwardedFlags(t *testing.T) {
 	}
 }
 
-// Both install paths pipe upstream's public install.sh, which replaces this
-// fork's binary with upstream's release: none of this fork's patches, none of
-// the guards that refuse an unauthenticated non-loopback bind. So the command
-// refuses unless the operator names that outcome, and a refusal runs nothing
-// and mints no tokens. PATCHES section 37.
-func TestServerInstallRefusesUpstreamReleaseWithoutOverride(t *testing.T) {
+// Both install paths pipe this fork's install.sh, at the version asked for,
+// and the flag that once let them install upstream's release is gone
+// (PATCHES 107, which removed 37.3's refusal).
+func TestServerInstallPipesThisForksRelease(t *testing.T) {
+	const installScript = "https://github.com/discordwell/subrouter/releases/latest/download/install.sh"
 	for name, server := range map[string]srServerConfig{
 		"gcp": {Name: "prod", URL: "http://100.64.0.1:31415", GCPInstance: "subrouter-prod", GCPZone: "us-central1-a"},
 		"ssh": {Name: "prod", URL: "http://100.64.0.1:31415", SSHHost: "worker@box"},
 	} {
 		t.Run(name, func(t *testing.T) {
-			newRunner := func(t *testing.T) (srRunner, *stdinCapturingRunner, srServerStore) {
+			newRunner := func(t *testing.T) (srRunner, *stdinCapturingRunner) {
 				t.Helper()
 				t.Setenv("HOME", t.TempDir())
-				// Unlocked so the refusal below is this one, not the remote gate's.
 				unlockRemoteGateForTest(t)
 				store := accounts.DefaultCodexStore()
-				servers := defaultSRServerStore(store)
-				if err := servers.save(srServerFile{Servers: []srServerConfig{server}}); err != nil {
+				if err := defaultSRServerStore(store).save(srServerFile{Servers: []srServerConfig{server}}); err != nil {
 					t.Fatal(err)
 				}
 				var out bytes.Buffer
 				fake := &stdinCapturingRunner{}
-				return srRunner{program: "sr", store: store, in: strings.NewReader(""), out: &out, errOut: &out, cmd: fake}, fake, servers
+				return srRunner{program: "sr", store: store, in: strings.NewReader(""), out: &out, errOut: &out, cmd: fake}, fake
 			}
 
-			for _, args := range [][]string{{}, {"--version", "1.2.3"}} {
-				runner, fake, servers := newRunner(t)
-				err := runner.run(context.Background(), append([]string{"server", "install", "prod"}, args...))
-				if err == nil || !strings.Contains(err.Error(), "--allow-upstream-release") || !strings.Contains(err.Error(), "from a source build") {
-					t.Fatalf("%v: err = %v, want a refusal naming --allow-upstream-release and this fork's deploy", args, err)
+			for args, wantVersion := range map[string]string{"": "latest", "--version 0.2.0": "0.2.0"} {
+				runner, fake := newRunner(t)
+				if err := runner.run(context.Background(), append([]string{"server", "install", "prod"}, strings.Fields(args)...)); err != nil {
+					t.Fatalf("install %q: %v", args, err)
 				}
-				if len(fake.commands) != 0 {
-					t.Fatalf("%v: ran %v despite refusing", args, fake.commands)
-				}
-				stored, _, findErr := servers.find("prod")
-				if findErr != nil || stored.AdminToken != "" || stored.AccountImportToken != "" {
-					t.Fatalf("%v: refusal minted control tokens (err %v)", args, findErr)
+				want := "curl -fsSL '" + installScript + "' | sudo env SUBROUTER_VERSION='" + wantVersion + "' sh"
+				if len(fake.commands) != 1 || !strings.Contains(strings.Join(fake.commands[0], " "), want) {
+					t.Fatalf("install %q: commands = %v, want one invocation running %s", args, fake.commands, want)
 				}
 			}
 
-			// Control: the override reaches the upstream install script.
-			runner, fake, _ := newRunner(t)
-			if err := runner.run(context.Background(), []string{"server", "install", "prod", "--allow-upstream-release"}); err != nil {
-				t.Fatalf("install with --allow-upstream-release failed, so the refusal above proves nothing: %v", err)
+			runner, fake := newRunner(t)
+			if err := runner.run(context.Background(), []string{"server", "install", "prod", "--allow-upstream-release"}); err == nil || !strings.Contains(err.Error(), "allow-upstream-release") {
+				t.Fatalf("--allow-upstream-release: err = %v, want an unknown-flag error", err)
 			}
-			if len(fake.commands) != 1 || !strings.Contains(strings.Join(fake.commands[0], " "), publicInstallScriptURL) {
-				t.Fatalf("commands = %v, want one invocation piping %s", fake.commands, publicInstallScriptURL)
+			if len(fake.commands) != 0 {
+				t.Fatalf("--allow-upstream-release ran %v", fake.commands)
 			}
 		})
 	}

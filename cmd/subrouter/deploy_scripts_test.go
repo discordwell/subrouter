@@ -1206,7 +1206,7 @@ esac
 	}
 	metadata := fmt.Sprintf(`{
   "schema":"subrouter.gcp.vm-release-metadata/v1",
-  "repository":"manaflow-ai/subrouter",
+  "repository":"discordwell/subrouter",
   "release_tag":"v0.1.52",
   "source_revision":"%s",
   "tag_on_main":true,
@@ -1930,11 +1930,8 @@ exit 0
 	} else if contextErr != nil {
 		t.Fatal(contextErr)
 	}
-	// It installs upstream's tagged release by design, so it must name that:
-	// this fork's `sr server install` refuses otherwise, after `server add
-	// --default` has already switched the operator's default (PATCHES 37).
-	if published, err := os.ReadFile(srLog); err != nil || !strings.Contains(string(published), "server install team --allow-upstream-release --version v1.2.3") {
-		t.Fatalf("publish did not pass --allow-upstream-release to server install (%v):\n%s", err, published)
+	if published, err := os.ReadFile(srLog); err != nil || !strings.Contains(string(published), "server install team --version v1.2.3") {
+		t.Fatalf("publish did not install the release tag (%v):\n%s", err, published)
 	}
 	validator := filepath.Join(repoRoot, "deploy", "gcp", "validate-deploy-evidence.py")
 	validate := exec.Command(mustLookPath(t, "python3"), validator, "--expect", "fresh-vm-acceptance", acceptancePath)
@@ -2167,7 +2164,7 @@ esac
 		ctx,
 		mustLookPath(t, "bash"),
 		helper,
-		"manaflow-ai/subrouter",
+		"discordwell/subrouter",
 		"v0.1.51",
 		revision,
 	)
@@ -2258,7 +2255,7 @@ esac
 		ctx,
 		mustLookPath(t, "bash"),
 		helper,
-		"manaflow-ai/subrouter",
+		"discordwell/subrouter",
 		"v0.1.51",
 		revision,
 	)

@@ -132,7 +132,7 @@ These commands change state that every running client depends on, or spend somet
 | `sr claude add <name>` | Stores a one-year setup token with no refresh token. | `sr claude addr <name>` for a browser login. |
 | `sr claude reset`, `sr codex reset`, `sr reset` | Spend a saved reset. | See [Saved resets](#saved-resets). |
 | `codex login` or `codex logout` with `CODEX_HOME` set to a pool store | Replaces or ends that account's login chain. | `sr codex login` and `sr codex logout` run on your own `~/.codex`. |
-| `deploy/macos/install-cli-autoupdate.sh`, `deploy/macos/migrate-launchagent-to-supervisor.sh`, `install.sh`, npm, pipx | Install upstream's release in place of this fork's build, or rewrite the plist the deploy scripts expect. | `make build` and `deploy-laptop.sh`. |
+| `deploy/macos/install-cli-autoupdate.sh`, `deploy/macos/migrate-launchagent-to-supervisor.sh`, `install.sh`, npm, pipx | Replace `~/bin/subrouter` outside `deploy-laptop.sh`, or rewrite the plist the deploy scripts expect. The npm and PyPI `subrouter` packages install upstream's build. | `make build` and `deploy-laptop.sh`. |
 | `cp` over `~/bin/subrouter` | Leaves a stale code signature. launchd then kills every start, and KeepAlive restarts it forever. | `deploy-laptop.sh`, which stages, signs, and renames. |
 | `go test` on `./internal/proxy`, `./internal/agents/claude`, or `./cmd/subrouter` | Reaches the real Keychain. | `ops/bin/sr-local-ci <packages>`, or `make docker-test`. |
 | one Claude or Codex login on two daemons | Each refresh rotates the token. The other daemon's copy dies for good. | `sr claude move <name> <server>`. |

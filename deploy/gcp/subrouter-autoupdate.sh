@@ -20,7 +20,7 @@
 # code.
 set -euo pipefail
 
-REPO="${SUBROUTER_REPO:-manaflow-ai/subrouter}"
+REPO="${SUBROUTER_REPO:-discordwell/subrouter}"
 BIN="${SUBROUTER_BIN:-/usr/local/bin/subrouter}"
 VERSION_FILE="${SUBROUTER_VERSION_FILE:-/etc/subrouter-version}"
 SERVICE="${SUBROUTER_SERVICE:-subrouter.service}"
