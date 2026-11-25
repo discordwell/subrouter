@@ -9,7 +9,7 @@ These scripts do the work, and `PATCHES.md` §69 records why:
 - `deploy/macos/rollback-laptop-peer.sh` restores the 2026-08-16 cutover backup.
 - `bin/claude-route` switches new Claude Code launches to the pool and turns the Claude socket on and off.
 
-Run every command below from the root of the checkout whose `ops/bin` is on your `PATH`. Each script reads the same paths from the environment: `SUBROUTER_LABEL` (default `ai.manaflow.subrouter`), `SUBROUTER_PLIST`, `SUBROUTER_ADDR`, and `SUBROUTER_CONTROL_SOCKET`. The defaults match a LaunchAgent in `~/Library/LaunchAgents`. The binary a script replaces is always the one the job runs: the program of a plain serve, or the `--worker-bin` of a supervised job. `SUBROUTER_BIN`, the npm and Python wrappers' setting, does not move it.
+Run every command below from the root of the checkout whose `ops/bin` is on your `PATH`. Each script reads the same paths from the environment: `SUBROUTER_LABEL` (default `ai.manaflow.subrouter`), `SUBROUTER_PLIST`, `SUBROUTER_ADDR`, and `SUBROUTER_CONTROL_SOCKET`. The defaults match a LaunchAgent in `~/Library/LaunchAgents`. The binary a script replaces is always the one the job runs: the program of a plain serve, or the `--worker-bin` of a supervised job. `SUBROUTER_BIN` does not move it (§69.3).
 
 ## Use claude-route from the checkout
 

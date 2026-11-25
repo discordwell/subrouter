@@ -12,16 +12,17 @@ import (
 )
 
 // This fork publishes its own releases (ops/PATCHES.md §107), so nothing may
-// fetch, install or verify manaflow-ai/subrouter's. In any file, a release,
-// API or raw-file URL for it is a finding. In code, so is the bare slug, the
-// way a script or Go names its default release repository. A comment line
-// may name it, to credit a port, and so may a quoted Go import path, which is
-// how install-daemon recognizes a binary built before the module was renamed
-// (§106).
+// fetch, install or verify manaflow-ai/subrouter's. In any file, comments and
+// Markdown included, a finding is a release, API or raw-file URL for it, a gh
+// --repo or -R that names it, or a go install of its module. In code, so is
+// the bare slug, the way a script or Go names its default release repository.
+// A comment line may name the slug, to credit a port, and so may a quoted Go
+// import path, which is how install-daemon recognizes a binary built before
+// the module was renamed (§106).
 
 const upstreamSlug = "manaflow-ai/subrouter"
 
-var upstreamURLRE = regexp.MustCompile(`(?i)(github\.com/manaflow-ai/subrouter/releases|api\.github\.com/repos/manaflow-ai/subrouter|raw\.githubusercontent\.com/manaflow-ai/subrouter)`)
+var upstreamURLRE = regexp.MustCompile(`(?i)(github\.com/manaflow-ai/subrouter/releases|\brepos/manaflow-ai/subrouter|raw\.githubusercontent\.com/manaflow-ai/subrouter|(?:--repo[= ]|-R\s*)manaflow-ai/subrouter|github\.com/manaflow-ai/subrouter/[^\s"'\x60]*@)`)
 
 const upstreamFix = "fetch discordwell/subrouter's releases instead (ops/PATCHES.md §107)"
 
@@ -39,9 +40,16 @@ func isCode(rel string, data []byte) bool {
 	return codeExtensions[path.Ext(rel)] || base == "Makefile" || base == "Dockerfile" || bytes.HasPrefix(data, []byte("#!"))
 }
 
-func isCommentLine(line string) bool {
+// blockCommentExtensions are the languages where a line that starts with "*"
+// continues a /* */ comment. In a shell script it is a case arm.
+var blockCommentExtensions = map[string]bool{".go": true, ".js": true, ".mjs": true, ".cjs": true, ".ts": true}
+
+func isCommentLine(rel, line string) bool {
 	line = strings.TrimSpace(line)
-	for _, prefix := range []string{"//", "#", "/*", "*", "<!--"} {
+	if strings.HasPrefix(line, "*") {
+		return blockCommentExtensions[path.Ext(rel)]
+	}
+	for _, prefix := range []string{"//", "#", "/*", "<!--"} {
 		if strings.HasPrefix(line, prefix) {
 			return true
 		}
@@ -51,7 +59,7 @@ func isCommentLine(line string) bool {
 
 // upstreamFindings returns what in line fetches or names upstream's releases.
 func upstreamFindings(rel, line string, code bool) []string {
-	if urls := upstreamURLRE.FindAllString(line, -1); urls != nil || !code || isCommentLine(line) {
+	if urls := upstreamURLRE.FindAllString(line, -1); urls != nil || !code || isCommentLine(rel, line) {
 		return urls
 	}
 	lower := strings.ToLower(line)
@@ -75,17 +83,23 @@ func TestUpstreamFindings(t *testing.T) {
 	}{
 		{"install.sh", `repo="manaflow-ai/subrouter"`, []string{"manaflow-ai/subrouter"}},
 		{"deploy/gcp/fetch-release.sh", `REPO="${SUBROUTER_REPO:-manaflow-ai/subrouter}"`, []string{"manaflow-ai/subrouter"}},
-		{"x.yml", `gh release download v1 --repo manaflow-ai/subrouter`, []string{"manaflow-ai/subrouter"}},
+		{"x.yml", `gh release download v1 --repo manaflow-ai/subrouter`, []string{"--repo manaflow-ai/subrouter"}},
 		{"cmd/subrouter/sr_update.go", `	updateReleaseRepo = "manaflow-ai/subrouter"`, []string{"manaflow-ai/subrouter"}},
 		{"cmd/subrouter/sr_server.go", `const u = "https://github.com/manaflow-ai/subrouter/releases/latest/download/install.sh"`, []string{"github.com/manaflow-ai/subrouter/releases"}},
 		{"README.md", "curl -fsSL https://github.com/Manaflow-AI/subrouter/releases/latest/download/install.sh | sh", []string{"github.com/Manaflow-AI/subrouter/releases"}},
-		{"x.go", `	u := "https://api.github.com/repos/manaflow-ai/subrouter/commits/v1"`, []string{"api.github.com/repos/manaflow-ai/subrouter"}},
+		{"x.go", `	u := "https://api.github.com/repos/manaflow-ai/subrouter/commits/v1"`, []string{"repos/manaflow-ai/subrouter"}},
 		{"x.sh", `# curl -fsSL https://raw.githubusercontent.com/manaflow-ai/subrouter/main/x.sh | bash`, []string{"raw.githubusercontent.com/manaflow-ai/subrouter"}},
-		{"x.sh", `gh api "repos/manaflow-ai/subrouter/compare/a...main"`, []string{"manaflow-ai/subrouter"}},
+		{"x.sh", `gh api "repos/manaflow-ai/subrouter/compare/a...main"`, []string{"repos/manaflow-ai/subrouter"}},
+		{"x.sh", `  *) repo="manaflow-ai/subrouter" ;;`, []string{"manaflow-ai/subrouter"}},
+		{"x.go", `var cmd = []string{"go", "install", "github.com/manaflow-ai/subrouter/cmd/subrouter@latest"}`, []string{"github.com/manaflow-ai/subrouter/cmd/subrouter@"}},
+		{"docs/upgrades.md", "Run `gh release download v0.1.167 --repo manaflow-ai/subrouter` to get it.", []string{"--repo manaflow-ai/subrouter"}},
+		{"docs/x.md", "Or `gh release view -R manaflow-ai/subrouter`.", []string{"-R manaflow-ai/subrouter"}},
+		{"docs/x.md", "Run `go install github.com/manaflow-ai/subrouter/cmd/subrouter@v0.1.167`.", []string{"github.com/manaflow-ai/subrouter/cmd/subrouter@"}},
 
 		{"x.go", `// Ported from upstream manaflow-ai/subrouter #370 (6bcbcbd).`, nil},
 		{"x.sh", `# upstream manaflow-ai/subrouter's script`, nil},
 		{"x.go", `	preRenameMainPackage = "github.com/manaflow-ai/subrouter/cmd/subrouter"`, nil},
+		{"x.go", `	 * Ported from upstream manaflow-ai/subrouter #389.`, nil},
 		{"AGENTS.md", "This repository is a maintained fork of manaflow-ai/subrouter.", nil},
 		{"install.sh", `repo="discordwell/subrouter"`, nil},
 	} {

@@ -2346,9 +2346,7 @@ func (r srRunner) serverSync(ctx context.Context, store srServerStore, args []st
 
 	fmt.Fprintln(r.out, r.serverHeading(server))
 	if !statusAvailable {
-		// Not `sr server install`: it rewrites the unit or plist that this
-		// fork's deploy scripts write (PATCHES 107).
-		fmt.Fprintln(r.out, "Account status: unavailable on this server version; upgrade "+server.Name+" to a current build to enable refresh-token checks (this fork deploys from source).")
+		fmt.Fprintln(r.out, "Account status: unavailable on this server version; upgrade "+server.Name+" to a current build to enable refresh-token checks.")
 	}
 	printEmailGroup(r.out, "Missing on server", missing)
 	printEmailGroup(r.out, "Already on server", present)

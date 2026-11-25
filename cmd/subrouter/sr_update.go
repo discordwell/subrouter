@@ -32,9 +32,9 @@ import (
 // backup and puts it back by itself when the restarted daemon does not answer
 // health with the version that was just installed.
 //
-// Team hosts (the supervised LaunchDaemon, GCP front slots) and package
-// manager wrappers own their binary through another path, so both commands
-// refuse there and name the command that does own it.
+// Team hosts (the supervised LaunchDaemon, GCP front slots) own their binary
+// through another path, so both commands refuse there and name the command
+// that does own it.
 
 const (
 	updateReleaseRepo    = "discordwell/subrouter"
@@ -71,7 +71,7 @@ rollback  Put the newest kept backup (or --to) back the same way. The last
           .subrouter-backups/. --list prints them.
 
 Team hosts are updated with subrouter-deploy.sh (install-release, pin,
-rollback); npm and pip installs are upgraded by their package manager.
+rollback).
 `
 
 type installKind string
@@ -122,8 +122,6 @@ type updater struct {
 	localAppData string
 
 	executable func() (string, error)
-	lookPath   func(string) (string, error)
-	environ    func(string) string
 
 	client       *http.Client
 	latestURL    string
@@ -168,8 +166,6 @@ func newDefaultUpdater(in io.Reader, out io.Writer) *updater {
 		home:         home,
 		localAppData: os.Getenv("LOCALAPPDATA"),
 		executable:   os.Executable,
-		lookPath:     exec.LookPath,
-		environ:      os.Getenv,
 		client:       &http.Client{Timeout: 10 * time.Minute},
 		latestURL:    envOrDefault("SUBROUTER_RELEASE_LATEST_URL", base+"/latest"),
 		apiLatestURL: envOrDefault("SUBROUTER_RELEASE_API_URL", "https://api.github.com/repos/"+updateReleaseRepo+"/releases/latest"),
@@ -354,7 +350,7 @@ func (u *updater) runRollbackArgs(ctx context.Context, args []string) error {
 // Detection
 
 // detect finds the binary this machine's daemon runs, or refuses when a team
-// deployment or a package manager wrapper owns it.
+// deployment owns it.
 func (u *updater) detect() (installTarget, error) {
 	exe, err := u.executable()
 	if err != nil {
@@ -367,9 +363,6 @@ func (u *updater) detect() (installTarget, error) {
 		return installTarget{}, err
 	}
 	if !found {
-		if manager, ok := u.wrapperManager(exe); ok {
-			return installTarget{}, wrapperRefusal(manager, exe)
-		}
 		target = installTarget{kind: installKindBinary, binary: exe}
 	}
 	if err := u.refuseTeamManaged(target.binary, exe); err != nil {
@@ -484,50 +477,6 @@ func (u *updater) refuseTeamManaged(paths ...string) error {
 		}
 	}
 	return nil
-}
-
-// wrapperManager recognizes the per-version cache the npm and pip wrappers
-// download into: <cache>/<version>/subrouter_<version>_<os>_<arch>[.exe].
-func (u *updater) wrapperManager(exe string) (string, bool) {
-	base := strings.TrimSuffix(filepath.Base(exe), ".exe")
-	version := filepath.Base(filepath.Dir(exe))
-	if !strings.HasPrefix(base, "subrouter_"+version+"_") {
-		return "", false
-	}
-	if u.environ("npm_config_user_agent") != "" || u.environ("npm_execpath") != "" {
-		return "npm", true
-	}
-	for _, name := range []string{"sr", "subrouter"} {
-		shim, err := u.lookPath(name)
-		if err != nil {
-			continue
-		}
-		head := make([]byte, 256)
-		file, err := os.Open(shim)
-		if err != nil {
-			continue
-		}
-		n, _ := file.Read(head)
-		file.Close()
-		text := string(head[:n])
-		switch {
-		case strings.Contains(text, "node"):
-			return "npm", true
-		case strings.Contains(text, "python") || strings.Contains(text, "subrouter_cli"):
-			return "pip", true
-		}
-	}
-	return "package manager", true
-}
-
-func wrapperRefusal(manager, exe string) error {
-	switch manager {
-	case "npm":
-		return fmt.Errorf("%s is downloaded by the npm package; upgrade with\n  npm install -g subrouter@latest\n(or subrouter@X.Y.Z for a specific release)", exe)
-	case "pip":
-		return fmt.Errorf("%s is downloaded by the Python package; upgrade with\n  pip install --upgrade subrouter\n(or 'pipx upgrade subrouter', or subrouter==X.Y.Z for a specific release)", exe)
-	}
-	return fmt.Errorf("%s is downloaded by the npm or pip package; upgrade it with 'npm install -g subrouter@latest' or 'pip install --upgrade subrouter'", exe)
 }
 
 func resolvePath(path string) string {

@@ -163,8 +163,6 @@ func newUpdateFixture(t *testing.T, installed string) *updateFixture {
 		goarch:         "amd64",
 		home:           home,
 		executable:     func() (string, error) { return binary, nil },
-		lookPath:       func(string) (string, error) { return "", os.ErrNotExist },
-		environ:        func(string) string { return "" },
 		client:         f.server.Client(),
 		latestURL:      f.server.URL + "/releases/latest",
 		apiLatestURL:   f.server.URL + "/api/latest",
@@ -460,38 +458,6 @@ func TestUpdateRefusesLinuxTeamHost(t *testing.T) {
 	err := f.u.runUpdateArgs(context.Background(), []string{"--yes"})
 	if err == nil || !strings.Contains(err.Error(), "team deployment") {
 		t.Fatalf("update on a GCP team host: err=%v", err)
-	}
-}
-
-func TestUpdateRefusesPackageManagerWrappers(t *testing.T) {
-	for _, tc := range []struct {
-		shim string
-		want string
-	}{
-		{"#!/usr/bin/env node\nrequire(\"./runner\").run(\"sr\");\n", "npm install -g subrouter@latest"},
-		{"#!/usr/bin/python3\nfrom subrouter_cli import sr\n", "pip install --upgrade subrouter"},
-	} {
-		f := newUpdateFixture(t, "v1.0.0")
-		cached := filepath.Join(f.root, "cache", "1.0.0", "subrouter_1.0.0_linux_amd64")
-		if err := os.MkdirAll(filepath.Dir(cached), 0o755); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(cached, fakeBinaryScript("v1.0.0"), 0o755); err != nil {
-			t.Fatal(err)
-		}
-		shim := filepath.Join(f.root, "shim-sr")
-		if err := os.WriteFile(shim, []byte(tc.shim), 0o755); err != nil {
-			t.Fatal(err)
-		}
-		f.u.executable = func() (string, error) { return cached, nil }
-		f.u.lookPath = func(string) (string, error) { return shim, nil }
-		err := f.u.runUpdateArgs(context.Background(), []string{"--yes"})
-		if err == nil || !strings.Contains(err.Error(), tc.want) {
-			t.Fatalf("wrapper install: err=%v, want %q", err, tc.want)
-		}
-		if got := f.u.binaryVersion(context.Background(), cached); got != "v1.0.0" {
-			t.Fatalf("wrapper cache was modified: %s", got)
-		}
 	}
 }
 
