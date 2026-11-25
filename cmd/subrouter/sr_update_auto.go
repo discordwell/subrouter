@@ -27,8 +27,8 @@ import (
 //
 //   - it runs at most once per autoUpdateInterval, recorded in a stamp file,
 //     so a launcher can trigger it on every start without network cost;
-//   - what a manual update refuses (a team host, a package manager's
-//     wrapper, a build newer than the latest release) is a quiet no-op;
+//   - what a manual update refuses (a team host, a build newer than the
+//     latest release) is a quiet no-op;
 //   - it never restarts a daemon under a request: an unsupervised daemon is
 //     replaced only when its drain-status reports nothing in flight across
 //     idleSamples probes, and otherwise the update is deferred, untouched, for
