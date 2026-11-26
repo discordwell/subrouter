@@ -416,9 +416,12 @@ func TestHostedClaudeUploadGuidanceNamesHostedCMUX(t *testing.T) {
 		program: "sr", store: accounts.CodexStore{Dir: t.TempDir()},
 		out: io.Discard, errOut: io.Discard,
 	}
-	err := runner.pushClaudeProfileToServer(context.Background(), "work", false)
-	if err == nil || !strings.Contains(err.Error(), "hosted cmux uses") {
-		t.Fatalf("error = %v", err)
+	// Named server or not: the storage, not the target, refuses the push.
+	for _, server := range []string{"", "home"} {
+		err := runner.pushClaudeProfileToServer(context.Background(), "work", server, false)
+		if err == nil || !strings.Contains(err.Error(), "hosted cmux uses") {
+			t.Fatalf("push to %q: error = %v", server, err)
+		}
 	}
 }
 
