@@ -805,6 +805,7 @@ func TestGrammarKeylessMachineHasNoServerVerbs(t *testing.T) {
 		{[]string{"claude", "move", "work"}, "unknown command: sr claude move"},
 		{[]string{"claude", "move", "work", "home"}, "unknown command: sr claude move"},
 		{[]string{"claude", "push", "work"}, "unknown command: sr claude push"},
+		{[]string{"claude", "push", "work", "home"}, "unknown command: sr claude push"},
 		{[]string{"claude", "remove", "work", "--server", "home"}, "unknown flag: --server"},
 		{[]string{"remove", "work", "--server", "home"}, "unknown flag: --server"},
 		{[]string{"claude", "add", "st", "--push"}, `unknown option "--push"`},
@@ -1059,7 +1060,7 @@ func TestGrammarHelpDocumentsTheProviderFirstVerbs(t *testing.T) {
 		}
 	}
 	for _, want := range []string{"sr claude add <name>", "sr claude addr [name]", "sr claude login [name]",
-		"sr claude move <name> [<server>]", "sr claude rename <old> <new>", "sr claude push [name] [--copy]"} {
+		"sr claude move <name> [<server>]", "sr claude rename <old> <new>", "sr claude push [name] [<server>] [--copy]"} {
 		if !strings.Contains(claudeOut, want) {
 			t.Errorf("sr claude help lacks %q", want)
 		}

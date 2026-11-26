@@ -75,7 +75,9 @@ func errorSuffix(msg string) string {
 	return ": " + msg
 }
 
-// resolveServer picks the named server, or the default when --server is absent.
+// resolveServer picks the named server. A blank name is refused, not read as
+// the default: `--server ""` is what an unset shell variable gives. A push or
+// move with no server named goes through claudeUploadTarget instead.
 func (r srRunner) resolveServer(name string) (srServerConfig, error) {
 	// selectedRemoteServer is gated and this was not: on a keyless machine that
 	// still had a servers.json, a remove aimed at a server sent an
@@ -85,14 +87,7 @@ func (r srRunner) resolveServer(name string) (srServerConfig, error) {
 		return srServerConfig{}, errors.New("unknown flag: --server")
 	}
 	if strings.TrimSpace(name) == "" {
-		server, ok, err := r.defaultRemoteServer()
-		if err != nil {
-			return srServerConfig{}, err
-		}
-		if !ok {
-			return srServerConfig{}, fmt.Errorf("no default server configured (see `sr remote`)")
-		}
-		return server, nil
+		return srServerConfig{}, errors.New("--server needs a server name")
 	}
 	// A named server heals as the default one does (selectedRemoteServer,
 	// namedRemoteServer): an entry recorded with a Tailscale node ID is
@@ -112,10 +107,51 @@ func (r srRunner) resolveServer(name string) (srServerConfig, error) {
 	return r.healAdminServer(context.Background(), store, server)
 }
 
-// moveClaudeProfile is `sr claude move <name> [<server>]`: the named server,
-// or the default one.
+// claudeUploadTarget is where `sr claude push` and `sr claude move` send a
+// profile: the server named; else the selected one (SUBROUTER_SERVER or the
+// default); else the only configured server, healed as a named one is. With
+// several and no default it guesses nothing: before any credential is read it
+// names each server in the command to rerun with it. A SUBROUTER_SERVER that
+// names this machine is a choice too, so the only server does not override it.
+// flags are the typed flags the rerun must keep: dropping `--copy` would turn
+// a refused copy into a move.
+//
+// 2026-11-26, the owner: "I should be able to push to a target remote!"
+func (r srRunner) claudeUploadTarget(named, verb, profile string, flags ...string) (srServerConfig, error) {
+	if strings.TrimSpace(named) != "" {
+		return r.resolveServer(named)
+	}
+	server, ok, err := r.selectedRemoteServer()
+	if err != nil || ok {
+		return server, err
+	}
+	servers, err := r.configuredRemoteServers()
+	if err != nil {
+		return srServerConfig{}, err
+	}
+	pinnedLocal := explicitLocalServerTarget()
+	if len(servers) == 1 && !pinnedLocal {
+		return r.resolveServer(servers[0].Name)
+	}
+	command := fmt.Sprintf("%s claude %s %s", r.programOrSubrouter(), verb, profile)
+	if len(servers) == 0 {
+		return srServerConfig{}, fmt.Errorf("no server is configured on this machine, so `%s` has nowhere to send it", command)
+	}
+	why := "no server is named and no default is set"
+	if pinnedLocal {
+		why = "no server is named, and SUBROUTER_SERVER or SUBROUTER_CODEX_SERVER selects this machine"
+	}
+	var refusal strings.Builder
+	fmt.Fprintf(&refusal, "%s; nothing was sent. Name a server:", why)
+	for _, server := range servers {
+		refusal.WriteString("\n  " + strings.Join(append([]string{command, server.Name}, flags...), " "))
+	}
+	return srServerConfig{}, errors.New(refusal.String())
+}
+
+// moveClaudeProfile is `sr claude move <name> [<server>]`.
 func (r srRunner) moveClaudeProfile(ctx context.Context, name, serverName string) error {
-	server, err := r.resolveServer(serverName)
+	server, err := r.claudeUploadTarget(serverName, "move", name)
 	if err != nil {
 		return err
 	}

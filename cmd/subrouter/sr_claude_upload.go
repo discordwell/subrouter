@@ -61,14 +61,22 @@ func (r srRunner) refusedRefreshTokenCopy(name string, server srServerConfig) er
 		name, server.Name, program, name, server.Name, server.Name)
 }
 
-// pushClaudeProfileToServer is `sr claude push <name> [--copy]`: an upload to
-// the default server. A setup token is COPIED, as upstream does. A
-// refresh-token profile is MOVED -- the command says so and why before it
-// starts -- because a copy would leave the chain in two places. --copy asks
-// for the copy explicitly, which the chokepoint refuses for a refresh token.
-func (r srRunner) pushClaudeProfileToServer(ctx context.Context, name string, copyOnly bool) error {
-	server, ok, err := r.claudePushServer(name, true)
-	if err != nil || !ok {
+// pushClaudeProfileToServer is `sr claude push <name> [<server>] [--copy]`: an
+// upload to the server claudeUploadTarget picks. A setup token is COPIED, as
+// upstream does. A refresh-token profile is MOVED -- the command says so and
+// why before it starts -- because a copy would leave the chain in two places.
+// --copy asks for the copy explicitly, which the chokepoint refuses for a
+// refresh token.
+func (r srRunner) pushClaudeProfileToServer(ctx context.Context, name, serverName string, copyOnly bool) error {
+	if _, err := r.claudePushStorage(name, true); err != nil {
+		return err
+	}
+	var flags []string
+	if copyOnly {
+		flags = []string{"--copy"}
+	}
+	server, err := r.claudeUploadTarget(serverName, "push", name, flags...)
+	if err != nil {
 		return err
 	}
 	// The profile's own spelling: push matches a selector the way upstream's
@@ -91,9 +99,15 @@ func (r srRunner) pushClaudeProfileToServer(ctx context.Context, name string, co
 // add: a COPY to the default server, and a silent no-op wherever upstream's is
 // (no server, or credential storage that is not Legacy). Only addSetupToken
 // calls it -- an OAuth add never uploads (addOAuth) -- and the chokepoint
-// would refuse a refresh-token copy even if one did.
+// would refuse a refresh-token copy even if one did. An add is not a request
+// to send a credential anywhere, so it never takes claudeUploadTarget's only
+// server.
 func (r srRunner) pushClaudeProfileAfterAdd(ctx context.Context, name string) error {
-	server, ok, err := r.claudePushServer(name, false)
+	ok, err := r.claudePushStorage(name, false)
+	if err != nil || !ok {
+		return err
+	}
+	server, ok, err := r.defaultRemoteServer()
 	if err != nil || !ok {
 		return err
 	}
@@ -122,49 +136,38 @@ func (r srRunner) copyClaudeProfileAfterAdd(ctx context.Context, name string, se
 	return err
 }
 
-// claudePushServer is where a push goes. requireServer is the explicit
-// `sr claude push`; false is the automatic upload after an add, which is a
-// silent no-op wherever upstream's is.
-func (r srRunner) claudePushServer(name string, requireServer bool) (srServerConfig, bool, error) {
+// claudePushStorage reports whether this machine's credential storage lets a
+// push send a local profile to a server. explicit is `sr claude push`, named
+// server or not; false is the automatic upload after an add, which is a silent
+// no-op wherever upstream's is.
+func (r srRunner) claudePushStorage(name string, explicit bool) (bool, error) {
 	config, err := cloudModeConfig()
 	if err != nil {
-		return srServerConfig{}, false, err
+		return false, err
 	}
 	switch source := config.EffectiveCredentialSource(); source {
 	case broker.CredentialSourceTeam, broker.CredentialSourceHosted:
-		if requireServer {
+		if explicit {
 			label := "team storage"
 			if source == broker.CredentialSourceHosted {
 				label = "hosted cmux"
 			}
-			return srServerConfig{}, false, fmt.Errorf(
+			return false, fmt.Errorf(
 				"%s uses '%s account import --only claude:%s'",
 				label,
 				r.programOrSubrouter(),
 				name,
 			)
 		}
-		return srServerConfig{}, false, nil
+		return false, nil
 	case broker.CredentialSourceLocal:
 		// Upstream's automatic upload never runs on local storage, and neither
 		// does this one. An explicit push is different: local credential storage
 		// and a self-hosted server are this fork's whole configuration, and
 		// "local" says where the vault is, not that a push has nowhere to go.
-		if !requireServer {
-			return srServerConfig{}, false, nil
-		}
+		return explicit, nil
 	}
-	server, ok, err := r.defaultRemoteServer()
-	if err != nil {
-		return srServerConfig{}, false, err
-	}
-	if !ok {
-		if !requireServer {
-			return srServerConfig{}, false, nil
-		}
-		return srServerConfig{}, false, fmt.Errorf("no default Subrouter server configured; run '%s server use <name>'", r.programOrSubrouter())
-	}
-	return server, true, nil
+	return true, nil
 }
 
 // readLocalClaudeCredential reads one local profile's credential, which is how

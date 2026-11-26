@@ -52,10 +52,12 @@ Usage:
   sr claude rename <old> <new>  Re-label a local profile
                                 (each configured server is checked for a clash; a server cannot rename)
   sr claude move <name> [<server>]
-                                MOVE a profile to a server (default: the default server): upload, confirm
-                                the server can use it, then remove the local copy
+                                MOVE a profile to a server: upload, confirm the server can use it, then
+                                remove the local copy. No server named: the default server, else the only
+                                one; with several and no default it names them and sends nothing
   sr claude env [name]          Print CLAUDE_CONFIG_DIR for a local/HTTPS profile (default: the active one)
-  sr claude push [name] [--copy] Upload a profile to the default server pool: a setup token is copied,
+  sr claude push [name] [<server>] [--copy]
+                                Upload a profile to a server, chosen as for move: a setup token is copied,
                                 a refresh-token profile is MOVED (--copy is refused for it)
   sr claude pick                Switch to the profile with the most quota left
   sr claude reset <name|email>
@@ -100,16 +102,16 @@ type claudeRunner struct {
 	// authStatus is a test seam for the read-only local-login preflight.
 	// Production uses claude.AuthStatusForPath.
 	authStatus func(context.Context, string, string) (*claude.AuthStatus, error)
-	// pushToServer uploads a profile to the default Subrouter server, when
-	// one is configured. nil when the claude runner is built without server
-	// support (tests). pushAfterAdd is the same upload but no-ops silently
-	// when no default server is configured.
+	// pushToServer uploads a profile to the server named, or to the one
+	// claudeUploadTarget picks when server is empty. nil when the claude
+	// runner is built without server support (tests). pushAfterAdd uploads to
+	// the default server only, and no-ops silently when none is set.
 	//
 	// pushToServer is `sr claude push`: a setup token is copied, a
 	// refresh-token profile is moved (copyOnly asks for the copy, which is
 	// refused for a refresh token). pushAfterAdd runs after a setup-token add
 	// only -- an OAuth add never uploads.
-	pushToServer func(ctx context.Context, name string, copyOnly bool) error
+	pushToServer func(ctx context.Context, name, server string, copyOnly bool) error
 	pushAfterAdd func(ctx context.Context, name string) error
 	pick         func(ctx context.Context) error
 	// reset is `sr claude reset` (PATCHES §46): it finds the daemon holding
@@ -225,8 +227,8 @@ func (r srRunner) claude(ctx context.Context, args []string) error {
 }
 
 // newClaudeRunner is the profile manager with every server hook wired. The
-// hooks reach a server only through resolveServer / defaultRemoteServer, both
-// behind the PATCHES 17 gate.
+// hooks reach a server only through claudeUploadTarget, resolveServer and
+// defaultRemoteServer, all behind the PATCHES 17 gate.
 func (r srRunner) newClaudeRunner(store claude.Store) claudeRunner {
 	return claudeRunner{
 		store:            store,
@@ -1665,19 +1667,28 @@ func (r claudeRunner) run(ctx context.Context, args []string) error {
 		if r.pushToServer == nil {
 			return fmt.Errorf("server push is not available")
 		}
-		name := ""
+		const usage = "usage: sr claude push [name] [<server>] [--copy]"
+		var positional []string
 		copyOnly := false
 		for _, arg := range args[1:] {
 			switch {
 			case arg == "--copy":
 				copyOnly = true
 			case strings.HasPrefix(arg, "-"):
-				return fmt.Errorf("unknown option %q\nusage: sr claude push [name] [--copy]", arg)
-			case name != "":
-				return fmt.Errorf("usage: sr claude push [name] [--copy]")
+				return fmt.Errorf("unknown option %q\n%s", arg, usage)
 			default:
-				name = arg
+				positional = append(positional, arg)
 			}
+		}
+		if len(positional) > 2 {
+			return errors.New(usage)
+		}
+		name, server := "", ""
+		if len(positional) > 0 {
+			name = positional[0]
+		}
+		if len(positional) == 2 {
+			server = positional[1]
 		}
 		if name == "" {
 			name = r.store.ActiveProfile()
@@ -1685,7 +1696,7 @@ func (r claudeRunner) run(ctx context.Context, args []string) error {
 		if name == "" {
 			return fmt.Errorf("usage: sr claude push <name>")
 		}
-		return r.pushToServer(ctx, name, copyOnly)
+		return r.pushToServer(ctx, name, server, copyOnly)
 	case "run":
 		name := ""
 		extra := []string{}
