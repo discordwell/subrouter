@@ -4717,3 +4717,45 @@ The owner, 2026-11-25: the fork publishes its own GitHub releases, so anyone can
 - Tests: `ops/publiccheck/upstream_release_test.go` (`TestUpstreamFindings`, `TestNoUpstreamReleaseFetch`), `cmd/subrouter/installer_lifecycle_test.go` (`TestServerInstallPipesThisForksRelease`), `cmd/subrouter/sr_host_test.go` (`TestHostInstallScriptIsIdempotent`), `cmd/subrouter/sr_update_test.go` (the wrapper test is deleted), `cmd/subrouter/deploy_scripts_test.go`, `cmd/subrouter/release_publish_test.go`, `cmd/subrouter-transport-observer/golden_options_test.go`
 - Docs: `README.md`, `ops/GETTING-STARTED.md`, `ops/OPERATING.md`, `ops/skills/subrouter/SKILL.md`, `ops/LAPTOP.md`, `docs/production.md`, `docs/upgrades.md`, `deploy/gcp/README.md`, `ops/deploy/lightsail/README.md`
 - Related: removes §37.3's refusal; amends §106.2 and §106.3.
+
+## 108. `sr claude push` takes a target server, and push and move pick one with no default
+
+The owner, 2026-11-26, with two servers configured and no default: "the push mechanic doesn't work very gracefully when I don't have a default set. I wrote it to be easy for when I only have one remote, but really I should be able to push to a target remote!"
+
+What was wrong. `sr claude push <name>` could reach only the default server. The operator guide says to leave out `--default`, so the laptop it describes has no default, and push failed with `no default Subrouter server configured; run 'sr server use <name>'`. That advice is harmful on this fork: `sr server use` rewrites the files every local agent authenticates through (`AGENTS.md`). `sr claude move <name>` with no server named failed too, with ``no default server configured (see `sr remote`)``.
+
+§108.1 What changed.
+
+1. `sr claude push [name] [<server>] [--copy]` sends the profile to `<server>`, whatever the default is. One positional is the profile. A third is a usage error. A setup token is still copied, a refresh-token profile is still moved after the announcement, and `--copy` on a refresh-token profile is still refused.
+2. One resolver, `claudeUploadTarget`, picks the server for push and for move, so the two verbs cannot drift. In order: the server named; else `SUBROUTER_SERVER` or the stored default, as before; else the only configured server (the built-ins are skipped), healed as a named server is. With two or more and no default, it reads no credential and sends nothing. The refusal names each server in the command to rerun with it, for the verb and profile typed, and keeps `--copy`. Without it, the rerun of a refused copy would be a move. With no configured server, it says so. A `SUBROUTER_SERVER` or `SUBROUTER_CODEX_SERVER` that names this machine is a choice, so the only server does not override it. The owner's words are on the resolver with their date.
+3. No error or help text from push or move names `sr server use`.
+4. `resolveServer` takes a named server only. A blank name is refused with `--server needs a server name`. Before, `sr claude remove <name> --server ""`, which is what an unset shell variable gives, deleted the account on the default server. `sr claude reset` already refused a blank `--server` and is unchanged.
+5. The storage check that `claudePushServer` held is `claudePushStorage`. An explicit push under team or hosted storage is refused as before, named server or not.
+
+§108.2 What did not change.
+
+- The copy after a setup-token add (`pushClaudeProfileAfterAdd`) goes to the default server only, and is a silent no-op without one. An add is not a request to send a credential anywhere, so it does not take the only server.
+- A machine without `remote.key` (§17): push and move are unknown commands, and nothing remote is named.
+- `sr claude remove <name> --server <server>` and `sr claude reset --server` with a server named. Upload transport, the check that the server can use a moved profile, and the local removal.
+
+§108.3 Residual risk.
+
+- A push or move with no server named, no default and one configured server now sends there. Before, it failed. A move, or a push of a refresh-token profile, then removes the local copy once that server confirms it can use it.
+- `sr server use local` clears the default, so it cannot be told from a default never set. After it, a push or move with no server named still goes to the only server. Only an environment target that names this machine holds it back.
+
+§108.4 Tests. `cmd/subrouter/sr_claude_push_target_test.go` drives `sr` on a sandboxed keyed machine against fake servers and checks which server received each request:
+- `TestPushToANamedServerWithNoDefault`: two servers, no default, `push <name> box2` for a refresh-token profile, a setup token, `--copy` and the `upload` spelling. Only `box2` receives it.
+- `TestPushToANamedServerOverTheDefault`: a named server wins over the default.
+- `TestPushAndMoveWithSeveralServersAndNoDefaultNameThem`: push, push `--copy` and move are refused with each server's rerun command and no `server use`. Neither server is reached, and the local profile stays.
+- `TestPushAndMoveWithOneServerAndNoDefaultUseIt`: push and move go to the only server.
+- `TestSetupTokenAddDoesNotTakeTheOnlyServer`: the copy after an add sends nothing with one server and no default.
+- `TestPushAndMoveDoNotOverrideAnExplicitLocalTarget`, `TestPushAndMoveWithNoServerSaySo`, `TestPushRefusesAThirdPositional`, `TestRemoveWithABlankServerDeletesNothing`.
+
+On the tree before this change, with only this file added, eight of the nine fail on what the owner saw: `usage: sr claude push [name] [--copy]` for a named server, `run 'sr server use <name>'` with no default, and a `remove --server ""` that deleted on the default server. `TestSetupTokenAddDoesNotTakeTheOnlyServer` passes there too, as it holds what §108 must not change. They ran under `ops/bin/sr-local-ci ./cmd/subrouter` on macOS. Docker was not running, so `make docker-test` was not run.
+
+`TestGrammarKeylessMachineHasNoServerVerbs` also refuses `push <name> <server>` as unknown, and `TestGrammarHelpDocumentsTheProviderFirstVerbs` checks the new push line. `TestHostedClaudeUploadGuidanceNamesHostedCMUX` also checks a named server.
+
+- Code: `cmd/subrouter/sr_claude_move.go` (`claudeUploadTarget`, `resolveServer`, `moveClaudeProfile`), `cmd/subrouter/sr_claude_upload.go` (`pushClaudeProfileToServer`, `pushClaudeProfileAfterAdd`, `claudePushStorage`), `cmd/subrouter/sr_claude.go` (the `push` case, `claudeRunner.pushToServer`, the help)
+- Tests: `cmd/subrouter/sr_claude_push_target_test.go`, `cmd/subrouter/sr_grammar_pass_test.go`, `cmd/subrouter/sr_onboarding_review_test.go`
+- Docs: `README.md`, `ops/OPERATING.md` (Move accounts to the box), `ops/skills/subrouter/SKILL.md` (Add an account)
+- Related: amends §22 (push and move); §17 and §51 are unchanged.

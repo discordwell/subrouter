@@ -418,6 +418,8 @@ Move Claude accounts one at a time. `sr claude move` uploads the login, waits fo
 sr claude move <name> box
 ```
 
+`sr claude push <name> box` sends a profile to that server too. It copies a setup token and moves a refresh-token profile, as `sr claude move` does. With no server named, both go to the default server, else to the only configured one. With two or more and no default, they send nothing and print the command for each server (§108).
+
 Keep the profile that `SUBROUTER_IDENTITY_ACCOUNT` names on the laptop. `sr claude move` does not check for it. With the socket on, moving it leaves `control_plane_identity` `missing` in `/_subrouter/health`. Every socket session's `/api/*` call then gets 503, and Claude Code withholds WebFetch. `claude-route status` shows which profile that is.
 
 `sr server login box` signs a Codex account in directly on the box. `sr claude remove <name> --server box` deletes an account on the box only.

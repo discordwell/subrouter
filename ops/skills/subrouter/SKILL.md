@@ -175,7 +175,8 @@ Give these commands to the operator to run. Each sign-in needs a person at a bro
 | A Codex account into the pool | `sr codex add [--device-auth] [--email <email>]`. It signs in through a throwaway `CODEX_HOME`. |
 | A Claude account with browser OAuth (a refresh token) | `sr claude addr [<name>]`. It prints a URL and waits for a pasted code. |
 | A Claude account from a 1-year setup token | `sr claude add <name>`. |
-| A Claude account onto the box | `sr claude move <name> [<server>]` on a machine with `remote.key`. |
+| A Claude account onto the box | `sr claude move <name> [<server>]` on a machine with `remote.key`. With no server named it goes to the default server, else to the only one. With several and no default it sends nothing and names them (§108). |
+| A setup-token Claude profile copied to the box | `sr claude push <name> [<server>]`. It picks the server as `move` does. On a refresh-token profile it moves instead. |
 | The operator's own Codex CLI login | `sr codex login`. It runs the real Codex CLI against `~/.codex`, never a pool account. |
 
 A refresh-token Claude profile is never in two places. Anthropic rotates refresh tokens on use, so a copy dies at the next refresh. `sr claude move` uploads the profile, confirms that the server can use it, and only then removes the local copy (§22). `sr claude add` takes a setup token, and `sr claude addr` is the OAuth login.
