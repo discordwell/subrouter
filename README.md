@@ -428,6 +428,7 @@ sr add claude <profile> --token -       # paste an existing setup token on stdin
 sr claude login <profile>               # classic browser OAuth login (refresh token)
 sr claude addr [<profile>]              # this fork: same as `sr claude login` ("add refresh")
 sr claude move <profile> [<server>]     # this fork: MOVE to a server (upload, verify, drop local)
+sr claude push <profile> [<server>] [--copy]  # copy a setup token to a server; a refresh token MOVES
 sr claude rename <old> <new>            # this fork: re-label a local profile
 sr claude remove <profile> [--server <server>]
 sr claude list
@@ -454,6 +455,11 @@ In this fork a refresh-token profile is never left in two places (every refresh
 rotates the token, and the second holder dies): `sr claude login`/`addr` never
 upload, `sr claude push` on such a profile MOVES it, and `sr claude move` is the
 explicit move. A setup token is still copied. See `ops/PATCHES.md` §22.
+
+Both verbs take the server to send to. With no server named, they go to the
+default server, else to the only configured one. With two or more and no
+default, they send nothing and print the command for each server. See
+`ops/PATCHES.md` §108.
 
 `sr claude list` reports only isolated local managed profiles and their local
 login state. `sr claude run <profile>` launches one of those profiles directly
