@@ -2992,6 +2992,7 @@ Usage:
   %[1]s addr claude [<name>]
                            Add a Claude profile with the browser OAuth login: a refresh token
                            (same as %[1]s claude addr / %[1]s claude login). It stays on this machine
+                           When exactly one server already holds that name, it MOVES there
   %[1]s claude move <name> [<server>]
                            MOVE a Claude profile to a server: upload, verify, remove the local copy
   %[1]s claude rename <old> <new>

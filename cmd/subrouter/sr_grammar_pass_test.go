@@ -56,7 +56,8 @@ type grammarBox struct {
 	// this machine during the upload, or during the move's check.
 	onImport      func()
 	onUsageStatus func()
-	// others are non-Claude accounts the registry lists beside what it holds.
+	// others are non-Claude accounts the registry and usage-status list
+	// beside what it holds.
 	others []remoteServerAccount
 }
 
@@ -92,6 +93,12 @@ func (b *grammarBox) serve(w http.ResponseWriter, r *http.Request) {
 			statuses = append(statuses, remoteServerUsageStatus{
 				ID: name, Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth,
 				AuthChecked: true, AuthValid: !b.unusable,
+			})
+		}
+		for _, other := range b.others {
+			statuses = append(statuses, remoteServerUsageStatus{
+				ID: other.ID, Provider: other.Provider, AuthMode: other.AuthMode,
+				AuthChecked: true, AuthValid: true,
 			})
 		}
 		_ = json.NewEncoder(w).Encode(statuses)
@@ -350,6 +357,14 @@ func (m *grammarMachine) addOAuthProfile(name string) {
 		m.t.Fatalf("fixture: sr claude addr %s: %v\n%s", name, err, out)
 	}
 	m.requireRefreshToken(name)
+	// The add reads each server for an account of its name (PATCHES 109). A
+	// test checks what its own command sends, so the fixture's reads are
+	// forgotten.
+	for _, box := range m.boxes {
+		box.mu.Lock()
+		box.requests = nil
+		box.mu.Unlock()
+	}
 }
 
 // addSetupTokenProfile writes a setup-token profile straight into the store, so
@@ -545,10 +560,10 @@ func TestGrammarAddrNeedsTheClaudeProvider(t *testing.T) {
 // --- The invariant: a refresh-token credential is never left in two places ----
 
 // On the owner's laptop (keyed, a default box, Legacy source) every OAuth
-// spelling stays on this machine: upstream copied the new profile to the
-// server afterwards. Nothing may reach the box -- not even a preflight -- and
-// nothing may print about an upload.
-func TestGrammarOAuthAddNeverReachesTheServer(t *testing.T) {
+// spelling stays on this machine when no server holds its name: upstream
+// copied the new profile to the server afterwards. The box may only be read
+// for the name (PATCHES 109), and nothing may print about an upload.
+func TestGrammarOAuthAddNeverCopiesToTheServer(t *testing.T) {
 	for _, args := range [][]string{
 		{"claude", "addr", "work"},
 		{"addr", "claude", "work"},
@@ -562,8 +577,10 @@ func TestGrammarOAuthAddNeverReachesTheServer(t *testing.T) {
 				t.Fatalf("%v: %v\n%s", args, err, out)
 			}
 			m.requireRefreshToken("work")
-			if seen := m.boxes["home"].seen(); len(seen) > 0 {
-				t.Fatalf("an OAuth add reached the server: %v\n%s", seen, out)
+			for _, request := range m.boxes["home"].seen() {
+				if request != http.MethodGet+" /_subrouter/usage-status" {
+					t.Fatalf("an OAuth add sent the server more than a read: %v\n%s", m.boxes["home"].seen(), out)
+				}
 			}
 			if strings.Contains(strings.ToLower(out), "upload") {
 				t.Fatalf("an OAuth add attempted an upload:\n%s", out)

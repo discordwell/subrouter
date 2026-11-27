@@ -43,6 +43,7 @@ Usage:
   sr claude addr [name]         Add a profile with the browser OAuth login: a refresh token, name inferred
                                 from the email (same as 'sr addr claude'). It stays on this machine;
                                 a refresh token held in two places dies at the next rotation
+                                When exactly one server already holds that name, it MOVES there instead
   sr claude login [name]        Same as 'sr claude addr'
   sr claude list                List local managed profiles with auth status and setup-token expiry
   sr claude switch [name]       Switch active local profile
@@ -110,7 +111,7 @@ type claudeRunner struct {
 	// pushToServer is `sr claude push`: a setup token is copied, a
 	// refresh-token profile is moved (copyOnly asks for the copy, which is
 	// refused for a refresh token). pushAfterAdd runs after a setup-token add
-	// only -- an OAuth add never uploads.
+	// only -- an OAuth add is never copied (settleOAuthAdd can move it).
 	pushToServer func(ctx context.Context, name, server string, copyOnly bool) error
 	pushAfterAdd func(ctx context.Context, name string) error
 	pick         func(ctx context.Context) error
@@ -123,6 +124,11 @@ type claudeRunner struct {
 	moveToServer     func(ctx context.Context, name, server string) error
 	renameProfile    func(ctx context.Context, oldName, newName string) error
 	removeFromServer func(ctx context.Context, name, server string) error
+	// settleOAuthAdd runs once a browser OAuth add has registered its profile
+	// on a machine with remote.key. It prints where the login stays, or moves
+	// it to the one configured server that already holds a Claude account of
+	// that name and reports moved. nil without server support.
+	settleOAuthAdd func(ctx context.Context, name string) (moved bool, err error)
 	// ephemeral is used by hosted account onboarding. OAuth runs in a
 	// temporary store, the credential is uploaded, and no local profile or
 	// trajectory directory survives the command.
@@ -243,6 +249,7 @@ func (r srRunner) newClaudeRunner(store claude.Store) claudeRunner {
 		moveToServer:     r.moveClaudeProfile,
 		renameProfile:    r.renameClaudeProfile,
 		removeFromServer: r.deleteRemoteAccount,
+		settleOAuthAdd:   r.settleClaudeOAuthAdd,
 	}
 }
 
@@ -2139,12 +2146,13 @@ func formatSetupTokenExpiry(expiresAt, now time.Time) string {
 // `sr add claude --oauth`. Claude Code writes a refreshable credential into the
 // profile directory and Subrouter adopts it.
 //
-// It NEVER uploads. Upstream copied the new profile to the default server
+// It NEVER copies. Upstream copied the new profile to the default server
 // afterwards, which leaves one refresh-token chain in two places: Anthropic
 // rotates the refresh token on every refresh, the second refresher holds a
 // rotated-away token, and that copy is dead for good (seven-alpha and
 // ten-alpha were lost exactly this way). The credential reaches a server only
-// by `sr claude move`, which removes the local copy once the server can use it.
+// by a move, which removes the local copy once the server can use it: `sr
+// claude move`, or settleOAuthAdd when a server already holds the name.
 func (r claudeRunner) addOAuth(ctx context.Context, name string) error {
 	claudePath, ok := claude.DetectCLI()
 	if !ok {
@@ -2384,10 +2392,13 @@ func (r claudeRunner) addOAuth(ctx context.Context, name string) error {
 	}
 
 	fmt.Fprintf(r.out, "\nAdded Claude profile %q.%s%s\n", profileName, email, plan)
-	// The hint names the server, so a keyless machine does not print it
+	// What it prints names servers, so a keyless machine does not run it
 	// (PATCHES 17).
-	if r.moveToServer != nil && remoteUnlocked() {
-		fmt.Fprintf(r.out, "Kept on this machine only (it holds a refresh token). To move it to a server: sr claude move %s\n", profileName)
+	if r.settleOAuthAdd != nil && remoteUnlocked() {
+		moved, err := r.settleOAuthAdd(ctx, profileName)
+		if err != nil || moved {
+			return err
+		}
 	}
 	fmt.Fprintf(r.out, "\n  sr claude switch %s\n", profileName)
 	fmt.Fprintf(r.out, "  sr claude run %s\n", profileName)

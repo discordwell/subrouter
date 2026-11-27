@@ -77,6 +77,7 @@ Usage:
                         refresh token, name inferred from the email (same as
                         sr claude addr / sr claude login). It stays on this
                         machine; a refresh token held in two places dies
+                        When exactly one server holds that name, it MOVES there
   sr claude move <name> [<server>]
                         MOVE a Claude profile to a server: upload, confirm the
                         server can use it, then remove the local copy
@@ -903,8 +904,9 @@ func (r srRunner) runRemoteAccountCommand(ctx context.Context, server srServerCo
 		// Upstream's arms. `sr add claude` under a selected remote is upstream's
 		// addClaudeToServer: a setup token is enrolled here and COPIED to this
 		// server (it cannot race; an unpinned plaintext server gets no copy,
-		// PATCHES §51); `--oauth` stays on this machine, because a
-		// refresh token held in two places dies at the next rotation.
+		// PATCHES §51); `--oauth` is never copied, because a refresh token
+		// held in two places dies at the next rotation. It moves only to a
+		// server that already holds its name (PATCHES §109).
 		if command == "add" && len(args) > 1 && claudeProviderWords[strings.ToLower(args[1])] {
 			return r.addClaudeToServer(ctx, server, args[2:])
 		}
@@ -3628,12 +3630,14 @@ func usageRowErrorHint(row srUsageRow) string {
 // A local row knows its kind from the credential it read. A server's row is
 // judged by its error: only an expired setup token says so, and a setup token
 // never refreshes, so everything else is an OAuth login. A server's account is
-// a profile on that server, so the hint says to run the command there: the
-// same command on this machine would sign in a new local profile and leave the
-// server's copy dead. It names the server's profile ID, never the row's email:
-// the email is the account's address from .claude.json, and `sr claude addr
-// <email>` on the server would sign a NEW profile in under that name and leave
-// the dead one in the pool.
+// a profile on that server, so the hint says to run the command there. The
+// same command on this machine reaches that server only with remote.key and
+// when it is the one configured server holding the name (PATCHES §109);
+// otherwise it signs in a new local profile and leaves the server's copy dead.
+// It names the server's profile ID, never the row's email: the email is the
+// account's address from .claude.json, and `sr claude addr <email>` on the
+// server would sign a NEW profile in under that name and leave the dead one in
+// the pool.
 func claudeUsageRowRepair(row srUsageRow) string {
 	if row.hostedAccount {
 		// Hosted cmux storage: there `sr add claude` is the storage's own add
