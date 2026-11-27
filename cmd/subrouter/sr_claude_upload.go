@@ -98,7 +98,7 @@ func (r srRunner) pushClaudeProfileToServer(ctx context.Context, name, serverNam
 // pushClaudeProfileAfterAdd is upstream's automatic upload after a setup-token
 // add: a COPY to the default server, and a silent no-op wherever upstream's is
 // (no server, or credential storage that is not Legacy). Only addSetupToken
-// calls it -- an OAuth add never uploads (addOAuth) -- and the chokepoint
+// calls it -- an OAuth add is never copied (addOAuth) -- and the chokepoint
 // would refuse a refresh-token copy even if one did. An add is not a request
 // to send a credential anywhere, so it never takes claudeUploadTarget's only
 // server.
@@ -274,8 +274,9 @@ func (r srRunner) pushClaudeProfileTo(ctx context.Context, name string, server s
 //     An unpinned plaintext server gets no copy; it stays here
 //     (copyClaudeProfileAfterAdd, PATCHES §51).
 //   - `--oauth` is the refresh-token login (`sr claude addr`). Upstream copied
-//     it too; here it is enrolled on this machine only. It reaches the server
-//     by `sr claude move`, the one path that removes the local copy.
+//     it too; here it is never copied. It reaches a server only by a move,
+//     the one path that removes the local copy: `sr claude move`, or the add's
+//     own move when a server already holds its name (settleClaudeOAuthAdd).
 func (r srRunner) addClaudeToServer(ctx context.Context, server srServerConfig, args []string) error {
 	options, err := parseClaudeAddArgs(args)
 	if err != nil {
@@ -285,8 +286,9 @@ func (r srRunner) addClaudeToServer(ctx context.Context, server srServerConfig, 
 	cr := r.newClaudeRunner(store)
 	if options.oauth {
 		cr.pushAfterAdd = nil
-		fmt.Fprintf(r.out, "An OAuth login holds a refresh token, so it stays on this machine and is not copied "+
-			"to %s; `%s claude move <name> %s` moves it there.\n", server.Name, r.programOrSubrouter(), server.Name)
+		fmt.Fprintf(r.out, "An OAuth login holds a refresh token, so it is not copied to %s. It moves to the one "+
+			"server that already holds an account of its name, if there is one, and otherwise stays on this "+
+			"machine; `%s claude move <name> %s` moves it there.\n", server.Name, r.programOrSubrouter(), server.Name)
 		return cr.addOAuth(ctx, options.name)
 	}
 	cr.pushAfterAdd = func(ctx context.Context, name string) error {

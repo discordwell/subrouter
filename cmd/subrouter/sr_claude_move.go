@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/discordwell/subrouter/internal/accounts"
@@ -156,6 +158,88 @@ func (r srRunner) moveClaudeProfile(ctx context.Context, name, serverName string
 		return err
 	}
 	return r.moveClaudeProfileTo(ctx, name, server)
+}
+
+// settleClaudeOAuthAdd is claudeRunner.settleOAuthAdd. A server whose account
+// died says `re-auth on that server with: sr claude addr <name>`, and run here
+// that login lands here. So when exactly one configured server already holds a
+// Claude account of the profile's name, the new login goes there by `sr claude
+// move <name> <server>`, and moved reports that it left this machine. With
+// several holders it sends nothing and names a move to each. With none it
+// stays here, as before. A server that cannot be read blocks nothing.
+//
+// 2026-11-27, the owner: "when I have an existing token name that's on a remote, doing claude addr without params should automatically put it onto that remote."
+func (r srRunner) settleClaudeOAuthAdd(ctx context.Context, name string) (bool, error) {
+	holders, unread, err := r.claudeServersHolding(ctx, name)
+	if err != nil {
+		fmt.Fprintf(r.errOut, "Warning: could not read the server list, so no server was checked for an account named %q: %v\n", name, err)
+	}
+	for _, server := range unread {
+		fmt.Fprintf(r.errOut, "Warning: could not read %s, so it was not checked for an account named %q.\n", server, name)
+	}
+	program := r.programOrSubrouter()
+	switch len(holders) {
+	case 0:
+		fmt.Fprintf(r.out, "Kept on this machine only (it holds a refresh token). To move it to a server: sr claude move %s\n", name)
+		return false, nil
+	case 1:
+		server := holders[0]
+		fmt.Fprintf(r.out, "%s already holds an account named %q, so this login moves there.\n", server, name)
+		if err := r.moveClaudeProfile(ctx, name, server); err != nil {
+			fmt.Fprintf(r.out, "The move to %s did not finish. To retry it: %s claude move %s %s\n", server, program, name, server)
+			return false, err
+		}
+		return true, nil
+	}
+	fmt.Fprintf(r.out, "Several servers hold an account named %q, so nothing was sent and this login stays here. Move it to one:\n", name)
+	for _, server := range holders {
+		fmt.Fprintf(r.out, "  %s claude move %s %s\n", program, name, server)
+	}
+	return false, nil
+}
+
+// claudeServersHolding reads every configured server for a Claude account
+// named name. holders are the servers that list one, usable or not: a dead
+// copy is the usual reason to sign in again. unread are the servers that did
+// not answer. The reads run at once, each within remoteAccountSectionTimeout,
+// so a dead tailnet costs one timeout. A keyless machine lists no servers
+// (PATCHES 17), so it reads nothing.
+//
+// Only a Claude row counts, as in verifyServerHoldsAccount, and the name must
+// match exactly, as that check does. A server's import matches a name without
+// case, so a login sent under another case would land there and then fail
+// the check, with the chain in both places.
+func (r srRunner) claudeServersHolding(ctx context.Context, name string) (holders, unread []string, err error) {
+	servers, err := r.configuredRemoteServers()
+	if err != nil {
+		return nil, nil, err
+	}
+	answered := make([]bool, len(servers))
+	holds := make([]bool, len(servers))
+	var wg sync.WaitGroup
+	for i, server := range servers {
+		wg.Go(func() {
+			readCtx, cancel := context.WithTimeout(ctx, remoteAccountSectionTimeout)
+			defer cancel()
+			// quiet: the reads share one output, and which of a server's
+			// paths answered does not matter here.
+			statuses, ok, _, err := r.fetchServerUsageStatusesAt(readCtx, server, usageStatusRoute, true)
+			answered[i] = ok && err == nil
+			holds[i] = slices.ContainsFunc(statuses, func(status remoteServerUsageStatus) bool {
+				return status.ID == name && status.Provider == accounts.ProviderClaude
+			})
+		})
+	}
+	wg.Wait()
+	for i, server := range servers {
+		switch {
+		case !answered[i]:
+			unread = append(unread, server.Name)
+		case holds[i]:
+			holders = append(holders, server.Name)
+		}
+	}
+	return holders, unread, nil
 }
 
 // moveClaudeProfileTo MOVES a profile to a server the caller already resolved:
