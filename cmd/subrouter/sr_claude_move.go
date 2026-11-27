@@ -198,11 +198,18 @@ func (r srRunner) settleClaudeOAuthAdd(ctx context.Context, name string) (bool, 
 	return false, nil
 }
 
+// claudeHolderReadTimeout bounds one server's answer to claudeServersHolding.
+// It is the admin call's own 15 s, not the 5 s `sr` status gives a section:
+// on 2026-11-27 the two boxes took 0.4 to 3.6 s to answer usage-status on a
+// quiet laptop, and a read cut short leaves the login here, for the move by
+// hand this lookup exists to spare. A variable so a test can shorten it.
+var claudeHolderReadTimeout = 15 * time.Second
+
 // claudeServersHolding reads every configured server for a Claude account
 // named name. holders are the servers that list one, usable or not: a dead
 // copy is the usual reason to sign in again. unread are the servers that did
-// not answer. The reads run at once, each within remoteAccountSectionTimeout,
-// so a dead tailnet costs one timeout. A keyless machine lists no servers
+// not answer. The reads run at once, each within claudeHolderReadTimeout, so
+// a dead tailnet costs one timeout. A keyless machine lists no servers
 // (PATCHES 17), so it reads nothing.
 //
 // Only a Claude row counts, as in verifyServerHoldsAccount, and the name must
@@ -219,7 +226,7 @@ func (r srRunner) claudeServersHolding(ctx context.Context, name string) (holder
 	var wg sync.WaitGroup
 	for i, server := range servers {
 		wg.Go(func() {
-			readCtx, cancel := context.WithTimeout(ctx, remoteAccountSectionTimeout)
+			readCtx, cancel := context.WithTimeout(ctx, claudeHolderReadTimeout)
 			defer cancel()
 			// quiet: the reads share one output, and which of a server's
 			// paths answered does not matter here.
