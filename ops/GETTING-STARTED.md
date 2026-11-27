@@ -87,7 +87,7 @@ Add each Claude Max account:
 sr claude addr <name>
 ```
 
-`<name>` is a label you choose, such as `work`. Without it, the profile is named after the account's email. Sign in as that account in the browser, and finish the steps the terminal prints. The command prints `Added Claude profile "<name>".`, followed by the account's email and plan. The login stays on this Mac.
+`<name>` is a label you choose, such as `work`. Without it, the profile is named after the account's email. Sign in as that account in the browser, and finish the steps the terminal prints. The command prints `Added Claude profile "<name>".`, followed by the account's email and plan. The login stays on this Mac. Once you add a box, a login under a name the box already holds moves there instead (§109).
 
 Type `addr`, not `add`. `sr claude add <name>` stores a one-year setup token with no refresh token.
 
@@ -259,3 +259,5 @@ A box is a cheap Linux machine on your tailnet that runs a second daemon. The la
 5. Run `srq pool` again. It now prints a section for the box's accounts as well.
 
 Never keep one account on both daemons. Each login refresh rotates the refresh token, and the daemon that did not refresh holds a dead copy for good. `sr claude move` uploads the login, checks that the box can use it, and only then removes the local copy.
+
+To sign an account on the box in again, run `sr claude addr <name>` on the laptop. When the box is the only server that holds that name, the new login moves there the same way. With two or more holders, nothing is sent and the command prints the move to each (§109).

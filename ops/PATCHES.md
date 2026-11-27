@@ -4759,3 +4759,53 @@ On the tree before this change, with only this file added, eight of the nine fai
 - Tests: `cmd/subrouter/sr_claude_push_target_test.go`, `cmd/subrouter/sr_grammar_pass_test.go`, `cmd/subrouter/sr_onboarding_review_test.go`
 - Docs: `README.md`, `ops/OPERATING.md` (Move accounts to the box), `ops/skills/subrouter/SKILL.md` (Add an account)
 - Related: amends §22 (push and move); §17 and §51 are unchanged.
+
+## 109. A browser OAuth add moves the new login to the one server that already holds its name
+
+The owner, 2026-11-27: "when I have an existing token name that's on a remote, doing claude addr without params should automatically put it onto that remote."
+
+What was wrong. A Claude account on a server dies there when its refresh token expires. The server's status then says `re-auth on that server with: sr claude addr <name>`. Run on the laptop, that command left the new login on the laptop only, under the name the server still listed. The owner then ran `sr claude move <name> <server>` by hand for each account. That was five accounts in two days.
+
+§109.1 What changed.
+
+1. A browser OAuth add (`sr claude addr [name]`, `sr claude login [name]`, `sr add claude --oauth`, for a new profile or a re-auth in place) on a machine with `remote.key` reads every configured server once the profile is registered. It looks for a Claude account under the profile's final name: the name typed, or the email a bare add infers. Only a Claude row counts, as in the move's check (`verifyServerHoldsAccount`). A row that reads `auth_valid` false counts, because a dead copy is the usual case. "Without params" means without naming a server.
+2. When exactly one server holds the name, the add says so in one line and runs `sr claude move <name> <server>` (`moveClaudeProfile`, then the unchanged `moveClaudeProfileTo`). On success the output ends with the move's `Moved ... is now its only owner` line, and it prints no `sr claude switch` or `sr claude run` line, since the profile left. On failure the move keeps the local profile, as it always has. The add returns the move's error, and its output names the `sr claude move <name> <server>` command to retry.
+3. When two or more servers hold the name, nothing is sent and the profile stays here. The add prints `sr claude move <name> <server>` for each holder and exits 0.
+4. When no server holds the name and every server answered, the output is what it was.
+5. The reads run at once, each bounded by `remoteAccountSectionTimeout` (5 s), so a dead tailnet costs one timeout. A server that does not answer blocks neither the add nor a move to a holder among the servers that did. The add names each such server in one line as not checked.
+6. `sr add claude --oauth` under a selected server says up front that the login is not copied there. It says that the login moves to the one server that already holds its name, and otherwise stays on this machine.
+7. The help for `sr claude addr`, `sr addr claude` and `subrouter addr claude` has one line more: with exactly one server holding the name, the login moves there. A machine without `remote.key` does not show it.
+
+The owner's words are on `settleClaudeOAuthAdd` with their date.
+
+§109.2 What did not change.
+
+- A machine without `remote.key` (§17) reads no server and names none.
+- The setup-token add and its copy to the selected server. The hosted `ephemeral` add.
+- `sr claude push` and `sr claude move`. The move's upload, its check that the server can use the account, and the local removal.
+- The server-side hint `re-auth on that server with: sr claude addr <name>` (`claudeUsageRowRepair` in `cmd/subrouter/sr.go`). Run on that server, the command still works. Run on a laptop with `remote.key`, it now works too when that server is the only configured one that holds the name. The hint is not reworded: a row from a peer this machine has no server entry for, or a name two servers hold, still needs the command on the server.
+
+§109.3 Residual risk.
+
+- The match is by name, because a server's rows publish no email for a Claude account. A different account signed in under a name a server holds replaces that server's copy.
+- A bare `sr claude addr` names the profile after the account's email. It matches only a server account named by that email.
+- The move does not check for the profile that `SUBROUTER_IDENTITY_ACCOUNT` names. If a server also holds that name, an add under it moves the identity profile off the laptop. `ops/OPERATING.md` already warns against moving it.
+- The match is exact. A server's import matches a name without case, but the move's check compares the exact name, so a login moved under another case would land on the server and then fail the check, with the chain in both places. A server account whose name differs only in case is therefore not a holder, and the login stays here. A move by hand to that server still fails that way, as it did before this change.
+- A server that does not answer is not checked. When it holds the name too, the login moves to the holder that answered, and the server that did not answer keeps its own copy.
+
+§109.4 Tests. `cmd/subrouter/sr_claude_addr_home_test.go` drives `sr` on a sandboxed keyed machine against fake servers. Each test checks which server received the login, what was printed, and whether the local profile remains:
+- `TestOAuthAddMovesToTheServerThatHoldsItsName`: a dead copy on the second of two servers. A bare `sr claude addr`, which takes the email as the name, `addr work`, `login work` and `add claude work --oauth` each move the login there.
+- `TestOAuthReauthInPlaceMovesToTheServerThatHoldsItsName`: the same for a re-auth of a local profile.
+- `TestOAuthAddWithNoServerHoldingItsNameIsUnchanged`: two servers and no holder. The output ends exactly as before.
+- `TestOAuthAddWithTwoServersHoldingItsNameSendsNothing`: nothing is sent, and the move to each holder is printed.
+- `TestOAuthAddMovesPastAServerThatDoesNotAnswer`: one server hangs. The add waits at most twice `remoteAccountSectionTimeout`, names that server, and moves to the holder.
+- `TestOAuthAddNamesAServerThatDoesNotAnswerAndKeepsTheLogin`, `TestOAuthAddKeepsTheLoginWhenTheMoveFails`, `TestOAuthAddDoesNotCountACodexRowWithItsName`, `TestOAuthAddOnAKeylessMachineReadsNoServer`, `TestSetupTokenAddIgnoresAServerHoldingItsName`, `TestOAuthAddUnderASelectedServerSaysWhereItGoes`.
+
+On the tree before this change, with only this file and the `sr_grammar_pass_test.go` changes added, seven of these twelve tests fail on what the owner saw. The login stays on the laptop, two holders get no move named, an unread server is not named, a failed move returns no error, and the selected-server line says the login stays on this machine. `TestOAuthAddWithNoServerHoldingItsNameIsUnchanged`, `TestOAuthAddDoesNotCountACodexRowWithItsName`, `TestOAuthAddOnAKeylessMachineReadsNoServer`, `TestSetupTokenAddIgnoresAServerHoldingItsName` and `TestGrammarOAuthAddNeverCopiesToTheServer` pass there too, as they hold what §109 must not change. They ran under `ops/bin/sr-local-ci ./cmd/subrouter` on macOS. Docker was not running, so `make docker-test` was not run.
+
+`TestGrammarOAuthAddNeverReachesTheServer` is now `TestGrammarOAuthAddNeverCopiesToTheServer`: the add may read the server's usage-status and send nothing more. The fake server lists its non-Claude accounts in usage-status too. The `addOAuthProfile` fixture forgets the reads of its own add, so each test checks only what its own command sent.
+
+- Code: `cmd/subrouter/sr_claude_move.go` (`settleClaudeOAuthAdd`, `claudeServersHolding`), `cmd/subrouter/sr_claude.go` (`claudeRunner.settleOAuthAdd`, `newClaudeRunner`, `addOAuth`, the help), `cmd/subrouter/sr_claude_upload.go` (`addClaudeToServer`), `cmd/subrouter/sr.go` and `cmd/subrouter/main.go` (the help)
+- Tests: `cmd/subrouter/sr_claude_addr_home_test.go`, `cmd/subrouter/sr_grammar_pass_test.go`
+- Docs: `README.md`, `ops/OPERATING.md` (Move accounts to the box), `ops/GETTING-STARTED.md` (Add a box), `ops/skills/subrouter/SKILL.md` (Add an account)
+- Related: amends §22, since an OAuth add can now move a login (it still never copies one). §17, §51 and §108 are unchanged.

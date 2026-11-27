@@ -453,8 +453,16 @@ and one server pool.
 
 In this fork a refresh-token profile is never left in two places (every refresh
 rotates the token, and the second holder dies): `sr claude login`/`addr` never
-upload, `sr claude push` on such a profile MOVES it, and `sr claude move` is the
+copy, `sr claude push` on such a profile MOVES it, and `sr claude move` is the
 explicit move. A setup token is still copied. See `ops/PATCHES.md` §22.
+
+On a machine with `remote.key`, `sr claude login`/`addr` moves the new login to
+the one configured server that already holds a Claude account of that name, as
+`sr claude move <profile> <server>` would. A dead copy there counts, so this is
+how a server's account is signed in again from this machine. When two or more
+servers hold the name, nothing is sent and the move to each is printed. A
+server that does not answer within five seconds is named and not checked. See
+`ops/PATCHES.md` §109.
 
 Both verbs take the server to send to. With no server named, they go to the
 default server, else to the only configured one. With two or more and no
