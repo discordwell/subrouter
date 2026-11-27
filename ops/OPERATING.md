@@ -420,7 +420,9 @@ sr claude move <name> box
 
 `sr claude push <name> box` sends a profile to that server too. It copies a setup token and moves a refresh-token profile, as `sr claude move` does. With no server named, both go to the default server, else to the only configured one. With two or more and no default, they send nothing and print the command for each server (§108).
 
-Keep the profile that `SUBROUTER_IDENTITY_ACCOUNT` names on the laptop. `sr claude move` does not check for it. With the socket on, moving it leaves `control_plane_identity` `missing` in `/_subrouter/health`. Every socket session's `/api/*` call then gets 503, and Claude Code withholds WebFetch. `claude-route status` shows which profile that is.
+To sign a box's account in again, for example when its status says `re-auth on that server with: sr claude addr <name>`, run `sr claude addr <name>` on the laptop. When exactly one configured server holds a Claude account of that name, the new login moves there as `sr claude move <name> <server>` would, and the laptop keeps no copy. A dead copy on the server counts. With two or more holders it sends nothing and prints the move to each. A server that does not answer within five seconds is named and not checked (§109).
+
+Keep the profile that `SUBROUTER_IDENTITY_ACCOUNT` names on the laptop. `sr claude move` does not check for it, and neither does `sr claude addr`: a login under that name moves to the one server that holds the name. With the socket on, moving it leaves `control_plane_identity` `missing` in `/_subrouter/health`. Every socket session's `/api/*` call then gets 503, and Claude Code withholds WebFetch. `claude-route status` shows which profile that is.
 
 `sr server login box` signs a Codex account in directly on the box. `sr claude remove <name> --server box` deletes an account on the box only.
 
