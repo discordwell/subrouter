@@ -461,7 +461,7 @@ the one configured server that already holds a Claude account of that name, as
 `sr claude move <profile> <server>` would. A dead copy there counts, so this is
 how a server's account is signed in again from this machine. When two or more
 servers hold the name, nothing is sent and the move to each is printed. A
-server that does not answer within five seconds is named and not checked. See
+server that does not answer within 15 seconds is named and not checked. See
 `ops/PATCHES.md` §109.
 
 Both verbs take the server to send to. With no server named, they go to the

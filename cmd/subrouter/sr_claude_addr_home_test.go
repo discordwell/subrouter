@@ -165,6 +165,9 @@ func TestOAuthAddMovesPastAServerThatDoesNotAnswer(t *testing.T) {
 		b.onUsageStatus = func() { <-release }
 	})
 	plantDeadCopy(m.boxes["box2"], "work")
+	bound := claudeHolderReadTimeout
+	claudeHolderReadTimeout = time.Second
+	t.Cleanup(func() { claudeHolderReadTimeout = bound })
 	started := time.Now()
 	out, err := m.run("sr", "claude", "addr", "work")
 	took := time.Since(started)
@@ -172,8 +175,8 @@ func TestOAuthAddMovesPastAServerThatDoesNotAnswer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("add: %v\n%s", err, out)
 	}
-	// Without its own bound, the read waits out the admin call's 15 s.
-	if took > 2*remoteAccountSectionTimeout {
+	// The read has its own bound: a server that never answers costs it once.
+	if took > 10*claudeHolderReadTimeout {
 		t.Fatalf("a server that does not answer held the add for %s", took.Round(time.Millisecond))
 	}
 	if !strings.Contains(out, `Warning: could not read home, so it was not checked for an account named "work".`) {
