@@ -4809,3 +4809,84 @@ On the tree before this change, with only this file and the `sr_grammar_pass_tes
 - Tests: `cmd/subrouter/sr_claude_addr_home_test.go`, `cmd/subrouter/sr_grammar_pass_test.go`
 - Docs: `README.md`, `ops/OPERATING.md` (Move accounts to the box), `ops/GETTING-STARTED.md` (Add a box), `ops/skills/subrouter/SKILL.md` (Add an account)
 - Related: amends §22, since an OAuth add can now move a login (it still never copies one). §17, §51 and §108 are unchanged.
+
+## 110. An account projected to waste its week drains days before its roll
+
+Owner, 2026-11-27, approving "an account projected to waste budget joins the drain when that projection appears, not at 24 hours": "Yeah that's a good fix. Go ahead and do it."
+
+What was wrong. One Claude account, `idle-full` here, rolled its week on 2026-11-21 and read 100% left at every reading for the whole week. It served 101 requests, all in its last 18 hours, and its week expired nearly full. In the same days four other accounts sat at 100% used with about three days to their rolls, and accounts chosen for a saved reset (§95) took new sessions while it stayed idle. The pool took 20 to 140 new sessions a day over 23 accounts. 51 hours before the roll its daemon logged:
+
+```
+paced allowance account=... in_burndown=false burndown_cause="" allowed_sessions=0 paced_sessions=0 taper=4 ceiling=20 needed=0.3533 burn_per_live=0.055 burn_source=pool burn_now=0 spendable=1 hours_to_roll=51.4588 projected_waste=1 danger=true live_sessions=0
+```
+
+`danger` gated nothing (§72). 36.6 hours before the roll the same line read `burn_per_live=0 burn_source="" projected_waste=0 danger=false`. The projection ran only when a burn per live session was measured, and the pool then had no live session-hours, although the projection reads only the account's own burn.
+
+So there were two causes. First, the drain tier opened only in the last 24 hours (§10, §41) or for a reset holder under 25% of its week (§56). Before that, a full account with no saved reset ranked in the steady pace clause, below every chosen account, and too few new sessions came to reach it. In its last 24 hours it waited behind earlier rolls. Second, the projection needed a burn per live session, which an idle pool does not have.
+
+§110.1 What changed.
+
+1. A third way into the burndown window: the early burndown on the account's pace (`inPaceBurndown`, cause `pace`). An account is in it when all of these hold:
+   - it is this daemon's own account, and it is not chosen for a saved reset, for either meter;
+   - `SUBROUTER_EARLY_DRAIN` is on;
+   - its reading is fresh, it is not exhausted, and its roll is more than 24 hours and at most `SUBROUTER_EARLY_DRAIN_HOURS` (72) away;
+   - the pace tracker measured its own burn, and at that burn the week rolls with more than `SUBROUTER_PACE_WASTE_THRESHOLD` (5 points) unspent. That is spendable less burn now times the hours to the roll, read on the drain's inputs, so the owner's reserve is never counted as waste.
+2. It joins `inBurndownWindow`, so everything that reads the window reads it: drain eligibility, the taper and the paced raise (§72), the at-cap demotion, the verdict's `burndown`, `allowed_sessions` and `burndown_cause`, the `PickSteady` demotion, and the refugee cap's burndown term. The short floor, the allowance and the reserve gate still apply. Among draining accounts the soonest roll still leads (`endgameUrgency`). So the account drains behind every account in its 24h window and behind every pace burndown whose roll is sooner.
+3. `Pace.Measured` says that the tracker read the account's own burn over its 30-minute minimum span, a `burn_now` of 0 included. `ProjectedWaste` and `Danger` now need only that, not a burn per live session. `needed` and the raise still need one. An account that the tracker has not measured, as in the 30 minutes after a restart, is not in the pace burndown: unmeasured fails closed.
+4. The reasons. When it wins on the drain: `early burndown: at its present burn its week would roll with budget unspent`. In steady mode: `the other is in early burndown on its pace and the router is loading it; not a place to park a session`. The board's note says the first. `srq pool` prints `burndown·pace n/m` and `at_cap·pace n/m`, with a legend line.
+
+The rule ends itself. The sessions it takes raise its burn. When that burn would spend the week by the roll, the projection falls under the threshold and the account leaves the window. It then ranks on its pace again, below the chosen accounts, and takes new sessions only as a steady account does. Its warm sessions stay: leaving changes only where the next new session goes. The allowance and the at-cap demotion feed new-session placement alone (§72), and `Evicted` and `CapacityEvicting` do not read the window. When its sessions end and its burn falls, it comes back.
+
+It ranks above chosen accounts whether or not the pool needs its resets, because the drain tier does. On 2026-11-26 the pool said it needed its resets and loaded chosen accounts while `idle-full` sat full 51 hours from its roll. A week of budget that expires in two days is worth spending before an account is loaded for a reset that is good for two more weeks. The 72-hour horizon keeps the rest of the pool on §95's "load, not balance".
+
+§110.2 Peers and older builds. A peer's account is its owner's answer. The cause travels in `new_session.burndown_cause`, and routing reads `burndown` and `at_cap`, never the cause. So an older daemon drains a §110 peer's pace burndown first, like any burndown, and gives it the roll's reason. An older `srq` prints a bare `burndown`. A peer from before §110 never publishes the cause, and this daemon never derives it from a peer's numbers.
+
+The board now reads the cause from the verdict, not from the raw score, which carries neither the pace table nor the reset choices. A box row takes the cause the box published, because a scheduler rebuilt from the box's windows cannot measure the box's burn. One side effect: a local account that is chosen for a reset and also under 25% with a hold no longer reads as early burndown on the board, which is how routing ranks it. The `local_endgame` field of the `remote pool decision` log line reads the verdict of the scheduler that selected the account, for the same reason.
+
+§110.3 Switches.
+
+- `SUBROUTER_EARLY_DRAIN`: unset or `1` is on, `0` is off, and any other value stops the daemon. Off, only the 24h window and a reset holder's early burndown drain, as before §110. The `danger` log field still reads the account's own burn.
+- `SUBROUTER_EARLY_DRAIN_HOURS`: whole hours from 25 to 168, default 72. 24 or less is refused, because the 24h window already drains every account and the early drain would have no hours to act in. To turn it off, set `SUBROUTER_EARLY_DRAIN=0`.
+- `SUBROUTER_PACE_WASTE_THRESHOLD` (§72) now also sets the pace burndown's threshold. `SUBROUTER_PACED_ALLOWANCE=0` does not turn the pace burndown off. It only keeps the account's allowance at the taper.
+
+The daemon logs one Info line at startup when either new setting is not the default. A change needs a restart. There is no CLI flag, because a rolled-back binary stops on a flag it does not know (§58).
+
+§110.4 See it.
+
+- `srq pool`: `new=yes (burndown·pace 0/4)` on an account days from its roll.
+- `usage-status`: `normalized.new_session` has `"reason": "burndown"`, `"burndown": true`, `"burndown_cause": "pace"` and `allowed_sessions`.
+- `pool.json` and the board: the state `drain` with the note above, and the reason above where that clause set the rank.
+- The log: `paced allowance ... in_burndown=true burndown_cause=pace ... projected_waste=... danger=true`. A change to the allowance or to `danger` logs one line.
+
+§110.5 Go back. Set `SUBROUTER_EARLY_DRAIN=0` in the daemon's environment and restart it (`ops/OPERATING.md`, Change the daemon's environment). Do it on the box too: a box keeps publishing its own pace burndowns, and this daemon drains them on the box's verdict.
+
+§110.6 What this leaves open.
+
+- The drain is still soonest roll first. An account joins behind every earlier roll. A live session discounts a draining account's urgency (§41), so under load the next session can go to a pace burndown ahead of a 24h-window account that carries sessions.
+- With demand under capacity, some budget still expires each week. This changes which budget expires, not whether some does: an idle account near its roll now spends ahead of accounts with more time left.
+- The burn window is 2 hours, so the burn lags. An account can take a few sessions more than it needs before its burn shows them, and reach its limit before its roll. The taper and the 5h brake bound it.
+- Codex accounts are not covered: the tracker measures local Claude accounts only. Accounts held by a peer that runs an older build are not covered either.
+- An account chosen for its Fable meter is not in the pace burndown on any pool, Opus included, because Opus work there would eat the week under its Fable meter (§95.2). The rule as first proposed left out only an account loaded on the pool being ranked.
+- The paced raise (§72) now applies in the pace burndown too, because the raise follows the burndown window. §72 left "the raise stays inside the burndown window" open, and §110 widens that window.
+- From 24 to 48 hours before the roll, the refugee cap's burndown term is larger than the normal one: 100 points 30 hours out take 16 refugees, not 10.
+- `sr auto-switch` (`PickSteady`) ranks a pace-burndown account last when it picks the active Claude profile, as it ranks every draining account. Before §110 an idle full account near its roll led that pick on its pace.
+- `sr status` does not show it.
+
+§110.7 Tests. `selectacct/pace_burndown_test.go`:
+
+- `TestAnIdleFullAccountDaysFromItsRollTakesTheNewSessionFirst`: the incident, through the pace tracker. 100% left 51.46 hours from its roll, its own burn 0, no saved reset, no live session, against an account chosen for its week with 84% left and a steady account with a full week 138 hours out. It runs once with no pool burn per live session and once with one. On the tree before this change, with only this file added, both fail: with no pool burn the projection is 0 and `danger` is false, and with one the chosen account wins. Now the idle account wins with the pace reason, and its verdict is eligible, `burndown`, cause `pace`, with an allowance of 4.
+- `TestThePaceBurndownActsOnlyOnAMeasuredLocalAccountInsideItsHorizon`: 73 hours out; exactly 24 and 23 hours out (cause `roll`); a burn that spends the week; an unmeasured burn; a reading that is not fresh; at its 5h wall; a peer's account with no verdict; chosen for its week; the switch off; the horizon at 48.
+- `TestThePaceBurndownDrainsAnIdleAccountInsideItsHorizon`: 51 hours, 24 hours and a minute, 72 hours, and 80 hours with the horizon at 96.
+- `TestThePaceBurndownCountsOnlyTheUnreservedWeek`; `TestAMeasuredIdleAccountIsProjectedToWasteItsWeek` (the 36.6-hour line, and a 20-minute series that projects nothing); `TestThePaceBurndownDrainsBehindEarlierRolls`; `TestLeavingThePaceBurndownMovesNoSession`; `TestAPeersPaceBurndownDrainsOnItsOwnersVerdict` (a peer's cause, and a peer that publishes none); `TestPickSteadyRanksAPaceBurndownAccountLast`; `TestAFableChoiceIsNotDrainedOnItsPace`.
+
+`internal/proxy/pace_burndown_test.go`: `TestPoolBoardShowsThePaceBurndown` reads a local row that the tracker measured and a box row whose box published the cause, and `TestRoutingCapacityEndgameCoversThePaceBurndown` reads `local_endgame`. Each fails when the cause is read from the raw score. `cmd/subrouter/paced_allowance_test.go` adds `TestEarlyDrainFromEnvironment` and `TestEarlyDrainHoursFromEnvironment`. `srq selftest` checks `·pace` locally and on a peer, both marks in one section, and a cause it does not know.
+
+Two §72 tests changed their fixtures, not their bounds. `TestPacedAllowanceOutsideBurndownCapsNothing` held an account 30 hours out at 90% burning 0.005 an hour, which is now a pace burndown, so it now burns 0.03 an hour, enough to spend its week. `TestPacedAllowanceUnmeasuredIsTheDefaultBurn` compares the default burn with a measured one, so it runs with the early drain off. `measuredPace` sets `Measured`, as the tracker does.
+
+Every sim gives the same output to the digit as before: `TestEndgameSimulation`, the GTO and velocity sims, `TestALoadedCodexAccountReachesItsLimitEarlierInItsWeek`, `TestThePacedAllowanceSpendsWhatTheTaperForfeits`, and `TestPacedAllowanceTradeTable` with `-paced-trade-table`. Their draining accounts roll within 24 hours, their steady accounts roll 80 hours out or more and burn nothing, and the endgame sim's pace carries only a burn per live session. A sim of an idle account 51 hours from its roll needs a new harness, so none was added. Docker was not running, so `make docker-test` was not run.
+
+- Knobs: `SUBROUTER_EARLY_DRAIN`, `SUBROUTER_EARLY_DRAIN_HOURS`, and `SUBROUTER_PACE_WASTE_THRESHOLD` (§72)
+- Code: `selectacct/scheduler.go` (`inPaceBurndown`, `inBurndownWindow`, `BurndownCause`, `BurndownCausePace`), `selectacct/pace.go` (`Pace.Measured`, `allowance`, `SetEarlyDrain`, `SetEarlyDrainHours`), `selectacct/explain.go`, `selectacct/new_session_verdict.go`, `internal/proxy/pool_ui.go` (`applyPoolReadings`, `classifyPoolState`), `internal/proxy/proxy.go` (`routingCapacityFor`), `cmd/subrouter/main.go` (`earlyDrainEnabled`, `earlyDrainHours`), `ops/bin/srq` (`_reason_label`, `EARLY_BURNDOWN_LEGENDS`)
+- Tests: `selectacct/pace_burndown_test.go`, `selectacct/pace_test.go`, `internal/proxy/pace_burndown_test.go`, `cmd/subrouter/paced_allowance_test.go`, `ops/bin/srq` (selftest)
+- Docs: `README.md`, `ops/OPERATING.md`, `ops/KNOWN-ISSUES.md`, `ops/skills/subrouter/SKILL.md`
+- Related: amends §56 (a third way into the burndown window), §72 (the projection reads the account's own burn, and `danger` now starts the pace burndown) and §95.2 (a chosen account now ranks below a pace burndown too). §41's order among draining accounts is unchanged.
