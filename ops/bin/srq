@@ -491,13 +491,15 @@ def _session_counts(norm):
 
 
 def _burndown_cause(norm):
-    """new_session.burndown_cause as published: "roll", "reset", or None.
+    """new_session.burndown_cause as published: "roll", "reset", "pace", or None.
 
-    Why the account is in the burndown window (PATCHES §56): its 24h roll, or a
-    reset holder's early burndown under 25% of its week. Read, never inferred
-    from a burndown whose roll is days away: srq does not reconstruct verdicts
-    (new_session_verdict). A daemon from before §56 publishes none, and every
-    burndown it publishes is the roll.
+    Why the account is in the burndown window: its 24h roll, a reset holder's
+    early burndown under 25% of its week (PATCHES §56), or an early burndown on
+    its pace, its own burn leaving budget unspent at the roll (§110). Read,
+    never inferred from a burndown whose roll is days away: srq does not
+    reconstruct verdicts (new_session_verdict). A daemon from before §56
+    publishes none, and every burndown it publishes is the roll; one from
+    before §110 never publishes "pace".
     """
     verdict = norm.get("new_session") if isinstance(norm, dict) else None
     cause = verdict.get("burndown_cause") if isinstance(verdict, dict) else None
@@ -868,6 +870,14 @@ def local_fallback(r):
 
 SLOT_REASONS = ("burndown", "at_cap", "chosen")
 
+# The early burndowns a verdict's reason is marked with, and what each mark
+# means, in the order the legend lists them. The roll needs no mark: the row's
+# own roll column explains it.
+EARLY_BURNDOWN_LEGENDS = {
+    "reset": "·reset = early burndown: holds an unclaimed week reset and under 25% of its week is left",
+    "pace": "·pace = early burndown: at its present burn its week would roll with budget unspent",
+}
+
 
 def _slots(r, field="new_session"):
     """The "live/allowed" of a draining (burndown), full (at_cap) or loaded
@@ -886,15 +896,18 @@ def _slots(r, field="new_session"):
 
 
 def _reason_label(r, field="new_session"):
-    """The verdict's reason, marked `·reset` on a reset holder's early burndown.
+    """The verdict's reason, marked with its early burndown's cause.
 
-    A burndown or at_cap whose cause is "reset" (PATCHES §56) is draining days
-    before its roll, so the row's own roll column cannot explain it. The roll
-    cause, and a daemon that publishes no cause, keep the bare reason.
+    A burndown or at_cap whose cause is "reset" (PATCHES §56) or "pace" (§110)
+    is draining days before its roll, so the row's own roll column cannot
+    explain it: `burndown·reset`, `at_cap·pace`. The roll cause, a cause this
+    srq does not know, and a daemon that publishes no cause keep the bare
+    reason.
     """
     reason = r.get(f"{field}_reason")
-    if reason in SLOT_REASONS and r.get(f"{field}_burndown_cause") == "reset":
-        return f"{reason}·reset"
+    cause = r.get(f"{field}_burndown_cause")
+    if reason in SLOT_REASONS and cause in EARLY_BURNDOWN_LEGENDS:
+        return f"{reason}·{cause}"
     return reason
 
 
@@ -960,7 +973,7 @@ def _render_sections(rows, where, peer=False):
         # and beside it one only where its daemon sent a request to start it (§90).
         show_unstarted = any(r["weekly_unstarted"] for r in sub)
         start_width = max((len(_start_sent(r)) for r in sub), default=0)
-        lines, any_slots, any_reset = [], False, False
+        lines, any_slots, marked = [], False, set()
         # A column only where the daemon published a spent Fable meter (§65),
         # so a section from an older daemon, or with no Fable spent, reads as
         # before.
@@ -988,13 +1001,15 @@ def _render_sections(rows, where, peer=False):
             slots = _slots(r)
             any_slots = any_slots or bool(slots)
             reason = _reason_label(r)
-            any_reset = any_reset or reason != r["new_session_reason"]
+            if reason != r["new_session_reason"]:
+                marked.add(r["new_session_burndown_cause"])
             flags = f"  new={_verdict_col(r['new_session'], reason, fallback, slots)}"
             # The case the header used to hide: open for a new session on the
             # account's own meters, refused for Fable on its own.
             if r["new_session"] and r["fable_new_session"] is False:
                 fable_label = _reason_label(r, "fable_new_session")
-                any_reset = any_reset or fable_label != r["fable_new_session_reason"]
+                if fable_label != r["fable_new_session_reason"]:
+                    marked.add(r["fable_new_session_burndown_cause"])
                 fable_reason = fable_label or "not usable"
                 fable_slots = _slots(r, "fable_new_session")
                 if fable_slots:
@@ -1018,9 +1033,9 @@ def _render_sections(rows, where, peer=False):
         print(f"=== {provider} @ {where} ({len(sub)} accounts): {head}")
         print("      (5h = short window, refills within hours; 7d = the WEEK, what actually runs out)")
         fable_legend = "fable = the Fable/oauth-apps week, its own meter; " if show_fable else ""
-        # Only a section that prints an n/m, a ·reset or a 2x explains it, so a
-        # section with none of them (and every row from an older daemon) reads
-        # as before.
+        # Only a section that prints an n/m, a ·reset, a ·pace or a 2x explains
+        # it, so a section with none of them (and every row from an older
+        # daemon) reads as before.
         extra = []
         if any_slots:
             loaded = any(_slots(r) and (r["new_session_reason"] == "chosen" or r["reset_choice_mode"] == "real") for r in sub)
@@ -1034,8 +1049,7 @@ def _render_sections(rows, where, peer=False):
                          if peer else
                          "fspent = the Fable meter this daemon publishes: an Opus or Sonnet turn ranks the account at up to"
                          " 2x its weekly pace as it fills, while SUBROUTER_FABLE_SPENT_PREFERENCE is on")
-        if any_reset:
-            extra.append("·reset = early burndown: holds an unclaimed week reset and under 25% of its week is left")
+        extra.extend(legend for cause, legend in EARLY_BURNDOWN_LEGENDS.items() if cause in marked)
         if show_hold:
             # A peer's 2x is the peer's word that it holds the reset. This
             # daemon ranks it at 2x only when it runs §56 with its switch on:
@@ -2173,6 +2187,38 @@ def cmd_selftest(_argv):
               "  new=fallback (at_cap 2/2)\n"
               "  acct2                              5h=  20%  7d=  40%  fable= 104%  rolls   100h  new=yes\n"
               "\n"))
+
+    print("an early burndown on the account's pace reads ·pace beside ·reset (PATCHES §110)")
+    # An idle account 50 hours from its roll, drained because its week would
+    # expire unspent, read like one rolling tonight.
+    paced = [holder_row(0, True, "burndown", "pace", roll_secs=180000, live_sessions=0, allowed_sessions=4),
+             holder_row(1, False, "at_cap", "pace", roll_secs=200000, live_sessions=4, allowed_sessions=4)]
+    pace_legend = "·pace = early burndown: at its present burn its week would roll with budget unspent"
+    local = rendered([summarize(r) for r in paced])
+    check("local: an early burndown on its pace 50h from its roll reads burndown·pace n/m",
+          "rolls    50h  new=yes (burndown·pace 0/4)\n" in local)
+    check("local: at its cap it reads at_cap·pace n/m", "new=fallback (at_cap·pace 4/4)\n" in local)
+    check("local: the legend explains ·pace, and not ·reset",
+          legend.replace(")", ";") + f"       {pace_legend})\n" in local and "·reset =" not in local)
+    both = rendered([summarize(r) for r in paced[:1] + early[:1]])
+    check("both causes in one section: each marked, ·reset's legend before ·pace's",
+          "(burndown·pace 0/4)" in both and "(burndown·reset 1/2)" in both
+          and f"       {reset_legend};\n       {pace_legend})\n" in both)
+    saved = globals()["_remote_get"]
+    globals()["_remote_get"] = lambda cfg, path: paced
+    try:
+        remote = rendered(remote_rows({"url": "https://box:31416", "token": "t", "fingerprint": "f"}),
+                          peer=True)
+    finally:
+        globals()["_remote_get"] = saved
+    check("peer: the box's pace cause on its rows",
+          "new=yes (burndown·pace 0/4)\n" in remote and "new=NO (at_cap·pace 4/4)\n" in remote)
+    unknown = [holder_row(0, True, "burndown", "dusk", roll_secs=180000, live_sessions=0, allowed_sessions=4)]
+    check("a cause this srq does not know reads as plain burndown",
+          rendered([summarize(r) for r in unknown])
+          == rendered([summarize(holder_row(0, True, "burndown", roll_secs=180000,
+                                            live_sessions=0, allowed_sessions=4))]))
+    check("--json carries the cause verbatim", summarize(paced[0])["new_session_burndown_cause"] == "pace")
 
     print("only a week reset reads 2x; a Fable reset reads Fn; an older daemon's key reads as before (PATCHES §64)")
     # Every account held a Fable reset from 2026-11-09, and a daemon before

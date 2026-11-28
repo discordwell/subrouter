@@ -86,9 +86,11 @@ const (
 	// erased on the next turn.
 	poolStateBurn = "burn"
 	// poolStateDrain is inside the burndown window: the 24h weekly roll,
-	// budget that expires whether or not anyone spends it, or a reset holder's
+	// budget that expires whether or not anyone spends it; a reset holder's
 	// early burndown under a quarter of its week, budget the claim would wipe
-	// (PATCHES §56). The note says which.
+	// (PATCHES §56); or an early burndown on the account's pace, budget its
+	// own burn would leave unspent at the roll (PATCHES §110). The note says
+	// which.
 	poolStateDrain = "drain"
 	// poolStatePristine is an account whose weekly window has not started
 	// (Score.WeeklyUnstarted): its tumbling fuse has never been lit, so
@@ -949,7 +951,15 @@ func applyPoolReadings(row *poolRow, status AccountUsageStatus, scheduler select
 	if factor := score.FableSpentFactor(); factor > 1 {
 		row.FableSpentFactor = factor
 	}
-	row.State, row.StateNote = classifyPoolState(status.Provider, status.ID, score, scheduler, now)
+	// The cause is the verdict's: the raw score carries neither this daemon's
+	// pace table nor its reset choices. A box row's scheduler is rebuilt from
+	// windows and cannot measure the box's burn, so a cause the box published
+	// is its own answer and wins.
+	cause := scheduler.NewSessionVerdict(status.Provider, status.ID, now).BurndownCause
+	if status.Normalized != nil && status.Normalized.NewSession != nil && status.Normalized.NewSession.BurndownCause != "" {
+		cause = status.Normalized.NewSession.BurndownCause
+	}
+	row.State, row.StateNote = classifyPoolState(status.Provider, status.ID, score, cause, scheduler, now)
 }
 
 // noteUnstartedRow says, on a row whose week has not started, what its daemon
@@ -1017,15 +1027,17 @@ func (s Server) unstartedRanking(status AccountUsageStatus, pool string, now tim
 // classifyPoolState is the one place a row's colour is decided.
 //
 // Every verdict below is asked of the scheduler rather than recomputed:
-// Exhausted, UsableForNewSession, BurndownCause and HoldsReset are the same
-// predicates selection gates and ranks on, and PRISTINE is the score's
-// WeeklyUnstarted, the fact the router ranks on (PATCHES §86). A pristine
+// Exhausted, UsableForNewSession, the verdict's burndown cause (the caller
+// reads it) and HoldsReset are the same predicates selection gates and ranks
+// on, and PRISTINE is the score's WeeklyUnstarted, the fact the router ranks
+// on (PATCHES §86). A pristine
 // account and a freshly-rolled one both read 100% left, and only the first
 // takes the next new session.
 func classifyPoolState(
 	provider accounts.Provider,
 	accountID string,
 	score selectacct.Score,
+	burndownCause string,
 	scheduler selectacct.Scheduler,
 	now time.Time,
 ) (string, string) {
@@ -1062,12 +1074,14 @@ func classifyPoolState(
 		}
 		return poolStatePristine, "weekly window not started: the next new session goes here first, to start its clock"
 	}
-	switch score.BurndownCause(now) {
+	switch burndownCause {
 	case selectacct.BurndownCauseRoll:
 		return poolStateDrain, "inside the 24h roll window; whatever is left here expires whether or not it is spent"
 	case selectacct.BurndownCauseReset:
 		return poolStateDrain, "early burndown: holds an unclaimed week reset (expires " + resetHoldExpiry(score) +
 			") and under 25% of its week is left; drained first so the reset can be claimed"
+	case selectacct.BurndownCausePace:
+		return poolStateDrain, "early burndown: at its present burn its week would roll with budget unspent; drained ahead of chosen and steady accounts, behind any that roll sooner"
 	}
 	if score.HoldsReset(now) {
 		return poolStateOK, "eligible for new sessions; ranks at 2x its weekly pace while it holds an unclaimed week reset (expires " +

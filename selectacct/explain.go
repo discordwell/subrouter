@@ -180,8 +180,9 @@ func (s Scheduler) compare(left, right account.Account, now time.Time, allowEndg
 			// concurrency taper; with several draining, the earliest roll
 			// leads but SHARES. At the taper cap it instead ranks BELOW every
 			// other routable account. A reset holder in early burndown
-			// (PATCHES §56) drains in the same tier, behind any account whose
-			// roll lands first (endgameUrgency).
+			// (PATCHES §56), and an account in early burndown on its pace
+			// (§110), drain in the same tier, behind any account whose roll
+			// lands first (endgameUrgency).
 			leftEndgame := leftScore.endgameDrainEligible(now)
 			rightEndgame := rightScore.endgameDrainEligible(now)
 			if leftEndgame != rightEndgame {
@@ -189,8 +190,11 @@ func (s Scheduler) compare(left, right account.Account, now time.Time, allowEndg
 				if rightEndgame {
 					winner = rightScore
 				}
-				if winner.BurndownCause(now) == BurndownCauseReset {
+				switch winner.BurndownCause(now) {
+				case BurndownCauseReset:
 					return leftEndgame, "early burndown: holds an unclaimed week reset and under 25% of its week is left"
+				case BurndownCausePace:
+					return leftEndgame, "early burndown: at its present burn its week would roll with budget unspent"
 				}
 				return leftEndgame, "inside its weekly roll window; that budget expires either way"
 			}
@@ -259,8 +263,9 @@ func (s Scheduler) compare(left, right account.Account, now time.Time, allowEndg
 			// Steady mode: rank endgame accounts LAST, the mirror of the
 			// drain-first ordering above. PickSteady chooses the account an
 			// interactive session will sit on for hours, and parking it on one
-			// that rolls tonight is how that session goes dry -- or on a reset
-			// holder the router is running into its wall days early.
+			// that rolls tonight is how that session goes dry -- or on an
+			// account in early burndown, which the router is loading days
+			// before its roll.
 			leftDraining := leftScore.inBurndownWindow(now) || leftScore.loading
 			rightDraining := rightScore.inBurndownWindow(now) || rightScore.loading
 			if leftDraining != rightDraining {
@@ -273,6 +278,8 @@ func (s Scheduler) compare(left, right account.Account, now time.Time, allowEndg
 					return rightDraining, reasonSteadyChosen
 				case drainer.BurndownCause(now) == BurndownCauseReset:
 					return rightDraining, "the other is in early burndown on a saved reset; not a place to park a session"
+				case drainer.BurndownCause(now) == BurndownCausePace:
+					return rightDraining, "the other is in early burndown on its pace and the router is loading it; not a place to park a session"
 				}
 				return rightDraining, "the other rolls within a day; not a place to park a session"
 			}

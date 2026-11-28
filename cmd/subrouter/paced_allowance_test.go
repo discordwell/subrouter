@@ -60,3 +60,35 @@ func TestPacedSessionCeilingFromEnvironment(t *testing.T) {
 		}
 	}
 }
+
+func TestEarlyDrainFromEnvironment(t *testing.T) {
+	const name = "SUBROUTER_EARLY_DRAIN"
+	for raw, want := range map[string]bool{"": true, " ": true, "1": true, " 1 ": true, "0": false} {
+		t.Setenv(name, raw)
+		if got, err := earlyDrainEnabled(); err != nil || got != want {
+			t.Fatalf("%s=%q: got %v err %v, want %v", name, raw, got, err, want)
+		}
+	}
+	for _, raw := range []string{"2", "true", "off", "yes"} {
+		t.Setenv(name, raw)
+		if _, err := earlyDrainEnabled(); err == nil || !strings.Contains(err.Error(), name) {
+			t.Fatalf("%s=%q accepted (err %v)", name, raw, err)
+		}
+	}
+}
+
+func TestEarlyDrainHoursFromEnvironment(t *testing.T) {
+	const name = "SUBROUTER_EARLY_DRAIN_HOURS"
+	for raw, want := range map[string]int{"": 72, " ": 72, "72": 72, "25": 25, " 48 ": 48, "168": 168} {
+		t.Setenv(name, raw)
+		if got, err := earlyDrainHours(); err != nil || got != want {
+			t.Fatalf("%s=%q: got %d err %v, want %d", name, raw, got, err, want)
+		}
+	}
+	for _, raw := range []string{"24", "0", "-1", "169", "48.5", "two days"} {
+		t.Setenv(name, raw)
+		if _, err := earlyDrainHours(); err == nil || !strings.Contains(err.Error(), name) {
+			t.Fatalf("%s=%q accepted (err %v)", name, raw, err)
+		}
+	}
+}

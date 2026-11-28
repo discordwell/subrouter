@@ -54,7 +54,7 @@ func pacedScheduler(score Score, pace Pace, live int) Scheduler {
 }
 
 func measuredPace(burnPerLive float64) Pace {
-	return Pace{BurnPerLive: burnPerLive, BurnNow: burnPerLive, Source: "account"}
+	return Pace{BurnPerLive: burnPerLive, BurnNow: burnPerLive, Source: "account", Measured: true}
 }
 
 func randomPacedScore(rng *rand.Rand, now time.Time) Score {
@@ -116,6 +116,9 @@ func TestPacedAllowanceSwitchOffIsTheLegacyTaperForAnyPace(t *testing.T) {
 
 func TestPacedAllowanceUnmeasuredIsTheDefaultBurn(t *testing.T) {
 	setPacedAllowanceForTest(t, true)
+	// The reference below is measured; §110 also routes on a measured burn,
+	// which the default burn never stands in for. This pins §72's sizing.
+	setEarlyDrainForTest(t, false)
 	rng := rand.New(rand.NewSource(69))
 	now := time.Now()
 	raised := 0
@@ -256,10 +259,13 @@ func TestPacedAllowanceOutsideBurndownCapsNothing(t *testing.T) {
 	setPacedAllowanceForTest(t, true)
 	now := time.Now()
 	score := pacedFixture(now, 0.90, 30*time.Hour)
-	if score.inBurndownWindow(now) {
-		t.Fatal("fixture drift: 30h from the roll is inside the burndown window")
-	}
+	// Burning 0.03 an hour it spends its 90% by the roll, so it is in no
+	// early burndown either (§110).
 	pace := measuredPace(0.005)
+	pace.BurnNow = 0.03
+	if pacedScheduler(score, pace, 0).score(account.ProviderClaude, "d1").inBurndownWindow(now) {
+		t.Fatal("fixture drift: the account is inside the burndown window")
+	}
 	for _, live := range []int{0, 6, 12} {
 		v := pacedVerdict(score, pace, live, now)
 		if v.AllowedSessions != 0 || !v.Eligible || v.AtCap || v.Burndown {

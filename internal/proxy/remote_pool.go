@@ -580,9 +580,9 @@ type routingCapacity struct {
 	// and carried seeds. The comparison falls back to Headroom there.
 	PaceOK bool
 	// Endgame marks the selected account as inside its burndown window: the
-	// 24h weekly roll, where the budget expires whether or not it is spent, or
-	// a reset holder's early burndown (PATCHES §56). The decision line's
-	// local_endgame.
+	// 24h weekly roll, where the budget expires whether or not it is spent, a
+	// reset holder's early burndown (PATCHES §56), or an early burndown on its
+	// pace (§110). The decision line's local_endgame.
 	Endgame bool
 	// Score is the selected account's full score, carried so the local/remote
 	// decision can run the SAME comparator selection runs rather than a second
