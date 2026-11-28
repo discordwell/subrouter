@@ -18,7 +18,7 @@ A Codex account enrolled with owner claims has the ID `codex-owner-<hash>`, and 
 
 ### The CLI's "protected" is not the router's gate
 
-When an account fails `UsableForNewSession`, the Use column of `sr status` reads `<n>% left, not routable`. `sr status --json` gives the account `"state": "protected"`, unless another state, such as `active` or `cooked`, takes precedence. The table's State column never prints `protected`. The router also routes an account in its burndown window, and there it ranks the account above every healthy one until the account reaches its session allowance (`at_cap`). Burndown covers the last 24 hours before the weekly roll. It also covers an account that holds an unclaimed reset that gives back the week once less than 25% of its week is left (§56). A Fable reset, which clears only the Fable limit, holds nothing (§64). An account at 8% left can be the router's first pick for a new session.
+When an account fails `UsableForNewSession`, the Use column of `sr status` reads `<n>% left, not routable`. `sr status --json` gives the account `"state": "protected"`, unless another state, such as `active` or `cooked`, takes precedence. The table's State column never prints `protected`. The router also routes an account in its burndown window, and there it ranks the account above every healthy one until the account reaches its session allowance (`at_cap`). Burndown covers the last 24 hours before the weekly roll. It also covers an account that holds an unclaimed reset that gives back the week once less than 25% of its week is left (§56). A Fable reset, which clears only the Fable limit, holds nothing (§64). It also covers an account whose own burn would leave budget unspent at a roll up to 72 hours away ([An account that would waste its week drains early](#an-account-that-would-waste-its-week-drains-early), §110). An account at 8% left can be the router's first pick for a new session, and so can an idle one at 100%.
 
 The router's verdict is `normalized.new_session` on each `usage-status` row. `srq pool` prints it as `new=`:
 
@@ -82,6 +82,20 @@ To see it:
 A peer's send changes no ranking here. Until the peer's reading turns, this daemon can still send that account one new session of its own.
 
 `SUBROUTER_SELF_START_WEEK=0` turns the daemon's own turn off. `SUBROUTER_SELF_START_MODEL` names another model for it. `SUBROUTER_START_UNSTARTED_WEEK=0` turns the priority and the session marks off. The two are independent: with the priority off, the daemon still sends its turn and marks the account. Either way the daemon still reads and publishes the fact, and a peer ranks on it by its own switch.
+
+### An account that would waste its week drains early
+
+An account that nobody spends keeps its week to the roll, and the roll takes it. So a local Claude account whose own burn would leave more than `SUBROUTER_PACE_WASTE_THRESHOLD` (5 points) of its week unspent at a roll up to 72 hours away joins the drain then, not in its last 24 hours (§110). The burn is what the daemon measured on the account over the last 2 hours, from its own readings: 0 for an idle account.
+
+- It drains behind every account that rolls sooner, those in their last 24 hours included, and ahead of the accounts chosen for a saved reset and every steady account. It takes the drain's allowance: up to 4 sessions by the taper, more if the time left needs them (§72).
+- It needs a current reading and 30 minutes of its own readings. After a restart, an account is not in it until its readings span 30 minutes.
+- The owner's reserve is not counted as waste: only the week above it.
+- When the sessions it takes burn fast enough to spend its week by the roll, it leaves the drain and ranks on its pace again. Its sessions stay. When they end and its burn falls, it comes back.
+- An account chosen for a saved reset is never in it. A peer's account is in it only on the peer's own verdict, and a peer from before §110 publishes none. Codex accounts are not measured and are never in it.
+
+To see it, `srq pool` prints `burndown·pace n/m` on the account, with a legend line. Its `usage-status` verdict reads `"reason": "burndown"`, `"burndown_cause": "pace"`. The board's row reads `drain` with the note `early burndown: at its present burn its week would roll with budget unspent`, and that is its `reason` in `pool.json` where the clause set its rank. Its `paced allowance` log line reads `in_burndown=true burndown_cause=pace` with `burn_now`, `hours_to_roll`, `projected_waste` and `danger=true`.
+
+`SUBROUTER_EARLY_DRAIN=0` turns it off. `SUBROUTER_EARLY_DRAIN_HOURS` moves the 72 hours, to any whole number from 25 to 168. A change needs a restart, on the box too, because this daemon drains a box's account on the box's verdict.
 
 ### Read the pool's burn
 
@@ -621,12 +635,12 @@ Both carry `{"meter": "week", "order": 1, "why": "..."}`.
 
 What a choice does to routing (§95.2). Only a choice published in real mode moves anything, and it moves only new sessions:
 
-- A chosen account that can take a new session ranks above every steady account. The drain stays above it: an account in its last 24 hours before its roll, and a reset holder in early burndown that is not chosen. An account whose week has not started still takes one session first (§86). Where machine policy is on, an account this machine is already bound to also comes first, and a chosen account that is shedding the model's requests (a capacity mark, which lasts minutes) goes after the accounts that are not.
+- A chosen account that can take a new session ranks above every steady account. The drain stays above it: an account in its last 24 hours before its roll, a reset holder in early burndown that is not chosen, and an account in early burndown on its pace (§110). An account whose week has not started still takes one session first (§86). Where machine policy is on, an account this machine is already bound to also comes first, and a chosen account that is shedding the model's requests (a capacity mark, which lasts minutes) goes after the accounts that are not.
 - Among chosen accounts the holder's order decides, 1 first. The next one takes new sessions only when the ones before it carry their allowance. On the Fable pool a `fable` choice goes before a `week` choice. The local-over-peer preference, the live-session spread and the per-request debit do not reorder chosen accounts.
 - A `week` or `codex_week` choice loads every model pool of the account. A `fable` choice loads the Fable pool only.
 - The allowance of a chosen account is `SUBROUTER_PACED_SESSION_CEILING` (20 by default), not the taper. A 5h window that cannot sustain more sessions still holds it at 1, and a 429 that is not a quota rejection holds it at 4 for 15 minutes. At its allowance it ranks below every other account that can take a session, and its verdict says `at_cap`.
 - The 5% short floor does not stop a chosen account, so a Codex account takes new sessions down to its limit. Its verdict reason is `chosen`. Exhaustion, the owner's holdout, a dead credential and a closed admission queue still refuse it.
-- A chosen account is not in the reset holder's early burndown: it is loaded in its holder's order instead. In its last 24 hours it drains like any account.
+- A chosen account is in neither early burndown, the reset holder's or the one on its pace: it is loaded in its holder's order instead. In its last 24 hours it drains like any account.
 - An Opus or Sonnet turn does not rank an account chosen for its Fable meter up for its spent Fable (the Fable-spent preference): that work would eat the week under its Fable reset. Every other account keeps the preference.
 - A session that already has an account never moves for a choice. A warm session stays where it is when another account becomes chosen, and it stays on a chosen account when the choice ends. A session idle for 70 minutes re-ranks as a new one, as it always did.
 
@@ -762,6 +776,8 @@ The daemon reads these from its environment when it starts.
 | `SUBROUTER_OUTAGE_SPILL_RATE` | 5 | Outage spills a second. `0` is off. |
 | `SUBROUTER_OUTAGE_SPILL_BURST` | 10 | The spill's burst. |
 | `SUBROUTER_RESET_HOLD_PRIORITY` | on | `0` stops ranking reset holders at 2x (§56). A value it does not recognize stops the daemon. |
+| `SUBROUTER_EARLY_DRAIN` | on | `0` stops an account whose own burn would leave budget unspent at its roll from draining before its last 24 hours (§110). Only `1` or `0`; any other value stops the daemon. |
+| `SUBROUTER_EARLY_DRAIN_HOURS` | 72 | How many hours before its roll such an account may start to drain (§110). Whole hours from 25 to 168; any other value stops the daemon. |
 | `SUBROUTER_FABLE_RESERVATION` | off | `1` holds back weekly budget for Fable (§57). A value it does not recognize stops the daemon. |
 | `SUBROUTER_FABLE_SPENT_PREFERENCE` | on | `0` stops ranking an Opus or Sonnet turn's accounts by their spent Fable meter (§65, §104). A value it does not recognize stops the daemon. |
 | `SUBROUTER_START_UNSTARTED_WEEK` | on | `0` stops giving the next new session first to an account whose weekly window has not started (§86). A value it does not recognize stops the daemon. |
@@ -776,6 +792,6 @@ The daemon reads these from its environment when it starts.
 | `SUBROUTER_PUBLIC_ADMIN` | off | On a box, `1` serves admin routes on the public listener to named admin tokens. |
 | `SUBROUTER_USAGE_HISTORY` | on | `0` stops recording this daemon's own meter readings and reset claims in `usage-history.jsonl` (§92.1), and with them the burn figures (§92.2). A value it does not recognize stops the daemon. |
 
-Most of these log an unreadable value and start with the default. Ten do not. `SUBROUTER_RESET_HOLD_PRIORITY`, `SUBROUTER_FABLE_RESERVATION`, `SUBROUTER_START_UNSTARTED_WEEK`, `SUBROUTER_SELF_START_WEEK`, `SUBROUTER_READ_CODEX_RESET_EXPIRY` and `SUBROUTER_USAGE_HISTORY` accept only `1` or `0`, or `true` or `false`, `yes` or `no`, `on` or `off`. `SUBROUTER_AUTO_RESET` accepts only `shadow`, `0` or `1`, and `SUBROUTER_AUTO_RESET_NEAR_EMPTY`, `SUBROUTER_AUTO_RESET_WORTH` and `SUBROUTER_RESET_LOADING` only `1` or `0`. Any other value stops `serve` from starting, and on a plain job launchd then restarts it forever. The other on/off settings read any value but `1`, `true`, `yes`, or `on` as off, and log nothing.
+Most of these log an unreadable value and start with the default. Twelve do not. `SUBROUTER_RESET_HOLD_PRIORITY`, `SUBROUTER_FABLE_RESERVATION`, `SUBROUTER_START_UNSTARTED_WEEK`, `SUBROUTER_SELF_START_WEEK`, `SUBROUTER_READ_CODEX_RESET_EXPIRY` and `SUBROUTER_USAGE_HISTORY` accept only `1` or `0`, or `true` or `false`, `yes` or `no`, `on` or `off`. `SUBROUTER_AUTO_RESET` accepts only `shadow`, `0` or `1`, `SUBROUTER_AUTO_RESET_NEAR_EMPTY`, `SUBROUTER_AUTO_RESET_WORTH`, `SUBROUTER_RESET_LOADING` and `SUBROUTER_EARLY_DRAIN` only `1` or `0`, and `SUBROUTER_EARLY_DRAIN_HOURS` only whole hours from 25 to 168. Any other value stops `serve` from starting, and on a plain job launchd then restarts it forever. The other on/off settings read any value but `1`, `true`, `yes`, or `on` as off, and log nothing.
 
 The deploy scripts read `SUBROUTER_LABEL`, `SUBROUTER_PLIST`, `SUBROUTER_ADDR` (as `host:port`), and `SUBROUTER_CONTROL_SOCKET` to find the job, and default to the LaunchAgent above.

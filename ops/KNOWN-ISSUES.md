@@ -322,7 +322,7 @@ Fixed by [PATCHES.md §50](PATCHES.md). It affects every build before it with a 
 - **With `SUBROUTER_FABLE_RESERVATION=1` and Fable unspent, early burndown takes 2 sessions at 25% measured and 1 below about 12.5%**, because the taper reads `WeeklyHeadroom`, which carries the Fable reservation only with that switch on (§57). By default it takes the full 4/3/2/1. The drain never takes fewer than 1, so it still reaches the wall, more slowly.
 - **A reserved holder may never burn down early.** The reserve gate reads `WeeklyHeadroom` (less the live debit and, with `SUBROUTER_FABLE_RESERVATION=1`, the Fable reservation), so a reserve above the holder's spendable week keeps it out.
 - **The legacy peer path can keep a 2x up to a body's age past expiry.** A peer on the legacy or `ignoresTargets` path anchors published seconds at now with no body-age gate, so an hour-old last-good body keeps the 2x up to an hour past the grant's expiry. Ranking only.
-- **`sr status` does not show early burndown.** Its Pick column can say `not routable` for a holder being drained. Read `srq pool` (`burndown·reset n/m`, `2x`) or the pool board.
+- **`sr status` does not show early burndown.** Its Pick column can say `not routable` for a holder being drained. Read `srq pool` (`burndown·reset n/m`, `burndown·pace n/m` since §110, `2x`) or the pool board.
 - **In shadow mode, the default, nothing claims the reset.** An early-burndown holder stays at its wall until the owner runs `sr claude reset <name>` or the week rolls, and the daemon logs what it would claim (§93). With `SUBROUTER_AUTO_RESET=1` the daemon that holds the account claims the reset there itself, behind the owner's under-1% condition, and the account's turns wait for it on the account (§93.2). It claims only when the claim is worth making (§94.2): a holder in a pool that does not need its reset, or whose roll is too near for a claim to add a quarter of a week, is held back and stays at its wall until a later reading or wall finds the claim worth it.
 
 ## Residual gaps §57 leaves open
@@ -400,3 +400,11 @@ A pre-§59 daemon (with §58) holds a turn whose lookup fails and retries the sa
 
 - **An account loaded for its Fable reset can meet its week wall first.** Fable work spends the week too, and §95 now chooses an account for its Fable reset however little of its week is left. If its week runs out before its Fable meter, it waits for its week roll with the Fable reset still held: no reset is spent, since a Fable claim needs the Fable meter out, and a chosen account at its limit takes no new session.
 - **A Fable reset behind a week reset is not claimed for Fable.** Only the grant Anthropic names next is ever claimed, so an account out of Fable whose next grant is a week reset waits until that week reset is used, as before §103.
+
+## Residual gaps §110 leaves open
+
+- **The drain is still soonest roll first.** An account in early burndown on its pace joins behind every earlier roll. A live session discounts a draining account, so under load it can take the next session ahead of an account in its last 24 hours that carries sessions (§41).
+- **Some budget still expires when demand is under capacity.** §110 changes which: an idle account near its roll spends ahead of accounts with more time left.
+- **The burn lags by up to 2 hours.** The burn is read over 2 hours, so an account can take a few sessions more than it needs before its burn shows them, and reach its limit before its roll.
+- **Not covered: Codex accounts, and accounts held by a peer from before §110.** The tracker measures local Claude accounts only, and an older peer publishes no `pace` cause, so its idle accounts drain only in their last 24 hours.
+- **An unmeasured account stays out.** For 30 minutes after a restart no account is in early burndown on its pace.

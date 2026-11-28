@@ -571,8 +571,9 @@ The daemon measures each local account's weekly burn per live session over
 the last two hours. A session is live while one of its requests is admitted
 and in flight. A request waiting in the admission queue burns nothing, so it
 does not count. In
-its burndown window (within a day of its weekly roll, or, for an account
-holding a saved weekly reset, once under a quarter of its week is left) an
+its burndown window (within a day of its weekly roll; for an account
+holding a saved weekly reset, once under a quarter of its week is left; or
+early, on its pace, below) an
 account normally takes at most 4 live sessions, fewer as its budget runs out.
 When the budget left over the hours left needs more live sessions than that,
 it takes them, up to 20. An account with no measured burn is sized on 1.5
@@ -594,7 +595,19 @@ turns the raise off: a burndown account keeps the taper of at most 4
 sessions, and every account takes 4 refugees. It does not turn off the closed
 queue below. `SUBROUTER_PACE_WASTE_THRESHOLD` sets, in points of the week
 (default 5), the projected waste at the roll that the log line reports as
-`danger=true`.
+`danger=true`, and that starts the early burndown below.
+
+An account whose own measured burn would leave more than that unspent at its
+roll drains early, from 72 hours before the roll (`ops/PATCHES.md` §110). It
+joins the burndown window behind every account that rolls sooner, and ahead
+of the accounts chosen for a saved reset and every steady account. When the
+sessions it takes burn fast enough to spend its week by the roll, it leaves
+the window, and its sessions stay. It needs a current reading and 30 minutes
+of its own readings, so an unmeasured account stays out. A peer's account
+drains early only on the peer's own verdict, and an account chosen for a
+saved reset never does. `srq pool` shows it as `burndown·pace n/m`.
+`SUBROUTER_EARLY_DRAIN=0` turns it off, and `SUBROUTER_EARLY_DRAIN_HOURS`
+(25 to 168) moves the 72 hours.
 
 Each account's owner also publishes how many warm refugees the account takes,
 so a refugee goes dark before it drains the account it moved to: one per 10
