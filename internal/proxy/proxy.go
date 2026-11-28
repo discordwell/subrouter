@@ -13317,12 +13317,15 @@ func (s Server) routingCapacityFor(base, scheduler selectacct.Scheduler, account
 	now := time.Now()
 	pace, paceOK := baseScore.WeeklyPace(now)
 	secondsToRefresh, refreshOK := baseScore.SecondsToWeeklyReset(now)
+	// The verdict's cause, as selection reads it: the raw score carries
+	// neither the pace table nor the reset choices (PATCHES §110).
+	endgame := scheduler.NewSessionVerdict(account.Provider, account.ID, now).BurndownCause != ""
 	return routingCapacity{
 		BelowFloor:       !scheduler.UsableForNewSession(account.Provider, account.ID),
 		Headroom:         headroom,
 		Pace:             pace,
 		PaceOK:           paceOK,
-		Endgame:          baseScore.BurndownCause(now) != "",
+		Endgame:          endgame,
 		WeeklyOnly:       baseScore.WeeklyOnly,
 		SecondsToRefresh: secondsToRefresh,
 		RefreshOK:        refreshOK,

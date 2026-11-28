@@ -397,6 +397,40 @@ func pacedSessionCeiling() (int, error) {
 	return sessions, nil
 }
 
+// earlyDrainEnabled reads SUBROUTER_EARLY_DRAIN (PATCHES §110): unset or 1,
+// an account whose own burn would leave budget unspent at its roll joins the
+// drain within SUBROUTER_EARLY_DRAIN_HOURS of it; 0, only the 24h roll window
+// and a reset holder's early burndown drain. Anything else is an error.
+func earlyDrainEnabled() (bool, error) {
+	raw := os.Getenv("SUBROUTER_EARLY_DRAIN")
+	switch strings.TrimSpace(raw) {
+	case "", "1":
+		return true, nil
+	case "0":
+		return false, nil
+	}
+	return false, fmt.Errorf("SUBROUTER_EARLY_DRAIN=%q: want 1 (the default) or 0", raw)
+}
+
+// earlyDrainHours reads SUBROUTER_EARLY_DRAIN_HOURS (PATCHES §110): how many
+// hours before its roll an account projected to waste budget joins the drain,
+// whole hours from 25 to 168 (a week), 72 when unset. 24 or less is refused:
+// the 24h roll window drains every account already, so the early drain would
+// have no hours to act in. SUBROUTER_EARLY_DRAIN=0 turns it off.
+func earlyDrainHours() (int, error) {
+	raw := os.Getenv("SUBROUTER_EARLY_DRAIN_HOURS")
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return selectacct.DefaultEarlyDrainHours, nil
+	}
+	hours, err := strconv.Atoi(trimmed)
+	if err != nil || hours < 25 || hours > 168 {
+		return 0, fmt.Errorf("SUBROUTER_EARLY_DRAIN_HOURS=%q: want whole hours from 25 to 168 (default %d); 24 or less leaves the early drain no hours before the 24h roll window, and SUBROUTER_EARLY_DRAIN=0 turns it off",
+			raw, selectacct.DefaultEarlyDrainHours)
+	}
+	return hours, nil
+}
+
 const paceSampleInterval = 30 * time.Second
 
 // selfStartScanInterval is how often the daemon looks for an unstarted Codex
@@ -1315,6 +1349,23 @@ func serve(args []string) error {
 	selectacct.SetPacedSessionCeiling(ceiling)
 	if ceiling != selectacct.DefaultPacedSessionCeiling {
 		slog.Info("paced session ceiling per account set by SUBROUTER_PACED_SESSION_CEILING", "sessions", ceiling, "default", selectacct.DefaultPacedSessionCeiling)
+	}
+	earlyDrain, err := earlyDrainEnabled()
+	if err != nil {
+		return err
+	}
+	drainHours, err := earlyDrainHours()
+	if err != nil {
+		return err
+	}
+	selectacct.SetEarlyDrain(earlyDrain)
+	selectacct.SetEarlyDrainHours(drainHours)
+	switch {
+	case !earlyDrain:
+		slog.Info("early drain disabled by SUBROUTER_EARLY_DRAIN; an account projected to waste budget drains only inside its 24h roll window",
+			"reenable", "unset SUBROUTER_EARLY_DRAIN and restart")
+	case drainHours != selectacct.DefaultEarlyDrainHours:
+		slog.Info("early drain horizon set by SUBROUTER_EARLY_DRAIN_HOURS", "hours", drainHours, "default", selectacct.DefaultEarlyDrainHours)
 	}
 
 	cloudConfigFile := strings.TrimSpace(*cloudConfigPath)

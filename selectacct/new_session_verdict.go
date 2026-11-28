@@ -75,9 +75,10 @@ type NewSessionVerdict struct {
 	Eligible bool `json:"eligible"`
 	// Reason names the deciding clause; see the Verdict* constants.
 	Reason string `json:"reason"`
-	// Burndown: inside the burndown window -- the 24h weekly roll, or a reset
-	// holder's early burndown (PATCHES §56) -- under its taper, above the short
-	// floor and the reserve (endgameDrainEligible). Ranks first.
+	// Burndown: inside the burndown window -- the 24h weekly roll, a reset
+	// holder's early burndown (PATCHES §56), or an early burndown on the
+	// account's pace (§110) -- under its taper, above the short floor and the
+	// reserve (endgameDrainEligible). Ranks first.
 	Burndown bool `json:"burndown"`
 	// AtCap: inside the window and carrying its full taper allowance
 	// (endgameAtCap), or chosen for a saved reset and carrying its allowance
@@ -96,11 +97,12 @@ type NewSessionVerdict struct {
 	// (PATCHES §95.2); 0 outside the burndown window for an account not
 	// chosen.
 	AllowedSessions int `json:"allowed_sessions"`
-	// BurndownCause says why the account is in the burndown window, "roll" or
-	// "reset" (Score.BurndownCause), whenever it is -- for logs, srq and the
-	// board; routing reads Burndown and AtCap. The one field that may be
-	// absent: absent is "not in the window", which is also all a daemon from
-	// before PATCHES §56 could have meant.
+	// BurndownCause says why the account is in the burndown window, "roll",
+	// "reset" or "pace" (Score.BurndownCause), whenever it is -- for logs, srq
+	// and the board; routing reads Burndown and AtCap, so a reader from before
+	// PATCHES §110 routes a "pace" burndown as any other. The one field that
+	// may be absent: absent is "not in the window", which is also all a daemon
+	// from before PATCHES §56 could have meant.
 	BurndownCause string `json:"burndown_cause,omitempty"`
 	// RefugeeCap is how many warm refugees the account takes (PATCHES §72),
 	// computed by its owner on its own score (Score.refugeeCap). A peer

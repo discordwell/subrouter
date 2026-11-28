@@ -996,13 +996,17 @@ const (
 	// BurndownCauseReset is the early burndown of a reset holder below
 	// ResetBurndownWeeklyRemaining of its week (inResetBurndown, PATCHES §56).
 	BurndownCauseReset = "reset"
+	// BurndownCausePace is the early burndown of an account whose own burn
+	// would leave budget unspent at its roll (inPaceBurndown, PATCHES §110).
+	BurndownCausePace = "pace"
 )
 
 // BurndownCause names why the account is in the burndown window, or "" when
-// it is not. The roll wins when both hold: that budget expires first whatever
-// the reset does. A peer's account carries its owner's cause in its verdict,
-// verbatim; one from a daemon too old to publish a cause reads "". Display and
-// logging only -- routing reads inBurndownWindow and the verdict.
+// it is not. The roll wins over the others: that budget expires first whatever
+// the reset or the burn does; the reset wins over the pace. A peer's account
+// carries its owner's cause in its verdict, verbatim; one from a daemon too
+// old to publish a cause reads "". Display and logging only -- routing reads
+// inBurndownWindow and the verdict.
 func (s Score) BurndownCause(now time.Time) string {
 	if verdict, ok := s.peerVerdict(); ok {
 		return verdict.BurndownCause
@@ -1012,6 +1016,8 @@ func (s Score) BurndownCause(now time.Time) string {
 		return BurndownCauseRoll
 	case s.inResetBurndown(now):
 		return BurndownCauseReset
+	case s.inPaceBurndown(now):
+		return BurndownCausePace
 	}
 	return ""
 }
@@ -1370,8 +1376,8 @@ func (s Score) shortBurnSustainable() bool {
 // routableForNewSession widens usableForNewSession for endgame drain: an
 // account inside its burndown window keeps taking new sessions below the
 // usual headroom threshold because its remaining budget is about to be lost
-// anyway (or, for a reset holder, refilled by the claim). Everything else
-// keeps the conservative gate.
+// anyway (or, for a reset holder, refilled by the claim; or, on its pace,
+// left unspent at the roll). Everything else keeps the conservative gate.
 func (s Score) routableForNewSession(now time.Time, allowEndgame bool) bool {
 	if verdict, ok := s.peerVerdict(); ok {
 		return verdict.Eligible
@@ -1403,24 +1409,24 @@ func (s Score) weeklyResetSecondsLeft(now time.Time) float64 {
 }
 
 // endgameDrainEligible marks an account that should be aggressively spent:
-// in its burndown window (within a day of its weekly roll, or a reset holder's
-// early burndown: inBurndownWindow), not exhausted (the 5h gate and upstream
-// 429 marks still apply through exhausted()), and below its concurrency
-// allowance. The allowance shrinks with remaining budget so the account
-// glides to exhaustion carrying roughly one final task rather than being
-// dogpiled the moment it enters the window; at the cap, traffic spills to
-// the next-draining account, then to steady-state ones. Sessions must be a
-// live-concurrency count (the proxy joins sticky assignments against its
-// in-flight tracker) — an all-time assignment count grows monotonically and
-// would keep this permanently false. Deliberately not gated on Fresh:
-// staleness is bounded by the per-assignment usage refresh and by the
-// absolute WeeklyResetAt deadline, and a wrong drain pick is corrected by
-// the upstream's own limit response.
+// in its burndown window (within a day of its weekly roll, or an early
+// burndown on a saved reset or on its pace: inBurndownWindow), not exhausted
+// (the 5h gate and upstream 429 marks still apply through exhausted()), and
+// below its concurrency allowance. The allowance shrinks with remaining
+// budget so the account glides to exhaustion carrying roughly one final task
+// rather than being dogpiled the moment it enters the window; at the cap,
+// traffic spills to the next-draining account, then to steady-state ones.
+// Sessions must be a live-concurrency count (the proxy joins sticky
+// assignments against its in-flight tracker) — an all-time assignment count
+// grows monotonically and would keep this permanently false. Deliberately not
+// gated on Fresh: staleness is bounded by the per-assignment usage refresh
+// and by the absolute WeeklyResetAt deadline, and a wrong drain pick is
+// corrected by the upstream's own limit response. (The pace burndown's entry
+// does read Fresh: its projection is not bounded by a deadline.)
 // A reserved account at its holdout is excluded here. Inside the 24h roll
 // window the holdout is already lifted (reserveReleased, PATCHES §60), so the
-// clause binds in a reset holder's early burndown, which can start days
-// before the roll: there the holdout would otherwise be drained with a week
-// still to run.
+// clause binds in an early burndown, which can start days before the roll:
+// there the holdout would otherwise be drained with a week still to run.
 func (s Score) endgameDrainEligible(now time.Time) bool {
 	if verdict, ok := s.peerVerdict(); ok {
 		return verdict.Burndown
@@ -1529,13 +1535,46 @@ func (s Score) inResetBurndown(now time.Time) bool {
 		!s.exhausted()
 }
 
-// inBurndownWindow is the window the drain tier runs in: the 24h roll, or a
-// reset holder's early burndown. Drain eligibility, the taper cap, the
-// published allowance and the steady-mode demotion read it; what is about the
-// roll itself (the Fable reservation's decay when §57's switch is on,
-// endgameUrgency) stays on the roll.
+// inPaceBurndown is the early burndown of an account projected to waste budget
+// (PATCHES §110): its own burn, measured, spends less than its week holds by
+// its roll, which lies past the 24h roll window and within EarlyDrainHours.
+// It drains now, under the same taper, floor and reserve as the 24h window,
+// behind every account whose roll lands first (endgameUrgency). The sessions
+// it takes raise its burn, and it leaves the window once that burn would
+// spend the week by the roll; its warm sessions stay.
+//
+// The projection is allowance's: Danger, on the drain's inputs, so the
+// owner's reserve is never counted as waste. A reading that is not Fresh may
+// be hours old, and an account the tracker has not measured (its first 30
+// minutes after a restart) stays out: unmeasured fails closed here. The
+// tracker measures local Claude accounts only, and a peer's early burndown is
+// its owner's call, read from its verdict like any other burndown. An account
+// chosen for a saved reset, for either meter, is loaded in its holder's order
+// instead (PATCHES §95.2): a Fable choice is kept off Opus work that would eat
+// the week under its Fable meter.
+//
+// 2026-11-27 owner, approving "an account projected to waste budget joins the
+// drain when that projection appears, not at 24 hours": "Yeah that's a good
+// fix. Go ahead and do it."
+func (s Score) inPaceBurndown(now time.Time) bool {
+	if !EarlyDrain() || s.Remote || s.ResetChoice.Meter != "" || !s.Fresh || s.exhausted() {
+		return false
+	}
+	seconds := s.weeklyResetSecondsLeft(now)
+	if seconds <= float64(claudeEndgameWindowSeconds) || seconds > float64(EarlyDrainHours())*3600 {
+		return false
+	}
+	return s.allowance(now).Danger
+}
+
+// inBurndownWindow is the window the drain tier runs in: the 24h roll, a
+// reset holder's early burndown, or an account's early burndown on its pace.
+// Drain eligibility, the taper cap, the published allowance and the
+// steady-mode demotion read it; what is about the roll itself (the Fable
+// reservation's decay when §57's switch is on, endgameUrgency) stays on the
+// roll.
 func (s Score) inBurndownWindow(now time.Time) bool {
-	return s.inEndgameWindow(now) || s.inResetBurndown(now)
+	return s.inEndgameWindow(now) || s.inResetBurndown(now) || s.inPaceBurndown(now)
 }
 
 // drainReadsMeasured is the scope of PATCHES §55: with its switch on (the

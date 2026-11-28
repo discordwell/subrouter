@@ -34,6 +34,10 @@ type Pace struct {
 	BurnPerLive float64
 	// BurnNow is the account's weekly fraction spent per hour over the window.
 	BurnNow float64
+	// Measured is the account's own burn read over a span of at least
+	// paceMinSpan: BurnNow is then a reading, 0 included, whether or not a
+	// BurnPerLive could be derived (PATCHES §110). False is unmeasured.
+	Measured bool
 	// Source is "account", "pool" (bootstrapped from this daemon's other
 	// accounts), "default" in an Allowance sized on defaultBurnPerLive, or ""
 	// when BurnPerLive is unmeasured.
@@ -58,9 +62,10 @@ type Allowance struct {
 	Needed      float64
 	Spendable   float64
 	HoursToRoll float64
-	// ProjectedWaste is Spendable less what the current burn spends by the
-	// roll. Danger is a measured account projected to waste more than
-	// PaceWasteThreshold.
+	// ProjectedWaste is Spendable less what the account's own measured burn
+	// (Pace.Measured) spends by the roll. Danger is an account so measured
+	// projected to waste more than PaceWasteThreshold; inside the early-drain
+	// horizon it is the pace burndown (Score.inPaceBurndown, PATCHES §110).
 	ProjectedWaste float64
 	Danger         bool
 	Pace           Pace
@@ -95,17 +100,18 @@ func (s Score) allowance(now time.Time) Allowance {
 		out.Pace.BurnPerLive, out.Pace.Source = defaultBurnPerLive, "default"
 	}
 	sustainable := s.shortBurnSustainable()
-	if out.HoursToRoll > 0 && out.Pace.BurnPerLive > 0 {
-		if measured {
-			out.ProjectedWaste = spendable - s.Pace.BurnNow*out.HoursToRoll
-			out.Danger = out.ProjectedWaste > PaceWasteThreshold()
-		}
-		if on {
-			out.Needed = spendable / out.HoursToRoll / out.Pace.BurnPerLive
-			if paced := int(math.Min(roundNeededSessions(out.Needed), float64(out.Ceiling))); spendable > 0 && sustainable &&
-				!out.Backpressured && paced > taper {
-				out.Paced = paced
-			}
+	// The projection needs the account's own burn only: an idle account with
+	// no live session-hours anywhere in the pool has no BurnPerLive, and is
+	// exactly the one wasting its week.
+	if out.HoursToRoll > 0 && s.Pace.Measured {
+		out.ProjectedWaste = spendable - s.Pace.BurnNow*out.HoursToRoll
+		out.Danger = out.ProjectedWaste > PaceWasteThreshold()
+	}
+	if out.HoursToRoll > 0 && out.Pace.BurnPerLive > 0 && on {
+		out.Needed = spendable / out.HoursToRoll / out.Pace.BurnPerLive
+		if paced := int(math.Min(roundNeededSessions(out.Needed), float64(out.Ceiling))); spendable > 0 && sustainable &&
+			!out.Backpressured && paced > taper {
+			out.Paced = paced
 		}
 	}
 	allowed := max(taper, out.Paced)
@@ -210,6 +216,36 @@ func PaceWasteThreshold() float64 {
 		return *threshold
 	}
 	return defaultPaceWasteThreshold
+}
+
+var earlyDrainOff atomic.Bool
+
+// SetEarlyDrain turns PATCHES §110's pace burndown on or off for this process.
+// The daemon calls it once at startup, before the first scheduler is built.
+func SetEarlyDrain(on bool) { earlyDrainOff.Store(!on) }
+
+// EarlyDrain reports whether §110's pace burndown is on.
+func EarlyDrain() bool { return !earlyDrainOff.Load() }
+
+// DefaultEarlyDrainHours is how far before its roll an account projected to
+// waste budget joins the drain (PATCHES §110), unless SetEarlyDrainHours says
+// otherwise. It keeps the drain off accounts whose week has days left to be
+// spent by ordinary routing, so §95's loading still runs the rest of the pool.
+const DefaultEarlyDrainHours = 72
+
+var earlyDrainHours atomic.Int64
+
+// SetEarlyDrainHours sets the early-drain horizon for this process; 0
+// restores DefaultEarlyDrainHours. The daemon accepts only hours above the 24h
+// roll window, where the pace burndown can act at all.
+func SetEarlyDrainHours(hours int) { earlyDrainHours.Store(int64(hours)) }
+
+// EarlyDrainHours is the early-drain horizon in hours.
+func EarlyDrainHours() int {
+	if hours := earlyDrainHours.Load(); hours > 0 {
+		return int(hours)
+	}
+	return DefaultEarlyDrainHours
 }
 
 type paceTracker struct {
@@ -351,7 +387,7 @@ func (p *paceTracker) publishLocked() {
 		if !ok {
 			continue
 		}
-		pace := Pace{BurnNow: used / hours}
+		pace := Pace{BurnNow: used / hours, Measured: true}
 		switch {
 		case live >= paceMinLiveHours:
 			pace.BurnPerLive, pace.Source = used/live, "account"
